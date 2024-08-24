@@ -1,6 +1,6 @@
 refuse
 psutil
-pysimplegui
+pysimplegui-4-foss
 Flask
 flask-socketio
 eventlet
