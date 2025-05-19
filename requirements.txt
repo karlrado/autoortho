@@ -16,6 +16,10 @@ click==8.1.7
     # via
     #   flask
     #   geocoder
+colorama==0.4.6
+    # via
+    #   click
+    #   pytest
 decorator==5.1.1
     # via ratelim
 dnspython==2.6.1
@@ -56,7 +60,7 @@ pluggy==1.5.0
     # via pytest
 psutil==6.0.0
     # via -r requirements.in
-pysimplegui==4.70.1
+pysimplegui-4-foss==4.60.4.1
     # via -r requirements.in
 pytest==8.3.3
     # via -r requirements.in
