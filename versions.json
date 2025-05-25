@@ -1,10 +1,15 @@
 [
   {
-    "version": "v0.8.1-karlrado",
-    "title": "v0.8.1-karlrado",
+    "version": "v0.8.2-karlrado",
+    "title": "v0.8.2-karlrado",
     "aliases": [
       "latest"
     ]
+  },
+  {
+    "version": "v0.8.1-karlrado",
+    "title": "v0.8.1-karlrado",
+    "aliases": []
   },
   {
     "version": "v0.8.0-karlrado",
