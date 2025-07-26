@@ -480,7 +480,7 @@ class ConfigUI(QMainWindow):
         self.file_cache_slider = ModernSlider()
         self.file_cache_slider.setRange(10, 500)
         self.file_cache_slider.setSingleStep(5)
-        self.file_cache_slider.setValue(int(self.cfg.cache.file_cache_size))
+        self.file_cache_slider.setValue(int(float(self.cfg.cache.file_cache_size)))
         self.file_cache_slider.setObjectName('file_cache_size')
         self.file_cache_label = QLabel(f"{self.cfg.cache.file_cache_size} GB")
         self.file_cache_slider.valueChanged.connect(
@@ -498,7 +498,7 @@ class ConfigUI(QMainWindow):
         mem_cache_layout.addWidget(QLabel("Memory cache (GB):"))
         self.mem_cache_slider = ModernSlider()
         self.mem_cache_slider.setRange(2, 64)
-        self.mem_cache_slider.setValue(int(self.cfg.cache.cache_mem_limit))
+        self.mem_cache_slider.setValue(int(float(self.cfg.cache.cache_mem_limit)))
         self.mem_cache_slider.setObjectName('cache_mem_limit')
         self.mem_cache_label = QLabel(f"{self.cfg.cache.cache_mem_limit} GB")
         self.mem_cache_slider.valueChanged.connect(
