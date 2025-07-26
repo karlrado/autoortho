@@ -342,6 +342,7 @@ class ConfigUI(QMainWindow):
 
         # Create tabs
         self.create_setup_tab()
+        self.create_settings_tab()
         self.create_scenery_tab()
         self.create_logs_tab()
 
@@ -457,6 +458,16 @@ class ConfigUI(QMainWindow):
             options_layout.addWidget(self.winfsp_check)
 
         layout.addWidget(options_group)
+        layout.addStretch()
+
+        self.tabs.addTab(setup_widget, "Setup")
+
+    def create_settings_tab(self):
+        """Create the advanced settings configuration tab"""
+        settings_widget = QWidget()
+        layout = QVBoxLayout()
+        layout.setSpacing(15)
+        settings_widget.setLayout(layout)
 
         # Cache settings group
         cache_group = QGroupBox("Cache Settings")
@@ -465,7 +476,7 @@ class ConfigUI(QMainWindow):
 
         # File cache size
         file_cache_layout = QHBoxLayout()
-        file_cache_layout.addWidget(QLabel("Cache size (GB):"))
+        file_cache_layout.addWidget(QLabel("File cache size (GB):"))
         self.file_cache_slider = ModernSlider()
         self.file_cache_slider.setRange(10, 500)
         self.file_cache_slider.setSingleStep(5)
@@ -498,9 +509,165 @@ class ConfigUI(QMainWindow):
         cache_layout.addLayout(mem_cache_layout)
 
         layout.addWidget(cache_group)
+
+        # AutoOrtho Settings group
+        autoortho_group = QGroupBox("AutoOrtho Settings")
+        autoortho_layout = QVBoxLayout()
+        autoortho_group.setLayout(autoortho_layout)
+
+        # Min zoom level
+        min_zoom_layout = QHBoxLayout()
+        min_zoom_layout.addWidget(QLabel("Minimum zoom level:"))
+        self.min_zoom_slider = ModernSlider()
+        self.min_zoom_slider.setRange(8, 18)
+        self.min_zoom_slider.setValue(int(self.cfg.autoortho.min_zoom))
+        self.min_zoom_slider.setObjectName('min_zoom')
+        self.min_zoom_label = QLabel(f"{self.cfg.autoortho.min_zoom}")
+        self.min_zoom_slider.valueChanged.connect(
+            lambda v: self.min_zoom_label.setText(f"{v}")
+        )
+        min_zoom_layout.addWidget(self.min_zoom_slider)
+        min_zoom_layout.addWidget(self.min_zoom_label)
+        autoortho_layout.addLayout(min_zoom_layout)
+
+        # Max wait time
+        maxwait_layout = QHBoxLayout()
+        maxwait_layout.addWidget(QLabel("Max wait time (seconds):"))
+        self.maxwait_slider = ModernSlider()
+        self.maxwait_slider.setRange(1, 100)
+        self.maxwait_slider.setSingleStep(1)
+        # Convert maxwait to int for slider (multiply by 10 for 0.1 precision)
+        maxwait_value = int(float(self.cfg.autoortho.maxwait) * 10)
+        self.maxwait_slider.setValue(maxwait_value)
+        self.maxwait_slider.setObjectName('maxwait')
+        self.maxwait_label = QLabel(f"{self.cfg.autoortho.maxwait}")
+        self.maxwait_slider.valueChanged.connect(
+            lambda v: self.maxwait_label.setText(f"{v/10:.1f}")
+        )
+        maxwait_layout.addWidget(self.maxwait_slider)
+        maxwait_layout.addWidget(self.maxwait_label)
+        autoortho_layout.addLayout(maxwait_layout)
+
+        # Fetch threads
+        threads_layout = QHBoxLayout()
+        threads_layout.addWidget(QLabel("Fetch threads:"))
+        self.fetch_threads_slider = ModernSlider()
+        self.fetch_threads_slider.setRange(1, 64)
+        self.fetch_threads_slider.setValue(int(self.cfg.autoortho.fetch_threads))
+        self.fetch_threads_slider.setObjectName('fetch_threads')
+        self.fetch_threads_label = QLabel(f"{self.cfg.autoortho.fetch_threads}")
+        self.fetch_threads_slider.valueChanged.connect(
+            lambda v: self.fetch_threads_label.setText(f"{v}")
+        )
+        threads_layout.addWidget(self.fetch_threads_slider)
+        threads_layout.addWidget(self.fetch_threads_label)
+        autoortho_layout.addLayout(threads_layout)
+
+        layout.addWidget(autoortho_group)
+
+        # DDS Compression Settings group
+        dds_group = QGroupBox("DDS Compression Settings")
+        dds_layout = QVBoxLayout()
+        dds_group.setLayout(dds_layout)
+
+        # Compressor
+        compressor_layout = QHBoxLayout()
+        compressor_layout.addWidget(QLabel("Compressor:"))
+        self.compressor_combo = QComboBox()
+        self.compressor_combo.addItems(['ISPC', 'STB'])
+        self.compressor_combo.setCurrentText(self.cfg.pydds.compressor)
+        self.compressor_combo.setObjectName('compressor')
+        compressor_layout.addWidget(self.compressor_combo)
+        compressor_layout.addStretch()
+        dds_layout.addLayout(compressor_layout)
+
+        # Format
+        format_layout = QHBoxLayout()
+        format_layout.addWidget(QLabel("Format:"))
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(['BC1', 'BC3'])
+        self.format_combo.setCurrentText(self.cfg.pydds.format)
+        self.format_combo.setObjectName('format')
+        format_layout.addWidget(self.format_combo)
+        format_layout.addStretch()
+        dds_layout.addLayout(format_layout)
+
+        layout.addWidget(dds_group)
+
+        # General Settings group
+        general_group = QGroupBox("General Settings")
+        general_layout = QVBoxLayout()
+        general_group.setLayout(general_layout)
+
+        self.gui_check = QCheckBox("Use GUI at startup")
+        self.gui_check.setChecked(self.cfg.general.gui)
+        self.gui_check.setObjectName('gui')
+        general_layout.addWidget(self.gui_check)
+
+        self.hide_check = QCheckBox("Hide window when running")
+        self.hide_check.setChecked(self.cfg.general.hide)
+        self.hide_check.setObjectName('hide')
+        general_layout.addWidget(self.hide_check)
+
+        self.debug_check = QCheckBox("Debug mode")
+        self.debug_check.setChecked(self.cfg.general.debug)
+        self.debug_check.setObjectName('debug')
+        general_layout.addWidget(self.debug_check)
+
+        layout.addWidget(general_group)
+
+        # Scenery Settings group
+        scenery_group = QGroupBox("Scenery Settings")
+        scenery_layout = QVBoxLayout()
+        scenery_group.setLayout(scenery_layout)
+
+        self.noclean_check = QCheckBox("Don't cleanup downloads")
+        self.noclean_check.setChecked(self.cfg.scenery.noclean)
+        self.noclean_check.setObjectName('noclean')
+        scenery_layout.addWidget(self.noclean_check)
+
+        layout.addWidget(scenery_group)
+
+        # FUSE Settings group
+        fuse_group = QGroupBox("FUSE Settings")
+        fuse_layout = QVBoxLayout()
+        fuse_group.setLayout(fuse_layout)
+
+        self.threading_check = QCheckBox("Enable multi-threading")
+        self.threading_check.setChecked(self.cfg.fuse.threading)
+        self.threading_check.setObjectName('threading')
+        fuse_layout.addWidget(self.threading_check)
+
+        layout.addWidget(fuse_group)
+
+        # Flight Data Settings group
+        flightdata_group = QGroupBox("Flight Data Settings")
+        flightdata_layout = QVBoxLayout()
+        flightdata_group.setLayout(flightdata_layout)
+
+        # Web UI port
+        webui_port_layout = QHBoxLayout()
+        webui_port_layout.addWidget(QLabel("Web UI port:"))
+        self.webui_port_edit = QLineEdit(str(self.cfg.flightdata.webui_port))
+        self.webui_port_edit.setObjectName('webui_port')
+        webui_port_layout.addWidget(self.webui_port_edit)
+        webui_port_layout.addStretch()
+        flightdata_layout.addLayout(webui_port_layout)
+
+        # X-Plane UDP port
+        xplane_port_layout = QHBoxLayout()
+        xplane_port_layout.addWidget(QLabel("X-Plane UDP port:"))
+        self.xplane_udp_port_edit = QLineEdit(str(self.cfg.flightdata.xplane_udp_port))
+        self.xplane_udp_port_edit.setObjectName('xplane_udp_port')
+        xplane_port_layout.addWidget(self.xplane_udp_port_edit)
+        xplane_port_layout.addStretch()
+        flightdata_layout.addLayout(xplane_port_layout)
+
+        layout.addWidget(flightdata_group)
+
         layout.addStretch()
 
-        self.tabs.addTab(setup_widget, "Setup")
+        self.tabs.addTab(settings_widget, "Settings")
 
     def create_scenery_tab(self):
         """Create the scenery management tab"""
@@ -747,13 +914,39 @@ class ConfigUI(QMainWindow):
         self.cfg.general.showconfig = self.showconfig_check.isChecked()
         self.cfg.autoortho.maptype_override = self.maptype_combo.currentText()
 
-        # Save cache settings
-        self.cfg.cache.file_cache_size = str(self.file_cache_slider.value())
-        self.cfg.cache.cache_mem_limit = str(self.mem_cache_slider.value())
-
         # Windows specific
         if platform.system() == 'Windows' and hasattr(self, 'winfsp_check'):
             self.cfg.windows.prefer_winfsp = self.winfsp_check.isChecked()
+
+        # Save Settings tab values
+        if hasattr(self, 'file_cache_slider'):
+            # Cache settings
+            self.cfg.cache.file_cache_size = str(self.file_cache_slider.value())
+            self.cfg.cache.cache_mem_limit = str(self.mem_cache_slider.value())
+
+            # AutoOrtho settings
+            self.cfg.autoortho.min_zoom = str(self.min_zoom_slider.value())
+            self.cfg.autoortho.maxwait = str(self.maxwait_slider.value() / 10.0)
+            self.cfg.autoortho.fetch_threads = str(self.fetch_threads_slider.value())
+
+            # DDS settings
+            self.cfg.pydds.compressor = self.compressor_combo.currentText()
+            self.cfg.pydds.format = self.format_combo.currentText()
+
+            # General settings
+            self.cfg.general.gui = self.gui_check.isChecked()
+            self.cfg.general.hide = self.hide_check.isChecked()
+            self.cfg.general.debug = self.debug_check.isChecked()
+
+            # Scenery settings
+            self.cfg.scenery.noclean = self.noclean_check.isChecked()
+
+            # FUSE settings
+            self.cfg.fuse.threading = self.threading_check.isChecked()
+
+            # Flight data settings
+            self.cfg.flightdata.webui_port = str(self.webui_port_edit.text())
+            self.cfg.flightdata.xplane_udp_port = str(self.xplane_udp_port_edit.text())
 
         self.cfg.save()
         self.ready.set()

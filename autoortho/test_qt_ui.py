@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import QApplication
 from autoortho.aoconfig import AOConfig
 from autoortho.config_ui_qt import ConfigUI
 
+
 def test_ui():
     """Test the PyQt6 UI"""
     app = QApplication(sys.argv)
@@ -22,8 +23,15 @@ def test_ui():
     ui = ConfigUI(cfg)
     ui.show()
 
+    # Test Settings tab by switching to it
+    ui.tabs.setCurrentIndex(1)  # Settings is the second tab
+
+    print("UI loaded successfully with Settings tab!")
+    print("Available tabs:", [ui.tabs.tabText(i) for i in range(ui.tabs.count())])
+
     # Run the application
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     test_ui()
