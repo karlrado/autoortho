@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QPushButton, QLabel, QLineEdit, QCheckBox, QComboBox,
     QSlider, QTextEdit, QFileDialog, QMessageBox, QScrollArea,
-    QSplashScreen, QGroupBox, QProgressBar, QStatusBar, QFrame
+    QSplashScreen, QGroupBox, QProgressBar, QStatusBar, QFrame, QSpinBox
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QSize
@@ -139,6 +139,59 @@ class ModernSlider(QSlider):
             QSlider::sub-page:horizontal {
                 background: #FF6B35;
                 border-radius: 3px;
+            }
+        """)
+
+
+class ModernSpinBox(QSpinBox):
+    """Custom styled spinbox"""
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet("""
+            QSpinBox {
+                background-color: #3A3A3A;
+                border: 1px solid #555;
+                padding: 6px;
+                border-radius: 4px;
+                color: white;
+                min-width: 80px;
+            }
+            QSpinBox:focus {
+                border-color: #FF6B35;
+            }
+            QSpinBox::up-button {
+                background-color: #FF6B35;
+                border: none;
+                border-radius: 2px;
+                width: 16px;
+            }
+            QSpinBox::up-button:hover {
+                background-color: #FF8555;
+            }
+            QSpinBox::up-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-bottom: 4px solid white;
+                width: 0px;
+                height: 0px;
+            }
+            QSpinBox::down-button {
+                background-color: #FF6B35;
+                border: none;
+                border-radius: 2px;
+                width: 16px;
+            }
+            QSpinBox::down-button:hover {
+                background-color: #FF8555;
+            }
+            QSpinBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 4px solid white;
+                width: 0px;
+                height: 0px;
             }
         """)
 
@@ -331,7 +384,13 @@ class ConfigUI(QMainWindow):
         # Add banner
         banner_label = QLabel()
         banner_pixmap = QPixmap(os.path.join(CUR_PATH, 'imgs', 'banner1.png'))
-        banner_label.setPixmap(banner_pixmap.scaled(QSize(400, 100), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        banner_label.setPixmap(
+            banner_pixmap.scaled(
+                QSize(400, 100),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+        )
         banner_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         main_layout.addWidget(banner_label)
 
@@ -374,9 +433,19 @@ class ConfigUI(QMainWindow):
     def create_setup_tab(self):
         """Create the setup configuration tab"""
         setup_widget = QWidget()
+
+        # Create scroll area for setup content
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+
+        # Create the actual content widget
+        setup_content = QWidget()
         layout = QVBoxLayout()
         layout.setSpacing(15)
-        setup_widget.setLayout(layout)
+        setup_content.setLayout(layout)
 
         # Paths group
         paths_group = QGroupBox("Paths Configuration")
@@ -385,45 +454,96 @@ class ConfigUI(QMainWindow):
 
         # Scenery path
         scenery_layout = QHBoxLayout()
-        scenery_layout.addWidget(QLabel("Scenery install dir:"))
+        scenery_label = QLabel("Scenery install dir:")
+        scenery_label.setToolTip(
+            "Directory where AutoOrtho scenery will be installed.\n"
+            "This should be a dedicated folder for AutoOrtho scenery,\n"
+            "typically separate from your X-Plane Custom Scenery folder.\n"
+            "Example: C:\\AutoOrtho_Scenery\\ or ~/AutoOrtho_Scenery/"
+        )
+        scenery_layout.addWidget(scenery_label)
         self.scenery_path_edit = QLineEdit(self.cfg.paths.scenery_path)
         self.scenery_path_edit.setObjectName('scenery_path')
+        self.scenery_path_edit.setToolTip(
+            "Full path to your AutoOrtho scenery installation directory"
+        )
         scenery_layout.addWidget(self.scenery_path_edit)
         browse_btn = StyledButton("Browse")
-        browse_btn.clicked.connect(lambda: self.browse_folder(self.scenery_path_edit))
+        browse_btn.clicked.connect(
+            lambda: self.browse_folder(self.scenery_path_edit)
+        )
         scenery_layout.addWidget(browse_btn)
         paths_layout.addLayout(scenery_layout)
 
         # X-Plane path
         xplane_layout = QHBoxLayout()
-        xplane_layout.addWidget(QLabel("X-Plane install dir:"))
+        xplane_label = QLabel("X-Plane install dir:")
+        xplane_label.setToolTip(
+            "Your main X-Plane installation directory.\n"
+            "This should contain the X-Plane.exe file and\n"
+            "the 'Custom Scenery' folder.\n"
+            "Example: C:\\X-Plane 12\\ or /Applications/X-Plane 12/"
+        )
+        xplane_layout.addWidget(xplane_label)
         self.xplane_path_edit = QLineEdit(self.cfg.paths.xplane_path)
         self.xplane_path_edit.setObjectName('xplane_path')
+        self.xplane_path_edit.setToolTip(
+            "Full path to your X-Plane installation directory"
+        )
         xplane_layout.addWidget(self.xplane_path_edit)
         browse_btn = StyledButton("Browse")
-        browse_btn.clicked.connect(lambda: self.browse_folder(self.xplane_path_edit))
+        browse_btn.clicked.connect(
+            lambda: self.browse_folder(self.xplane_path_edit)
+        )
         xplane_layout.addWidget(browse_btn)
         paths_layout.addLayout(xplane_layout)
 
         # Cache dir
         cache_layout = QHBoxLayout()
-        cache_layout.addWidget(QLabel("Image cache dir:"))
+        cache_label = QLabel("Image cache dir:")
+        cache_label.setToolTip(
+            "Directory for caching downloaded imagery.\n"
+            "Should be on a fast drive (SSD recommended) with plenty of "
+            "space.\n"
+            "Cache helps reduce download times for frequently visited "
+            "areas.\n"
+            "Optimal: SSD with 50-500GB available space"
+        )
+        cache_layout.addWidget(cache_label)
         self.cache_dir_edit = QLineEdit(self.cfg.paths.cache_dir)
         self.cache_dir_edit.setObjectName('cache_dir')
+        self.cache_dir_edit.setToolTip(
+            "Full path to your image cache directory"
+        )
         cache_layout.addWidget(self.cache_dir_edit)
         browse_btn = StyledButton("Browse")
-        browse_btn.clicked.connect(lambda: self.browse_folder(self.cache_dir_edit))
+        browse_btn.clicked.connect(
+            lambda: self.browse_folder(self.cache_dir_edit)
+        )
         cache_layout.addWidget(browse_btn)
         paths_layout.addLayout(cache_layout)
 
         # Download dir
         download_layout = QHBoxLayout()
-        download_layout.addWidget(QLabel("Temp download dir:"))
+        download_label = QLabel("Temp download dir:")
+        download_label.setToolTip(
+            "Temporary directory for downloading scenery packages.\n"
+            "Should have enough space for large scenery downloads "
+            "(10-50GB).\n"
+            "Files are deleted after successful installation.\n"
+            "Can be on any drive with sufficient free space."
+        )
+        download_layout.addWidget(download_label)
         self.download_dir_edit = QLineEdit(self.cfg.paths.download_dir)
         self.download_dir_edit.setObjectName('download_dir')
+        self.download_dir_edit.setToolTip(
+            "Full path to temporary download directory"
+        )
         download_layout.addWidget(self.download_dir_edit)
         browse_btn = StyledButton("Browse")
-        browse_btn.clicked.connect(lambda: self.browse_folder(self.download_dir_edit))
+        browse_btn.clicked.connect(
+            lambda: self.browse_folder(self.download_dir_edit)
+        )
         download_layout.addWidget(browse_btn)
         paths_layout.addLayout(download_layout)
 
@@ -437,15 +557,39 @@ class ConfigUI(QMainWindow):
         self.showconfig_check = QCheckBox("Always show config menu")
         self.showconfig_check.setChecked(self.cfg.general.showconfig)
         self.showconfig_check.setObjectName('showconfig')
+        self.showconfig_check.setToolTip(
+            "If enabled, the configuration window will always appear on "
+            "startup.\n"
+            "If disabled, AutoOrtho will start directly without showing "
+            "this window.\n"
+            "Recommended: Enabled until you're satisfied with your "
+            "configuration."
+        )
         options_layout.addWidget(self.showconfig_check)
 
         # Map type
         maptype_layout = QHBoxLayout()
-        maptype_layout.addWidget(QLabel("Map type override:"))
+        maptype_label = QLabel("Map type override:")
+        maptype_label.setToolTip(
+            "Force AutoOrtho to use a specific imagery source:\n"
+            "• BI (Bing): High quality, good worldwide coverage\n"
+            "• GO2 (Google): Excellent quality, some restrictions\n"
+            "• NAIP: Very high quality for USA only\n"
+            "• EOX: Good for Europe and some other regions\n"
+            "• USGS: USA government imagery\n"
+            "• Firefly: Alternative commercial source\n"
+            "Leave empty for automatic selection (recommended)"
+        )
+        maptype_layout.addWidget(maptype_label)
         self.maptype_combo = QComboBox()
-        self.maptype_combo.addItems(['', 'BI', 'GO2', 'NAIP', 'EOX', 'USGS', 'Firefly'])
+        self.maptype_combo.addItems([
+            '', 'BI', 'GO2', 'NAIP', 'EOX', 'USGS', 'Firefly'
+        ])
         self.maptype_combo.setCurrentText(self.cfg.autoortho.maptype_override)
         self.maptype_combo.setObjectName('maptype_override')
+        self.maptype_combo.setToolTip(
+            "Select a specific map provider or leave empty for auto-selection"
+        )
         maptype_layout.addWidget(self.maptype_combo)
         maptype_layout.addStretch()
         options_layout.addLayout(maptype_layout)
@@ -455,19 +599,44 @@ class ConfigUI(QMainWindow):
             self.winfsp_check = QCheckBox("Prefer WinFSP over Dokan")
             self.winfsp_check.setChecked(self.cfg.windows.prefer_winfsp)
             self.winfsp_check.setObjectName('prefer_winfsp')
+            self.winfsp_check.setToolTip(
+                "WinFSP generally provides better performance than Dokan.\n"
+                "Enable this if you have WinFSP installed.\n"
+                "If you experience issues, try disabling this option.\n"
+                "Recommended: Enabled (if WinFSP is available)"
+            )
             options_layout.addWidget(self.winfsp_check)
 
         layout.addWidget(options_group)
         layout.addStretch()
+
+        # Set the content widget to the scroll area
+        scroll_area.setWidget(setup_content)
+
+        # Create the main layout for the tab
+        tab_layout = QVBoxLayout()
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.addWidget(scroll_area)
+        setup_widget.setLayout(tab_layout)
 
         self.tabs.addTab(setup_widget, "Setup")
 
     def create_settings_tab(self):
         """Create the advanced settings configuration tab"""
         settings_widget = QWidget()
+
+        # Create scroll area for settings content
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+
+        # Create the actual content widget
+        settings_content = QWidget()
         layout = QVBoxLayout()
         layout.setSpacing(15)
-        settings_widget.setLayout(layout)
+        settings_content.setLayout(layout)
 
         # Cache settings group
         cache_group = QGroupBox("Cache Settings")
@@ -476,12 +645,25 @@ class ConfigUI(QMainWindow):
 
         # File cache size
         file_cache_layout = QHBoxLayout()
-        file_cache_layout.addWidget(QLabel("File cache size (GB):"))
+        file_cache_label = QLabel("File cache size (GB):")
+        file_cache_label.setToolTip(
+            "Maximum disk space used for caching imagery files.\n"
+            "Larger cache = fewer downloads but more disk usage.\n"
+            "Optimal: 50-200GB for regular use, 200-500GB for extensive "
+            "flying.\n"
+            "Minimum recommended: 20GB"
+        )
+        file_cache_layout.addWidget(file_cache_label)
         self.file_cache_slider = ModernSlider()
         self.file_cache_slider.setRange(10, 500)
         self.file_cache_slider.setSingleStep(5)
-        self.file_cache_slider.setValue(int(float(self.cfg.cache.file_cache_size)))
+        self.file_cache_slider.setValue(
+            int(float(self.cfg.cache.file_cache_size))
+        )
         self.file_cache_slider.setObjectName('file_cache_size')
+        self.file_cache_slider.setToolTip(
+            "Drag to adjust maximum cache size in gigabytes"
+        )
         self.file_cache_label = QLabel(f"{self.cfg.cache.file_cache_size} GB")
         self.file_cache_slider.valueChanged.connect(
             lambda v: self.file_cache_label.setText(f"{v} GB")
@@ -490,16 +672,32 @@ class ConfigUI(QMainWindow):
         file_cache_layout.addWidget(self.file_cache_label)
         self.clean_cache_btn = StyledButton("Clean Cache")
         self.clean_cache_btn.clicked.connect(self.on_clean_cache)
+        self.clean_cache_btn.setToolTip(
+            "Remove old cached files to free up disk space.\n"
+            "This will delete the oldest cached images first."
+        )
         file_cache_layout.addWidget(self.clean_cache_btn)
         cache_layout.addLayout(file_cache_layout)
 
         # Memory cache limit
         mem_cache_layout = QHBoxLayout()
-        mem_cache_layout.addWidget(QLabel("Memory cache (GB):"))
+        mem_cache_label = QLabel("Memory cache (GB):")
+        mem_cache_label.setToolTip(
+            "Maximum RAM used for caching images in memory.\n"
+            "Higher values improve performance but use more RAM.\n"
+            "Optimal: 4-16GB depending on your system RAM.\n"
+            "Don't exceed 25% of your total system RAM."
+        )
+        mem_cache_layout.addWidget(mem_cache_label)
         self.mem_cache_slider = ModernSlider()
         self.mem_cache_slider.setRange(2, 64)
-        self.mem_cache_slider.setValue(int(float(self.cfg.cache.cache_mem_limit)))
+        self.mem_cache_slider.setValue(
+            int(float(self.cfg.cache.cache_mem_limit))
+        )
         self.mem_cache_slider.setObjectName('cache_mem_limit')
+        self.mem_cache_slider.setToolTip(
+            "Drag to adjust maximum memory cache size in gigabytes"
+        )
         self.mem_cache_label = QLabel(f"{self.cfg.cache.cache_mem_limit} GB")
         self.mem_cache_slider.valueChanged.connect(
             lambda v: self.mem_cache_label.setText(f"{v} GB")
@@ -517,11 +715,23 @@ class ConfigUI(QMainWindow):
 
         # Min zoom level
         min_zoom_layout = QHBoxLayout()
-        min_zoom_layout.addWidget(QLabel("Minimum zoom level:"))
+        min_zoom_label = QLabel("Minimum zoom level:")
+        min_zoom_label.setToolTip(
+            "Minimum detail level for imagery downloads.\n"
+            "Higher values = more detail but larger downloads.\n"
+            "8-11: Low detail, faster downloads\n"
+            "12-14: Medium detail, balanced (recommended)\n"
+            "15-18: High detail, slower downloads\n"
+            "Optimal: 13 for most users"
+        )
+        min_zoom_layout.addWidget(min_zoom_label)
         self.min_zoom_slider = ModernSlider()
         self.min_zoom_slider.setRange(8, 18)
         self.min_zoom_slider.setValue(int(self.cfg.autoortho.min_zoom))
         self.min_zoom_slider.setObjectName('min_zoom')
+        self.min_zoom_slider.setToolTip(
+            "Drag to adjust minimum zoom level (8=low detail, 18=high detail)"
+        )
         self.min_zoom_label = QLabel(f"{self.cfg.autoortho.min_zoom}")
         self.min_zoom_slider.valueChanged.connect(
             lambda v: self.min_zoom_label.setText(f"{v}")
@@ -532,7 +742,15 @@ class ConfigUI(QMainWindow):
 
         # Max wait time
         maxwait_layout = QHBoxLayout()
-        maxwait_layout.addWidget(QLabel("Max wait time (seconds):"))
+        maxwait_label = QLabel("Max wait time (seconds):")
+        maxwait_label.setToolTip(
+            "Maximum time to wait for imagery downloads before timing out.\n"
+            "Lower values = faster response but may miss imagery\n"
+            "Higher values = better reliability but slower response\n"
+            "Optimal: 5-15 seconds depending on internet speed\n"
+            "Slow internet: 15-30 seconds"
+        )
+        maxwait_layout.addWidget(maxwait_label)
         self.maxwait_slider = ModernSlider()
         self.maxwait_slider.setRange(1, 100)
         self.maxwait_slider.setSingleStep(1)
@@ -540,6 +758,9 @@ class ConfigUI(QMainWindow):
         maxwait_value = int(float(self.cfg.autoortho.maxwait) * 10)
         self.maxwait_slider.setValue(maxwait_value)
         self.maxwait_slider.setObjectName('maxwait')
+        self.maxwait_slider.setToolTip(
+            "Drag to adjust maximum wait time in seconds"
+        )
         self.maxwait_label = QLabel(f"{self.cfg.autoortho.maxwait}")
         self.maxwait_slider.valueChanged.connect(
             lambda v: self.maxwait_label.setText(f"{v/10:.1f}")
@@ -550,17 +771,36 @@ class ConfigUI(QMainWindow):
 
         # Fetch threads
         threads_layout = QHBoxLayout()
-        threads_layout.addWidget(QLabel("Fetch threads:"))
-        self.fetch_threads_slider = ModernSlider()
-        self.fetch_threads_slider.setRange(1, 64)
-        self.fetch_threads_slider.setValue(int(self.cfg.autoortho.fetch_threads))
-        self.fetch_threads_slider.setObjectName('fetch_threads')
-        self.fetch_threads_label = QLabel(f"{self.cfg.autoortho.fetch_threads}")
-        self.fetch_threads_slider.valueChanged.connect(
-            lambda v: self.fetch_threads_label.setText(f"{v}")
+        threads_label = QLabel("Fetch threads:")
+        threads_label.setToolTip(
+            "Number of simultaneous download threads.\n"
+            "More threads = faster downloads but higher CPU/network usage.\n"
+            "Too many threads may cause timeouts or instability.\n"
+            "Optimal: 4-8 threads for most systems\n"
+            f"Your system has {os.cpu_count() or 1} CPU threads available."
         )
-        threads_layout.addWidget(self.fetch_threads_slider)
-        threads_layout.addWidget(self.fetch_threads_label)
+        threads_layout.addWidget(threads_label)
+        self.fetch_threads_spinbox = ModernSpinBox()
+
+        # Get available CPU threads
+        max_threads = os.cpu_count() or 1
+        self.fetch_threads_spinbox.setRange(1, max_threads)
+
+        # Ensure initial value doesn't exceed available threads
+        initial_threads = min(
+            int(self.cfg.autoortho.fetch_threads), max_threads
+        )
+        self.fetch_threads_spinbox.setValue(initial_threads)
+        self.fetch_threads_spinbox.setObjectName('fetch_threads')
+        self.fetch_threads_spinbox.setToolTip(
+            f"Number of download threads (1-{max_threads})"
+        )
+
+        # Add validation when value changes
+        self.fetch_threads_spinbox.valueChanged.connect(self.validate_threads)
+
+        threads_layout.addWidget(self.fetch_threads_spinbox)
+        threads_layout.addWidget(QLabel(f"(max: {max_threads})"))
         autoortho_layout.addLayout(threads_layout)
 
         layout.addWidget(autoortho_group)
@@ -572,22 +812,48 @@ class ConfigUI(QMainWindow):
 
         # Compressor
         compressor_layout = QHBoxLayout()
-        compressor_layout.addWidget(QLabel("Compressor:"))
+        compressor_label = QLabel("Compressor:")
+        compressor_label.setToolTip(
+            "Algorithm used for DDS texture compression:\n"
+            "• ISPC: Intel's high-performance compressor (recommended)\n"
+            "  - Faster compression, better quality\n"
+            "  - Requires modern CPU\n"
+            "• STB: Standard compressor (compatibility)\n"
+            "  - Slower but works on all systems\n"
+            "  - Use if ISPC causes issues"
+        )
+        compressor_layout.addWidget(compressor_label)
         self.compressor_combo = QComboBox()
         self.compressor_combo.addItems(['ISPC', 'STB'])
         self.compressor_combo.setCurrentText(self.cfg.pydds.compressor)
         self.compressor_combo.setObjectName('compressor')
+        self.compressor_combo.setToolTip(
+            "Select compression algorithm (ISPC recommended)"
+        )
         compressor_layout.addWidget(self.compressor_combo)
         compressor_layout.addStretch()
         dds_layout.addLayout(compressor_layout)
 
         # Format
         format_layout = QHBoxLayout()
-        format_layout.addWidget(QLabel("Format:"))
+        format_label = QLabel("Format:")
+        format_label.setToolTip(
+            "DDS compression format:\n"
+            "• BC1: Smaller files, no transparency, good for terrain\n"
+            "  - 4:1 compression ratio\n"
+            "  - Recommended for most scenery\n"
+            "• BC3: Larger files, supports transparency\n"
+            "  - 3:1 compression ratio\n"
+            "  - Use only if transparency is needed"
+        )
+        format_layout.addWidget(format_label)
         self.format_combo = QComboBox()
         self.format_combo.addItems(['BC1', 'BC3'])
         self.format_combo.setCurrentText(self.cfg.pydds.format)
         self.format_combo.setObjectName('format')
+        self.format_combo.setToolTip(
+            "Select DDS format (BC1 recommended for most uses)"
+        )
         format_layout.addWidget(self.format_combo)
         format_layout.addStretch()
         dds_layout.addLayout(format_layout)
@@ -602,16 +868,31 @@ class ConfigUI(QMainWindow):
         self.gui_check = QCheckBox("Use GUI at startup")
         self.gui_check.setChecked(self.cfg.general.gui)
         self.gui_check.setObjectName('gui')
+        self.gui_check.setToolTip(
+            "Show graphical interface when AutoOrtho starts.\n"
+            "If disabled, AutoOrtho runs in background only.\n"
+            "Recommended: Enabled for easier monitoring and control."
+        )
         general_layout.addWidget(self.gui_check)
 
         self.hide_check = QCheckBox("Hide window when running")
         self.hide_check.setChecked(self.cfg.general.hide)
         self.hide_check.setObjectName('hide')
+        self.hide_check.setToolTip(
+            "Minimize AutoOrtho window to system tray when running.\n"
+            "Helps keep desktop clean during long flights.\n"
+            "You can still access it from the system tray."
+        )
         general_layout.addWidget(self.hide_check)
 
         self.debug_check = QCheckBox("Debug mode")
         self.debug_check.setChecked(self.cfg.general.debug)
         self.debug_check.setObjectName('debug')
+        self.debug_check.setToolTip(
+            "Enable detailed logging for troubleshooting.\n"
+            "Creates larger log files with more information.\n"
+            "Only enable if experiencing issues or when asked by support."
+        )
         general_layout.addWidget(self.debug_check)
 
         layout.addWidget(general_group)
@@ -624,6 +905,12 @@ class ConfigUI(QMainWindow):
         self.noclean_check = QCheckBox("Don't cleanup downloads")
         self.noclean_check.setChecked(self.cfg.scenery.noclean)
         self.noclean_check.setObjectName('noclean')
+        self.noclean_check.setToolTip(
+            "Keep downloaded scenery files after installation.\n"
+            "Useful for reinstalling or sharing scenery packages.\n"
+            "Warning: Can use significant disk space over time.\n"
+            "Recommended: Disabled unless you need the original files."
+        )
         scenery_layout.addWidget(self.noclean_check)
 
         layout.addWidget(scenery_group)
@@ -636,6 +923,12 @@ class ConfigUI(QMainWindow):
         self.threading_check = QCheckBox("Enable multi-threading")
         self.threading_check.setChecked(self.cfg.fuse.threading)
         self.threading_check.setObjectName('threading')
+        self.threading_check.setToolTip(
+            "Use multiple threads for file system operations.\n"
+            "Improves performance on multi-core systems.\n"
+            "May cause issues on some older systems.\n"
+            "Recommended: Enabled on modern multi-core CPUs."
+        )
         fuse_layout.addWidget(self.threading_check)
 
         layout.addWidget(fuse_group)
@@ -647,18 +940,40 @@ class ConfigUI(QMainWindow):
 
         # Web UI port
         webui_port_layout = QHBoxLayout()
-        webui_port_layout.addWidget(QLabel("Web UI port:"))
+        webui_port_label = QLabel("Web UI port:")
+        webui_port_label.setToolTip(
+            "Port number for the web-based monitoring interface.\n"
+            "Access via http://localhost:[port] in your browser.\n"
+            "Must be an unused port between 1024-65535.\n"
+            "Default: 8080. Change if port conflicts occur."
+        )
+        webui_port_layout.addWidget(webui_port_label)
         self.webui_port_edit = QLineEdit(str(self.cfg.flightdata.webui_port))
         self.webui_port_edit.setObjectName('webui_port')
+        self.webui_port_edit.setToolTip(
+            "Port number for web interface (default: 8080)"
+        )
         webui_port_layout.addWidget(self.webui_port_edit)
         webui_port_layout.addStretch()
         flightdata_layout.addLayout(webui_port_layout)
 
         # X-Plane UDP port
         xplane_port_layout = QHBoxLayout()
-        xplane_port_layout.addWidget(QLabel("X-Plane UDP port:"))
-        self.xplane_udp_port_edit = QLineEdit(str(self.cfg.flightdata.xplane_udp_port))
+        xplane_port_label = QLabel("X-Plane UDP port:")
+        xplane_port_label.setToolTip(
+            "UDP port for receiving flight data from X-Plane.\n"
+            "Must match the port configured in X-Plane's data output "
+            "settings.\n"
+            "Default: 49001. Check X-Plane Settings > Data Output."
+        )
+        xplane_port_layout.addWidget(xplane_port_label)
+        self.xplane_udp_port_edit = QLineEdit(
+            str(self.cfg.flightdata.xplane_udp_port)
+        )
         self.xplane_udp_port_edit.setObjectName('xplane_udp_port')
+        self.xplane_udp_port_edit.setToolTip(
+            "UDP port for X-Plane data (must match X-Plane settings)"
+        )
         xplane_port_layout.addWidget(self.xplane_udp_port_edit)
         xplane_port_layout.addStretch()
         flightdata_layout.addLayout(xplane_port_layout)
@@ -666,6 +981,15 @@ class ConfigUI(QMainWindow):
         layout.addWidget(flightdata_group)
 
         layout.addStretch()
+
+        # Set the content widget to the scroll area
+        scroll_area.setWidget(settings_content)
+
+        # Create the main layout for the tab
+        tab_layout = QVBoxLayout()
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.addWidget(scroll_area)
+        settings_widget.setLayout(tab_layout)
 
         self.tabs.addTab(settings_widget, "Settings")
 
@@ -678,7 +1002,9 @@ class ConfigUI(QMainWindow):
         # Create scroll area for scenery list
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
 
         self.scenery_content = QWidget()
         self.scenery_layout = QVBoxLayout()
@@ -770,7 +1096,11 @@ class ConfigUI(QMainWindow):
                 # Install button
                 install_btn = StyledButton("Install", primary=True)
                 install_btn.setObjectName(f"scenery-{r.region_id}")
-                install_btn.clicked.connect(lambda checked, rid=r.region_id: self.on_install_scenery(rid))
+                install_btn.clicked.connect(
+                    lambda checked, rid=r.region_id: (
+                        self.on_install_scenery(rid)
+                    )
+                )
                 item_layout.addWidget(install_btn)
             else:
                 status_label = QLabel("✓ Up to date")
@@ -784,9 +1114,24 @@ class ConfigUI(QMainWindow):
     def show_splash(self):
         """Show splash screen"""
         splash_pix = QPixmap(os.path.join(CUR_PATH, 'imgs', 'splash.png'))
-        self.splash = QSplashScreen(splash_pix, Qt.WindowType.WindowStaysOnTopHint)
+        self.splash = QSplashScreen(
+            splash_pix, Qt.WindowType.WindowStaysOnTopHint
+        )
         self.splash.show()
         QTimer.singleShot(2000, self.splash.close)
+
+    def validate_threads(self, value):
+        """Validate fetch threads value and show warning if too high"""
+        max_threads = os.cpu_count() or 1
+        if value > max_threads:
+            QMessageBox.information(
+                self,
+                "Thread Limit",
+                f"Number of threads cannot be greater than {max_threads} "
+                f"(available CPU threads on this machine).\n"
+                f"Value has been adjusted to {max_threads}."
+            )
+            self.fetch_threads_spinbox.setValue(max_threads)
 
     def browse_folder(self, line_edit):
         """Open folder browser dialog"""
@@ -833,7 +1178,9 @@ class ConfigUI(QMainWindow):
         """Called when cache cleaning is complete"""
         self.clean_cache_btn.setEnabled(True)
         self.run_button.setEnabled(True)
-        QMessageBox.information(self, "Cache Cleaned", "Cache cleaning completed!")
+        QMessageBox.information(
+            self, "Cache Cleaned", "Cache cleaning completed!"
+        )
 
     def on_install_scenery(self, region_id):
         """Handle scenery installation"""
@@ -848,7 +1195,9 @@ class ConfigUI(QMainWindow):
             progress_bar.setVisible(True)
 
         # Create worker thread
-        worker = SceneryDownloadWorker(self.dl, region_id, self.cfg.paths.download_dir)
+        worker = SceneryDownloadWorker(
+            self.dl, region_id, self.cfg.paths.download_dir
+        )
         worker.progress.connect(self.on_download_progress)
         worker.finished.connect(self.on_download_finished)
         worker.error.connect(self.on_download_error)
@@ -866,7 +1215,9 @@ class ConfigUI(QMainWindow):
         status = progress_data.get('status', 'Downloading...')
         MBps = progress_data.get('MBps', 0)
         if pcnt_done > 0:
-            self.update_status_bar(f"{region_id}: {pcnt_done:.1f}% ({MBps:.1f} MB/s)")
+            self.update_status_bar(
+                f"{region_id}: {pcnt_done:.1f}% ({MBps:.1f} MB/s)"
+            )
         else:
             self.update_status_bar(f"{region_id}: {status}")
 
@@ -921,13 +1272,21 @@ class ConfigUI(QMainWindow):
         # Save Settings tab values
         if hasattr(self, 'file_cache_slider'):
             # Cache settings
-            self.cfg.cache.file_cache_size = str(self.file_cache_slider.value())
-            self.cfg.cache.cache_mem_limit = str(self.mem_cache_slider.value())
+            self.cfg.cache.file_cache_size = str(
+                self.file_cache_slider.value()
+            )
+            self.cfg.cache.cache_mem_limit = str(
+                self.mem_cache_slider.value()
+            )
 
             # AutoOrtho settings
             self.cfg.autoortho.min_zoom = str(self.min_zoom_slider.value())
-            self.cfg.autoortho.maxwait = str(self.maxwait_slider.value() / 10.0)
-            self.cfg.autoortho.fetch_threads = str(self.fetch_threads_slider.value())
+            self.cfg.autoortho.maxwait = str(
+                self.maxwait_slider.value() / 10.0
+            )
+            self.cfg.autoortho.fetch_threads = str(
+                self.fetch_threads_spinbox.value()
+            )
 
             # DDS settings
             self.cfg.pydds.compressor = self.compressor_combo.currentText()
@@ -945,8 +1304,12 @@ class ConfigUI(QMainWindow):
             self.cfg.fuse.threading = self.threading_check.isChecked()
 
             # Flight data settings
-            self.cfg.flightdata.webui_port = str(self.webui_port_edit.text())
-            self.cfg.flightdata.xplane_udp_port = str(self.xplane_udp_port_edit.text())
+            self.cfg.flightdata.webui_port = str(
+                self.webui_port_edit.text()
+            )
+            self.cfg.flightdata.xplane_udp_port = str(
+                self.xplane_udp_port_edit.text()
+            )
 
         self.cfg.save()
         self.ready.set()
@@ -1016,7 +1379,9 @@ class ConfigUI(QMainWindow):
 
         if msg:
             if self.cfg.general.gui:
-                QMessageBox.warning(self, "Configuration Issues", "\n".join(msg))
+                QMessageBox.warning(
+                    self, "Configuration Issues", "\n".join(msg)
+                )
 
         if self.errors:
             log.error("ERRORS DETECTED. Exiting.")
@@ -1024,25 +1389,38 @@ class ConfigUI(QMainWindow):
 
     def clean_cache(self, cache_dir, size_gb):
         """Clean cache directory"""
-        self.status_update.emit(f"Cleaning up cache_dir {cache_dir}. Please wait...")
+        self.status_update.emit(
+            f"Cleaning up cache_dir {cache_dir}. Please wait..."
+        )
 
         target_gb = max(size_gb, 10)
         target_bytes = pow(2, 30) * target_gb
 
         try:
-            cfiles = sorted(pathlib.Path(cache_dir).glob('**/*'), key=os.path.getmtime)
+            cfiles = sorted(
+                pathlib.Path(cache_dir).glob('**/*'), key=os.path.getmtime
+            )
             if not cfiles:
                 self.status_update.emit("Cache is empty.")
                 return
 
-            cache_bytes = sum(file.stat().st_size for file in cfiles if file.is_file())
+            cache_bytes = sum(
+                file.stat().st_size for file in cfiles if file.is_file()
+            )
             cachecount = len(cfiles)
             avgcachesize = cache_bytes / cachecount if cachecount > 0 else 0
 
-            self.status_update.emit(f"Cache has {cachecount} files. Total size approx {cache_bytes//1048576} MB.")
+            self.status_update.emit(
+                f"Cache has {cachecount} files. "
+                f"Total size approx {cache_bytes//1048576} MB."
+            )
 
-            empty_files = [x for x in cfiles if x.is_file() and x.stat().st_size == 0]
-            self.status_update.emit(f"Found {len(empty_files)} empty files to cleanup.")
+            empty_files = [
+                x for x in cfiles if x.is_file() and x.stat().st_size == 0
+            ]
+            self.status_update.emit(
+                f"Found {len(empty_files)} empty files to cleanup."
+            )
             for file in empty_files:
                 if os.path.exists(file):
                     os.remove(file)
@@ -1053,7 +1431,9 @@ class ConfigUI(QMainWindow):
 
             to_delete = int((cache_bytes - target_bytes) // avgcachesize)
 
-            self.status_update.emit(f"Over cache size limit, will remove {to_delete} files.")
+            self.status_update.emit(
+                f"Over cache size limit, will remove {to_delete} files."
+            )
             for file in cfiles[:to_delete]:
                 if file.is_file():
                     os.remove(file)
@@ -1065,19 +1445,26 @@ class ConfigUI(QMainWindow):
     def _check_ortho_dir(self, path):
         """Check if orthophoto directory is valid"""
         ret = True
-        if not sorted(pathlib.Path(path).glob(f"Earth nav data/*/*.dsf")):
-            self.warnings.append(f"Orthophoto dir {path} seems wrong. This may cause issues.")
+        if not sorted(pathlib.Path(path).glob("Earth nav data/*/*.dsf")):
+            self.warnings.append(
+                f"Orthophoto dir {path} seems wrong. "
+                "This may cause issues."
+            )
             ret = False
         return ret
 
     def _check_xplane_dir(self, path):
         """Check if X-Plane directory is valid"""
         if not os.path.isdir(path):
-            self.errors.append(f"XPlane install directory '{path}' is not a directory.")
+            self.errors.append(
+                f"XPlane install directory '{path}' is not a directory."
+            )
             return False
 
         if "Custom Scenery" not in os.listdir(path):
-            self.errors.append(f"XPlane install directory '{path}' seems wrong.")
+            self.errors.append(
+                f"XPlane install directory '{path}' seems wrong."
+            )
             return False
 
         return True
