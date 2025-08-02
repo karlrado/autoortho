@@ -74,6 +74,10 @@ min_zoom = 12
 maxwait = 0.5
 maptypes = ['Null', 'BI', 'NAIP', 'EOX', 'USGS', 'Firefly']
 fetch_threads = 32
+# Maximum download bandwidth in Mbits/sec (0 = unlimited)
+max_bandwidth_mbits = 0
+# Simheaven compatibility mode.
+simheaven_compat = True
 
 [pydds]
 # ISPC or STB for dds file compression

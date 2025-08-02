@@ -24,6 +24,7 @@ from PyQt6.QtGui import (
 
 import downloader
 from version import __version__
+import getortho
 
 log = logging.getLogger(__name__)
 
@@ -594,6 +595,16 @@ class ConfigUI(QMainWindow):
         maptype_layout.addStretch()
         options_layout.addLayout(maptype_layout)
 
+        self.simheaven_compat_check = QCheckBox("SimHeaven compatibility mode")
+        self.simheaven_compat_check.setChecked(self.cfg.autoortho.simheaven_compat)
+        self.simheaven_compat_check.setObjectName('simheaven_compat')
+        self.simheaven_compat_check.setToolTip(
+            "Enable this if you are using SimHeaven scenery.\n"
+            "This will disable AutoOrtho Overlays to use the SimHeaven "
+            "overlay instead."
+        )
+        options_layout.addWidget(self.simheaven_compat_check)
+
         # Windows specific
         if platform.system() == 'Windows':
             self.winfsp_check = QCheckBox("Prefer WinFSP over Dokan")
@@ -802,6 +813,40 @@ class ConfigUI(QMainWindow):
         threads_layout.addWidget(self.fetch_threads_spinbox)
         threads_layout.addWidget(QLabel(f"(max: {max_threads})"))
         autoortho_layout.addLayout(threads_layout)
+
+        # Bandwidth limit
+        bandwidth_layout = QHBoxLayout()
+        bandwidth_label = QLabel("Max bandwidth (Mbits/s):")
+        bandwidth_label.setToolTip(
+            "Maximum download bandwidth in megabits per second.\n"
+            "0 = unlimited bandwidth (default)\n"
+            "Useful for limiting network usage during flight\n"
+            "or on metered/shared connections.\n"
+            "Recommended: 50-200 Mbits for most users"
+        )
+        bandwidth_layout.addWidget(bandwidth_label)
+        self.bandwidth_slider = ModernSlider()
+        self.bandwidth_slider.setRange(0, 1000)  # 0 to 1000 Mbits
+        self.bandwidth_slider.setSingleStep(10)
+        bandwidth_value = int(float(self.cfg.autoortho.max_bandwidth_mbits))
+        self.bandwidth_slider.setValue(bandwidth_value)
+        self.bandwidth_slider.setObjectName('max_bandwidth_mbits')
+        self.bandwidth_slider.setToolTip(
+            "Drag to adjust maximum bandwidth limit in megabits per second"
+        )
+        if bandwidth_value == 0:
+            bandwidth_text = "Unlimited"
+        else:
+            bandwidth_text = f"{bandwidth_value} Mbits/s"
+        self.bandwidth_label = QLabel(bandwidth_text)
+        self.bandwidth_slider.valueChanged.connect(
+            lambda v: self.bandwidth_label.setText(
+                "Unlimited" if v == 0 else f"{v} Mbits/s"
+            )
+        )
+        bandwidth_layout.addWidget(self.bandwidth_slider)
+        bandwidth_layout.addWidget(self.bandwidth_label)
+        autoortho_layout.addLayout(bandwidth_layout)
 
         layout.addWidget(autoortho_group)
 
@@ -1157,6 +1202,14 @@ class ConfigUI(QMainWindow):
         """Handle Save button click"""
         self.save_config()
         self.cfg.load()
+        
+        # Update bandwidth limiter with new settings
+        try:
+            new_bandwidth = float(self.cfg.autoortho.max_bandwidth_mbits)
+            getortho.chunk_getter.update_bandwidth_limit(new_bandwidth)
+        except (ValueError, AttributeError) as e:
+            log.warning(f"Could not update bandwidth limit: {e}")
+        
         self.update_status_bar("Configuration saved")
 
     def on_clean_cache(self):
@@ -1286,6 +1339,9 @@ class ConfigUI(QMainWindow):
             )
             self.cfg.autoortho.fetch_threads = str(
                 self.fetch_threads_spinbox.value()
+            )
+            self.cfg.autoortho.max_bandwidth_mbits = str(
+                self.bandwidth_slider.value()
             )
 
             # DDS settings
@@ -1478,6 +1534,9 @@ class ConfigUI(QMainWindow):
         for worker in self.download_workers.values():
             worker.terminate()
             worker.wait()
+        # Clean up background mount processes
+        if hasattr(self, 'unmount_sceneries'):
+            self.unmount_sceneries()
         event.accept()
 
 

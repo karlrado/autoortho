@@ -39,6 +39,139 @@ tile_stats = StatTracker(20, 12)
 mm_stats = StatTracker(0, 5)
 partial_stats = StatTracker()
 
+
+class BandwidthLimiter:
+    """
+    Thread-safe bandwidth limiter using token bucket algorithm.
+    Provides smooth rate limiting across multiple download threads.
+    """
+    
+    def __init__(self, max_mbits_per_sec=0):
+        """
+        Initialize bandwidth limiter.
+        
+        Args:
+            max_mbits_per_sec (float): Maximum bandwidth in megabits per second.
+                                      0 means unlimited bandwidth.
+        """
+        self.max_mbits_per_sec = max_mbits_per_sec
+        self.max_bytes_per_sec = (max_mbits_per_sec * 1_000_000) // 8 if max_mbits_per_sec > 0 else 0
+        self.tokens = self.max_bytes_per_sec
+        self.last_update = time.time()
+        self.lock = threading.RLock()
+        self.total_bytes_downloaded = 0
+        self.window_start = time.time()
+        
+        log.info(f"BandwidthLimiter initialized: {max_mbits_per_sec} Mbits/s "
+                f"({self.max_bytes_per_sec} bytes/s)")
+    
+    def set_limit(self, max_mbits_per_sec):
+        """Update bandwidth limit dynamically."""
+        with self.lock:
+            self.max_mbits_per_sec = max_mbits_per_sec
+            self.max_bytes_per_sec = (max_mbits_per_sec * 1_000_000) // 8 if max_mbits_per_sec > 0 else 0
+            self.tokens = min(self.tokens, self.max_bytes_per_sec)
+            log.info(f"BandwidthLimiter limit updated: {max_mbits_per_sec} Mbits/s")
+    
+    def acquire_tokens(self, bytes_needed):
+        """
+        Acquire tokens for downloading bytes_needed amount of data.
+        Returns the delay (in seconds) that should be applied before the download.
+        
+        Args:
+            bytes_needed (int): Number of bytes that will be downloaded
+            
+        Returns:
+            float: Delay in seconds (0 if no delay needed)
+        """
+        if self.max_bytes_per_sec == 0:  # Unlimited bandwidth
+            return 0.0
+            
+        if bytes_needed <= 0:
+            return 0.0
+        
+        with self.lock:
+            now = time.time()
+            
+            # Refill tokens based on elapsed time
+            elapsed = now - self.last_update
+            if elapsed > 0:
+                tokens_to_add = elapsed * self.max_bytes_per_sec
+                self.tokens = min(self.max_bytes_per_sec, self.tokens + tokens_to_add)
+                self.last_update = now
+            
+            if self.tokens >= bytes_needed:
+                # We have enough tokens, consume them immediately
+                self.tokens -= bytes_needed
+                return 0.0
+            else:
+                # Not enough tokens, calculate delay needed
+                deficit = bytes_needed - self.tokens
+                delay = deficit / self.max_bytes_per_sec
+                
+                # Consume all available tokens
+                self.tokens = 0
+                
+                # Cap delay to reasonable maximum to prevent excessive blocking
+                delay = min(delay, 30.0)  # Max 30 second delay
+                
+                return delay
+    
+    def record_bytes(self, bytes_downloaded):
+        """
+        Record actual bytes downloaded for statistics.
+        
+        Args:
+            bytes_downloaded (int): Actual number of bytes downloaded
+        """
+        if bytes_downloaded <= 0:
+            return
+            
+        with self.lock:
+            self.total_bytes_downloaded += bytes_downloaded
+            
+            # Update statistics
+            now = time.time()
+            window_duration = now - self.window_start
+            
+            # Reset statistics window every 60 seconds
+            if window_duration >= 60.0:
+                if window_duration > 0:
+                    actual_mbits_per_sec = (self.total_bytes_downloaded * 8) / (window_duration * 1_000_000)
+                    set_stat('bandwidth_usage_mbits', round(actual_mbits_per_sec, 2))
+                    set_stat('bandwidth_limit_mbits', self.max_mbits_per_sec)
+                    
+                    log.debug(f"Bandwidth usage: {actual_mbits_per_sec:.2f} Mbits/s "
+                             f"(limit: {self.max_mbits_per_sec} Mbits/s)")
+                
+                # Reset window
+                self.total_bytes_downloaded = 0
+                self.window_start = now
+    
+    def get_current_usage(self):
+        """
+        Get current bandwidth usage statistics.
+        
+        Returns:
+            dict: Dictionary with current usage info
+        """
+        with self.lock:
+            now = time.time()
+            window_duration = now - self.window_start
+            
+            if window_duration > 0:
+                current_mbits_per_sec = (self.total_bytes_downloaded * 8) / (window_duration * 1_000_000)
+            else:
+                current_mbits_per_sec = 0.0
+                
+            return {
+                'current_mbits_per_sec': round(current_mbits_per_sec, 2),
+                'limit_mbits_per_sec': self.max_mbits_per_sec,
+                'tokens_available': self.tokens,
+                'max_tokens': self.max_bytes_per_sec
+            }
+
+
 def _is_jpeg(dataheader):
     # FFD8FF identifies image as a JPEG
     if dataheader[:3] == b'\xFF\xD8\xFF':
@@ -91,6 +224,10 @@ class Getter(object):
         )
         self.session.mount('https://', adapter)
         self.session.mount('http://', adapter)
+        
+        # Initialize bandwidth limiter
+        bandwidth_limit = float(CFG.autoortho.max_bandwidth_mbits)
+        self.bandwidth_limiter = BandwidthLimiter(bandwidth_limit)
 
         for i in range(num_workers):
             t = threading.Thread(target=self.worker, args=(i,), daemon=True)
@@ -106,6 +243,14 @@ class Getter(object):
         for t in self.workers:
             t.join()
         self.stat_t.join()
+
+    def update_bandwidth_limit(self, max_mbits_per_sec):
+        """Update bandwidth limit dynamically without restarting"""
+        if hasattr(self, 'bandwidth_limiter'):
+            self.bandwidth_limiter.set_limit(max_mbits_per_sec)
+            log.info(f"Updated bandwidth limit to {max_mbits_per_sec} Mbits/s")
+        else:
+            log.warning("Bandwidth limiter not initialized, cannot update limit")
 
     def worker(self, idx):
         global STATS
@@ -152,6 +297,7 @@ class ChunkGetter(Getter):
 
         kwargs['idx'] = self.localdata.idx
         kwargs['session'] = self.session
+        kwargs['bandwidth_limiter'] = self.bandwidth_limiter
         #log.debug(f"{obj}, {args}, {kwargs}")
         return obj.get(*args, **kwargs)
 
@@ -244,7 +390,7 @@ class Chunk(object):
         with open(self.cache_path, 'wb') as h:
             h.write(self.data)
 
-    def get(self, idx=0, session=requests):
+    def get(self, idx=0, session=requests, bandwidth_limiter=None):
         log.debug(f"Getting {self}") 
 
         if self.get_cache():
@@ -282,6 +428,15 @@ class Chunk(object):
         self.attempt += 1
 
         log.debug(f"Requesting {self.url} ..")
+
+        # Apply bandwidth limiting before download
+        if bandwidth_limiter:
+            # Estimate chunk size (typical image tiles are 10-50KB)
+            estimated_size = 25000  # 25KB average estimate
+            delay = bandwidth_limiter.acquire_tokens(estimated_size)
+            if delay > 0:
+                log.debug(f"Bandwidth limiting: delaying {delay:.2f}s for {self}")
+                time.sleep(delay)
 
         use_requests = True
         
@@ -328,6 +483,11 @@ class Chunk(object):
                 self.data = b''
 
             inc_stat('bytes_dl', len(self.data))
+            
+            # Record actual bytes downloaded for bandwidth tracking
+            if bandwidth_limiter and self.data:
+                bandwidth_limiter.record_bytes(len(self.data))
+                
         except Exception as err:
             log.warning(f"Failed to get chunk {self} on server {server}. Err: {err} URL: {self.url}")
             return False

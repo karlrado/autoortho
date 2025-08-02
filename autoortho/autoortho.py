@@ -284,6 +284,14 @@ class AOMountUI(AOMount, config_ui.ConfigUI):
     def __init__(self, *args, **kwargs):
         AOMount.__init__(self, *args, **kwargs)
         config_ui.ConfigUI.__init__(self, *args, **kwargs)
+    
+    def mount_sceneries(self, blocking=True):
+        """Mount sceneries using AOMount functionality"""
+        return AOMount.mount_sceneries(self, blocking)
+    
+    def unmount_sceneries(self):
+        """Unmount sceneries using AOMount functionality"""
+        return AOMount.unmount_sceneries(self)
 
 
 def main():
