@@ -516,8 +516,6 @@ class Tile(object):
     width = 16
     height = 16
 
-    max_mipmap = 4
-
     priority = -1
     #tile_condition = None
     _lock = None
@@ -533,7 +531,7 @@ class Tile(object):
     imgs = None
 
     def __init__(self, col, row, maptype, zoom, min_zoom=0, priority=0,
-            cache_dir=None):
+            cache_dir=None, max_zoom=None):
         self.row = int(row)
         self.col = int(col)
         self.maptype = maptype
@@ -553,10 +551,15 @@ class Tile(object):
         if min_zoom:
             self.min_zoom = int(min_zoom)
 
+
         if cache_dir:
             self.cache_dir = cache_dir
         else:
             self.cache_dir = CFG.paths.cache_dir
+
+        self.max_mipmap = 6
+        # Set max zoom level - if not specified, use original tile zoom (no capping)
+        self.max_zoom = int(max_zoom) if max_zoom is not None else self.zoom
         
         # Hack override maptype
         #self.maptype = "BI"
@@ -577,8 +580,31 @@ class Tile(object):
         else:
             use_ispc=False
 
-        self.dds = pydds.DDS(self.width*256, self.height*256, ispc=use_ispc,
+        # Calculate DDS size based on max_zoom instead of original tile zoom
+        zoom_reduction = self.zoom - self.max_zoom
+        if zoom_reduction > 0:
+            # Use dimensions appropriate for max_zoom level
+            effective_width = self.width >> zoom_reduction
+            effective_height = self.height >> zoom_reduction
+            dds_width = effective_width * 256
+            dds_height = effective_height * 256
+            log.info(f"Creating DDS at capped size: {dds_width}x{dds_height} (effective {effective_width}x{effective_height} chunks)")
+            print(f"Creating DDS at capped size: {dds_width}x{dds_height} (effective {effective_width}x{effective_height} chunks)")
+        else:
+            # No capping, use original dimensions
+            dds_width = self.width * 256
+            dds_height = self.height * 256
+            log.info(f"Creating DDS at original size: {dds_width}x{dds_height}")
+            print(f"Creating DDS at original size: {dds_width}x{dds_height}")
+            
+        self.dds = pydds.DDS(dds_width, dds_height, ispc=use_ispc,
                 dxt_format=CFG.pydds.format)
+        
+        log.info(f"Tile ZL{self.zoom} capped to max ZL{self.max_zoom} (reduction: {zoom_reduction} levels)")
+        print(f"Tile ZL{self.zoom} capped to max ZL{self.max_zoom} (reduction: {zoom_reduction} levels)")
+        if zoom_reduction > 0:
+            log.info(f"Mipmaps 0-{zoom_reduction-1} will reuse ZL{self.max_zoom} data, mipmap {zoom_reduction}+ will use lower ZLs")
+            print(f"Mipmaps 0-{zoom_reduction-1} will reuse ZL{self.max_zoom} data, mipmap {zoom_reduction}+ will use lower ZLs")
         self.id = f"{row}_{col}_{maptype}_{zoom}"
 
 
@@ -586,7 +612,7 @@ class Tile(object):
         return self.priority < other.priority
 
     def __repr__(self):
-        return f"Tile({self.col}, {self.row}, {self.maptype}, {self.zoom}, {self.min_zoom}, {self.cache_dir})"
+        return f"Tile({self.col}, {self.row}, {self.maptype}, {self.zoom}, min_zoom={self.min_zoom}, max_zoom={self.max_zoom}, max_mm={self.max_mipmap})"
 
     @locked
     def _create_chunks(self, quick_zoom=0, min_zoom=None):
@@ -669,9 +695,9 @@ class Tile(object):
 
         mipmap = self.find_mipmap_pos(offset)
         log.debug(f"Get_bytes for mipmap {mipmap} ...")
-        if mipmap > 4:
+        if mipmap > self.max_mipmap:
             # Just get the entire mipmap
-            self.get_mipmap(4)
+            self.get_mipmap(self.max_mipmap)
             return True
 
         # Exit if already retrieved
@@ -815,20 +841,52 @@ class Tile(object):
         # Get an image for a particular mipmap
         #
 
-        # Get effective zoom
+        # Get effective zoom  
+        original_mipmap = mipmap  # Store original before _get_quick_zoom overwrites it
         zoom = self.zoom - mipmap
+        print(f"GET_IMG: Default zoom: {self.zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
         log.debug(f"GET_IMG: Default zoom: {self.zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
-        col, row, width, height, zoom, mipmap = self._get_quick_zoom(zoom, min_zoom)
-        log.debug(f"Will use:  Zoom: {zoom},  Mipmap: {mipmap}")
+        col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(zoom, min_zoom)
+        log.debug(f"Will use:  Zoom: {zoom},  Zoom_diff: {zoom_diff}")
+        print(f"GET_IMG: Will use:  Zoom: {zoom},  Zoom_diff: {zoom_diff}")
+        
+        # Restore original mipmap parameter 
+        mipmap = original_mipmap
+        
+        # Apply zoom level capping logic
+        # Calculate what zoom level this mipmap would normally use
+        normal_zoom = self.zoom - mipmap
+        
+        # Cap it to max_zoom if it would be higher
+        capped_zoom = min(normal_zoom, self.max_zoom)
+        
+        # Calculate how many zoom levels we're capped by
+        zoom_offset = normal_zoom - capped_zoom
+        
+        log.debug(f"GET_IMG: Mipmap {mipmap} - Normal zoom: {normal_zoom}, Capped to: {capped_zoom}, Offset: {zoom_offset}")
+        print(f"GET_IMG: Mipmap {mipmap} - Normal zoom: {normal_zoom}, Capped to: {capped_zoom}, Offset: {zoom_offset}")
+        
+        # If we're capping, use the capped zoom level for downloads but keep original dimensions
+        if zoom_offset > 0:
+            # Override the zoom for chunk downloading
+            zoom = capped_zoom
+            log.debug(f"GET_IMG: Using capped zoom {zoom} instead of normal zoom {normal_zoom}")
+            print(f"GET_IMG: Using capped zoom {zoom} instead of normal zoom {normal_zoom}")
+            
+            # Recalculate coordinates for the capped zoom level  
+            col, row, width, height, _, _ = self._get_quick_zoom(zoom, min_zoom)
+        
+        log.debug(f"GET_IMG: Final zoom {zoom} for mipmap {mipmap}, coords: {col}x{row}, size: {width}x{height}")
+        print(f"GET_IMG: Final zoom {zoom} for mipmap {mipmap}, coords: {col}x{row}, size: {width}x{height}")
         
         # Do we already have this img?
-        if mipmap in self.imgs:
-            log.debug(f"GET_IMG: Found saved image: {self.imgs[mipmap]}")
-            return self.imgs.get(mipmap)
+        if original_mipmap in self.imgs:
+            log.debug(f"GET_IMG: Found saved image: {self.imgs[original_mipmap]}")
+            return self.imgs.get(original_mipmap)
 
         log.debug(f"GET_IMG: MM List before { {x.idx:x.retrieved for x in self.dds.mipmap_list} }")
-        if self.dds.mipmap_list[mipmap].retrieved:
-            log.debug(f"GET_IMG: We already have mipmap {mipmap} for {self}")
+        if original_mipmap < len(self.dds.mipmap_list) and self.dds.mipmap_list[original_mipmap].retrieved:
+            log.debug(f"GET_IMG: We already have mipmap {original_mipmap} for {self}")
             return
 
         if startrow == 0 and endrow is None:
@@ -838,26 +896,39 @@ class Tile(object):
 
         startchunk = 0
         endchunk = None
-        # Determine start and end chunk
-        chunks_per_row = 16 >> mipmap
+        # Determine start and end chunk using original mipmap dimensions 
+        original_chunks_per_row = 16 >> original_mipmap
         if startrow:
-            startchunk = startrow * chunks_per_row
+            startchunk = startrow * original_chunks_per_row
         if endrow is not None:
-            endchunk = (endrow * chunks_per_row) + chunks_per_row
+            endchunk = (endrow * original_chunks_per_row) + original_chunks_per_row
+            
+        # But adjust for the actual number of chunks we'll download at the capped zoom
+        if zoom_offset > 0:
+            # Scale down the chunk indices for the capped zoom level
+            scale_down_factor = 2 ** zoom_offset
+            startchunk = startchunk // scale_down_factor
+            if endchunk:
+                endchunk = endchunk // scale_down_factor
+            log.debug(f"GET_IMG: Adjusted chunk indices for capped zoom - start: {startchunk}, end: {endchunk}")
+            print(f"GET_IMG: Adjusted chunk indices for capped zoom - start: {startchunk}, end: {endchunk}")
 
+        # Create chunks for the actual zoom level we'll download from
         self._create_chunks(zoom, min_zoom)
         chunks = self.chunks[zoom][startchunk:endchunk]
-        log.debug(f"Start chunk: {startchunk}  End chunk: {endchunk}  Chunklen {len(self.chunks[zoom])}")
+        log.debug(f"Start chunk: {startchunk}  End chunk: {endchunk}  Chunklen {len(self.chunks[zoom])} for zoom {zoom}")
 
         log.debug(f"GET_IMG: {self} : Retrieve mipmap for ZOOM: {zoom} MIPMAP: {mipmap}")
         data_updated = False
-        log.debug(f"GET_IMG: {self} submitting chunks.")
+        log.debug(f"GET_IMG: {self} submitting chunks for zoom {zoom}.")
         for chunk in chunks:
             if not chunk.ready.is_set():
-                #log.info(f"SUBMIT: {chunk}")
+                log.debug(f"GET_IMG: Submitting chunk {chunk} for zoom {zoom}")
                 chunk.priority = self.min_zoom - mipmap 
                 chunk_getter.submit(chunk)
                 data_updated = True
+            else:
+                log.debug(f"GET_IMG: Chunk {chunk} already ready - reusing for mipmap {mipmap}")
 
         # We've already determined this mipmap is not marked as 'retrieved' so we should create 
         # a new image, regardless here.
@@ -865,28 +936,47 @@ class Tile(object):
         #    log.info("No updates to chunks.  Exit.")
         #    return False
 
-        log.debug(f"GET_IMG: Create new image: Zoom: {self.zoom} | {(256*width, 256*height)}")
+        # Calculate image dimensions based on the actual zoom level we're using for downloads
+        # This creates smaller textures that save VRAM when zoom is capped
+        img_width = 256 * width
+        img_height = 256 * height
         
-        new_im = AoImage.new('RGBA', (256*width,256*height), (66,77,55))
+        log.debug(f"GET_IMG: Using download dimensions {width}x{height} chunks = {img_width}x{img_height} pixels")
+        print(f"GET_IMG: Using download dimensions {width}x{height} chunks = {img_width}x{img_height} pixels")
+        
+        log.debug(f"GET_IMG: Create new image: Zoom: {zoom} | {(img_width, img_height)}")
+        
+        new_im = AoImage.new('RGBA', (img_width, img_height), (66,77,55))
 
         log.debug(f"GET_IMG: Will use image {new_im}")
 
+        # Check if we have any chunks to process
+        if len(chunks) == 0:
+            log.warning(f"GET_IMG: No chunks created for zoom {zoom}, mipmap {mipmap}")
+            # Create a placeholder image with the expected dimensions
+            placeholder_img = AoImage.new('RGBA', (img_width, img_height), (128, 128, 128))
+            return placeholder_img
+            
         chunks[0].ready.wait(maxwait)
+        
+        # No scaling needed - we create textures at native resolution
+        
         #log.info(f"NUM CHUNKS: {len(chunks)}")
         for chunk in chunks:
             chunk_ready = chunk.ready.is_set()
             #chunk_ready = chunk.ready.wait(maxwait)
             
-            start_x = int((chunk.width) * (chunk.col - col))
-            start_y = int((chunk.height) * (chunk.row - row))
+            # Calculate position using native chunk size (no scaling)
+            start_x = int(chunk.width * (chunk.col - col))
+            start_y = int(chunk.height * (chunk.row - row))
 
             chunk_img = None
             if chunk_ready and chunk.data:
                 # We returned and have data!
                 log.debug(f"GET_IMG: Ready and found chunk data.")
                 chunk_img = AoImage.load_from_memory(chunk.data)
-            elif mipmap < 4 and not chunk_ready:
-                # Ran out of time, requesting mm 0-3.  Search for backup...
+            elif mipmap < self.max_mipmap and not chunk_ready:
+                # Ran out of time, requesting mm below max.  Search for backup...
                 log.debug(f"GET_IMG: Tile {self} not ready.  Try to find backup chunk.")
                 chunk_img = self.get_best_chunk(chunk.col, chunk.row, mipmap, zoom)
                 if chunk_img:
@@ -905,6 +995,7 @@ class Tile(object):
 
 
             if chunk_img:
+                # Paste chunk at native resolution (no scaling)
                 new_im.paste(
                     chunk_img,
                     (
@@ -919,16 +1010,16 @@ class Tile(object):
                 else:
                     log.warning(f"GET_IMG: FAILED! {chunk}:  LEN: {len(chunk.data)}  HEADER: {chunk.data[:8]}")
 
-        if complete_img and mipmap <= 4:
+        if complete_img and original_mipmap <= self.max_mipmap:
             log.debug(f"GET_IMG: Save complete image for later...")
-            self.imgs[mipmap] = new_im
+            self.imgs[original_mipmap] = new_im
 
         log.debug(f"GET_IMG: DONE!  IMG created {new_im}")
         # Return image along with mipmap and zoom level this was created at
         return new_im
 
     def get_best_chunk(self, col, row, mm, zoom):
-        for i in range(mm+1, 5):
+        for i in range(mm + 1, self.max_mipmap + 1):
 
             # Difference between requested mm and found image mm level
             diff = i - mm
@@ -1009,7 +1100,6 @@ class Tile(object):
         self.ready.clear()
         start_time = time.time()
         try:
-            #self.dds.gen_mipmaps(new_im, mipmap) 
             if mipmap == 0:
                 self.dds.gen_mipmaps(new_im, mipmap, 0) 
             else:
@@ -1104,6 +1194,13 @@ class TileCacher(object):
         self.cache_dir = CFG.paths.cache_dir
         log.info(f"Cache dir: {self.cache_dir}")
         self.min_zoom = CFG.autoortho.min_zoom
+        # Add max_zoom configuration - defaults to original tile zoom (no capping)
+        self.max_zoom_offset = 2 #getattr(CFG.autoortho, 'max_zoom_offset', 0)  # How many levels to cap
+        if self.max_zoom_offset > 0:
+            log.info(f"Zoom level capping enabled: Limiting maximum download to {self.max_zoom_offset} levels below tile zoom")
+            log.info(f"ZL18 tiles will cap at ZL{18-self.max_zoom_offset}, ZL19 tiles will cap at ZL{19-self.max_zoom_offset}")
+        else:
+            log.info(f"No zoom level capping - using original tile zoom levels")
 
         self.clean_t = threading.Thread(target=self.clean, daemon=True)
         self.clean_t.start()
@@ -1187,9 +1284,12 @@ class TileCacher(object):
             if not tile:
                 self.misses += 1
                 inc_stat('tile_mem_miss')
+                # Calculate max_zoom for this tile based on offset
+                tile_max_zoom = zoom - self.max_zoom_offset if self.max_zoom_offset > 0 else zoom
                 tile = Tile(col, row, map_type, zoom, 
                     cache_dir = self.cache_dir,
-                    min_zoom = self.min_zoom)
+                    min_zoom = self.min_zoom,
+                    max_zoom = tile_max_zoom)
                 self.tiles[idx] = tile
                 self.open_count[idx] = self.open_count.get(idx, 0) + 1
                 if self.open_count[idx] > 1:
