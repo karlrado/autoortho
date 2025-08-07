@@ -633,31 +633,31 @@ class Tile(object):
         self.dds = pydds.DDS(dds_width, dds_height, ispc=use_ispc,
                 dxt_format=CFG.pydds.format)
         
-        log.info(f"Tile ZL{self.zoom} adaptively sized for max available ZL{self.actual_max_zoom} (reduction: {zoom_reduction} levels)")
-        print(f"Tile ZL{self.zoom} adaptively sized for max available ZL{self.actual_max_zoom} (reduction: {zoom_reduction} levels)")
+        log.info(f"Tile '{self.zoom}' using detected max available ZL{self.actual_max_zoom} (target was ZL{self.max_zoom})")
+        print(f"Tile '{self.zoom}' using detected max available ZL{self.actual_max_zoom} (target was ZL{self.max_zoom})")
         if zoom_reduction > 0:
-            log.info(f"Mipmaps 0-{zoom_reduction-1} will reuse ZL{self.actual_max_zoom} data, mipmap {zoom_reduction}+ will use lower ZLs")
-            print(f"Mipmaps 0-{zoom_reduction-1} will reuse ZL{self.actual_max_zoom} data, mipmap {zoom_reduction}+ will use lower ZLs")
+            log.info(f"Mipmaps 0-{zoom_reduction-1} will reuse ZL{self.actual_max_zoom} data, higher mipmaps use progressively lower zoom levels")
+            print(f"Mipmaps 0-{zoom_reduction-1} will reuse ZL{self.actual_max_zoom} data, higher mipmaps use progressively lower zoom levels")
         self.id = f"{row}_{col}_{maptype}_{zoom}"
 
     def _detect_available_max_zoom(self):
         """
         Detect the actual maximum zoom level available for this tile by testing
         a representative sample of chunks at different zoom levels.
-        Returns the highest zoom level where most chunks are available.
+        Returns the highest zoom level where ANY chunks are available.
         """
-        # Don't test beyond our configured max_zoom limit
-        test_max = min(self.max_zoom, self.zoom)
+        # Don't test beyond our target zoom level
+        test_max = self.max_zoom  # max_zoom is now the direct target, not calculated from tile zoom
         
-        log.info(f"Detecting available max zoom for tile ZL{self.zoom} (testing up to ZL{test_max})")
-        print(f"Detecting available max zoom for tile ZL{self.zoom} (testing up to ZL{test_max})")
+        log.info(f"Detecting available max zoom for tile '{self.zoom}' (testing up to target ZL{test_max})")
+        print(f"Detecting available max zoom for tile '{self.zoom}' (testing up to target ZL{test_max})")
         
         # Test in descending order from max_zoom to min_zoom
         for test_zoom in range(test_max, self.min_zoom - 1, -1):
             availability_count = self._test_zoom_availability(test_zoom)
             
-            # If majority of chunks are available at this zoom level, use it
-            if availability_count >= 0.6:  # 60% success rate threshold
+            # If ANY chunks are available at this zoom level, use it (changed from 60% threshold)
+            if availability_count > 0.0:  # Any chunk available = use this zoom level
                 log.info(f"Detected max available zoom: ZL{test_zoom} (availability: {availability_count:.1%})")
                 print(f"Detected max available zoom: ZL{test_zoom} (availability: {availability_count:.1%})")
                 return test_zoom
@@ -1340,13 +1340,11 @@ class TileCacher(object):
         self.cache_dir = CFG.paths.cache_dir
         log.info(f"Cache dir: {self.cache_dir}")
         self.min_zoom = CFG.autoortho.min_zoom
-        # Add max_zoom configuration - defaults to original tile zoom (no capping)
-        self.max_zoom_offset = 2 #getattr(CFG.autoortho, 'max_zoom_offset', 0)  # How many levels to cap
-        if self.max_zoom_offset > 0:
-            log.info(f"Zoom level capping enabled: Limiting maximum download to {self.max_zoom_offset} levels below tile zoom")
-            log.info(f"ZL18 tiles will cap at ZL{18-self.max_zoom_offset}, ZL19 tiles will cap at ZL{19-self.max_zoom_offset}")
-        else:
-            log.info(f"No zoom level capping - using original tile zoom levels")
+        # Set target zoom level directly - much simpler than offset calculations
+        # TODO: Make this configurable via CFG.autoortho.target_zoom_level
+        self.target_zoom_level = 16  # Direct zoom level target, regardless of tile name
+        log.info(f"Target zoom level set to ZL{self.target_zoom_level}")
+        log.info(f"All tiles (ZL18, ZL19, etc.) will download data at ZL{self.target_zoom_level} or lower based on availability")
 
         self.clean_t = threading.Thread(target=self.clean, daemon=True)
         self.clean_t.start()
@@ -1430,12 +1428,11 @@ class TileCacher(object):
             if not tile:
                 self.misses += 1
                 inc_stat('tile_mem_miss')
-                # Calculate max_zoom for this tile based on offset
-                tile_max_zoom = zoom - self.max_zoom_offset if self.max_zoom_offset > 0 else zoom
+                # Use target zoom level directly - much cleaner than offset calculations
                 tile = Tile(col, row, map_type, zoom, 
                     cache_dir = self.cache_dir,
                     min_zoom = self.min_zoom,
-                    max_zoom = tile_max_zoom)
+                    max_zoom = self.target_zoom_level)
                 self.tiles[idx] = tile
                 self.open_count[idx] = self.open_count.get(idx, 0) + 1
                 if self.open_count[idx] > 1:
