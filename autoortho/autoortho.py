@@ -170,10 +170,75 @@ class AOMount:
         self.cfg = cfg
         self.mount_threads = []
 
+    def apply_simheaven_compat(self, use_simheaven_overlay=False):
+        """
+        Modify scenery_packs.ini to enable/disable AutoOrtho overlays based on SimHeaven compatibility
+        
+        Args:
+            use_simheaven_overlay (bool): If True, disable AutoOrtho overlays (for SimHeaven compatibility)
+                                        If False, enable AutoOrtho overlays (normal mode)
+        """
+        if use_simheaven_overlay:
+            log.info("Applying SimHeaven compatibility overlay - disabling AutoOrtho overlays.")
+        else:
+            log.info("Applying included overlay - enabling AutoOrtho overlays.")
+        
+        # Get the scenery_packs.ini file path
+        xplane_path = self.cfg.paths.xplane_path
+        if not xplane_path:
+            log.warning("X-Plane path not configured. Cannot modify scenery_packs.ini")
+            return
+        
+        scenery_packs_path = os.path.join(xplane_path, "Custom Scenery", "scenery_packs.ini")
+        
+        if not os.path.exists(scenery_packs_path):
+            log.warning(f"scenery_packs.ini not found at {scenery_packs_path}")
+            return
+        
+        try:
+            # Read the current content
+            with open(scenery_packs_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            modified = False
+            overlay_pattern = "Custom Scenery/yAutoOrtho_Overlays/"
+            
+            # Process each line
+            for i, line in enumerate(lines):
+                line_stripped = line.strip()
+                
+                if use_simheaven_overlay:
+                    # Disable AutoOrtho overlays (for SimHeaven compatibility)
+                    if line_stripped.startswith("SCENERY_PACK ") and overlay_pattern in line_stripped:
+                        lines[i] = line.replace("SCENERY_PACK ", "SCENERY_PACK_DISABLED ", 1)
+                        modified = True
+                        log.info(f"Disabled AutoOrtho overlay: {line_stripped}")
+                else:
+                    # Enable AutoOrtho overlays (normal mode)
+                    if line_stripped.startswith("SCENERY_PACK_DISABLED ") and overlay_pattern in line_stripped:
+                        lines[i] = line.replace("SCENERY_PACK_DISABLED ", "SCENERY_PACK ", 1)
+                        modified = True
+                        log.info(f"Enabled AutoOrtho overlay: {line_stripped}")
+            
+            # Write back the modified content if changes were made
+            if modified:
+                with open(scenery_packs_path, 'w', encoding='utf-8') as f:
+                    f.writelines(lines)
+                log.info(f"Successfully updated scenery_packs.ini at {scenery_packs_path}")
+            else:
+                mode_str = "SimHeaven compatibility" if use_simheaven_overlay else "normal"
+                log.info(f"No AutoOrtho overlay entries found to modify for {mode_str} mode")
+                
+        except Exception as e:
+            log.error(f"Failed to modify scenery_packs.ini: {e}")
+            raise
+
     def mount_sceneries(self, blocking=True):
         if not self.cfg.scenery_mounts:
             log.warning(f"No installed sceneries detected.  Exiting.")
             return
+        
+        self.apply_simheaven_compat(self.cfg.autoortho.simheaven_compat)
 
         self.mounts_running = True
         for scenery in self.cfg.scenery_mounts:

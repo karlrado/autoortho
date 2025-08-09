@@ -68,6 +68,9 @@ log_file = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "logs", "au
 maptype_override =
 # Minimum zoom level to allow.  THIS WILL NOT INCREASE THE MAX QUALITY OF SATELLITE IMAGERY
 min_zoom = 12
+# Maximum zoom level to allow.  Higher values = more detail but larger downloads and more VRAM usage.
+# Optimal: 16 for most cases. Keep in mind that every extra ZL increases VRAM and potential network usage by 4x.
+max_zoom = 16
 # Max time to wait for images.  Higher numbers mean better quality, but more
 # stutters.  Lower numbers will be more responsive at the expense of
 # ocassional low quality tiles.
@@ -77,7 +80,7 @@ fetch_threads = 32
 # Maximum download bandwidth in Mbits/sec (0 = unlimited)
 max_bandwidth_mbits = 0
 # Simheaven compatibility mode.
-simheaven_compat = True
+simheaven_compat = False
 
 [pydds]
 # ISPC or STB for dds file compression

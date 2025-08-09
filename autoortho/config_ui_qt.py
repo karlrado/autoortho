@@ -73,7 +73,7 @@ class StyledButton(QPushButton):
         if self.primary:
             return """
                 QPushButton {
-                    background-color: #FF6B35;
+                    background-color: #6eb6ff;
                     color: white;
                     border: none;
                     padding: 8px 16px;
@@ -104,7 +104,7 @@ class StyledButton(QPushButton):
                 }
                 QPushButton:hover {
                     background-color: #4A4A4A;
-                    border-color: #FF6B35;
+                    border-color: #6eb6ff;
                 }
                 QPushButton:pressed {
                     background-color: #2A2A2A;
@@ -128,7 +128,7 @@ class ModernSlider(QSlider):
                 border-radius: 3px;
             }
             QSlider::handle:horizontal {
-                background: #FF6B35;
+                background: #6eb6ff;
                 width: 18px;
                 height: 18px;
                 margin: -6px 0;
@@ -138,7 +138,7 @@ class ModernSlider(QSlider):
                 background: #FF8555;
             }
             QSlider::sub-page:horizontal {
-                background: #FF6B35;
+                background: #6eb6ff;
                 border-radius: 3px;
             }
         """)
@@ -158,10 +158,10 @@ class ModernSpinBox(QSpinBox):
                 min-width: 80px;
             }
             QSpinBox:focus {
-                border-color: #FF6B35;
+                border-color: #6eb6ff;
             }
             QSpinBox::up-button {
-                background-color: #FF6B35;
+                background-color: #6eb6ff;
                 border: none;
                 border-radius: 2px;
                 width: 16px;
@@ -178,7 +178,7 @@ class ModernSpinBox(QSpinBox):
                 height: 0px;
             }
             QSpinBox::down-button {
-                background-color: #FF6B35;
+                background-color: #6eb6ff;
                 border: none;
                 border-radius: 2px;
                 width: 16px;
@@ -272,7 +272,7 @@ class ConfigUI(QMainWindow):
             }
             QTabBar::tab:selected {
                 background-color: #3A3A3A;
-                color: #FF6B35;
+                color: #6eb6ff;
                 font-weight: bold;
             }
             QTabBar::tab:hover {
@@ -287,7 +287,7 @@ class ConfigUI(QMainWindow):
                 color: white;
             }
             QLineEdit:focus {
-                border-color: #FF6B35;
+                border-color: #6eb6ff;
             }
             QTextEdit {
                 background-color: #2A2A2A;
@@ -308,8 +308,8 @@ class ConfigUI(QMainWindow):
                 background-color: #3A3A3A;
             }
             QCheckBox::indicator:checked {
-                background-color: #FF6B35;
-                border-color: #FF6B35;
+                background-color: #6eb6ff;
+                border-color: #6eb6ff;
             }
             QComboBox {
                 background-color: #3A3A3A;
@@ -319,7 +319,7 @@ class ConfigUI(QMainWindow):
                 min-width: 150px;
             }
             QComboBox:hover {
-                border-color: #FF6B35;
+                border-color: #6eb6ff;
             }
             QComboBox::drop-down {
                 border: none;
@@ -338,7 +338,7 @@ class ConfigUI(QMainWindow):
                 padding-top: 8px;
             }
             QGroupBox::title {
-                color: #FF6B35;
+                color: #6eb6ff;
                 subcontrol-origin: margin;
                 left: 10px;
                 padding: 0 5px;
@@ -605,6 +605,9 @@ class ConfigUI(QMainWindow):
         )
         options_layout.addWidget(self.simheaven_compat_check)
 
+
+        self.simheaven_compat_check.stateChanged.connect(self.on_simheaven_compat_check)
+
         # Windows specific
         if platform.system() == 'Windows':
             self.winfsp_check = QCheckBox("Prefer WinFSP over Dokan")
@@ -751,6 +754,29 @@ class ConfigUI(QMainWindow):
         min_zoom_layout.addWidget(self.min_zoom_label)
         autoortho_layout.addLayout(min_zoom_layout)
 
+        max_zoom_layout = QHBoxLayout()
+        max_zoom_label = QLabel("Maximum zoom level:")
+        max_zoom_label.setToolTip(
+            "Maximum zoom level for imagery downloads.\n"
+            "Higher values = more detail but larger downloads and more VRAM usage.\n"
+            "Optimal: 16 for most cases. Keep in mind that every extra ZL increases VRAM and potential network usage by 4x."
+        )
+        max_zoom_layout.addWidget(max_zoom_label)
+        self.max_zoom_slider = ModernSlider()
+        self.max_zoom_slider.setRange(1, 18)
+        self.max_zoom_slider.setValue(int(self.cfg.autoortho.max_zoom))
+        self.max_zoom_slider.setObjectName('max_zoom')
+        self.max_zoom_slider.setToolTip(
+            "Drag to adjust maximum zoom level (1=low detail, 18=high detail)"
+        )
+        self.max_zoom_label = QLabel(f"{self.cfg.autoortho.max_zoom}")
+        self.max_zoom_slider.valueChanged.connect(
+            lambda v: self.max_zoom_label.setText(f"{v}")
+        )
+        max_zoom_layout.addWidget(self.max_zoom_slider)
+        max_zoom_layout.addWidget(self.max_zoom_label)
+        autoortho_layout.addLayout(max_zoom_layout)
+
         # Max wait time
         maxwait_layout = QHBoxLayout()
         maxwait_label = QLabel("Max wait time (seconds):")
@@ -794,7 +820,7 @@ class ConfigUI(QMainWindow):
         self.fetch_threads_spinbox = ModernSpinBox()
 
         # Get available CPU threads
-        max_threads = os.cpu_count() or 1
+        max_threads = 128 #os.cpu_count() or 1
         self.fetch_threads_spinbox.setRange(1, max_threads)
 
         # Ensure initial value doesn't exceed available threads
@@ -808,7 +834,7 @@ class ConfigUI(QMainWindow):
         )
 
         # Add validation when value changes
-        self.fetch_threads_spinbox.valueChanged.connect(self.validate_threads)
+        #self.fetch_threads_spinbox.valueChanged.connect(self.validate_threads)
 
         threads_layout.addWidget(self.fetch_threads_spinbox)
         threads_layout.addWidget(QLabel(f"(max: {max_threads})"))
@@ -1108,7 +1134,7 @@ class ConfigUI(QMainWindow):
 
             # Title
             title_label = QLabel(f"<b>{latest.name}</b>")
-            title_label.setStyleSheet("color: #FF6B35; font-size: 16px;")
+            title_label.setStyleSheet("color: #6eb6ff; font-size: 16px;")
             item_layout.addWidget(title_label)
 
             pending_update = False
@@ -1177,6 +1203,13 @@ class ConfigUI(QMainWindow):
                 f"Value has been adjusted to {max_threads}."
             )
             self.fetch_threads_spinbox.setValue(max_threads)
+
+    def on_simheaven_compat_check(self, state):
+        """Handle SimHeaven compatibility check"""
+        if state == Qt.CheckState.Checked:
+            self.cfg.autoortho.simheaven_compat = True
+        else:
+            self.cfg.autoortho.simheaven_compat = False
 
     def browse_folder(self, line_edit):
         """Open folder browser dialog"""
@@ -1317,6 +1350,7 @@ class ConfigUI(QMainWindow):
         # Save options
         self.cfg.general.showconfig = self.showconfig_check.isChecked()
         self.cfg.autoortho.maptype_override = self.maptype_combo.currentText()
+        self.cfg.autoortho.simheaven_compat = self.simheaven_compat_check.isChecked()
 
         # Windows specific
         if platform.system() == 'Windows' and hasattr(self, 'winfsp_check'):
@@ -1334,6 +1368,7 @@ class ConfigUI(QMainWindow):
 
             # AutoOrtho settings
             self.cfg.autoortho.min_zoom = str(self.min_zoom_slider.value())
+            self.cfg.autoortho.max_zoom = str(self.max_zoom_slider.value())
             self.cfg.autoortho.maxwait = str(
                 self.maxwait_slider.value() / 10.0
             )
