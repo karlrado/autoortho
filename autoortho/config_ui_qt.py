@@ -777,6 +777,21 @@ class ConfigUI(QMainWindow):
         max_zoom_layout.addWidget(self.max_zoom_label)
         autoortho_layout.addLayout(max_zoom_layout)
 
+        # Mipmap level offset
+        mipmap_level_offset_layout = QHBoxLayout()
+        mipmap_level_offset_label = QLabel("Mipmap level offset:")
+        mipmap_level_offset_label.setToolTip(
+            "How close to the ground should the imagery start transitioning to smaller (lower ZL) images?\n"
+            "X-Plane uses mipmaps as LODs to decrease texture quality as you get further away from the ground.\n"
+            "This setting controls how close to the ground the imagery starts transitioning to lower ZL images.\n"
+            "Higher values = The higher ZL image stays rendered for more distance.\n"
+            "Lower values = The higher ZL image is rendered for less distance and transitions into lower ZL images sooner.\n"
+            "Optimal: 0 for most cases, since it's X-Plane's default, specially if using max zoom level >=1.\n"
+            "Increase if using lower zoom levels and want to keep quality for longer distances, use at own risk.\n"
+        )
+        mipmap_level_offset_layout.addWidget(mipmap_level_offset_label)
+        self.mipmap_level_offset_slider = ModernSlider()
+
         # Max wait time
         maxwait_layout = QHBoxLayout()
         maxwait_label = QLabel("Max wait time (seconds):")
@@ -819,8 +834,7 @@ class ConfigUI(QMainWindow):
         threads_layout.addWidget(threads_label)
         self.fetch_threads_spinbox = ModernSpinBox()
 
-        # Get available CPU threads
-        max_threads = 128 #os.cpu_count() or 1
+        max_threads = 100
         self.fetch_threads_spinbox.setRange(1, max_threads)
 
         # Ensure initial value doesn't exceed available threads
@@ -832,9 +846,6 @@ class ConfigUI(QMainWindow):
         self.fetch_threads_spinbox.setToolTip(
             f"Number of download threads (1-{max_threads})"
         )
-
-        # Add validation when value changes
-        #self.fetch_threads_spinbox.valueChanged.connect(self.validate_threads)
 
         threads_layout.addWidget(self.fetch_threads_spinbox)
         threads_layout.addWidget(QLabel(f"(max: {max_threads})"))

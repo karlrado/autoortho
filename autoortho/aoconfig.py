@@ -71,6 +71,8 @@ min_zoom = 12
 # Maximum zoom level to allow.  Higher values = more detail but larger downloads and more VRAM usage.
 # Optimal: 16 for most cases. Keep in mind that every extra ZL increases VRAM and potential network usage by 4x.
 max_zoom = 16
+# How close to the ground should the imagery start transitioning to smaller (lower ZL) images?
+mipmap_level_offset = 0
 # Max time to wait for images.  Higher numbers mean better quality, but more
 # stutters.  Lower numbers will be more responsive at the expense of
 # ocassional low quality tiles.
