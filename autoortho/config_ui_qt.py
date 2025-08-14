@@ -24,7 +24,6 @@ from PyQt6.QtGui import (
 
 import downloader
 from version import __version__
-import getortho
 
 log = logging.getLogger(__name__)
 
@@ -732,24 +731,21 @@ class ConfigUI(QMainWindow):
         min_zoom_label = QLabel("Minimum zoom level:")
         min_zoom_label.setToolTip(
             "Minimum detail level for imagery downloads.\n"
-            "Higher values = more detail but larger downloads.\n"
-            "8-11: Low detail, faster downloads\n"
-            "12-14: Medium detail, balanced (recommended)\n"
-            "15-18: High detail, slower downloads\n"
-            "Optimal: 13 for most users"
+            "Higher values = program will attempt to always download higher quality imagery, but may miss some tiles.\n"
+            "Lower values = program will download fallback to lower quality imagery, but will not miss any tiles.\n"
+            "Optimal: 12 for most users since will always attempt to at least get an image at this level."
         )
         min_zoom_layout.addWidget(min_zoom_label)
         self.min_zoom_slider = ModernSlider()
-        self.min_zoom_slider.setRange(8, 18)
+        self.min_zoom_slider.setRange(12, 18)
         self.min_zoom_slider.setValue(int(self.cfg.autoortho.min_zoom))
         self.min_zoom_slider.setObjectName('min_zoom')
         self.min_zoom_slider.setToolTip(
-            "Drag to adjust minimum zoom level (8=low detail, 18=high detail)"
+            "Drag to adjust minimum zoom level (12=low detail, 18=high detail)"
         )
         self.min_zoom_label = QLabel(f"{self.cfg.autoortho.min_zoom}")
         self.min_zoom_slider.valueChanged.connect(
             lambda v: (
-                self.min_zoom_label.setText(f"{v}"),
                 self.validate_min_and_max_zoom("min")
             )
         )
@@ -766,16 +762,15 @@ class ConfigUI(QMainWindow):
         )
         max_zoom_layout.addWidget(max_zoom_label)
         self.max_zoom_slider = ModernSlider()
-        self.max_zoom_slider.setRange(1, 18)
+        self.max_zoom_slider.setRange(12, 18)
         self.max_zoom_slider.setValue(int(self.cfg.autoortho.max_zoom))
         self.max_zoom_slider.setObjectName('max_zoom')
         self.max_zoom_slider.setToolTip(
-            "Drag to adjust maximum zoom level (1=low detail, 18=high detail)"
+            "Drag to adjust maximum zoom level (12=low detail, 18=high detail)"
         )
         self.max_zoom_label = QLabel(f"{self.cfg.autoortho.max_zoom}")
         self.max_zoom_slider.valueChanged.connect(
             lambda v: (
-                self.max_zoom_label.setText(f"{v}"),
                 self.validate_min_and_max_zoom("max")
             )
         )
@@ -791,7 +786,7 @@ class ConfigUI(QMainWindow):
         )
         max_zoom_near_airports_layout.addWidget(max_zoom_near_airports_label)
         self.max_zoom_near_airports_slider = ModernSlider()
-        self.max_zoom_near_airports_slider.setRange(1, 18)
+        self.max_zoom_near_airports_slider.setRange(12, 18)
         self.max_zoom_near_airports_slider.setValue(int(self.cfg.autoortho.max_zoom_near_airports))
         self.max_zoom_near_airports_slider.setObjectName('max_zoom_near_airports')
         self.max_zoom_near_airports_slider.setToolTip(
@@ -1243,7 +1238,7 @@ class ConfigUI(QMainWindow):
             self.max_zoom_near_airports_label.setText(f"{self.max_zoom_slider.value()}")
 
     def validate_min_and_max_zoom(
-        self, instigator="min"
+        self, instigator: str
     ):
         """Validate min and max zoom values"""
         if self.min_zoom_slider.value() >= self.max_zoom_slider.value():
@@ -1253,11 +1248,21 @@ class ConfigUI(QMainWindow):
                 "Minimum zoom level must be less than maximum zoom level."
             )
             if instigator == "min":
-                self.min_zoom_slider.setValue(self.max_zoom_slider.value() - 1)
-                self.min_zoom_label.setText(f"{self.max_zoom_slider.value() - 1}")
+                current_value = int(self.min_zoom_label.text())
+                self.min_zoom_slider.setValue(current_value)
             elif instigator == "max":
-                self.max_zoom_slider.setValue(self.min_zoom_slider.value() + 1)
-                self.max_zoom_label.setText(f"{self.min_zoom_slider.value() + 1}")
+                current_value = int(self.max_zoom_label.text())
+                self.max_zoom_slider.setValue(current_value)
+            else:
+                raise ValueError(f"Invalid instigator: {instigator}")
+        else:
+            if instigator == "min":
+                self.min_zoom_label.setText(f"{self.min_zoom_slider.value()}")
+            elif instigator == "max":
+                self.max_zoom_label.setText(f"{self.max_zoom_slider.value()}")
+                if self.max_zoom_near_airports_slider.value() < self.max_zoom_slider.value():
+                    self.max_zoom_near_airports_slider.setValue(self.max_zoom_slider.value())
+                    self.max_zoom_near_airports_label.setText(f"{self.max_zoom_slider.value()}")
             else:
                 raise ValueError(f"Invalid instigator: {instigator}")
 
@@ -1309,7 +1314,7 @@ class ConfigUI(QMainWindow):
         # Update bandwidth limiter with new settings
         try:
             new_bandwidth = float(self.cfg.autoortho.max_bandwidth_mbits)
-            getortho.chunk_getter.update_bandwidth_limit(new_bandwidth)
+            # getortho.chunk_getter.update_bandwidth_limit(new_bandwidth)
         except (ValueError, AttributeError) as e:
             log.warning(f"Could not update bandwidth limit: {e}")
         

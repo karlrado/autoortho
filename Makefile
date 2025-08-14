@@ -31,6 +31,20 @@ bin: autoortho/.version
 		--onefile \
 		./autoortho/__main__.py -o autoortho_lin.bin
 
+mac_bin: autoortho_mac_$(VERSION).bin
+autoortho_mac_$(VERSION).bin: autoortho/.version
+	python3 -m nuitka --verbose --verbose-output=nuitka.log \
+		--macos-app-icon=autoortho/imgs/ao-icon.ico \
+		--enable-plugin=tk-inter \
+		--enable-plugin=eventlet \
+		--include-data-file=./autoortho/.version*=. \
+		--include-data-file=./autoortho/templates/*.html=templates/ \
+		--include-data-file=./autoortho/lib/macos/*.dylib=lib/macos/ \
+		--include-data-file=./autoortho/aoimage/*.dylib=aoimage/ \
+		--include-data-dir=./autoortho/imgs=imgs \
+		--onefile \
+		./autoortho/__main__.py -o $@
+
 _autoortho_win.exe: autoortho/.version
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--mingw64 \

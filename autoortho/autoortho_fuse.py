@@ -291,6 +291,13 @@ class AutoOrtho(Operations):
             return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
                 'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
                 'f_frsize', 'f_namemax'))
+        elif platform.system() == 'Darwin':
+            # macOS support
+            stv = os.statvfs(full_path)
+            #log.info(stv)
+            return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
+                'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
+                'f_frsize'))  # f_namemax not available on macOS
 
     def unlink(self, path):
         return os.unlink(self._full_path(path))
@@ -341,6 +348,7 @@ class AutoOrtho(Operations):
         elif path.endswith('AOISWORKING'):
             return h
         else:
+            # For macOS, Linux, and other Unix-like systems
             h = os.open(full_path, flags)
 
         log.debug(f"OPEN: FH= {h}")

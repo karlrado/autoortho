@@ -40,6 +40,7 @@ tile_stats = StatTracker(20, 12)
 mm_stats = StatTracker(0, 5)
 partial_stats = StatTracker()
 
+USING_KUBILUS_MESH = True
 
 class BandwidthLimiter:
     """
@@ -1383,8 +1384,8 @@ class TileCacher(object):
         log.info(f"Cache dir: {self.cache_dir}")
         self.min_zoom = CFG.autoortho.min_zoom
         # Set target zoom level directly - much simpler than offset calculations
-        # TODO: Make this configurable via CFG.autoortho.target_zoom_level
         self.target_zoom_level = CFG.autoortho.max_zoom  # Direct zoom level target, regardless of tile name
+        self.target_zoom_level_near_airports = CFG.autoortho.max_zoom_near_airports
         log.info(f"Target zoom level set to ZL{self.target_zoom_level}")
         log.info(f"All tiles (ZL18, ZL19, etc.) will download data at ZL{self.target_zoom_level} or lower based on availability")
 
@@ -1395,6 +1396,12 @@ class TileCacher(object):
             # Windows doesn't handle FS cache the same way so enable here.
             self.enable_cache = True
             self.cache_tile_lim = 50
+    
+    def _get_target_zoom_level(self, default_zoom: int) -> int:
+        if USING_KUBILUS_MESH:
+            return self.target_zoom_level_near_airports if default_zoom == "18" else self.target_zoom_level
+        else:
+            return self.target_zoom_level_near_airports if default_zoom == "19" else self.target_zoom_level
 
     def _to_tile_id(self, row, col, map_type, zoom):
         if self.maptype_override:
@@ -1474,7 +1481,7 @@ class TileCacher(object):
                 tile = Tile(col, row, map_type, zoom, 
                     cache_dir = self.cache_dir,
                     min_zoom = self.min_zoom,
-                    max_zoom = self.target_zoom_level)
+                    max_zoom = self._get_target_zoom_level(zoom))
                 self.tiles[idx] = tile
                 self.open_count[idx] = self.open_count.get(idx, 0) + 1
                 if self.open_count[idx] > 1:
