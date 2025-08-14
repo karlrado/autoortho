@@ -748,7 +748,10 @@ class ConfigUI(QMainWindow):
         )
         self.min_zoom_label = QLabel(f"{self.cfg.autoortho.min_zoom}")
         self.min_zoom_slider.valueChanged.connect(
-            lambda v: self.min_zoom_label.setText(f"{v}")
+            lambda v: (
+                self.min_zoom_label.setText(f"{v}"),
+                self.validate_min_and_max_zoom("min")
+            )
         )
         min_zoom_layout.addWidget(self.min_zoom_slider)
         min_zoom_layout.addWidget(self.min_zoom_label)
@@ -771,11 +774,39 @@ class ConfigUI(QMainWindow):
         )
         self.max_zoom_label = QLabel(f"{self.cfg.autoortho.max_zoom}")
         self.max_zoom_slider.valueChanged.connect(
-            lambda v: self.max_zoom_label.setText(f"{v}")
+            lambda v: (
+                self.max_zoom_label.setText(f"{v}"),
+                self.validate_min_and_max_zoom("max")
+            )
         )
         max_zoom_layout.addWidget(self.max_zoom_slider)
         max_zoom_layout.addWidget(self.max_zoom_label)
         autoortho_layout.addLayout(max_zoom_layout)
+
+        # Max zoom near airports
+        max_zoom_near_airports_layout = QHBoxLayout()
+        max_zoom_near_airports_label = QLabel("Max zoom near airports:")
+        max_zoom_near_airports_label.setToolTip(
+            "Maximum zoom level to allow near airports. Zoom level around airports used by default is 18."
+        )
+        max_zoom_near_airports_layout.addWidget(max_zoom_near_airports_label)
+        self.max_zoom_near_airports_slider = ModernSlider()
+        self.max_zoom_near_airports_slider.setRange(1, 18)
+        self.max_zoom_near_airports_slider.setValue(int(self.cfg.autoortho.max_zoom_near_airports))
+        self.max_zoom_near_airports_slider.setObjectName('max_zoom_near_airports')
+        self.max_zoom_near_airports_slider.setToolTip(
+            "Drag to adjust maximum zoom level to allow near airports"
+        )
+        self.max_zoom_near_airports_label = QLabel(f"{self.cfg.autoortho.max_zoom_near_airports}")
+        self.max_zoom_near_airports_slider.valueChanged.connect(
+            lambda v: (
+                self.max_zoom_near_airports_label.setText(f"{v}"),
+                self.validate_max_zoom_near_airports()
+            )
+        )
+        max_zoom_near_airports_layout.addWidget(self.max_zoom_near_airports_slider)
+        max_zoom_near_airports_layout.addWidget(self.max_zoom_near_airports_label)
+        autoortho_layout.addLayout(max_zoom_near_airports_layout)
 
         # Mipmap level offset
         mipmap_level_offset_layout = QHBoxLayout()
@@ -827,9 +858,7 @@ class ConfigUI(QMainWindow):
         threads_label.setToolTip(
             "Number of simultaneous download threads.\n"
             "More threads = faster downloads but higher CPU/network usage.\n"
-            "Too many threads may cause timeouts or instability.\n"
-            "Optimal: 4-8 threads for most systems\n"
-            f"Your system has {os.cpu_count() or 1} CPU threads available."
+            "Too many threads may cause timeouts or instability."
         )
         threads_layout.addWidget(threads_label)
         self.fetch_threads_spinbox = ModernSpinBox()
@@ -1202,6 +1231,36 @@ class ConfigUI(QMainWindow):
         self.splash.show()
         QTimer.singleShot(2000, self.splash.close)
 
+    def validate_max_zoom_near_airports(self):
+        """Validate max zoom near airports value"""
+        if self.max_zoom_near_airports_slider.value() < self.max_zoom_slider.value():
+            QMessageBox.warning(
+                self,
+                "Invalid Zoom Settings",
+                "Maximum zoom level to near airports must be greater or equal to maximum zoom level."
+            )
+            self.max_zoom_near_airports_slider.setValue(self.max_zoom_slider.value())
+            self.max_zoom_near_airports_label.setText(f"{self.max_zoom_slider.value()}")
+
+    def validate_min_and_max_zoom(
+        self, instigator="min"
+    ):
+        """Validate min and max zoom values"""
+        if self.min_zoom_slider.value() >= self.max_zoom_slider.value():
+            QMessageBox.warning(
+                self,
+                "Invalid Zoom Settings",
+                "Minimum zoom level must be less than maximum zoom level."
+            )
+            if instigator == "min":
+                self.min_zoom_slider.setValue(self.max_zoom_slider.value() - 1)
+                self.min_zoom_label.setText(f"{self.max_zoom_slider.value() - 1}")
+            elif instigator == "max":
+                self.max_zoom_slider.setValue(self.min_zoom_slider.value() + 1)
+                self.max_zoom_label.setText(f"{self.min_zoom_slider.value() + 1}")
+            else:
+                raise ValueError(f"Invalid instigator: {instigator}")
+
     def validate_threads(self, value):
         """Validate fetch threads value and show warning if too high"""
         max_threads = os.cpu_count() or 1
@@ -1379,7 +1438,9 @@ class ConfigUI(QMainWindow):
 
             # AutoOrtho settings
             self.cfg.autoortho.min_zoom = str(self.min_zoom_slider.value())
+            self.cfg.autoortho.max_zoom_near_airports = str(self.max_zoom_near_airports_slider.value())
             self.cfg.autoortho.max_zoom = str(self.max_zoom_slider.value())
+            self.cfg.autoortho.mipmap_level_offset = str(self.mipmap_level_offset_slider.value())
             self.cfg.autoortho.maxwait = str(
                 self.maxwait_slider.value() / 10.0
             )
