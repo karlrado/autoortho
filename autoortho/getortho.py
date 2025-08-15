@@ -344,7 +344,7 @@ class Chunk(object):
     def __init__(self, col, row, maptype, zoom, priority=0, cache_dir='.cache'):
         self.col = col
         self.row = row
-        self.zoom = zoom
+        self.tilename_zoom = zoom
         self.maptype = maptype
         self.cache_dir = cache_dir
         
@@ -365,7 +365,7 @@ class Chunk(object):
         return self.priority < other.priority
 
     def __repr__(self):
-        return f"Chunk({self.col},{self.row},{self.maptype},{self.zoom},{self.priority})"
+        return f"Chunk({self.col},{self.row},{self.maptype},{self.tilename_zoom},{self.priority})"
 
     def get_cache(self):
         if os.path.isfile(self.cache_path):
@@ -411,7 +411,7 @@ class Chunk(object):
 
         server_num = idx%(len(self.serverlist))
         server = self.serverlist[server_num]
-        quadkey = _gtile_to_quadkey(self.col, self.row, self.zoom)
+        quadkey = _gtile_to_quadkey(self.col, self.row, self.tilename_zoom)
 
         # Hack override maptype
         #maptype = "ARC"
@@ -419,13 +419,13 @@ class Chunk(object):
         MAPID = "s2cloudless-2023_3857"
         MATRIXSET = "g"
         MAPTYPES = {
-            "EOX": f"https://{server}.tiles.maps.eox.at/wmts/?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.zoom}&TileCol={self.col}&TileRow={self.row}",
+            "EOX": f"https://{server}.tiles.maps.eox.at/wmts/?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.tilename_zoom}&TileCol={self.col}&TileRow={self.row}",
             "BI": f"https://t.ssl.ak.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=15312",
-            "GO2": f"http://mts{server_num}.google.com/vt/lyrs=s&x={self.col}&y={self.row}&z={self.zoom}",
-            "ARC": f"http://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-            "NAIP": f"http://naip.maptiles.arcgis.com/arcgis/rest/services/NAIP/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-            "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-            "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{self.zoom}/{self.row}/{self.col}"
+            "GO2": f"http://mts{server_num}.google.com/vt/lyrs=s&x={self.col}&y={self.row}&z={self.tilename_zoom}",
+            "ARC": f"http://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{self.tilename_zoom}/{self.row}/{self.col}",
+            "NAIP": f"http://naip.maptiles.arcgis.com/arcgis/rest/services/NAIP/MapServer/tile/{self.tilename_zoom}/{self.row}/{self.col}",
+            "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{self.tilename_zoom}/{self.row}/{self.col}",
+            "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{self.tilename_zoom}/{self.row}/{self.col}"
         }
 
 
@@ -544,8 +544,10 @@ class Tile(object):
     maptype = None
     zoom = -1
     min_zoom = 12
-    width = 16
-    height = 16
+    base_chunk_resolution = 4 # 4px for baseline ZL12 chunk
+    baseline_zl = 12
+    width = 16 # Chunks per row
+    height = 16 # Chunks per column
 
     priority = -1
     #tile_condition = None
@@ -562,11 +564,11 @@ class Tile(object):
     imgs = None
 
     def __init__(self, col, row, maptype, zoom, min_zoom=0, priority=0,
-            cache_dir=None, max_zoom=None):
+            cache_dir=None, max_zoom=None, mipmap_offset=0):
         self.row = int(row)
         self.col = int(col)
         self.maptype = maptype
-        self.zoom = int(zoom)
+        self.tilename_zoom = int(zoom)
         self.chunks = {}
         self.cache_file = (-1, None)
         self.ready = threading.Event()
@@ -588,10 +590,12 @@ class Tile(object):
         else:
             self.cache_dir = CFG.paths.cache_dir
 
-        self.max_mipmap = 6
+
         # Set max zoom level - if not specified, use original tile zoom (no capping)
-        self.max_zoom = int(max_zoom) if max_zoom is not None else self.zoom
-        
+        self.max_zoom = int(max_zoom) if max_zoom is not None else self.tilename_zoom
+
+        self.max_mipmap = self.max_zoom - self.min_zoom
+
         # Hack override maptype
         #self.maptype = "BI"
 
@@ -615,29 +619,18 @@ class Tile(object):
         # This is very time consuming while loading flight, left commented out for now
         # self.actual_max_zoom = self._detect_available_max_zoom()
         self.actual_max_zoom = self.max_zoom
+
+        self.chunk_resolution = (self.base_chunk_resolution * pow(2, self.actual_max_zoom - self.baseline_zl))
         
-        # Calculate DDS size based on actual available zoom level
-        zoom_reduction = self.zoom - self.actual_max_zoom
-        if zoom_reduction > 0:
-            # Use dimensions appropriate for actual max available zoom level
-            effective_width = self.width >> zoom_reduction
-            effective_height = self.height >> zoom_reduction
-            dds_width = effective_width * 256
-            dds_height = effective_height * 256
-            log.info(f"Creating DDS at detected max available size: {dds_width}x{dds_height} (ZL{self.actual_max_zoom}, {effective_width}x{effective_height} chunks)")
-        else:
-            # No capping needed, use original dimensions
-            dds_width = self.width * 256
-            dds_height = self.height * 256
-            log.info(f"Creating DDS at original size: {dds_width}x{dds_height} (ZL{self.actual_max_zoom})")
+        dds_width = self.width * self.chunk_resolution
+        dds_height = self.height * self.chunk_resolution
+        log.info(f"Creating DDS at original size: {dds_width}x{dds_height} (ZL{self.actual_max_zoom})")
             
         self.dds = pydds.DDS(dds_width, dds_height, ispc=use_ispc,
                 dxt_format=CFG.pydds.format)
-        
-        log.info(f"Tile '{self.zoom}' using detected max available ZL{self.actual_max_zoom} (target was ZL{self.max_zoom})")
-        if zoom_reduction > 0:
-            log.info(f"Mipmaps 0-{zoom_reduction-1} will reuse ZL{self.actual_max_zoom} data, higher mipmaps use progressively lower zoom levels")
-        self.id = f"{row}_{col}_{maptype}_{zoom}"
+
+        log.info(f"Tile '{self.tilename_zoom}' using detected max available ZL{self.actual_max_zoom} (target was ZL{self.max_zoom})")
+        self.id = f"{row}_{col}_{maptype}_{self.tilename_zoom}"
 
     def _detect_available_max_zoom(self):
         """
@@ -649,7 +642,7 @@ class Tile(object):
         # Don't test beyond our target zoom level
         test_max = self.max_zoom  # max_zoom is now the direct target, not calculated from tile zoom
         
-        log.info(f"Fast zoom detection for tile '{self.zoom}' (testing up to target ZL{test_max})")
+        log.info(f"Fast zoom detection for tile '{self.tilename_zoom}' (testing up to target ZL{test_max})")
         
         # OPTIMIZATION: Test in descending order but only check cache first for speed
         for test_zoom in range(test_max, self.min_zoom - 1, -1):
@@ -670,7 +663,7 @@ class Tile(object):
         Returns the fraction of cached chunks (0.0 to 1.0).
         """
         # Calculate chunk dimensions for this zoom level
-        zoom_diff = self.zoom - test_zoom
+        zoom_diff = self.tilename_zoom - test_zoom
         test_width = max(1, self.width >> zoom_diff)
         test_height = max(1, self.height >> zoom_diff)
         
@@ -722,7 +715,7 @@ class Tile(object):
         Returns the fraction of successful chunks (0.0 to 1.0).
         """
         # Calculate chunk dimensions for this zoom level
-        zoom_diff = self.zoom - test_zoom
+        zoom_diff = self.tilename_zoom - test_zoom
         test_width = max(1, self.width >> zoom_diff)
         test_height = max(1, self.height >> zoom_diff)
         
@@ -777,7 +770,7 @@ class Tile(object):
         return self.priority < other.priority
 
     def __repr__(self):
-        return f"Tile({self.col}, {self.row}, {self.maptype}, {self.zoom}, min_zoom={self.min_zoom}, max_zoom={self.max_zoom}, max_mm={self.max_mipmap})"
+        return f"Tile({self.col}, {self.row}, {self.maptype}, {self.tilename_zoom}, min_zoom={self.min_zoom}, max_zoom={self.max_zoom}, max_mm={self.max_mipmap})"
 
     @locked
     def _create_chunks(self, quick_zoom=0, min_zoom=None):
@@ -795,8 +788,8 @@ class Tile(object):
     def _find_cache_file(self):
         #with self.tile_condition:
         with self.tile_lock:
-            for z in range(self.zoom, (self.min_zoom-1), -1):
-                cache_file = os.path.join(self.cache_dir, f"{self.row}_{self.col}_{self.maptype}_{self.zoom}_{z}.dds")
+            for z in range(self.tilename_zoom, (self.min_zoom-1), -1):
+                cache_file = os.path.join(self.cache_dir, f"{self.row}_{self.col}_{self.maptype}_{self.tilename_zoom}_{z}.dds")
                 if os.path.exists(cache_file):
                     log.info(f"Found cache for {cache_file}...")
                     self.cache_file = (z, cache_file)
@@ -809,16 +802,16 @@ class Tile(object):
     def _get_quick_zoom(self, quick_zoom=0, min_zoom=None):
         if quick_zoom:
             # Max difference in steps this tile can support
-            max_diff = min((self.zoom - int(quick_zoom)), self.max_mipmap)
+            max_diff = min((self.tilename_zoom - int(quick_zoom)), self.max_mipmap)
             if not min_zoom:
                 # Minimum zoom level allowed
-                min_zoom = max((self.zoom - max_diff), self.min_zoom)
+                min_zoom = max((self.tilename_zoom - max_diff), self.min_zoom)
             
             # Effective zoom level we will use 
             quick_zoom = max(int(quick_zoom), min_zoom)
 
             # Effective difference in steps we will use
-            zoom_diff = min((self.zoom - int(quick_zoom)), self.max_mipmap)
+            zoom_diff = min((self.tilename_zoom - int(quick_zoom)), self.max_mipmap)
 
             col = int(self.col/pow(2,zoom_diff))
             row = int(self.row/pow(2,zoom_diff))
@@ -830,7 +823,7 @@ class Tile(object):
             row = self.row
             width = self.width
             height = self.height
-            zoom = self.zoom
+            zoom = self.tilename_zoom
             zoom_diff = 0
 
         return (col, row, width, height, zoom, zoom_diff)
@@ -986,14 +979,14 @@ class Tile(object):
         return self.dds.read(length)
 
     def write(self):
-        outfile = os.path.join(self.cache_dir, f"{self.row}_{self.col}_{self.maptype}_{self.zoom}_{self.zoom}.dds")
+        outfile = os.path.join(self.cache_dir, f"{self.row}_{self.col}_{self.maptype}_{self.tilename_zoom}_{self.tilename_zoom}.dds")
         self.ready.clear()
         self.dds.write(outfile)
         self.ready.set()
         return outfile
 
     def get_header(self):
-        outfile = os.path.join(self.cache_dir, f"{self.row}_{self.col}_{self.maptype}_{self.zoom}_{self.zoom}.dds")
+        outfile = os.path.join(self.cache_dir, f"{self.row}_{self.col}_{self.maptype}_{self.tilename_zoom}_{self.tilename_zoom}.dds")
         
         self.ready.clear()
         self.dds.write(outfile)
@@ -1008,9 +1001,9 @@ class Tile(object):
 
         # Get effective zoom  
         original_mipmap = mipmap  # Store original before _get_quick_zoom overwrites it
-        zoom = self.zoom - mipmap
-        print(f"GET_IMG: Default zoom: {self.zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
-        log.debug(f"GET_IMG: Default zoom: {self.zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
+        zoom = self.tilename_zoom - mipmap
+        print(f"GET_IMG: Default zoom: {self.tilename_zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
+        log.debug(f"GET_IMG: Default zoom: {self.tilename_zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(zoom, min_zoom)
         log.debug(f"Will use:  Zoom: {zoom},  Zoom_diff: {zoom_diff}")        
         # Restore original mipmap parameter 
@@ -1018,7 +1011,7 @@ class Tile(object):
         
         # Apply zoom level capping logic based on detected actual max zoom
         # Calculate what zoom level this mipmap would normally use
-        normal_zoom = self.zoom - original_mipmap
+        normal_zoom = self.tilename_zoom - original_mipmap
         
         # Cap it to actual_max_zoom if it would be higher
         capped_zoom = min(normal_zoom, self.actual_max_zoom)
@@ -1033,7 +1026,7 @@ class Tile(object):
             # This mipmap should use capped zoom data
             # Check if we already generated an image for this capped zoom level
             for existing_mm, existing_img in self.imgs.items():
-                existing_normal_zoom = self.zoom - existing_mm
+                existing_normal_zoom = self.tilename_zoom - existing_mm
                 existing_capped_zoom = min(existing_normal_zoom, self.actual_max_zoom)
                 
                 if existing_capped_zoom == capped_zoom and existing_img:
@@ -1280,7 +1273,7 @@ class Tile(object):
         end_time = time.time()
         self.ready.set()
 
-        zoom = self.zoom - mipmap
+        zoom = self.tilename_zoom - mipmap
         tile_time = end_time - start_time
         mm_stats.set(mipmap, tile_time)
 
