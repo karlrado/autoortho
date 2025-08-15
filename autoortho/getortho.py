@@ -545,7 +545,7 @@ class Tile(object):
     maptype = None
     zoom = -1
     min_zoom = 12
-    base_chunk_resolution = 4 # 4px for baseline ZL12 chunk
+    base_image_resolution = 64 # 64px for baseline ZL12 chunk
     baseline_zl = 12
 
     priority = -1
@@ -620,12 +620,12 @@ class Tile(object):
         # self.actual_max_zoom = self._detect_available_max_zoom()
         self.actual_max_zoom = self.max_zoom
 
-        self.chunk_resolution = (self.base_chunk_resolution * pow(2, self.actual_max_zoom - self.baseline_zl))
-        self.width = max(1, self.chunk_resolution / 256) # Chunks per row
-        self.height = max(1, self.chunk_resolution / 256) # Chunks per column
+        self.chunks_per_row_and_col = int(self.base_image_resolution * pow(2, self.actual_max_zoom - self.baseline_zl)) # Chunks per row and column
+        self.width = int(max(1, self.chunks_per_row_and_col / 256)) # Chunks per row
+        self.height = int(max(1, self.chunks_per_row_and_col / 256)) # Chunks per column
         
-        dds_width = self.width * self.chunk_resolution
-        dds_height = self.height * self.chunk_resolution
+        dds_width = self.width * 256
+        dds_height = self.height * 256
         log.info(f"Creating DDS at original size: {dds_width}x{dds_height} (ZL{self.actual_max_zoom})")
             
         self.dds = pydds.DDS(dds_width, dds_height, ispc=use_ispc,
@@ -801,33 +801,51 @@ class Tile(object):
 
 
     def _get_quick_zoom(self, quick_zoom=0, min_zoom=None):
-        if quick_zoom:
-            # Max difference in steps this tile can support
-            max_diff = min((self.max_zoom - int(quick_zoom)), self.max_mipmap)
-            if not min_zoom:
-                # Minimum zoom level allowed
-                min_zoom = max((self.max_zoom - max_diff), self.min_zoom)
+        """Calculate tile parameters for the given zoom level.
+        
+        Args:
+            quick_zoom: Target zoom level (0 means use max_zoom)
+            min_zoom: Minimum allowed zoom level
             
-            # Effective zoom level we will use 
-            quick_zoom = max(int(quick_zoom), min_zoom)
+        Returns:
+            Tuple of (col, row, width, height, zoom, zoom_diff)
+        """
+        # Handle simple case: no quick zoom specified
+        if not quick_zoom:
+            return (self.col, self.row, self.width, self.height, self.max_zoom, 0)
+        
+        quick_zoom = int(quick_zoom)
+        
+        # Calculate the maximum zoom difference this tile can support
+        max_supported_diff = min(self.max_zoom - quick_zoom, self.max_mipmap)
+        
+        # Determine minimum zoom level if not provided
+        if min_zoom is None:
+            min_zoom = max(self.max_zoom - max_supported_diff, self.min_zoom)
+        
+        # Clamp quick_zoom to minimum allowed value
+        effective_zoom = max(quick_zoom, min_zoom)
+        
+        # Calculate actual zoom difference (limited by max_mipmap)
+        zoom_diff = min(self.max_zoom - effective_zoom, self.max_mipmap)
 
-            # Effective difference in steps we will use
-            zoom_diff = min((self.max_zoom - int(quick_zoom)), self.max_mipmap)
-
-            col = int(self.col/pow(2,zoom_diff))
-            row = int(self.row/pow(2,zoom_diff))
-            width = int(self.width/pow(2,zoom_diff))
-            height = int(self.height/pow(2,zoom_diff))
-            zoom = int(quick_zoom)
-        else:
-            col = self.col
-            row = self.row
-            width = self.width
-            height = self.height
-            zoom = self.max_zoom
-            zoom_diff = 0
-
-        return (col, row, width, height, zoom, zoom_diff)
+        # Calculate tilename zoom difference
+        tilename_zoom_diff = self.tilename_zoom - effective_zoom
+        
+        # Scale coordinates and dimensions based on zoom difference
+        def scale_by_zoom_diff(value, diff):
+            """Scale a value by 2^diff (positive diff scales down, negative scales up)"""
+            if diff >= 0:
+                return value >> diff  
+            else:
+                return value << (-diff)  
+        
+        scaled_col = scale_by_zoom_diff(self.col, tilename_zoom_diff)
+        scaled_row = scale_by_zoom_diff(self.row, tilename_zoom_diff)
+        scaled_width = max(1, scale_by_zoom_diff(self.width, zoom_diff))
+        scaled_height = max(1, scale_by_zoom_diff(self.height, zoom_diff))
+        
+        return (scaled_col, scaled_row, scaled_width, scaled_height, effective_zoom, zoom_diff)
 
 
     def fetch(self, quick_zoom=0, background=False):
