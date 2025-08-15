@@ -547,8 +547,6 @@ class Tile(object):
     min_zoom = 12
     base_chunk_resolution = 4 # 4px for baseline ZL12 chunk
     baseline_zl = 12
-    width = 16 # Chunks per row
-    height = 16 # Chunks per column
 
     priority = -1
     #tile_condition = None
@@ -623,6 +621,8 @@ class Tile(object):
         self.actual_max_zoom = self.max_zoom
 
         self.chunk_resolution = (self.base_chunk_resolution * pow(2, self.actual_max_zoom - self.baseline_zl))
+        self.width = max(1, self.chunk_resolution / 256) # Chunks per row
+        self.height = max(1, self.chunk_resolution / 256) # Chunks per column
         
         dds_width = self.width * self.chunk_resolution
         dds_height = self.height * self.chunk_resolution
@@ -1001,16 +1001,10 @@ class Tile(object):
         #
 
         # Get effective zoom  
-        original_mipmap = mipmap
         zoom = min((self.max_zoom + self.mipmap_offset - mipmap), self.max_zoom)
         log.debug(f"GET_IMG: Default tile zoom: {self.zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(zoom, min_zoom)
         log.debug(f"Will use:  Zoom: {zoom},  Zoom_diff: {zoom_diff}")        
-        # Restore original mipmap parameter 
-        mipmap = original_mipmap
-        # Apply zoom level capping logic based on detected actual max zoom
-        # Calculate what zoom level this mipmap would normally use
-        normal_zoom = self.max_zoom - mipmap
                 
         # Calculate how many zoom levels we're capped by
         is_mipmap_reused = (mipmap > 0 and (zoom == self.max_zoom))
