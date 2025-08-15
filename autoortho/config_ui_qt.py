@@ -72,7 +72,7 @@ class StyledButton(QPushButton):
         if self.primary:
             return """
                 QPushButton {
-                    background-color: #6eb6ff;
+                    background-color: #1d71d1;
                     color: white;
                     border: none;
                     padding: 8px 16px;
@@ -81,7 +81,7 @@ class StyledButton(QPushButton):
                     font-size: 14px;
                 }
                 QPushButton:hover {
-                    background-color: #FF8555;
+                    background-color: #5183bd;
                 }
                 QPushButton:pressed {
                     background-color: #E55B25;
@@ -103,7 +103,7 @@ class StyledButton(QPushButton):
                 }
                 QPushButton:hover {
                     background-color: #4A4A4A;
-                    border-color: #6eb6ff;
+                    border-color: #1d71d1;
                 }
                 QPushButton:pressed {
                     background-color: #2A2A2A;
@@ -127,17 +127,17 @@ class ModernSlider(QSlider):
                 border-radius: 3px;
             }
             QSlider::handle:horizontal {
-                background: #6eb6ff;
+                background: #6da4e3;
                 width: 18px;
                 height: 18px;
                 margin: -6px 0;
                 border-radius: 9px;
             }
             QSlider::handle:horizontal:hover {
-                background: #FF8555;
+                background: #5183bd;
             }
             QSlider::sub-page:horizontal {
-                background: #6eb6ff;
+                background: #6da4e3;
                 border-radius: 3px;
             }
         """)
@@ -157,16 +157,16 @@ class ModernSpinBox(QSpinBox):
                 min-width: 80px;
             }
             QSpinBox:focus {
-                border-color: #6eb6ff;
+                border-color: #6da4e3;
             }
             QSpinBox::up-button {
-                background-color: #6eb6ff;
+                background-color: #6da4e3;
                 border: none;
                 border-radius: 2px;
                 width: 16px;
             }
             QSpinBox::up-button:hover {
-                background-color: #FF8555;
+                background-color: #5183bd;
             }
             QSpinBox::up-arrow {
                 image: none;
@@ -177,13 +177,13 @@ class ModernSpinBox(QSpinBox):
                 height: 0px;
             }
             QSpinBox::down-button {
-                background-color: #6eb6ff;
+                background-color: #6da4e3;
                 border: none;
                 border-radius: 2px;
                 width: 16px;
             }
             QSpinBox::down-button:hover {
-                background-color: #FF8555;
+                background-color: #5183bd;
             }
             QSpinBox::down-arrow {
                 image: none;
@@ -271,7 +271,7 @@ class ConfigUI(QMainWindow):
             }
             QTabBar::tab:selected {
                 background-color: #3A3A3A;
-                color: #6eb6ff;
+                color: #ffffff;
                 font-weight: bold;
             }
             QTabBar::tab:hover {
@@ -286,7 +286,7 @@ class ConfigUI(QMainWindow):
                 color: white;
             }
             QLineEdit:focus {
-                border-color: #6eb6ff;
+                border-color: #1d71d1;
             }
             QTextEdit {
                 background-color: #2A2A2A;
@@ -307,8 +307,8 @@ class ConfigUI(QMainWindow):
                 background-color: #3A3A3A;
             }
             QCheckBox::indicator:checked {
-                background-color: #6eb6ff;
-                border-color: #6eb6ff;
+                background-color: #1d71d1;
+                border-color: #1d71d1;
             }
             QComboBox {
                 background-color: #3A3A3A;
@@ -318,7 +318,7 @@ class ConfigUI(QMainWindow):
                 min-width: 150px;
             }
             QComboBox:hover {
-                border-color: #6eb6ff;
+                border-color: #1d71d1;
             }
             QComboBox::drop-down {
                 border: none;
@@ -337,7 +337,7 @@ class ConfigUI(QMainWindow):
                 padding-top: 8px;
             }
             QGroupBox::title {
-                color: #6eb6ff;
+                color: #ffffff;
                 subcontrol-origin: margin;
                 left: 10px;
                 padding: 0 5px;
@@ -786,7 +786,7 @@ class ConfigUI(QMainWindow):
         )
         max_zoom_near_airports_layout.addWidget(max_zoom_near_airports_label)
         self.max_zoom_near_airports_slider = ModernSlider()
-        self.max_zoom_near_airports_slider.setRange(12, 18)
+        self.max_zoom_near_airports_slider.setRange(12, 19)
         self.max_zoom_near_airports_slider.setValue(int(self.cfg.autoortho.max_zoom_near_airports))
         self.max_zoom_near_airports_slider.setObjectName('max_zoom_near_airports')
         self.max_zoom_near_airports_slider.setToolTip(
@@ -817,6 +817,25 @@ class ConfigUI(QMainWindow):
         )
         mipmap_level_offset_layout.addWidget(mipmap_level_offset_label)
         self.mipmap_level_offset_slider = ModernSlider()
+        self.mipmap_level_offset_slider.setRange(0, 5)
+        self.mipmap_level_offset_slider.setValue(int(self.cfg.autoortho.mipmap_level_offset))
+        self.mipmap_level_offset_slider.setObjectName('mipmap_level_offset')
+        self.mipmap_level_offset_slider.setToolTip(
+            "Drag to adjust how far to the ground should the imagery start transitioning to smaller (lower ZL) images\n"
+            "0 is Default X-Plane mipmap level offset, and therefore the recommended value.\n"
+            "Increase if using lower zoom levels and want to keep quality for longer distances.\n"
+            "IMPORTANT: Resource impact hasn't been tested, use at own risk.\n"
+            )
+        # Set initial label text - show "Default" for 0, otherwise show the number
+        initial_value = int(self.cfg.autoortho.mipmap_level_offset)
+        initial_text = "Default" if initial_value == 0 else str(initial_value)
+        self.mipmap_level_offset_label = QLabel(initial_text)
+        self.mipmap_level_offset_slider.valueChanged.connect(
+            lambda v: self.mipmap_level_offset_label.setText("Default" if v == 0 else str(v))
+        )
+        mipmap_level_offset_layout.addWidget(self.mipmap_level_offset_slider)
+        mipmap_level_offset_layout.addWidget(self.mipmap_level_offset_label)
+        autoortho_layout.addLayout(mipmap_level_offset_layout)
 
         # Max wait time
         maxwait_layout = QHBoxLayout()
@@ -1169,7 +1188,7 @@ class ConfigUI(QMainWindow):
 
             # Title
             title_label = QLabel(f"<b>{latest.name}</b>")
-            title_label.setStyleSheet("color: #6eb6ff; font-size: 16px;")
+            title_label.setStyleSheet("color: #6da4e3; font-size: 16px;")
             item_layout.addWidget(title_label)
 
             pending_update = False
@@ -1303,22 +1322,46 @@ class ConfigUI(QMainWindow):
         self.update_status_bar("Mounting sceneries...")
         self.mount_sceneries(blocking=False)
         self.verify()
+        self.running = True  # Set running state
         self.update_status_bar("Running")
         self.showMinimized()
 
     def on_save(self):
         """Handle Save button click"""
+        # Check if program is already running
+        if self.running:
+            reply = QMessageBox.question(
+                self,
+                "Save Settings While Running",
+                "AutoOrtho Injection is already running. Some settings may not take effect until you restart AutoOrtho.\n\n"
+                "Do you want to save the settings anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            
+            if reply == QMessageBox.StandardButton.No:
+                self.update_status_bar("Save cancelled")
+                return
+        
         self.save_config()
         self.cfg.load()
         
         # Update bandwidth limiter with new settings
         try:
             new_bandwidth = float(self.cfg.autoortho.max_bandwidth_mbits)
-            # getortho.chunk_getter.update_bandwidth_limit(new_bandwidth)
+            # getortho.chunk_getter.update_bandwidth_limit(new_bandwidth) Removed as it needed an import that was not thaaat necessary
         except (ValueError, AttributeError) as e:
             log.warning(f"Could not update bandwidth limit: {e}")
         
-        self.update_status_bar("Configuration saved")
+        if self.running:
+            self.update_status_bar("Configuration saved - some changes may require restart")
+            QMessageBox.information(
+                self,
+                "Settings Saved",
+                "Settings have been saved. Some changes may not take effect until you restart AutoOrtho."
+            )
+        else:
+            self.update_status_bar("Configuration saved")
 
     def on_clean_cache(self):
         """Handle Clean Cache button click"""
@@ -1483,11 +1526,104 @@ class ConfigUI(QMainWindow):
         self.ready.set()
         self.refresh_scenery()
 
+
+    def apply_simheaven_compat(self, use_simheaven_overlay=False):
+        """
+        Modify scenery_packs.ini to enable/disable AutoOrtho overlays based on SimHeaven compatibility
+        
+        Args:
+            use_simheaven_overlay (bool): If True, disable AutoOrtho overlays (for SimHeaven compatibility)
+                                        If False, enable AutoOrtho overlays (normal mode)
+        """
+        if use_simheaven_overlay:
+            log.info("Applying SimHeaven compatibility overlay - disabling AutoOrtho overlays.")
+        else:
+            log.info("Applying included overlay - enabling AutoOrtho overlays.")
+        
+        # Get the scenery_packs.ini file path
+        xplane_path = self.cfg.paths.xplane_path
+        if not xplane_path:
+            log.warning("X-Plane path not configured. Cannot modify scenery_packs.ini")
+            return
+        
+        scenery_packs_path = os.path.join(xplane_path, "Custom Scenery", "scenery_packs.ini")
+        
+        if not os.path.exists(scenery_packs_path):
+            log.warning(f"scenery_packs.ini not found at {scenery_packs_path}")
+            return
+        
+        try:
+            # Read the current content
+            with open(scenery_packs_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            overlay_pattern = "Custom Scenery/yAutoOrtho_Overlays/"
+            simheaven_overlay_pattern = "Custom Scenery/simHeaven_X-World"
+            
+            # First, check if SimHeaven overlay pattern exists
+            simheaven_found = False
+            for line in lines:
+                line_stripped = line.strip()
+                if simheaven_overlay_pattern in line_stripped:
+                    simheaven_found = True
+                    log.info(f"Found SimHeaven overlay entry: {line_stripped}")
+                    break
+            
+            if not simheaven_found:
+                log.info("No SimHeaven overlay found in scenery_packs.ini - skipping AutoOrtho overlay modifications")
+                QMessageBox.information(
+                    self,
+                    "SimHeaven Compatibility",
+                    "No SimHeaven scenery found in scenery_packs.ini - skipping AutoOrtho overlay modifications, make sure to install SimHeaven scenery and run X-Plane once."
+                )
+                return
+            
+            modified = False
+            
+            # Process each line to modify AutoOrtho overlays
+            for i, line in enumerate(lines):
+                line_stripped = line.strip()
+                
+                if use_simheaven_overlay:
+                    # Disable AutoOrtho overlays (for SimHeaven compatibility)
+                    if line_stripped.startswith("SCENERY_PACK ") and overlay_pattern in line_stripped:
+                        lines[i] = line.replace("SCENERY_PACK ", "SCENERY_PACK_DISABLED ", 1)
+                        modified = True
+                        log.info(f"Disabled AutoOrtho overlay: {line_stripped}")
+                else:
+                    # Enable AutoOrtho overlays (normal mode)
+                    if line_stripped.startswith("SCENERY_PACK_DISABLED ") and overlay_pattern in line_stripped:
+                        lines[i] = line.replace("SCENERY_PACK_DISABLED ", "SCENERY_PACK ", 1)
+                        modified = True
+                        log.info(f"Enabled AutoOrtho overlay: {line_stripped}")
+            
+            # Write back the modified content if changes were made
+            if modified:
+                with open(scenery_packs_path, 'w', encoding='utf-8') as f:
+                    f.writelines(lines)
+                log.info(f"Successfully updated scenery_packs.ini at {scenery_packs_path}")
+            else:
+                log.info(f"No AutoOrtho overlay found in scenery_packs.ini - skipping AutoOrtho overlay modifications")
+                if not use_simheaven_overlay:
+                    QMessageBox.information(
+                        self,
+                        "SimHeaven Compatibility",
+                        "No AutoOrtho overlay entry found in scenery_packs.ini, therefore it was not activated.\n"
+                        "If not using any external overlays, make sure to install AutoOrthoOverlays scenery and run X-Plane once."
+                    )
+                
+        except Exception as e:
+            log.error(f"Failed to modify scenery_packs.ini: {e}")
+            raise
+
     def refresh_scenery(self):
         """Refresh scenery data"""
         self.dl.regions = {}
         self.dl.extract_dir = self.cfg.paths.scenery_path
         self.dl.download_dir = self.cfg.paths.download_dir
+        self.apply_simheaven_compat(self.cfg.autoortho.simheaven_compat)
+
+        
         self.dl.find_regions()
         for r in self.dl.regions.values():
             latest = r.get_latest_release()

@@ -7,6 +7,7 @@ import math
 import tempfile
 import platform
 import threading
+import concurrent.futures
 
 import subprocess
 import collections
@@ -344,7 +345,7 @@ class Chunk(object):
     def __init__(self, col, row, maptype, zoom, priority=0, cache_dir='.cache'):
         self.col = col
         self.row = row
-        self.tilename_zoom = zoom
+        self.zoom = zoom
         self.maptype = maptype
         self.cache_dir = cache_dir
         
@@ -365,7 +366,7 @@ class Chunk(object):
         return self.priority < other.priority
 
     def __repr__(self):
-        return f"Chunk({self.col},{self.row},{self.maptype},{self.tilename_zoom},{self.priority})"
+        return f"Chunk({self.col},{self.row},{self.maptype},{self.zoom},{self.priority})"
 
     def get_cache(self):
         if os.path.isfile(self.cache_path):
@@ -411,7 +412,7 @@ class Chunk(object):
 
         server_num = idx%(len(self.serverlist))
         server = self.serverlist[server_num]
-        quadkey = _gtile_to_quadkey(self.col, self.row, self.tilename_zoom)
+        quadkey = _gtile_to_quadkey(self.col, self.row, self.zoom)
 
         # Hack override maptype
         #maptype = "ARC"
@@ -419,13 +420,13 @@ class Chunk(object):
         MAPID = "s2cloudless-2023_3857"
         MATRIXSET = "g"
         MAPTYPES = {
-            "EOX": f"https://{server}.tiles.maps.eox.at/wmts/?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.tilename_zoom}&TileCol={self.col}&TileRow={self.row}",
+            "EOX": f"https://{server}.tiles.maps.eox.at/wmts/?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.zoom}&TileCol={self.col}&TileRow={self.row}",
             "BI": f"https://t.ssl.ak.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=15312",
-            "GO2": f"http://mts{server_num}.google.com/vt/lyrs=s&x={self.col}&y={self.row}&z={self.tilename_zoom}",
-            "ARC": f"http://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{self.tilename_zoom}/{self.row}/{self.col}",
-            "NAIP": f"http://naip.maptiles.arcgis.com/arcgis/rest/services/NAIP/MapServer/tile/{self.tilename_zoom}/{self.row}/{self.col}",
-            "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{self.tilename_zoom}/{self.row}/{self.col}",
-            "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{self.tilename_zoom}/{self.row}/{self.col}"
+            "GO2": f"http://mts{server_num}.google.com/vt/lyrs=s&x={self.col}&y={self.row}&z={self.zoom}",
+            "ARC": f"http://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
+            "NAIP": f"http://naip.maptiles.arcgis.com/arcgis/rest/services/NAIP/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
+            "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
+            "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{self.zoom}/{self.row}/{self.col}"
         }
 
 
@@ -578,6 +579,7 @@ class Tile(object):
 
         self.bytes_read = 0
         self.lowest_offset = 99999999
+        self.mipmap_offset = mipmap_offset
 
 
         #self.tile_condition = threading.Condition()
@@ -629,7 +631,6 @@ class Tile(object):
         self.dds = pydds.DDS(dds_width, dds_height, ispc=use_ispc,
                 dxt_format=CFG.pydds.format)
 
-        log.info(f"Tile '{self.tilename_zoom}' using detected max available ZL{self.actual_max_zoom} (target was ZL{self.max_zoom})")
         self.id = f"{row}_{col}_{maptype}_{self.tilename_zoom}"
 
     def _detect_available_max_zoom(self):
@@ -788,7 +789,7 @@ class Tile(object):
     def _find_cache_file(self):
         #with self.tile_condition:
         with self.tile_lock:
-            for z in range(self.tilename_zoom, (self.min_zoom-1), -1):
+            for z in range(self.max_zoom, (self.min_zoom-1), -1):
                 cache_file = os.path.join(self.cache_dir, f"{self.row}_{self.col}_{self.maptype}_{self.tilename_zoom}_{z}.dds")
                 if os.path.exists(cache_file):
                     log.info(f"Found cache for {cache_file}...")
@@ -802,16 +803,16 @@ class Tile(object):
     def _get_quick_zoom(self, quick_zoom=0, min_zoom=None):
         if quick_zoom:
             # Max difference in steps this tile can support
-            max_diff = min((self.tilename_zoom - int(quick_zoom)), self.max_mipmap)
+            max_diff = min((self.max_zoom - int(quick_zoom)), self.max_mipmap)
             if not min_zoom:
                 # Minimum zoom level allowed
-                min_zoom = max((self.tilename_zoom - max_diff), self.min_zoom)
+                min_zoom = max((self.max_zoom - max_diff), self.min_zoom)
             
             # Effective zoom level we will use 
             quick_zoom = max(int(quick_zoom), min_zoom)
 
             # Effective difference in steps we will use
-            zoom_diff = min((self.tilename_zoom - int(quick_zoom)), self.max_mipmap)
+            zoom_diff = min((self.max_zoom - int(quick_zoom)), self.max_mipmap)
 
             col = int(self.col/pow(2,zoom_diff))
             row = int(self.row/pow(2,zoom_diff))
@@ -823,7 +824,7 @@ class Tile(object):
             row = self.row
             width = self.width
             height = self.height
-            zoom = self.tilename_zoom
+            zoom = self.max_zoom
             zoom_diff = 0
 
         return (col, row, width, height, zoom, zoom_diff)
@@ -1000,58 +1001,45 @@ class Tile(object):
         #
 
         # Get effective zoom  
-        original_mipmap = mipmap  # Store original before _get_quick_zoom overwrites it
-        zoom = self.tilename_zoom - mipmap
-        print(f"GET_IMG: Default zoom: {self.tilename_zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
-        log.debug(f"GET_IMG: Default zoom: {self.tilename_zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
+        original_mipmap = mipmap
+        zoom = min((self.max_zoom + self.mipmap_offset - mipmap), self.max_zoom)
+        log.debug(f"GET_IMG: Default tile zoom: {self.zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(zoom, min_zoom)
         log.debug(f"Will use:  Zoom: {zoom},  Zoom_diff: {zoom_diff}")        
         # Restore original mipmap parameter 
         mipmap = original_mipmap
-        
         # Apply zoom level capping logic based on detected actual max zoom
         # Calculate what zoom level this mipmap would normally use
-        normal_zoom = self.tilename_zoom - original_mipmap
-        
-        # Cap it to actual_max_zoom if it would be higher
-        capped_zoom = min(normal_zoom, self.actual_max_zoom)
-        
-        # Calculate how many zoom levels we're capped by
-        zoom_offset = normal_zoom - capped_zoom
-        
-        log.debug(f"GET_IMG: Mipmap {original_mipmap} - Normal zoom: {normal_zoom}, Capped to: {capped_zoom}, Offset: {zoom_offset}")
-        
-        # For mipmap reuse: check if we already have data for this capped zoom level
-        if zoom_offset > 0:
-            # This mipmap should use capped zoom data
-            # Check if we already generated an image for this capped zoom level
-            for existing_mm, existing_img in self.imgs.items():
-                existing_normal_zoom = self.tilename_zoom - existing_mm
-                existing_capped_zoom = min(existing_normal_zoom, self.actual_max_zoom)
+        normal_zoom = self.max_zoom - mipmap
                 
-                if existing_capped_zoom == capped_zoom and existing_img:
-                    log.debug(f"GET_IMG: Reusing mipmap {existing_mm} data for mipmap {original_mipmap} (both use ZL{capped_zoom})")
-                    # Store the reused image for this mipmap
-                    self.imgs[original_mipmap] = existing_img
-                    return existing_img
-            
-            # Override the zoom for chunk downloading
-            zoom = capped_zoom
-            log.debug(f"GET_IMG: Using capped zoom {zoom} instead of normal zoom {normal_zoom}")
-            
-            # Recalculate coordinates for the capped zoom level  
-            col, row, width, height, _, _ = self._get_quick_zoom(zoom, min_zoom)
+        # Calculate how many zoom levels we're capped by
+        is_mipmap_reused = (mipmap > 0 and (zoom == self.max_zoom))
         
-        log.debug(f"GET_IMG: Final zoom {zoom} for mipmap {original_mipmap}, coords: {col}x{row}, size: {width}x{height}")
+        
+        # For mipmap reuse: check if we already have data for this  zoom level
+        if is_mipmap_reused:
+            # Check if we already generated an image for this reused mipmap
+            for existing_mm, existing_img in self.imgs.items():
+                existing_normal_zoom = self.max_zoom - existing_mm
+                existing_offseted_zoom = min((existing_normal_zoom + self.mipmap_offset), self.max_zoom)
+                
+                if existing_offseted_zoom == zoom and existing_img:
+                    log.debug(f"GET_IMG: Reusing mipmap {existing_mm} data for mipmap {mipmap} (both use ZL{zoom})")
+                    # Store the reused image for this mipmap
+                    self.imgs[mipmap] = existing_img
+                    return existing_img
+        
+        
+        log.debug(f"GET_IMG: Final zoom {zoom} for mipmap {mipmap}, coords: {col}x{row}, size: {width}x{height}")
         
         # Do we already have this img?
-        if original_mipmap in self.imgs:
-            log.debug(f"GET_IMG: Found saved image: {self.imgs[original_mipmap]}")
-            return self.imgs.get(original_mipmap)
+        if mipmap in self.imgs:
+            log.debug(f"GET_IMG: Found saved image: {self.imgs[mipmap]}")
+            return self.imgs.get(mipmap)
 
         log.debug(f"GET_IMG: MM List before { {x.idx:x.retrieved for x in self.dds.mipmap_list} }")
-        if original_mipmap < len(self.dds.mipmap_list) and self.dds.mipmap_list[original_mipmap].retrieved:
-            log.debug(f"GET_IMG: We already have mipmap {original_mipmap} for {self}")
+        if mipmap < len(self.dds.mipmap_list) and self.dds.mipmap_list[mipmap].retrieved:
+            log.debug(f"GET_IMG: We already have mipmap {mipmap} for {self}")
             return
 
         if startrow == 0 and endrow is None:
@@ -1100,7 +1088,6 @@ class Tile(object):
         img_height = 256 * height
         
         log.debug(f"GET_IMG: Using download dimensions {width}x{height} chunks = {img_width}x{img_height} pixels")
-        print(f"GET_IMG: Using download dimensions {width}x{height} chunks = {img_width}x{img_height} pixels")
         
         log.debug(f"GET_IMG: Create new image: Zoom: {zoom} | {(img_width, img_height)}")
         
@@ -1115,8 +1102,6 @@ class Tile(object):
             placeholder_img = AoImage.new('RGBA', (img_width, img_height), (128, 128, 128))
             return placeholder_img
             
-        # PARALLEL chunk processing - wait for all chunks concurrently
-        import concurrent.futures
         
         def process_chunk(chunk):
             """Process a single chunk and return (chunk, chunk_img, start_x, start_y)"""
@@ -1171,9 +1156,9 @@ class Tile(object):
                 except Exception as exc:
                     log.error(f"Chunk processing failed: {exc}")
 
-        if complete_img and original_mipmap <= self.max_mipmap:
+        if complete_img and mipmap <= self.max_mipmap:
             log.debug(f"GET_IMG: Save complete image for later...")
-            self.imgs[original_mipmap] = new_im
+            self.imgs[mipmap] = new_im
 
         log.debug(f"GET_IMG: DONE!  IMG created {new_im}")
         # Return image along with mipmap and zoom level this was created at
@@ -1273,7 +1258,7 @@ class Tile(object):
         end_time = time.time()
         self.ready.set()
 
-        zoom = self.tilename_zoom - mipmap
+        zoom = self.max_zoom - mipmap
         tile_time = end_time - start_time
         mm_stats.set(mipmap, tile_time)
 
@@ -1379,6 +1364,7 @@ class TileCacher(object):
         # Set target zoom level directly - much simpler than offset calculations
         self.target_zoom_level = CFG.autoortho.max_zoom  # Direct zoom level target, regardless of tile name
         self.target_zoom_level_near_airports = CFG.autoortho.max_zoom_near_airports
+        self.mipmap_offset = CFG.autoortho.mipmap_level_offset
         log.info(f"Target zoom level set to ZL{self.target_zoom_level}")
         log.info(f"All tiles (ZL18, ZL19, etc.) will download data at ZL{self.target_zoom_level} or lower based on availability")
 
@@ -1471,10 +1457,13 @@ class TileCacher(object):
                 self.misses += 1
                 inc_stat('tile_mem_miss')
                 # Use target zoom level directly - much cleaner than offset calculations
-                tile = Tile(col, row, map_type, zoom, 
+                tile = Tile(
+                    col, row, map_type, zoom, 
                     cache_dir = self.cache_dir,
                     min_zoom = self.min_zoom,
-                    max_zoom = self._get_target_zoom_level(zoom))
+                    max_zoom = self._get_target_zoom_level(zoom),
+                    mipmap_offset = self.mipmap_offset
+                )
                 self.tiles[idx] = tile
                 self.open_count[idx] = self.open_count.get(idx, 0) + 1
                 if self.open_count[idx] > 1:
