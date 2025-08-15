@@ -41,7 +41,7 @@ tile_stats = StatTracker(20, 12)
 mm_stats = StatTracker(0, 5)
 partial_stats = StatTracker()
 
-USING_KUBILUS_MESH = True
+USING_KUBILUS_MESH = False
 
 class BandwidthLimiter:
     """
@@ -361,6 +361,11 @@ class Chunk(object):
             self.maptype = "EOX"
 
         self.cache_path = os.path.join(self.cache_dir, f"{self.chunk_id}.jpg")
+        
+        # FIXED: Check cache during initialization and set ready if found
+        if self.get_cache():
+            self.ready.set()
+            log.debug(f"Chunk {self} initialized with cached data")
 
     def __lt__(self, other):
         return self.priority < other.priority
@@ -384,7 +389,7 @@ class Chunk(object):
             else:
                 log.info(f"Loading file {self} not a JPEG! {data[:3]} path: {self.cache_path}")
                 self.data = b''
-            #    return False
+                return False  # FIXED: Explicitly return False for corrupted cache
         else:
             inc_stat('chunk_miss')
             return False
@@ -393,12 +398,33 @@ class Chunk(object):
         if not self.data:
             return
 
+        # FIXED: Check if file already exists to prevent race condition
+        if os.path.exists(self.cache_path):
+            log.debug(f"Cache file already exists for {self}, skipping save")
+            return
+
         # Temporarily use an invalid cache file name so that it cannot be
         # found while it is being written.
         temp_filename = os.path.join(self.cache_dir, f"XX_{self.chunk_id}.jpg")
-        with open(temp_filename, 'wb') as h:
-            h.write(self.data)
-        os.rename(temp_filename, self.cache_path)
+        
+        try:
+            with open(temp_filename, 'wb') as h:
+                h.write(self.data)
+            # FIXED: Handle case where target file was created by another thread
+            if not os.path.exists(self.cache_path):
+                os.rename(temp_filename, self.cache_path)
+            else:
+                # Another thread beat us to it, clean up temp file
+                os.remove(temp_filename)
+                log.debug(f"Another thread saved cache for {self}, removed temp file")
+        except Exception as e:
+            # Clean up temp file if anything goes wrong
+            if os.path.exists(temp_filename):
+                try:
+                    os.remove(temp_filename)
+                except:
+                    pass
+            log.warning(f"Failed to save cache for {self}: {e}")
 
     def get(self, idx=0, session=requests, bandwidth_limiter=None):
         log.debug(f"Getting {self}") 
@@ -545,7 +571,8 @@ class Tile(object):
     maptype = None
     zoom = -1
     min_zoom = 12
-    base_image_resolution = 64 # 64px for baseline ZL12 chunk
+    width = 16
+    height = 16
     baseline_zl = 12
 
     priority = -1
@@ -618,15 +645,19 @@ class Tile(object):
         # TODO VRAM usage optimization only getting the max ZL of the zone instead of the default max zoom
         # This is very time consuming while loading flight, left commented out for now
         # self.actual_max_zoom = self._detect_available_max_zoom()
-        self.actual_max_zoom = self.max_zoom
+        self.tilezoom_diff = self.tilename_zoom - self.max_zoom
 
-        self.chunks_per_row_and_col = int(self.base_image_resolution * pow(2, self.actual_max_zoom - self.baseline_zl)) # Chunks per row and column
-        self.width = int(max(1, self.chunks_per_row_and_col / 256)) # Chunks per row
-        self.height = int(max(1, self.chunks_per_row_and_col / 256)) # Chunks per column
-        
-        dds_width = self.width * 256
-        dds_height = self.height * 256
-        log.info(f"Creating DDS at original size: {dds_width}x{dds_height} (ZL{self.actual_max_zoom})")
+        if self.tilezoom_diff >= 0:
+
+            self.chunks_per_row = self.width >> self.tilezoom_diff
+            self.chunks_per_col = self.height >> self.tilezoom_diff
+        else:
+            self.chunks_per_row = self.width << (-self.tilezoom_diff)
+            self.chunks_per_col = self.height << (-self.tilezoom_diff)
+
+        dds_width = self.chunks_per_row * 256
+        dds_height = self.chunks_per_col * 256
+        log.debug(f"Creating DDS at original size: {dds_width}x{dds_height} (ZL{self.max_zoom})")
             
         self.dds = pydds.DDS(dds_width, dds_height, ispc=use_ispc,
                 dxt_format=CFG.pydds.format)
@@ -779,12 +810,15 @@ class Tile(object):
 
         if not self.chunks.get(zoom):
             self.chunks[zoom] = []
+            log.debug(f"Creating chunks for zoom {zoom}: {width}x{height} grid starting at ({col},{row})")
 
             for r in range(row, row+height):
                 for c in range(col, col+width):
-                    #chunk = Chunk(c, r, self.maptype, zoom, priority=self.priority)
+                    # FIXED: Create chunk and let it check cache during initialization
                     chunk = Chunk(c, r, self.maptype, zoom, cache_dir=self.cache_dir)
                     self.chunks[zoom].append(chunk)
+        else:
+            log.debug(f"Reusing existing {len(self.chunks[zoom])} chunks for zoom {zoom}")
 
     def _find_cache_file(self):
         #with self.tile_condition:
@@ -842,8 +876,8 @@ class Tile(object):
         
         scaled_col = scale_by_zoom_diff(self.col, tilename_zoom_diff)
         scaled_row = scale_by_zoom_diff(self.row, tilename_zoom_diff)
-        scaled_width = max(1, scale_by_zoom_diff(self.width, zoom_diff))
-        scaled_height = max(1, scale_by_zoom_diff(self.height, zoom_diff))
+        scaled_width = max(1, scale_by_zoom_diff(self.width, tilename_zoom_diff))
+        scaled_height = max(1, scale_by_zoom_diff(self.height, tilename_zoom_diff))
         
         return (scaled_col, scaled_row, scaled_width, scaled_height, effective_zoom, zoom_diff)
 
@@ -1178,7 +1212,7 @@ class Tile(object):
 
     def get_best_chunk(self, col, row, mm, zoom):
         # For adaptive system, search up to actual_max_zoom level
-        max_search_zoom = self.actual_max_zoom
+        max_search_zoom = self.max_zoom
         
         for i in range(mm + 1, self.max_mipmap + 1):
             # Difference between requested mm and found image mm level
