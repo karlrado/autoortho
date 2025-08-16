@@ -1,17 +1,19 @@
 !define PRODUCT_NAME "AutoOrtho"
-;!define PRODUCT_VERSION "0.5.1"
-;!define PY_VERSION "3.10.6"
-;!define PY_MAJOR_VERSION "3.10"
+;!define PRODUCT_VERSION "0.8.1"
+;!define PY_VERSION "3.12.9"
+;!define PY_MAJOR_VERSION "3.12"
 ;!define BITNESS "32"
 !define ARCH_TAG ""
-;!define INSTALLER_NAME "AutoOrtho_0.5.1.exe"
+;!define INSTALLER_NAME "AutoOrtho_0.8.1.exe"
 !define INSTALLER_NAME "AutoOrtho.exe"
 !define PRODUCT_ICON "ao-icon.ico"
 
 ; Marker file to tell the uninstaller that it's a user installation
 !define USER_INSTALL_MARKER _user_install_marker
 
-SetCompressor lzma
+; Use best compression to reduce file entropy (looks less suspicious)
+SetCompressor /SOLID lzma
+SetCompressorDictSize 32
 
 !if "${NSIS_PACKEDVERSION}" >= 0x03000000
   Unicode true
@@ -48,6 +50,23 @@ SetCompressor lzma
 Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
 OutFile "${INSTALLER_NAME}"
 ShowInstDetails show
+
+; Add version info and manifest to reduce AV false positives
+VIProductVersion "0.0.8.1"
+VIAddVersionKey "ProductName" "${PRODUCT_NAME}"
+VIAddVersionKey "CompanyName" "AutoOrtho Project"
+VIAddVersionKey "LegalCopyright" "© AutoOrtho Project"
+VIAddVersionKey "FileDescription" "${PRODUCT_NAME} Installer"
+VIAddVersionKey "FileVersion" "0.1.0"
+VIAddVersionKey "ProductVersion" "0.8.1"
+
+; Request admin rights explicitly in manifest
+RequestExecutionLevel admin
+
+; === CODE SIGNING (Uncomment when you have a certificate) ===
+; !finalize 'signtool.exe sign /f "certificate.p12" /p "password" /t "http://timestamp.comodoca.com" "%1"'
+; Or for EV certificates:
+; !finalize 'signtool.exe sign /sha1 "THUMBPRINT" /t "http://timestamp.comodoca.com" "%1"'
 
 Var cmdLineInstallDir
 
@@ -246,7 +265,6 @@ Function ValidateInstallLocation
   Push $1
   Push $2
   
-  
   ; Check if installing directly to X-Plane root
   IfFileExists "$INSTDIR\X-Plane.exe" dangerous_xplane_root
   IfFileExists "$INSTDIR\X-Plane 12.exe" dangerous_xplane_root
@@ -255,13 +273,17 @@ Function ValidateInstallLocation
   ; Check if directory is not empty (except for previous AutoOrtho install)
   Call CheckDirectoryContents
   Pop $2
+  
+  ; Debug: Show what we detected (remove this after testing)
+  ; MessageBox MB_OK "Debug: Directory check result = '$2'"
+  
   StrCmp $2 "safe" safe_location
   StrCmp $2 "autoortho" safe_location  ; Previous AutoOrtho install
   
   ; Directory not empty and doesn't contain AutoOrtho
   MessageBox MB_YESNO|MB_ICONEXCLAMATION "Warning: The target directory '$INSTDIR' is not empty.$\n$\nInstalling AutoOrtho here may cause issues during uninstallation.$\n$\nRecommended: Choose an empty directory or dedicated AutoOrtho folder.$\n$\nContinue anyway?" IDYES safe_location
   Abort
-  
+
 
 dangerous_xplane_root:
   MessageBox MB_OK|MB_ICONSTOP "DANGER: You are trying to install to the X-Plane root directory!$\n$\nThis could cause your entire X-Plane installation to be deleted during uninstallation.$\n$\nPlease choose a different directory like:$\n• C:\AutoOrtho$\n• D:\AutoOrtho$\n$\nInstallation aborted for your safety."
@@ -278,11 +300,28 @@ Function CheckDirectoryContents
   Push $1
   Push $2
   
-  ; Check if directory is empty or contains only AutoOrtho files
+  ; First check if directory is empty using proper NSIS method
   FindFirst $0 $1 "$INSTDIR\*.*"
-  StrCmp $0 "" empty_dir  ; No files found
+  StrCmp $1 "." 0 _notempty
+    FindNext $0 $1
+    StrCmp $1 ".." 0 _notempty
+      ClearErrors
+      FindNext $0 $1
+      IfErrors 0 _notempty
+        ; Directory is empty
+        FindClose $0
+        StrCpy $0 "safe"
+        Goto done
+        
+_notempty:
+  ; Directory not empty - check what's in it
+  FindClose $0
+  ClearErrors
   
-  ; Check each file/folder
+  ; Start over and check each file
+  StrCpy $2 "autoortho"  ; Assume it's all AutoOrtho files until proven otherwise
+  FindFirst $0 $1 "$INSTDIR\*.*"
+  
 check_loop:
   StrCmp $1 "." next_file
   StrCmp $1 ".." next_file
@@ -294,26 +333,23 @@ check_loop:
   StrCmp $1 "uninstall.exe" autoortho_file
   
   ; Found non-AutoOrtho file
-  FindClose $0
   StrCpy $2 "not_empty"
-  Goto done
-  
+  Goto end_check
+
 autoortho_file:
 next_file:
   FindNext $0 $1
-  StrCmp $0 "" autoortho_dir  ; End of files, all were AutoOrtho
+  StrCmp $0 "" end_check  ; End of files
   Goto check_loop
 
-empty_dir:
-  StrCpy $2 "safe"
-  Goto done
-
-autoortho_dir:
+end_check:
   FindClose $0
-  StrCpy $2 "autoortho"
+  StrCpy $0 $2  ; Put result in $0
 
 done:
-  Push $2
-  Pop $1
-  Pop $0
+  ; Restore registers and return result
+  Pop $2    ; Restore original $2  
+  Pop $1    ; Restore original $1
+  Exch $0   ; Exchange result with saved $0 (result now on top of stack)
 FunctionEnd
+
