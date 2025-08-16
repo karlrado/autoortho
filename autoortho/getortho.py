@@ -41,7 +41,7 @@ tile_stats = StatTracker(20, 12)
 mm_stats = StatTracker(0, 5)
 partial_stats = StatTracker()
 
-USING_KUBILUS_MESH = False
+USING_KUBILUS_MESH = True
 
 class BandwidthLimiter:
     """
@@ -1508,7 +1508,7 @@ class TileCacher(object):
                     cache_dir = self.cache_dir,
                     min_zoom = self.min_zoom,
                     max_zoom = self._get_target_zoom_level(zoom),
-                    mipmap_offset = self.mipmap_offset
+                    mipmap_offset = int(self.mipmap_offset)
                 )
                 self.tiles[idx] = tile
                 self.open_count[idx] = self.open_count.get(idx, 0) + 1

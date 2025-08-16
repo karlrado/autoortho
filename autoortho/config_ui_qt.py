@@ -226,7 +226,6 @@ class ConfigUI(QMainWindow):
 
         # Setup UI
         self.init_ui()
-        self.show_splash()
 
         # Connect signals
         self.status_update.connect(self.update_status_bar)
@@ -1235,15 +1234,6 @@ class ConfigUI(QMainWindow):
             self.scenery_layout.addWidget(item_frame)
 
         self.scenery_layout.addStretch()
-
-    def show_splash(self):
-        """Show splash screen"""
-        splash_pix = QPixmap(os.path.join(CUR_PATH, 'imgs', 'splash.png'))
-        self.splash = QSplashScreen(
-            splash_pix, Qt.WindowType.WindowStaysOnTopHint
-        )
-        self.splash.show()
-        QTimer.singleShot(2000, self.splash.close)
 
     def validate_max_zoom_near_airports(self):
         """Validate max zoom near airports value"""
