@@ -126,6 +126,69 @@ class AutoOrtho(Operations):
         full_path = self._full_path(path)
         return os.chown(full_path, uid, gid)
 
+    def _calculate_dds_size(self, row, col, maptype, zoom):
+        """Calculate the actual DDS file size based on tile parameters and current configuration."""
+        try:
+            # Convert parameters to the format expected by the tile system
+            row = int(row)
+            col = int(col)
+            zoom = int(zoom)
+            
+            # Replicate the max_zoom selection logic from TileCacher
+            if getortho.USING_KUBILUS_MESH:
+                max_zoom = self.tc.target_zoom_level_near_airports if zoom == 18 else self.tc.target_zoom_level
+            else:
+                max_zoom = self.tc.target_zoom_level_near_airports if zoom == 19 else self.tc.target_zoom_level
+            
+            min_zoom = self.tc.min_zoom
+            
+            # Replicate tile dimension calculation logic from Tile.__init__
+            width = 16  # Default tile width in chunks
+            height = 16  # Default tile height in chunks
+            
+            tilezoom_diff = zoom - int(max_zoom)
+            
+            if tilezoom_diff >= 0:
+                chunks_per_row = width >> tilezoom_diff
+                chunks_per_col = height >> tilezoom_diff
+            else:
+                chunks_per_row = width << (-tilezoom_diff)
+                chunks_per_col = height << (-tilezoom_diff)
+            
+            # Calculate DDS dimensions in pixels
+            dds_width = chunks_per_row * 256
+            dds_height = chunks_per_col * 256
+            
+            # Replicate DDS size calculation logic from pydds.DDS.__init__
+            if CFG.pydds.format == 'BC3':
+                blocksize = 16
+            else:
+                blocksize = 8
+            
+            # Calculate total size including all mipmaps
+            curbytes = 128  # DDS header size
+            current_width = dds_width
+            current_height = dds_height
+            
+            while (current_width >= 1) and (current_height >= 1):
+                mipmap_size = max(1, (current_width * current_height >> 4)) * blocksize
+                curbytes += mipmap_size
+                current_width = current_width >> 1
+                current_height = current_height >> 1
+            
+            log.debug(f"Calculated DDS size for {row}_{col}_{maptype}_{zoom}: {curbytes} bytes "
+                     f"(dimensions: {dds_width}x{dds_height}, max_zoom: {max_zoom}, tilezoom_diff: {tilezoom_diff})")
+            
+            return curbytes
+            
+        except Exception as e:
+            log.warning(f"Failed to calculate DDS size for {row}_{col}_{maptype}_{zoom}: {e}, using fallback")
+            # Fallback to hardcoded values if calculation fails
+            if CFG.pydds.format == "BC1":
+                return 11184952
+            else:
+                return 22369776
+
     @lru_cache(maxsize=1024)
     def getattr(self, path, fh=None):
         log.debug(f"GETATTR {path}")
@@ -143,14 +206,11 @@ class AutoOrtho(Operations):
                 flighttrack.ft.start()
                 self.startup = False
 
-            #row, col, maptype, zoom = m.groups()
-            #log.debug(f"GETATTR: Fetch for {path}: %s" % str(m.groups()))
+            row, col, maptype, zoom = m.groups()
+            log.debug(f"GETATTR: Fetch for {path}: %s" % str(m.groups()))
 
-            if CFG.pydds.format == "BC1":
-                dds_size = 11184952
-            else:
-                #dds_size = 22369744
-                dds_size = 22369776
+            # Calculate dynamic DDS size based on actual tile parameters
+            dds_size = self._calculate_dds_size(row, col, maptype, zoom)
 
             attrs = {
                 'st_atime': 1649857250.382081, 

@@ -655,6 +655,9 @@ class Tile(object):
             self.chunks_per_row = self.width << (-self.tilezoom_diff)
             self.chunks_per_col = self.height << (-self.tilezoom_diff)
 
+        self.chunks_per_row = max(1, self.chunks_per_row)
+        self.chunks_per_col = max(1, self.chunks_per_col)
+
         dds_width = self.chunks_per_row * 256
         dds_height = self.chunks_per_col * 256
         log.debug(f"Creating DDS at original size: {dds_width}x{dds_height} (ZL{self.max_zoom})")
@@ -923,29 +926,33 @@ class Tile(object):
         
         log.debug(f"Retrieving {length} bytes from mipmap {mipmap} offset {offset}")
 
-        if CFG.pydds.format == "BC1":
-            bytes_per_row = 524288 >> mipmap
-        else:
-            bytes_per_row = 1048576 >> mipmap
-
-        rows_per_mipmap = 16 >> mipmap
-
         # how deep are we in a mipmap
         mm_offset = max(0, offset - self.dds.mipmap_list[mipmap].startpos)
         log.debug(f"MM_offset: {mm_offset}  Offset {offset}.  Startpos {self.dds.mipmap_list[mipmap]}")
-    
-        if CFG.pydds.format == "BC1":
-            # Calculate which row 'offset' is in
-            startrow = mm_offset >> (19 - mipmap)
-            # Calculate which row 'offset+length' is in
-            endrow = (mm_offset + length) >> (19 - mipmap)
-        else:  
-            # Calculate which row 'offset' is in
-            startrow = mm_offset >> (20 - mipmap)
-            # Calculate which row 'offset+length' is in
-            endrow = (mm_offset + length) >> (20 - mipmap)
 
-        log.debug(f"Startrow: {startrow} Endrow: {endrow}")
+        # Dynamically compute bytes-per-chunk-row for this mip level based on actual DDS dimensions
+        base_width_px = max(4, int(self.dds.width) >> mipmap)
+        base_height_px = max(4, int(self.dds.height) >> mipmap)
+        blocksize = 8 if CFG.pydds.format == "BC1" else 16
+        blocks_per_row = max(1, base_width_px // 4)
+        bytes_per_row = blocks_per_row * blocksize
+        # Each chunk-row is 256 px tall → 64 blocks vertically
+        bytes_per_chunk_row = bytes_per_row * 64
+
+        # Compute start/end chunk-rows touched by the requested byte range
+        startrow = mm_offset // bytes_per_chunk_row
+        endrow = (mm_offset + max(0, length - 1)) // bytes_per_chunk_row
+
+        # Clamp to valid range of chunk rows for this mipmap
+        chunk_rows_in_mm = max(1, base_height_px // 256)
+        if startrow >= chunk_rows_in_mm:
+            startrow = chunk_rows_in_mm - 1
+        if endrow >= chunk_rows_in_mm:
+            endrow = chunk_rows_in_mm - 1
+        if endrow < startrow:
+            endrow = startrow
+
+        log.debug(f"Startrow: {startrow} Endrow: {endrow} bytes_per_chunk_row: {bytes_per_chunk_row} width_px: {base_width_px} height_px: {base_height_px}")
         
         new_im = self.get_img(mipmap, startrow, endrow,
                 maxwait=self.maxchunk_wait)
@@ -1001,30 +1008,35 @@ class Tile(object):
             # If offset = 0, read the header
             log.debug("READ_DDS_BYTES: Read header")
             self.get_bytes(0, length)
-        #elif offset < 32768:
-        #elif offset < 65536:
-        elif offset < 131072:
-        #elif offset < 262144:
-        #elif offset < 1048576:
-            # How far into mipmap 0 do we go before just getting the whole thing
-            log.debug("READ_DDS_BYTES: Middle of mipmap 0")
-            self.get_bytes(0, length + offset)
-        elif (offset + length) < mipmap.endpos:
-            # Total length is within this mipmap.  Make sure we have it.
-            log.debug(f"READ_DDS_BYTES: Detected middle read for mipmap {mipmap.idx}")
-            if not mipmap.retrieved:
-                log.debug(f"READ_DDS_BYTES: Retrieve {mipmap.idx}")
-                self.get_mipmap(mipmap.idx)
         else:
-            log.debug(f"READ_DDS_BYTES: Start before this mipmap {mipmap.idx}")
-            # We already know we start before the end of this mipmap
-            # We must extend beyond the length.
-            
-            # Get bytes prior to this mipmap
-            self.get_bytes(offset, length)
+            # Dynamically scale the early-read heuristic based on actual mip-0 bytes per chunk-row
+            blocksize = 8 if CFG.pydds.format == "BC1" else 16
+            width_px_m0 = max(4, int(self.dds.width))
+            blocks_per_row_m0 = max(1, width_px_m0 // 4)
+            bytes_per_row_m0 = blocks_per_row_m0 * blocksize
+            bytes_per_chunk_row_m0 = bytes_per_row_m0 * 64
 
-            # Get the entire next mipmap
-            self.get_mipmap(mm_idx + 1)
+            # If we're still within the first chunk-row of mipmap 0, just fetch from the start
+            early_threshold = bytes_per_chunk_row_m0
+            if mm_idx == 0 and offset < early_threshold:
+                log.debug("READ_DDS_BYTES: Early region of mipmap 0 - fetching from start")
+                self.get_bytes(0, length + offset)
+            elif (offset + length) < mipmap.endpos:
+                # Total length is within this mipmap.  Make sure we have it.
+                log.debug(f"READ_DDS_BYTES: Detected middle read for mipmap {mipmap.idx}")
+                if not mipmap.retrieved:
+                    log.debug(f"READ_DDS_BYTES: Retrieve {mipmap.idx}")
+                    self.get_mipmap(mipmap.idx)
+            else:
+                log.debug(f"READ_DDS_BYTES: Start before this mipmap {mipmap.idx}")
+                # We already know we start before the end of this mipmap
+                # We must extend beyond the length.
+                
+                # Get bytes prior to this mipmap
+                self.get_bytes(offset, length)
+
+                # Get the entire next mipmap
+                self.get_mipmap(mm_idx + 1)
         
         self.bytes_read += length
         # Seek and return data
