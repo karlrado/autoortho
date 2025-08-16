@@ -150,7 +150,7 @@ Section "Uninstall"
   IfFileExists "$INSTDIR\ao-icon.ico" autoortho_confirmed
   
   ; No AutoOrtho files found - this is dangerous!
-  MessageBox MB_YESNO|MB_ICONWARNING "WARNING: AutoOrtho files not detected in '$INSTDIR'$\n$\nThis may not be a valid AutoOrtho installation directory.$\nDeleting this directory could remove important files!$\n$\nAre you absolutely sure you want to continue?" IDYES force_uninstall
+  MessageBox MB_YESNO|MB_ICONEXCLAMATION "WARNING: AutoOrtho files not detected in '$INSTDIR'$\n$\nThis may not be a valid AutoOrtho installation directory.$\nDeleting this directory could remove important files!$\n$\nAre you absolutely sure you want to continue?" IDYES force_uninstall
   
   ; User chose not to continue - just clean registry and exit
   DeleteRegKey SHCTX "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
@@ -259,7 +259,7 @@ Function ValidateInstallLocation
   StrCmp $2 "autoortho" safe_location  ; Previous AutoOrtho install
   
   ; Directory not empty and doesn't contain AutoOrtho
-  MessageBox MB_YESNO|MB_ICONWARNING "Warning: The target directory '$INSTDIR' is not empty.$\n$\nInstalling AutoOrtho here may cause issues during uninstallation.$\n$\nRecommended: Choose an empty directory or dedicated AutoOrtho folder.$\n$\nContinue anyway?" IDYES safe_location
+  MessageBox MB_YESNO|MB_ICONEXCLAMATION "Warning: The target directory '$INSTDIR' is not empty.$\n$\nInstalling AutoOrtho here may cause issues during uninstallation.$\n$\nRecommended: Choose an empty directory or dedicated AutoOrtho folder.$\n$\nContinue anyway?" IDYES safe_location
   Abort
   
 
