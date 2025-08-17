@@ -11,6 +11,7 @@ import concurrent.futures
 
 import subprocess
 import collections
+import uuid
 
 from io import BytesIO
 from urllib.request import urlopen, Request
@@ -396,33 +397,66 @@ class Chunk(object):
         if not self.data:
             return
 
-        # FIXED: Check if file already exists to prevent race condition
-        if os.path.exists(self.cache_path):
-            log.debug(f"Cache file already exists for {self}, skipping save")
-            return
+        # Ensure cache directory exists
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+        except Exception:
+            pass
 
-        # Temporarily use an invalid cache file name so that it cannot be
-        # found while it is being written.
-        temp_filename = os.path.join(self.cache_dir, f"XX_{self.chunk_id}.jpg")
-        
+        # Unique temp filename per writer to avoid collisions between threads/tiles
+        temp_filename = os.path.join(self.cache_dir, f"XX_{self.chunk_id}_{uuid.uuid4().hex}.tmp")
+
+        # Write data to the unique temp file first
         try:
             with open(temp_filename, 'wb') as h:
                 h.write(self.data)
-            # FIXED: Handle case where target file was created by another thread
-            if not os.path.exists(self.cache_path):
-                os.rename(temp_filename, self.cache_path)
-            else:
-                # Another thread beat us to it, clean up temp file
-                os.remove(temp_filename)
-                log.debug(f"Another thread saved cache for {self}, removed temp file")
         except Exception as e:
-            # Clean up temp file if anything goes wrong
-            if os.path.exists(temp_filename):
+            # Could not write temp file
+            try:
+                if os.path.exists(temp_filename):
+                    os.remove(temp_filename)
+            except Exception:
+                pass
+            log.warning(f"Failed to save cache for {self}: {e}")
+            return
+
+        # Try to move into place. On Windows this can fail if another thread wins the race.
+        # Strategy:
+        #  - If destination already exists, just remove our temp and return (another thread won)
+        #  - Otherwise, attempt os.rename with a few retries for transient WinError 32
+        max_attempts = 3
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                if os.path.exists(self.cache_path):
+                    # Another writer got there first; clean up our temp
+                    os.remove(temp_filename)
+                    log.debug(f"Cache file already exists for {self}, skipping save (race) on attempt {attempt}")
+                    return
+                os.rename(temp_filename, self.cache_path)
+                return
+            except FileExistsError:
+                # Destination appeared between exists check and rename
                 try:
                     os.remove(temp_filename)
-                except:
+                except Exception:
                     pass
-            log.warning(f"Failed to save cache for {self}: {e}")
+                log.debug(f"Another thread saved cache for {self}, removed temp file")
+                return
+            except OSError as e:
+                # WinError 32: file in use; WinError 2: not found (should be rare with unique temp)
+                if attempt < max_attempts and getattr(e, 'winerror', None) in (32,):
+                    time.sleep(0.05 * attempt)
+                    continue
+                # Final failure: clean up temp and warn
+                try:
+                    if os.path.exists(temp_filename):
+                        os.remove(temp_filename)
+                except Exception:
+                    pass
+                log.warning(f"Failed to save cache for {self}: {e}")
+                return
 
     def get(self, idx=0, session=requests, bandwidth_limiter=None):
         log.debug(f"Getting {self}") 
@@ -1422,7 +1456,6 @@ class TileCacher(object):
         self.target_zoom_level_near_airports = CFG.autoortho.max_zoom_near_airports
         self.mipmap_offset = CFG.autoortho.mipmap_level_offset
         log.info(f"Target zoom level set to ZL{self.target_zoom_level}")
-        log.info(f"All tiles (ZL18, ZL19, etc.) will download data at ZL{self.target_zoom_level} or lower based on availability")
 
         self.clean_t = threading.Thread(target=self.clean, daemon=True)
         self.clean_t.start()

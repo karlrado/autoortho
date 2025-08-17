@@ -169,12 +169,9 @@ class ModernSpinBox(QSpinBox):
                 background-color: #5183bd;
             }
             QSpinBox::up-arrow {
-                image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-bottom: 4px solid white;
-                width: 0px;
-                height: 0px;
+                image: url(autoortho/imgs/plus-16.png);
+                width: 12px;
+                height: 12px;
             }
             QSpinBox::down-button {
                 background-color: #6da4e3;
@@ -186,12 +183,9 @@ class ModernSpinBox(QSpinBox):
                 background-color: #5183bd;
             }
             QSpinBox::down-arrow {
-                image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 4px solid white;
-                width: 0px;
-                height: 0px;
+                image: url(autoortho/imgs/minus-16.png);
+                width: 12px;
+                height: 12px;
             }
         """)
 
@@ -323,11 +317,10 @@ class ConfigUI(QMainWindow):
                 border: none;
             }
             QComboBox::down-arrow {
-                image: none;
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-top: 5px solid #999;
-                margin-right: 5px;
+                image: url(autoortho/imgs/arrow-204-16.png);
+                width: 16px;
+                height: 16px;
+                margin-right: 10px;
             }
             QGroupBox {
                 border: 1px solid #3A3A3A;
@@ -400,8 +393,8 @@ class ConfigUI(QMainWindow):
 
         # Create tabs
         self.create_setup_tab()
-        self.create_settings_tab()
         self.create_scenery_tab()
+        self.create_settings_tab()
         self.create_logs_tab()
 
         # Button layout
@@ -549,7 +542,7 @@ class ConfigUI(QMainWindow):
         layout.addWidget(paths_group)
 
         # Options group
-        options_group = QGroupBox("Options")
+        options_group = QGroupBox("Basic Settings")
         options_layout = QVBoxLayout()
         options_group.setLayout(options_layout)
 
@@ -593,6 +586,42 @@ class ConfigUI(QMainWindow):
         maptype_layout.addStretch()
         options_layout.addLayout(maptype_layout)
 
+                # File cache size
+        file_cache_layout = QHBoxLayout()
+        file_cache_label = QLabel("File cache size (GB):")
+        file_cache_label.setToolTip(
+            "Maximum disk space used for caching imagery files.\n"
+            "Larger cache = fewer downloads but more disk usage.\n"
+            "Optimal: 50-200GB for regular use, 200-500GB for extensive "
+            "flying.\n"
+            "Minimum recommended: 20GB"
+        )
+        file_cache_layout.addWidget(file_cache_label)
+        self.file_cache_slider = ModernSlider()
+        self.file_cache_slider.setRange(10, 500)
+        self.file_cache_slider.setSingleStep(5)
+        self.file_cache_slider.setValue(
+            int(float(self.cfg.cache.file_cache_size))
+        )
+        self.file_cache_slider.setObjectName('file_cache_size')
+        self.file_cache_slider.setToolTip(
+            "Drag to adjust maximum cache size in gigabytes"
+        )
+        self.file_cache_label = QLabel(f"{self.cfg.cache.file_cache_size} GB")
+        self.file_cache_slider.valueChanged.connect(
+            lambda v: self.file_cache_label.setText(f"{v} GB")
+        )
+        file_cache_layout.addWidget(self.file_cache_slider)
+        file_cache_layout.addWidget(self.file_cache_label)
+        self.clean_cache_btn = StyledButton("Clean Cache")
+        self.clean_cache_btn.clicked.connect(self.on_clean_cache)
+        self.clean_cache_btn.setToolTip(
+            "Remove old cached files to free up disk space.\n"
+            "This will delete the oldest cached images first."
+        )
+        file_cache_layout.addWidget(self.clean_cache_btn)
+        options_layout.addLayout(file_cache_layout)
+
         self.simheaven_compat_check = QCheckBox("SimHeaven compatibility mode")
         self.simheaven_compat_check.setChecked(self.cfg.autoortho.simheaven_compat)
         self.simheaven_compat_check.setObjectName('simheaven_compat')
@@ -606,18 +635,6 @@ class ConfigUI(QMainWindow):
 
         self.simheaven_compat_check.stateChanged.connect(self.on_simheaven_compat_check)
 
-        # Windows specific
-        if platform.system() == 'Windows':
-            self.winfsp_check = QCheckBox("Prefer WinFSP over Dokan")
-            self.winfsp_check.setChecked(self.cfg.windows.prefer_winfsp)
-            self.winfsp_check.setObjectName('prefer_winfsp')
-            self.winfsp_check.setToolTip(
-                "WinFSP generally provides better performance than Dokan.\n"
-                "Enable this if you have WinFSP installed.\n"
-                "If you experience issues, try disabling this option.\n"
-                "Recommended: Enabled (if WinFSP is available)"
-            )
-            options_layout.addWidget(self.winfsp_check)
 
         layout.addWidget(options_group)
         layout.addStretch()
@@ -654,42 +671,6 @@ class ConfigUI(QMainWindow):
         cache_group = QGroupBox("Cache Settings")
         cache_layout = QVBoxLayout()
         cache_group.setLayout(cache_layout)
-
-        # File cache size
-        file_cache_layout = QHBoxLayout()
-        file_cache_label = QLabel("File cache size (GB):")
-        file_cache_label.setToolTip(
-            "Maximum disk space used for caching imagery files.\n"
-            "Larger cache = fewer downloads but more disk usage.\n"
-            "Optimal: 50-200GB for regular use, 200-500GB for extensive "
-            "flying.\n"
-            "Minimum recommended: 20GB"
-        )
-        file_cache_layout.addWidget(file_cache_label)
-        self.file_cache_slider = ModernSlider()
-        self.file_cache_slider.setRange(10, 500)
-        self.file_cache_slider.setSingleStep(5)
-        self.file_cache_slider.setValue(
-            int(float(self.cfg.cache.file_cache_size))
-        )
-        self.file_cache_slider.setObjectName('file_cache_size')
-        self.file_cache_slider.setToolTip(
-            "Drag to adjust maximum cache size in gigabytes"
-        )
-        self.file_cache_label = QLabel(f"{self.cfg.cache.file_cache_size} GB")
-        self.file_cache_slider.valueChanged.connect(
-            lambda v: self.file_cache_label.setText(f"{v} GB")
-        )
-        file_cache_layout.addWidget(self.file_cache_slider)
-        file_cache_layout.addWidget(self.file_cache_label)
-        self.clean_cache_btn = StyledButton("Clean Cache")
-        self.clean_cache_btn.clicked.connect(self.on_clean_cache)
-        self.clean_cache_btn.setToolTip(
-            "Remove old cached files to free up disk space.\n"
-            "This will delete the oldest cached images first."
-        )
-        file_cache_layout.addWidget(self.clean_cache_btn)
-        cache_layout.addLayout(file_cache_layout)
 
         # Memory cache limit
         mem_cache_layout = QHBoxLayout()
@@ -761,7 +742,7 @@ class ConfigUI(QMainWindow):
         )
         max_zoom_layout.addWidget(max_zoom_label)
         self.max_zoom_slider = ModernSlider()
-        self.max_zoom_slider.setRange(12, 18)
+        self.max_zoom_slider.setRange(12, 17) # Max X-Plane allows is tile zoom + 1 , 17 accounts for kubilus mesh
         self.max_zoom_slider.setValue(int(self.cfg.autoortho.max_zoom))
         self.max_zoom_slider.setObjectName('max_zoom')
         self.max_zoom_slider.setToolTip(
@@ -785,7 +766,7 @@ class ConfigUI(QMainWindow):
         )
         max_zoom_near_airports_layout.addWidget(max_zoom_near_airports_label)
         self.max_zoom_near_airports_slider = ModernSlider()
-        self.max_zoom_near_airports_slider.setRange(12, 19)
+        self.max_zoom_near_airports_slider.setRange(12, 19) # Max X-Plane allows is tile zoom + 1 , 19 accounts for kubilus mesh near airports
         self.max_zoom_near_airports_slider.setValue(int(self.cfg.autoortho.max_zoom_near_airports))
         self.max_zoom_near_airports_slider.setObjectName('max_zoom_near_airports')
         self.max_zoom_near_airports_slider.setToolTip(
@@ -856,7 +837,7 @@ class ConfigUI(QMainWindow):
         )
 
         threads_layout.addWidget(self.fetch_threads_spinbox)
-        threads_layout.addWidget(QLabel(f"(max: {max_threads})"))
+        threads_layout.addStretch()
         autoortho_layout.addLayout(threads_layout)
 
         layout.addWidget(autoortho_group)
@@ -987,6 +968,19 @@ class ConfigUI(QMainWindow):
         )
         fuse_layout.addWidget(self.threading_check)
 
+        # Windows specific
+        if platform.system() == 'Windows':
+            self.winfsp_check = QCheckBox("Prefer WinFSP over Dokan")
+            self.winfsp_check.setChecked(self.cfg.windows.prefer_winfsp)
+            self.winfsp_check.setObjectName('prefer_winfsp')
+            self.winfsp_check.setToolTip(
+                "WinFSP generally provides better performance than Dokan.\n"
+                "Enable this if you have WinFSP installed.\n"
+                "If you experience issues, try disabling this option.\n"
+                "Recommended: Enabled (if WinFSP is available)"
+            )
+            fuse_layout.addWidget(self.winfsp_check)
+
         layout.addWidget(fuse_group)
 
         # Flight Data Settings group
@@ -1047,7 +1041,7 @@ class ConfigUI(QMainWindow):
         tab_layout.addWidget(scroll_area)
         settings_widget.setLayout(tab_layout)
 
-        self.tabs.addTab(settings_widget, "Settings")
+        self.tabs.addTab(settings_widget, "Advanced Settings")
 
     def create_scenery_tab(self):
         """Create the scenery management tab"""
@@ -1287,6 +1281,14 @@ class ConfigUI(QMainWindow):
 
     def on_clean_cache(self):
         """Handle Clean Cache button click"""
+
+        if self.running:
+            QMessageBox.warning(
+                self,
+                "Cannot clean cache while running",
+                "Cannot clean cache while AutoOrtho injection is running. Please stop AutoOrtho and try again."
+            )
+            return
         self.update_status_bar("Cleaning cache...")
         self.clean_cache_btn.setEnabled(False)
         self.run_button.setEnabled(False)
