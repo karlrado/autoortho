@@ -802,40 +802,6 @@ class ConfigUI(QMainWindow):
         max_zoom_near_airports_layout.addWidget(self.max_zoom_near_airports_label)
         autoortho_layout.addLayout(max_zoom_near_airports_layout)
 
-        # Mipmap level offset
-        mipmap_level_offset_layout = QHBoxLayout()
-        mipmap_level_offset_label = QLabel("Mipmap level offset:")
-        mipmap_level_offset_label.setToolTip(
-            "How close to the ground should the imagery start transitioning to smaller (lower ZL) images?\n"
-            "X-Plane uses mipmaps as LODs to decrease texture quality as you get further away from the ground.\n"
-            "This setting controls how close to the ground the imagery starts transitioning to lower ZL images.\n"
-            "Higher values = The higher ZL image stays rendered for more distance.\n"
-            "Lower values = The higher ZL image is rendered for less distance and transitions into lower ZL images sooner.\n"
-            "Optimal: 0 for most cases, since it's X-Plane's default, specially if using max zoom level >=1.\n"
-            "Increase if using lower zoom levels and want to keep quality for longer distances, use at own risk.\n"
-        )
-        mipmap_level_offset_layout.addWidget(mipmap_level_offset_label)
-        self.mipmap_level_offset_slider = ModernSlider()
-        self.mipmap_level_offset_slider.setRange(0, 5)
-        self.mipmap_level_offset_slider.setValue(int(self.cfg.autoortho.mipmap_level_offset))
-        self.mipmap_level_offset_slider.setObjectName('mipmap_level_offset')
-        self.mipmap_level_offset_slider.setToolTip(
-            "Drag to adjust how far to the ground should the imagery start transitioning to smaller (lower ZL) images\n"
-            "0 is Default X-Plane mipmap level offset, and therefore the recommended value.\n"
-            "Increase if using lower zoom levels and want to keep quality for longer distances.\n"
-            "IMPORTANT: Resource impact hasn't been tested, use at own risk.\n"
-            )
-        # Set initial label text - show "Default" for 0, otherwise show the number
-        initial_value = int(self.cfg.autoortho.mipmap_level_offset)
-        initial_text = "Default" if initial_value == 0 else str(initial_value)
-        self.mipmap_level_offset_label = QLabel(initial_text)
-        self.mipmap_level_offset_slider.valueChanged.connect(
-            lambda v: self.mipmap_level_offset_label.setText("Default" if v == 0 else str(v))
-        )
-        mipmap_level_offset_layout.addWidget(self.mipmap_level_offset_slider)
-        mipmap_level_offset_layout.addWidget(self.mipmap_level_offset_label)
-        autoortho_layout.addLayout(mipmap_level_offset_layout)
-
         # Max wait time
         maxwait_layout = QHBoxLayout()
         maxwait_label = QLabel("Max wait time (seconds):")
@@ -892,40 +858,6 @@ class ConfigUI(QMainWindow):
         threads_layout.addWidget(self.fetch_threads_spinbox)
         threads_layout.addWidget(QLabel(f"(max: {max_threads})"))
         autoortho_layout.addLayout(threads_layout)
-
-        # Bandwidth limit
-        bandwidth_layout = QHBoxLayout()
-        bandwidth_label = QLabel("Max bandwidth (Mbits/s):")
-        bandwidth_label.setToolTip(
-            "Maximum download bandwidth in megabits per second.\n"
-            "0 = unlimited bandwidth (default)\n"
-            "Useful for limiting network usage during flight\n"
-            "or on metered/shared connections.\n"
-            "Recommended: 50-200 Mbits for most users"
-        )
-        bandwidth_layout.addWidget(bandwidth_label)
-        self.bandwidth_slider = ModernSlider()
-        self.bandwidth_slider.setRange(0, 1000)  # 0 to 1000 Mbits
-        self.bandwidth_slider.setSingleStep(10)
-        bandwidth_value = int(float(self.cfg.autoortho.max_bandwidth_mbits))
-        self.bandwidth_slider.setValue(bandwidth_value)
-        self.bandwidth_slider.setObjectName('max_bandwidth_mbits')
-        self.bandwidth_slider.setToolTip(
-            "Drag to adjust maximum bandwidth limit in megabits per second"
-        )
-        if bandwidth_value == 0:
-            bandwidth_text = "Unlimited"
-        else:
-            bandwidth_text = f"{bandwidth_value} Mbits/s"
-        self.bandwidth_label = QLabel(bandwidth_text)
-        self.bandwidth_slider.valueChanged.connect(
-            lambda v: self.bandwidth_label.setText(
-                "Unlimited" if v == 0 else f"{v} Mbits/s"
-            )
-        )
-        bandwidth_layout.addWidget(self.bandwidth_slider)
-        bandwidth_layout.addWidget(self.bandwidth_label)
-        autoortho_layout.addLayout(bandwidth_layout)
 
         layout.addWidget(autoortho_group)
 
@@ -1478,15 +1410,11 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.min_zoom = str(self.min_zoom_slider.value())
             self.cfg.autoortho.max_zoom_near_airports = str(self.max_zoom_near_airports_slider.value())
             self.cfg.autoortho.max_zoom = str(self.max_zoom_slider.value())
-            self.cfg.autoortho.mipmap_level_offset = str(self.mipmap_level_offset_slider.value())
             self.cfg.autoortho.maxwait = str(
                 self.maxwait_slider.value() / 10.0
             )
             self.cfg.autoortho.fetch_threads = str(
                 self.fetch_threads_spinbox.value()
-            )
-            self.cfg.autoortho.max_bandwidth_mbits = str(
-                self.bandwidth_slider.value()
             )
 
             # DDS settings

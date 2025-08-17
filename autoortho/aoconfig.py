@@ -73,16 +73,12 @@ min_zoom = 12
 max_zoom = 16
 # Maximum zoom level to allow near airports. Zoom level around airports used by default is 18.
 max_zoom_near_airports = 18
-# How close to the ground should the imagery start transitioning to smaller (lower ZL) images?
-mipmap_level_offset = 0
 # Max time to wait for images.  Higher numbers mean better quality, but more
 # stutters.  Lower numbers will be more responsive at the expense of
 # ocassional low quality tiles.
 maxwait = 0.5
 maptypes = ['Null', 'BI', 'NAIP', 'EOX', 'USGS', 'Firefly']
 fetch_threads = 32
-# Maximum download bandwidth in Mbits/sec (0 = unlimited)
-max_bandwidth_mbits = 0
 # Simheaven compatibility mode.
 simheaven_compat = False
 

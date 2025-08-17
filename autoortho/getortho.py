@@ -228,9 +228,6 @@ class Getter(object):
         self.session.mount('https://', adapter)
         self.session.mount('http://', adapter)
         
-        # Initialize bandwidth limiter
-        bandwidth_limit = float(CFG.autoortho.max_bandwidth_mbits)
-        self.bandwidth_limiter = BandwidthLimiter(bandwidth_limit)
 
         for i in range(num_workers):
             t = threading.Thread(target=self.worker, args=(i,), daemon=True)
@@ -252,11 +249,12 @@ class Getter(object):
 
     def update_bandwidth_limit(self, max_mbits_per_sec):
         """Update bandwidth limit dynamically without restarting"""
-        if hasattr(self, 'bandwidth_limiter'):
-            self.bandwidth_limiter.set_limit(max_mbits_per_sec)
-            log.info(f"Updated bandwidth limit to {max_mbits_per_sec} Mbits/s")
-        else:
-            log.warning("Bandwidth limiter not initialized, cannot update limit")
+        raise NotImplementedError
+        #if hasattr(self, 'bandwidth_limiter'):
+        #    self.bandwidth_limiter.set_limit(max_mbits_per_sec)
+        #    log.info(f"Updated bandwidth limit to {max_mbits_per_sec} Mbits/s")
+        #else:
+        #    log.warning("Bandwidth limiter not initialized, cannot update limit")
 
     def worker(self, idx):
         global STATS
@@ -303,7 +301,7 @@ class ChunkGetter(Getter):
 
         kwargs['idx'] = self.localdata.idx
         kwargs['session'] = self.session
-        kwargs['bandwidth_limiter'] = self.bandwidth_limiter
+        #kwargs['bandwidth_limiter'] = self.bandwidth_limiter
         #log.debug(f"{obj}, {args}, {kwargs}")
         return obj.get(*args, **kwargs)
 
