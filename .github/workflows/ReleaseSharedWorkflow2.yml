@@ -123,59 +123,59 @@ jobs:
         prerelease: ${{ inputs.prerelease }}
 
 
-  build-macos:
-    runs-on: macos-latest
+#  build-macos:
+#    runs-on: macos-latest
 
-    env:
-      VERNAME: ${{ inputs.version }} 
+#    env:
+#      VERNAME: ${{ inputs.version }} 
 
-    steps:
-    - uses: actions/checkout@v4
+#    steps:
+#    - uses: actions/checkout@v4
    
-    - uses: actions/setup-python@v4
-      with:
-        python-version: '3.12'
+#    - uses: actions/setup-python@v4
+#      with:
+#        python-version: '3.12'
 
-    - name: Setup dependencies
-      run: |
-        # Install Homebrew dependencies
-        brew install jpeg-turbo macfuse
+#    - name: Setup dependencies
+#      run: |
+#        # Install Homebrew dependencies
+#        brew install jpeg-turbo macfuse
         
         # Install Python dependencies
-        python -m pip install -U -r requirements.txt
-        python -m pip install -U -r requirements-build.txt
+#        python -m pip install -U -r requirements.txt
+#        python -m pip install -U -r requirements-build.txt
 
-    - name: Build native libraries
-      run: |
-        # Build aoimage.dylib
-        cd autoortho/aoimage
-        make -f Makefile.macos aoimage.dylib
-        cd ../..
+#    - name: Build native libraries
+#      run: |
+#        # Build aoimage.dylib
+#        cd autoortho/aoimage
+#        make -f Makefile.macos aoimage.dylib
+#        cd ../..
         
-        # Build texture compression libraries
-        cd autoortho/lib/macos
-        make
-        cd ../../..
+#        # Build texture compression libraries
+#        cd autoortho/lib/macos
+#        make
+#        cd ../../..
 
-    - name: Optionally set internal version separately
-      if: ${{ inputs.internalver != '' }}
-      run: |
-        echo "${{ inputs.internalver }}" > autoortho/.version
+#    - name: Optionally set internal version separately
+#      if: ${{ inputs.internalver != '' }}
+#      run: |
+#        echo "${{ inputs.internalver }}" > autoortho/.version
 
-    - name: Build macOS binary
-      run: |
-        make mac_bin VERSION=${{ env.VERNAME }}
+#    - name: Build macOS binary
+#      run: |
+#        make mac_bin VERSION=${{ env.VERNAME }}
 
-    - name: Save artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: macbin
-        path: autoortho_mac_*.bin
+#    - name: Save artifact
+#      uses: actions/upload-artifact@v4
+#      with:
+#        name: macbin
+#        path: autoortho_mac_*.bin
 
-    - name: Release
-      if: ${{ inputs.relname != '' }}
-      uses: softprops/action-gh-release@v1
-      with:
-        files: autoortho_mac_*.bin
-        tag_name: ${{ inputs.relname }}
-        prerelease: ${{ inputs.prerelease }}
+#    - name: Release
+#      if: ${{ inputs.relname != '' }}
+#      uses: softprops/action-gh-release@v1
+#      with:
+#        files: autoortho_mac_*.bin
+#        tag_name: ${{ inputs.relname }}
+#        prerelease: ${{ inputs.prerelease }}
