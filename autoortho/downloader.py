@@ -633,7 +633,7 @@ class Region(object):
             return
         elif self.local_rel:
             log.info("Local release detected.  Uninstalling...")
-            self.local_rel.uninstall()
+            # self.local_rel.uninstall()
             self.releases.pop(self.local_rel.ver)
             self.local_rel = None
 
