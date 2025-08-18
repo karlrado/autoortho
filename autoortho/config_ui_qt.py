@@ -60,6 +60,25 @@ class SceneryDownloadWorker(QThread):
             self.error.emit(self.region_id, str(err))
             log.error(tb)
 
+class SceneryUninstallWorker(QThread):
+    """Worker thread for uninstalling scenery"""
+    finished = pyqtSignal(str, bool)  # region_id, success
+    error = pyqtSignal(str, str)  # region_id, error_message
+    
+    def __init__(self, dl_manager, region_id):
+        super().__init__()
+        self.dl_manager = dl_manager
+        self.region_id = region_id
+    
+    def run(self):
+        try:
+            success = self.dl_manager.regions[self.region_id].local_rel.uninstall()
+            self.finished.emit(self.region_id, success)
+        except Exception as err:
+            tb = traceback.format_exc()
+            self.error.emit(self.region_id, str(err))
+            log.error(tb)
+
 
 class StyledButton(QPushButton):
     """Custom styled button with hover effects"""
@@ -636,11 +655,56 @@ class ConfigUI(QMainWindow):
         self.simheaven_compat_check.stateChanged.connect(self.on_simheaven_compat_check)
 
 
-        layout.addWidget(options_group)
-        layout.addStretch()
+        #self.using_custom_tiles_check = QCheckBox("Advanced Custom Tiles Options")
+        #self.using_custom_tiles_check.setChecked(self.cfg.autoortho.using_custom_tiles)
+        #self.using_custom_tiles_check.setObjectName('using_custom_tiles')
+        #self.using_custom_tiles_check.setToolTip(
+        #    "Enable this if you are using custom build Ortho4XP tiles instead of base scenery packages from autoortho and want more control over the zoom levels.\n"
+        #    "This will allow you to set custom zoom levels based on your tiles for this session.\n"
+        #    "IMPORTANT: Make sure you setup the zoom levels to the ones matching your tiles, otherwise you may experience issues with the scenery. "
+        #    "You can still use custom tiles without this option, but all tiles will be capped to general max zoom level you set in advanced settings, "
+        #    "even if they are airport tiles that should be at higher zoom levels."
+        #)
 
+        #self.using_custom_tiles_check.stateChanged.connect(lambda state: on_using_custom_tiles_check(state))
+        #options_layout.addWidget(self.using_custom_tiles_check)
+
+
+        layout.addWidget(options_group)
+
+        # TODO: Add custom tiles config here
+        #custom_tiles_group = QGroupBox("Advanced Custom Tiles Setup")
+        #custom_tiles_layout = QVBoxLayout()
+        #custom_tiles_group.setLayout(custom_tiles_layout)
+
+        #custom_tiles_label = QLabel("Advanced Custom Tiles Setup")
+        #custom_tiles_label.setToolTip(
+        #        "This is only used if you are using custom tiles.\n"
+        #        "Settting this values will allow autoortho to correctly identify the tiles near airports from your custom tiles, allowing you to control their max zoom levels "
+        #        "depending on whether they are near airport tiles or not via the two sliders in Advanced Settings.\n"
+        #        "If you are not sure what values your tiles are built to, just uncheck the Advanced Custom Tiles Options box "
+        #        "and let autoortho cap your tiles to the general max zoom level you set in advanced settings."
+        #)
+        #custom_tiles_layout.addWidget(custom_tiles_label)
+
+        #custom_tiles_doc_label = QLabel("Please make sure you read the documentation on how add custom built tiles to AutoOrtho, "
+        #"you can find it here: https://programmingdinosaur.github.io/autoortho4xplane/details#adding-your-own-created-sceneries",openExternalLinks=True)
+        #custom_tiles_layout.addWidget(custom_tiles_doc_label)
+
+        #custom_tiles_general_zoom_label = QLabel("General zoom level your custom Ortho4XP tiles were built for:")
+        #custom_tiles_layout.addWidget(custom_tiles_general_zoom_label)
+        #self.custom_tiles_general_zoom_combo = QComboBox()
+        #self.custom_tiles_general_zoom_combo.addItems(['12', '13', '14', '15', '16', '17', '18', '19'])
+        #self.custom_tiles_general_zoom_combo.setCurrentText(str("baa"))
+        #self.custom_tiles_general_zoom_combo.setObjectName('custom_tiles_general_zoom')
+        #self.custom_tiles_general_zoom_combo.setToolTip(
+        #    "Drag to adjust minimum zoom level for custom tiles"
+        #)
+        #custom_tiles_layout.addWidget(self.custom_tiles_general_zoom_combo)
+    
         # Set the content widget to the scroll area
         scroll_area.setWidget(setup_content)
+        layout.addStretch()
 
         # Create the main layout for the tab
         tab_layout = QVBoxLayout()
@@ -746,7 +810,7 @@ class ConfigUI(QMainWindow):
         self.max_zoom_slider.setValue(int(self.cfg.autoortho.max_zoom))
         self.max_zoom_slider.setObjectName('max_zoom')
         self.max_zoom_slider.setToolTip(
-            "Drag to adjust maximum zoom level (12=low detail, 18=high detail)"
+            "Drag to adjust maximum zoom level (12=low detail, 17=high detail)"
         )
         self.max_zoom_label = QLabel(f"{self.cfg.autoortho.max_zoom}")
         self.max_zoom_slider.valueChanged.connect(
@@ -1145,6 +1209,16 @@ class ConfigUI(QMainWindow):
 
                 # Install button
                 install_btn = StyledButton("Install", primary=True)
+                install_btn.setFixedSize(150,35)
+                install_btn.setStyleSheet(
+                    """
+                    background-color: #2d78ba;
+                    font-size: 16px;
+                    font-weight: bold;
+                    text-align: center;
+                    line-height: 30px;
+                    """
+                )
                 install_btn.setObjectName(f"scenery-{r.region_id}")
                 install_btn.clicked.connect(
                     lambda checked, rid=r.region_id: (
@@ -1156,10 +1230,46 @@ class ConfigUI(QMainWindow):
                 status_label = QLabel("✓ Up to date")
                 status_label.setStyleSheet("color: #4CAF50;")
                 item_layout.addWidget(status_label)
+                delete_btn = StyledButton("Uninstall", primary=False)
+                delete_btn.setObjectName(f"uninstall-{r.region_id}")
+                delete_btn.setToolTip(
+                    f"Uninstall the scenery package {latest.name}.\n"
+                    "This will remove the scenery package from your system."
+                )
+                delete_btn.setStyleSheet(
+                    """
+                    background-color: #ba0000;
+                    color: white;
+                    font-size: 16px;
+                    font-weight: bold;
+                    text-align: center;
+                    line-height: 30px;
+                    """
+                )
+                delete_btn.setFixedSize(150,35)
+                delete_btn.clicked.connect(
+                    lambda checked, rid=r.region_id: (
+                        self.on_delete_scenery(rid)
+                    )
+                )
+                item_layout.addWidget(delete_btn)
 
             self.scenery_layout.addWidget(item_frame)
 
         self.scenery_layout.addStretch()
+
+    def on_delete_scenery(self, region_id):
+        """Handle scenery deletion"""
+        button = self.findChild(QPushButton, f"uninstall-{region_id}")
+        if button:
+            button.setEnabled(False)
+            button.setText("Uninstalling...")
+
+        # Create worker thread
+        worker = SceneryUninstallWorker(self.dl, region_id)
+        worker.finished.connect(self.on_uninstall_finished)
+        worker.error.connect(self.on_uninstall_error)
+        worker.start()
 
     def validate_max_zoom_near_airports(self):
         """Validate max zoom near airports value"""
@@ -1236,6 +1346,8 @@ class ConfigUI(QMainWindow):
         self.save_config()
         self.cfg.load()
         self.update_status_bar("Mounting sceneries...")
+        self.run_button.setEnabled(False)
+        self.run_button.setText("Running")
         self.mount_sceneries(blocking=False)
         self.verify()
         self.running = True  # Set running state
@@ -1332,6 +1444,30 @@ class ConfigUI(QMainWindow):
 
         self.download_workers[region_id] = worker
         worker.start()
+
+    def on_uninstall_error(self, region_id, error_msg):
+        """Handle uninstall error"""
+        self.show_error.emit(f"Failed to uninstall {region_id}:\n{error_msg}")
+        self.on_uninstall_finished(region_id, False)
+
+    def on_uninstall_finished(self, region_id, success):
+        """Handle uninstall completion"""
+        button = self.findChild(QPushButton, f"uninstall-{region_id}")
+        if button:
+            button.setEnabled(True)
+
+        if success:
+            self.update_status_bar(f"Successfully uninstalled {region_id}")
+            self.refresh_scenery_list()
+            button.setText("Uninstalled")
+        else:
+            self.update_status_bar(f"Failed to uninstall {region_id}")
+            button.setText("Uninstall")
+
+        # Clean up worker
+        if region_id in self.download_workers:
+            del self.download_workers[region_id]
+
 
     def on_download_progress(self, region_id, progress_data):
         """Update download progress"""

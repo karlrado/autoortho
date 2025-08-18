@@ -357,6 +357,7 @@ class Release(object):
         self.release_dict = release_dict if release_dict else {}
         self.packages = {}
         self.info_path = os.path.join(self.install_dir, "z_autoortho", f"{self.name}_info.json")
+        self.subfolder_dir = os.path.join(self.install_dir, "z_autoortho", "scenery", f"z_ao_{self.name}")
         self.ortho_dirs = []
         self.info_ver = "v2"
 
@@ -541,29 +542,26 @@ class Release(object):
         self.cleaned = True
 
 
-    def uninstall(self):
+    def uninstall(self) -> bool:
         #self.cleanup()
-        #log.info(f"Removing {self.install_dir}")
-        #shutil.rmtree(self.install_dir)
-        for o in self.ortho_dirs:
-            if os.path.exists(o):
-                log.info(f"Removing {o}")
-                shutil.rmtree(o)
 
-        legacy_dirs = [
-            os.path.join(self.install_dir, "z_autoortho", "textures"),
-            os.path.join(self.install_dir, "z_autoortho", "_textures")
-        ]
-        for l in legacy_dirs:
-            if os.path.exists(l):
-                shutil.rmtree(l)
+        try:
+            log.info(f"Removing {self.subfolder_dir}")
 
-        # for k,v in self.packages.items():
-        #     log.debug(v)
-        #     log.info(f"Uninstall package: {k}")
-        #     v.uninstall()
+            if os.path.exists(self.subfolder_dir):
+                log.info(f"Removing {self.subfolder_dir}")
+                shutil.rmtree(self.subfolder_dir)
 
-        self.installed = False
+            if os.path.exists(self.info_path):
+                log.info(f"Removing {self.info_path}")
+                os.remove(self.info_path)
+
+            log.info(f"Release {self.name} uninstalled.")
+            self.installed = False
+        except Exception as err:
+            log.error(f"Failed to uninstall {self.name}: {err}")
+            return False
+        return True
         #self.downloaded = False
 
 
@@ -705,6 +703,7 @@ class OrthoManager(object):
         return data
 
     def find_regions(self):
+        self.regions = {}
         log.info(f"Looking for available regions ...")
         
         rel_data = self._get_release_data()
