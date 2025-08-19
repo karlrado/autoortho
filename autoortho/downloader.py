@@ -210,7 +210,7 @@ class Package(object):
                 log.info("match!")
                 posible_destpath = os.path.join(self.download_dir, match.group(1))
 
-            #if os.path.isfile(self.zf.path):
+            # If the file is already present, count it as done for overall progress
             if os.path.isfile(destpath) or os.path.isfile(posible_destpath):
                 log.info(f"{destpath} already exists.  Skip.")
                 #print(f"{self.zf.path} already exists.  Skip.")
@@ -218,6 +218,23 @@ class Package(object):
                 #self.downloaded = True
                 #return
                 #continue
+                if isinstance(self.progress_state, dict):
+                    self.progress_state['files_done'] = self.progress_state.get('files_done', 0) + 1
+                    if self.progress_callback:
+                        files_total = self.progress_state.get('files_total', 0)
+                        files_done = self.progress_state.get('files_done', 0)
+                        overall_pcnt = 0
+                        if files_total:
+                            overall_pcnt = round((files_done / files_total) * 100, 2)
+                        self.progress_callback({
+                            'status': f"Downloaded {files_done}/{files_total}",
+                            'pcnt_done': 100,
+                            'MBps': 0,
+                            'overall_pcnt': overall_pcnt,
+                            'files_done': files_done,
+                            'files_total': files_total,
+                        })
+                continue
             else:
                 while retries < self.max_retries:
                     try:

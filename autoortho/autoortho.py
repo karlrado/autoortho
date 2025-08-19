@@ -17,6 +17,7 @@ from contextlib import contextmanager
 import aoconfig
 import aostats
 import winsetup
+import macsetup
 import flighttrack
 
 from version import __version__
@@ -69,6 +70,11 @@ def setupmount(mountpoint, systemtype):
 
     elif systemtype == "winfsp-FUSE":
         ret = winsetup.setup_winfsp_mount(mountpoint)
+        if not ret:
+            raise MountError(f"Failed to setup mount point {mountpoint}!")
+
+    elif systemtype == "mac-FUSE":
+        ret = macsetup.setup_macfuse_mount(mountpoint)
         if not ret:
             raise MountError(f"Failed to setup mount point {mountpoint}!")
 
@@ -255,7 +261,20 @@ class AOMount:
                             mount,
                             nothreads
                     )
+            elif platform.system() == 'Darwin':
+                systemtype, libpath = macsetup.find_mac_libs()
+                with setupmount(mountpoint, systemtype) as mount:
+                    log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
+                    import autoortho_fuse
+                    from refuse import high
+                    high._libfuse = ctypes.CDLL(libpath)
+                    autoortho_fuse.run(
+                            autoortho_fuse.AutoOrtho(root),
+                            mount,
+                            nothreads
+                    )
             else:
+                # Linux
                 with setupmount(mountpoint, "Linux-FUSE") as mount:
                     log.info("Running in FUSE mode.")
                     log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")

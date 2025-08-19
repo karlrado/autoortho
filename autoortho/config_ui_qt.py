@@ -238,6 +238,7 @@ class ConfigUI(QMainWindow):
         self.download_workers = {}
         self.download_progress = {}
         self.uninstall_workers = {}
+        self.simheaven_config_changed_session = False
 
         # Setup UI
         self.init_ui()
@@ -467,12 +468,10 @@ class ConfigUI(QMainWindow):
 
         # Scenery path
         scenery_layout = QHBoxLayout()
-        scenery_label = QLabel("Scenery install dir:")
+        scenery_label = QLabel("Custom Scenery folder:")
         scenery_label.setToolTip(
             "Directory where AutoOrtho scenery will be installed.\n"
-            "This should be a dedicated folder for AutoOrtho scenery,\n"
-            "typically separate from your X-Plane Custom Scenery folder.\n"
-            "Example: C:\\AutoOrtho_Scenery\\ or ~/AutoOrtho_Scenery/"
+            "This should be a your X-Plane Custom Scenery folder."
         )
         scenery_layout.addWidget(scenery_label)
         self.scenery_path_edit = QLineEdit(self.cfg.paths.scenery_path)
@@ -1603,7 +1602,9 @@ class ConfigUI(QMainWindow):
         # Save options
         self.cfg.general.showconfig = self.showconfig_check.isChecked()
         self.cfg.autoortho.maptype_override = self.maptype_combo.currentText()
-        self.cfg.autoortho.simheaven_compat = self.simheaven_compat_check.isChecked()
+        if self.cfg.autoortho.simheaven_compat != self.simheaven_compat_check.isChecked():
+            self.cfg.autoortho.simheaven_compat = self.simheaven_compat_check.isChecked()
+            self.simheaven_config_changed_session = True
 
         # Windows specific
         if platform.system() == 'Windows' and hasattr(self, 'winfsp_check'):
@@ -1752,7 +1753,9 @@ class ConfigUI(QMainWindow):
         self.dl.regions = {}
         self.dl.extract_dir = self.cfg.paths.scenery_path
         self.dl.download_dir = self.cfg.paths.download_dir
-        self.apply_simheaven_compat(self.cfg.autoortho.simheaven_compat)
+        if self.simheaven_config_changed_session:
+            self.apply_simheaven_compat(self.cfg.autoortho.simheaven_compat)
+            self.simheaven_config_changed_session = False
 
         
         self.dl.find_regions()

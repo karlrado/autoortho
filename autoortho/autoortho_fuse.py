@@ -136,9 +136,11 @@ class AutoOrtho(Operations):
             
             # Replicate the max_zoom selection logic from TileCacher
             if getortho.USING_KUBILUS_MESH:
-                max_zoom = self.tc.target_zoom_level_near_airports if zoom == 18 else self.tc.target_zoom_level
+                uncapped_zoom = self.tc.target_zoom_level_near_airports if zoom == 18 else self.tc.target_zoom_level
             else:
-                max_zoom = self.tc.target_zoom_level_near_airports if zoom == 19 else self.tc.target_zoom_level
+                uncapped_zoom = self.tc.target_zoom_level_near_airports if zoom == 19 else self.tc.target_zoom_level
+
+            max_zoom = min(zoom + 1,uncapped_zoom)
             
             min_zoom = self.tc.min_zoom
             

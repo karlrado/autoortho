@@ -622,7 +622,7 @@ class Tile(object):
     imgs = None
 
     def __init__(self, col, row, maptype, zoom, min_zoom=0, priority=0,
-            cache_dir=None, max_zoom=None, mipmap_offset=0):
+            cache_dir=None, max_zoom=None):
         self.row = int(row)
         self.col = int(col)
         self.maptype = maptype
@@ -636,7 +636,6 @@ class Tile(object):
 
         self.bytes_read = 0
         self.lowest_offset = 99999999
-        self.mipmap_offset = mipmap_offset
 
 
         #self.tile_condition = threading.Condition()
@@ -1097,28 +1096,10 @@ class Tile(object):
         #
 
         # Get effective zoom  
-        zoom = min((self.max_zoom + self.mipmap_offset - mipmap), self.max_zoom)
+        zoom = min((self.max_zoom - mipmap), self.max_zoom)
         log.debug(f"GET_IMG: Default tile zoom: {self.zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(zoom, min_zoom)
         log.debug(f"Will use:  Zoom: {zoom},  Zoom_diff: {zoom_diff}")        
-                
-        # Calculate how many zoom levels we're capped by
-        is_mipmap_reused = (mipmap > 0 and (zoom == self.max_zoom))
-        
-        
-        # For mipmap reuse: check if we already have data for this  zoom level
-        if is_mipmap_reused:
-            # Check if we already generated an image for this reused mipmap
-            for existing_mm, existing_img in self.imgs.items():
-                existing_normal_zoom = self.max_zoom - existing_mm
-                existing_offseted_zoom = min((existing_normal_zoom + self.mipmap_offset), self.max_zoom)
-                
-                if existing_offseted_zoom == zoom and existing_img:
-                    log.debug(f"GET_IMG: Reusing mipmap {existing_mm} data for mipmap {mipmap} (both use ZL{zoom})")
-                    # Store the reused image for this mipmap
-                    self.imgs[mipmap] = existing_img
-                    return existing_img
-        
         
         log.debug(f"GET_IMG: Final zoom {zoom} for mipmap {mipmap}, coords: {col}x{row}, size: {width}x{height}")
         
@@ -1450,11 +1431,10 @@ class TileCacher(object):
         
         self.cache_dir = CFG.paths.cache_dir
         log.info(f"Cache dir: {self.cache_dir}")
-        self.min_zoom = CFG.autoortho.min_zoom
+        self.min_zoom = int(CFG.autoortho.min_zoom)
         # Set target zoom level directly - much simpler than offset calculations
-        self.target_zoom_level = CFG.autoortho.max_zoom  # Direct zoom level target, regardless of tile name
-        self.target_zoom_level_near_airports = CFG.autoortho.max_zoom_near_airports
-        self.mipmap_offset = CFG.autoortho.mipmap_level_offset
+        self.target_zoom_level = int(CFG.autoortho.max_zoom)  # Direct zoom level target, regardless of tile name
+        self.target_zoom_level_near_airports = int(CFG.autoortho.max_zoom_near_airports)
         log.info(f"Target zoom level set to ZL{self.target_zoom_level}")
 
         self.clean_t = threading.Thread(target=self.clean, daemon=True)
@@ -1467,9 +1447,10 @@ class TileCacher(object):
     
     def _get_target_zoom_level(self, default_zoom: int) -> int:
         if USING_KUBILUS_MESH:
-            return self.target_zoom_level_near_airports if default_zoom == "18" else self.target_zoom_level
+            uncapped_target_zoom = self.target_zoom_level_near_airports if default_zoom == 18 else self.target_zoom_level
         else:
-            return self.target_zoom_level_near_airports if default_zoom == "19" else self.target_zoom_level
+            uncapped_target_zoom = self.target_zoom_level_near_airports if default_zoom == 19 else self.target_zoom_level
+        return min(default_zoom + 1, uncapped_target_zoom)
 
     def _to_tile_id(self, row, col, map_type, zoom):
         if self.maptype_override:
@@ -1548,10 +1529,9 @@ class TileCacher(object):
                 # Use target zoom level directly - much cleaner than offset calculations
                 tile = Tile(
                     col, row, map_type, zoom, 
-                    cache_dir = self.cache_dir,
-                    min_zoom = self.min_zoom,
-                    max_zoom = self._get_target_zoom_level(zoom),
-                    mipmap_offset = int(self.mipmap_offset)
+                    cache_dir=self.cache_dir,
+                    min_zoom=self.min_zoom,
+                    max_zoom=self._get_target_zoom_level(zoom),
                 )
                 self.tiles[idx] = tile
                 self.open_count[idx] = self.open_count.get(idx, 0) + 1

@@ -14,45 +14,35 @@ def find_mac_libs():
     fuse_libs = []
 
     # Check for macFUSE installation
-    log.info("Looking for macFUSE ...")
+    log.info("Looking for macFUSE or fuse-t ...")
     
     # Common macFUSE library paths
     possible_paths = [
         '/usr/local/lib/libfuse.dylib',
-        '/usr/local/lib/libfuse.2.dylib',
-        '/usr/local/lib/libfuse3.dylib',
-        '/usr/local/lib/libfuse3.4.dylib',
-        '/Library/Frameworks/macFUSE.framework/Versions/Current/lib/libfuse.dylib',
-        '/Library/Frameworks/macFUSE.framework/Versions/A/lib/libfuse.dylib'
+        '/usr/local/lib/libfuse-t.dylib',
     ]
     
     # Try to find libfuse using ctypes utility
-    _lib_fuse = find_library('fuse')
+    _lib_fuse = find_library('libfuse')
     if _lib_fuse:
-        log.info(f"Found libfuse via find_library: {_lib_fuse}")
-        fuse_libs.append(("macFUSE", _lib_fuse))
+        log.info(f"Found macfuse via find_library: {_lib_fuse}")
+        fuse_libs.append(("mac-FUSE", _lib_fuse))
+
+    _lib_fuse_t = find_library('libfuse-t')
+    if _lib_fuse_t:
+        log.info(f"Found fuse-t via find_library: {_lib_fuse_t}")
+        fuse_libs.append(("mac-FUSE", _lib_fuse_t))
     else:
         # Check common installation paths
         for path in possible_paths:
             if os.path.exists(path):
-                log.info(f"Found macFUSE at {path}")
-                fuse_libs.append(("macFUSE", path))
+                log.info(f"Found a fuse library at {path}")
+                fuse_libs.append(("mac-FUSE", path))
                 break
-    
-    # Check if macFUSE kernel extension is loaded
-    try:
-        result = subprocess.run(['kextstat'], capture_output=True, text=True)
-        if 'io.macfuse.filesystems.macfuse' in result.stdout:
-            log.info("macFUSE kernel extension is loaded")
-        else:
-            log.warning("macFUSE kernel extension not found. You may need to restart or enable it in System Settings.")
-    except Exception as e:
-        log.warning(f"Could not check macFUSE kernel extension status: {e}")
+
 
     if not fuse_libs:
-        log.error("No macFUSE installation detected!")
-        log.error("Please install macFUSE: brew install --cask macfuse")
-        log.error("After installation, you may need to enable it in System Settings → Privacy & Security")
+        log.error("No macFUSE or fuse-t installation detected!")
         return None, None
 
     fusemode, fuselib = fuse_libs[0]
