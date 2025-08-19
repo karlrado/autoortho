@@ -262,7 +262,7 @@ class Getter(object):
         self.localdata.idx = idx
         while self.WORKING:
             try:
-                obj, args, kwargs = self.queue.get(timeout=30)
+                obj, args, kwargs = self.queue.get(timeout=5)
                 #log.debug(f"Got: {obj} {args} {kwargs}")
             except Empty:
                 #log.debug(f"timeout, continue")

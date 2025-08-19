@@ -5,6 +5,7 @@ import sys
 import pathlib
 import platform
 import threading
+import time
 import traceback
 import logging
 from packaging import version
@@ -236,6 +237,7 @@ class ConfigUI(QMainWindow):
         # Download management
         self.download_workers = {}
         self.download_progress = {}
+        self.uninstall_workers = {}
 
         # Setup UI
         self.init_ui()
@@ -1201,11 +1203,18 @@ class ConfigUI(QMainWindow):
                 info_label.setStyleSheet("color: #BBB;")
                 item_layout.addWidget(info_label)
 
-                # Progress bar (hidden initially)
-                progress_bar = QProgressBar()
-                progress_bar.setVisible(False)
-                progress_bar.setObjectName(f"progress-{r.region_id}")
-                item_layout.addWidget(progress_bar)
+                # Progress bars (hidden initially)
+                progress_current = QProgressBar()
+                progress_current.setVisible(False)
+                progress_current.setObjectName(f"progress-current-{r.region_id}")
+                progress_current.setToolTip("Current file download progress")
+                item_layout.addWidget(progress_current)
+
+                progress_overall = QProgressBar()
+                progress_overall.setVisible(False)
+                progress_overall.setObjectName(f"progress-overall-{r.region_id}")
+                progress_overall.setToolTip("Overall download progress across all files")
+                item_layout.addWidget(progress_overall)
 
                 # Install button
                 install_btn = StyledButton("Install", primary=True)
@@ -1269,6 +1278,9 @@ class ConfigUI(QMainWindow):
         worker = SceneryUninstallWorker(self.dl, region_id)
         worker.finished.connect(self.on_uninstall_finished)
         worker.error.connect(self.on_uninstall_error)
+        # Keep a strong reference so the thread isn't GC'd while running
+        worker.setParent(self)
+        self.uninstall_workers[region_id] = worker
         worker.start()
 
     def validate_max_zoom_near_airports(self):
@@ -1425,14 +1437,17 @@ class ConfigUI(QMainWindow):
     def on_install_scenery(self, region_id):
         """Handle scenery installation"""
         button = self.findChild(QPushButton, f"scenery-{region_id}")
-        progress_bar = self.findChild(QProgressBar, f"progress-{region_id}")
+        progress_current = self.findChild(QProgressBar, f"progress-current-{region_id}")
+        progress_overall = self.findChild(QProgressBar, f"progress-overall-{region_id}")
 
         if button:
             button.setEnabled(False)
-            button.setText("Working...")
+            button.setText("Downloading...")
 
-        if progress_bar:
-            progress_bar.setVisible(True)
+        if progress_current:
+            progress_current.setVisible(True)
+        if progress_overall:
+            progress_overall.setVisible(True)
 
         # Create worker thread
         worker = SceneryDownloadWorker(
@@ -1465,36 +1480,94 @@ class ConfigUI(QMainWindow):
             button.setText("Uninstall")
 
         # Clean up worker
+        if region_id in self.uninstall_workers:
+            try:
+                self.uninstall_workers[region_id].wait()
+                self.uninstall_workers[region_id].deleteLater()
+            except Exception:
+                pass
+            del self.uninstall_workers[region_id]
         if region_id in self.download_workers:
             del self.download_workers[region_id]
 
 
     def on_download_progress(self, region_id, progress_data):
         """Update download progress"""
-        progress_bar = self.findChild(QProgressBar, f"progress-{region_id}")
-        if progress_bar:
+        # Throttle UI updates to avoid freezing
+        if not hasattr(self, '_last_ui_progress'):
+            self._last_ui_progress = {}
+        last = self._last_ui_progress.get(region_id, 0)
+        now = time.time()
+        if now - last < 0.1:
+            return
+        self._last_ui_progress[region_id] = now
+
+        progress_current = self.findChild(QProgressBar, f"progress-current-{region_id}")
+        progress_overall = self.findChild(QProgressBar, f"progress-overall-{region_id}")
+
+        stage = progress_data.get('stage')
+        if stage == 'verify':
+            # Switch to verification mode: show a single bar (overall), hide current
+            if progress_current:
+                progress_current.setVisible(False)
+            if progress_overall:
+                progress_overall.setVisible(True)
+                progress_overall.setValue(int(progress_data.get('verify_pcnt', 0)))
+            # Also change button text while verifying
+            button = self.findChild(QPushButton, f"scenery-{region_id}")
+            if button:
+                button.setText("Verifying...")
+            # Update status with verification state
+            status = progress_data.get('status', 'Verifying...')
+            self.update_status_bar(f"{region_id}: {status}")
+            return
+        else:
             pcnt_done = progress_data.get('pcnt_done', 0)
-            progress_bar.setValue(int(pcnt_done))
+            overall_pcnt = progress_data.get('overall_pcnt')
+            files_done = progress_data.get('files_done')
+            files_total = progress_data.get('files_total')
+
+            if progress_current is not None:
+                progress_current.setVisible(True)
+                progress_current.setValue(int(pcnt_done))
+
+            if progress_overall is not None:
+                if overall_pcnt is None and files_done is not None and files_total:
+                    try:
+                        overall_pcnt = (float(files_done) / float(files_total)) * 100.0
+                    except Exception:
+                        overall_pcnt = 0
+                if overall_pcnt is None:
+                    overall_pcnt = 0
+                progress_overall.setVisible(True)
+                progress_overall.setValue(int(overall_pcnt))
 
         status = progress_data.get('status', 'Downloading...')
         MBps = progress_data.get('MBps', 0)
-        if pcnt_done > 0:
-            self.update_status_bar(
-                f"{region_id}: {pcnt_done:.1f}% ({MBps:.1f} MB/s)"
-            )
-        else:
+        try:
+            if pcnt_done > 0:
+                self.update_status_bar(
+                    f"{region_id}: {pcnt_done:.1f}% ({MBps:.1f} MB/s)"
+                )
+            else:
+                self.update_status_bar(f"{region_id}: {status}")
+        except UnboundLocalError:
+            # If pcnt_done wasn't defined (e.g., stage mismatch), fall back to status
             self.update_status_bar(f"{region_id}: {status}")
 
     def on_download_finished(self, region_id, success):
         """Handle download completion"""
         button = self.findChild(QPushButton, f"scenery-{region_id}")
-        progress_bar = self.findChild(QProgressBar, f"progress-{region_id}")
+        progress_current = self.findChild(QProgressBar, f"progress-current-{region_id}")
+        progress_overall = self.findChild(QProgressBar, f"progress-overall-{region_id}")
 
         if success:
             if button:
                 button.setVisible(False)
-            if progress_bar:
-                progress_bar.setVisible(False)
+            if progress_current:
+                progress_current.setVisible(False)
+            if progress_overall:
+                progress_overall.setVisible(False)
             self.update_status_bar(f"Successfully installed {region_id}")
             # Refresh the scenery list
             self.refresh_scenery_list()
@@ -1502,8 +1575,10 @@ class ConfigUI(QMainWindow):
             if button:
                 button.setText("Retry?")
                 button.setEnabled(True)
-            if progress_bar:
-                progress_bar.setVisible(False)
+            if progress_current:
+                progress_current.setVisible(False)
+            if progress_overall:
+                progress_overall.setVisible(False)
             self.update_status_bar(f"Failed to install {region_id}")
 
         # Clean up worker
@@ -1838,6 +1913,11 @@ class ConfigUI(QMainWindow):
         for worker in self.download_workers.values():
             worker.terminate()
             worker.wait()
+        # Stop all uninstall workers
+        for worker in self.uninstall_workers.values():
+            worker.terminate()
+            worker.wait()
+        self.uninstall_workers.clear()
         # Clean up background mount processes
         if hasattr(self, 'unmount_sceneries'):
             self.unmount_sceneries()
