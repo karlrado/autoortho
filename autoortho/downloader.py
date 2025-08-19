@@ -598,6 +598,7 @@ class Release(object):
         # Verify and install all packages in parallel
         if not self.verify_and_install_all(progress_callback):
             log.error(f"Verification/Install failed for {self.name}")
+            self.downloaded = False
             return False
         self.save()
         self.installed = True
