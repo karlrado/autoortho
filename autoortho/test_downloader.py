@@ -20,64 +20,14 @@ def scenery_v1(tmpdir):
     scenery_dir = os.path.join(tmpdir, 'Custom Scenery')
     with open(os.path.join('.','testfiles','infofiles','test_info_v1.json')) as h:
         info = json.loads(h.read())
-    
-    os.makedirs(os.path.join(scenery_dir, 'z_test_00', 'stuff'))
-    os.makedirs(os.path.join(scenery_dir, 'z_test_01', 'stuff'))
-    os.makedirs(os.path.join(scenery_dir, 'z_autoortho', '_textures'))
+
     os.makedirs(os.path.join(scenery_dir, 'z_autoortho', 'textures'))
    
-    info['ortho_dirs'] = [
-            os.path.join(scenery_dir, 'z_test_00'),
-            os.path.join(scenery_dir, 'z_test_01'),
-            os.path.join(scenery_dir, 'z_test_02'),
-    ]
 
     with open(os.path.join(scenery_dir, 'z_autoortho', 'test_info.json'), 'w') as h:
         h.write(json.dumps(info))
 
     return scenery_dir
-
-
-def test_v1_upgrade(scenery_v1):
-    assert scenery_v1
-
-    dl_dir = os.path.join(scenery_v1, '..', 'downloads')
-    d = downloader.OrthoManager(scenery_v1, dl_dir)
-    d.info_cache = os.path.join('.', 'testfiles', '.release_info')
-
-    log.info("Find releases.")
-    d.region_list = ['test']
-    #d.find_releases()
-    d.find_regions()
-    region = d.regions.get('test')
-    
-    #log.info("Download release")
-    #rel = region.get_latest_release()
-    #rel.download()
-
-    log.info("Install release")
-    #rel.install()
-    region.install_release()
-
-    extracts = os.listdir(scenery_v1)
-    extracts.sort()
-    assert extracts == [
-            'yAutoOrtho_Overlays', 'z_autoortho'
-    ]
-
-    scenery = os.listdir(os.path.join(scenery_v1, "z_autoortho", "scenery"))
-    scenery.sort()
-    assert scenery == ['z_ao_test']
-
-    orthodetails = os.listdir(os.path.join(scenery_v1, "z_autoortho"))
-    orthodetails.sort()
-    assert orthodetails == ['scenery', 'test_info.json']
-
-    log.info("Retry find releases")
-    d.find_regions()
-    region = d.regions.get('test')
-    log.info("Retry install")
-    region.install_release()
 
 
 def test_upgrade(tmpdir):

@@ -10,7 +10,6 @@ import tempfile
 import platform
 import argparse
 import threading
-import importlib
 
 from pathlib import Path
 from contextlib import contextmanager
@@ -18,7 +17,7 @@ from contextlib import contextmanager
 import aoconfig
 import aostats
 import winsetup
-import config_ui
+import macsetup
 import flighttrack
 
 from version import __version__
@@ -27,6 +26,15 @@ import logging
 log = logging.getLogger(__name__)
 
 import geocoder
+
+# Import PyQt6 modules
+try:
+    from PyQt6.QtWidgets import QApplication
+    import config_ui_qt as config_ui
+    USE_QT = True
+except ImportError:
+    import config_ui
+    USE_QT = False
 
 class MountError(Exception):
     pass
@@ -62,6 +70,11 @@ def setupmount(mountpoint, systemtype):
 
     elif systemtype == "winfsp-FUSE":
         ret = winsetup.setup_winfsp_mount(mountpoint)
+        if not ret:
+            raise MountError(f"Failed to setup mount point {mountpoint}!")
+
+    elif systemtype == "mac-FUSE":
+        ret = macsetup.setup_macfuse_mount(mountpoint)
         if not ret:
             raise MountError(f"Failed to setup mount point {mountpoint}!")
 
@@ -144,7 +157,7 @@ def diagnose(CFG):
     if failed:
         log.warning("***************")
         log.warning("***************")
-        log.warning("FAILURES DETECTED!!")  
+        log.warning("FAILURES DETECTED!!")
         log.warning("Please review logs and setup.")
         log.warning("***************")
         log.warning("***************")
@@ -163,6 +176,8 @@ class AOMount:
         self.cfg = cfg
         self.mount_threads = []
 
+
+
     def mount_sceneries(self, blocking=True):
         if not self.cfg.scenery_mounts:
             log.warning(f"No installed sceneries detected.  Exiting.")
@@ -174,14 +189,14 @@ class AOMount:
                 target=self.domount,
                 daemon=False,
                 args=(
-                    scenery.get('root'), 
-                    scenery.get('mount'), 
+                    scenery.get('root'),
+                    scenery.get('mount'),
                     self.cfg.fuse.threading
                 )
             )
             t.start()
             self.mount_threads.append(t)
-        
+
         if not blocking:
             log.info("Running mounts in non-blocking mode.")
             time.sleep(1)
@@ -193,7 +208,7 @@ class AOMount:
                 raise(SystemExit)
 
             signal.signal(signal.SIGTERM, handle_sigterm)
-            
+
             time.sleep(1)
             # Check things out
             diagnose(self.cfg)
@@ -242,18 +257,31 @@ class AOMount:
                     from refuse import high
                     high._libfuse = ctypes.CDLL(libpath)
                     autoortho_fuse.run(
-                            autoortho_fuse.AutoOrtho(root), 
+                            autoortho_fuse.AutoOrtho(root),
+                            mount,
+                            nothreads
+                    )
+            elif platform.system() == 'Darwin':
+                systemtype, libpath = macsetup.find_mac_libs()
+                with setupmount(mountpoint, systemtype) as mount:
+                    log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
+                    import autoortho_fuse
+                    from refuse import high
+                    high._libfuse = ctypes.CDLL(libpath)
+                    autoortho_fuse.run(
+                            autoortho_fuse.AutoOrtho(root),
                             mount,
                             nothreads
                     )
             else:
+                # Linux
                 with setupmount(mountpoint, "Linux-FUSE") as mount:
                     log.info("Running in FUSE mode.")
                     log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
                     import autoortho_fuse
                     autoortho_fuse.run(
                             autoortho_fuse.AutoOrtho(root),
-                            mount, 
+                            mount,
                             nothreads
                     )
 
@@ -273,10 +301,18 @@ class AOMount:
             time.sleep(0.5)
 
 
-class AOMountUI(config_ui.ConfigUI, AOMount):
+class AOMountUI(AOMount, config_ui.ConfigUI):
     def __init__(self, *args, **kwargs):
-        self.mount_threads = []
-        super().__init__(*args, **kwargs)
+        AOMount.__init__(self, *args, **kwargs)
+        config_ui.ConfigUI.__init__(self, *args, **kwargs)
+    
+    def mount_sceneries(self, blocking=True):
+        """Mount sceneries using AOMount functionality"""
+        return AOMount.mount_sceneries(self, blocking)
+    
+    def unmount_sceneries(self):
+        """Unmount sceneries using AOMount functionality"""
+        return AOMount.unmount_sceneries(self)
 
 
 def main():
@@ -332,7 +368,7 @@ def main():
     # Start helper threads
     ftrack.start()
     stats.start()
-   
+
     # Run things
     if args.root and args.mountpoint:
         # Just mount specific requested dirs
@@ -342,8 +378,8 @@ def main():
         print("mountpoint:", mountpoint)
         aom = AOMount(CFG)
         aom.domount(
-            root, 
-            mountpoint, 
+            root,
+            mountpoint,
             CFG.fuse.threading
         )
     elif run_headless:
@@ -352,9 +388,15 @@ def main():
         aom.mount_sceneries()
     else:
         log.info("Running CFG UI")
-        cfgui = AOMountUI(CFG)
-        cfgui.setup()
-        
+        if USE_QT:
+            app = QApplication(sys.argv)
+            cfgui = AOMountUI(CFG)
+            cfgui.show()
+            app.exec()
+        else:
+            cfgui = AOMountUI(CFG)
+            cfgui.setup()
+
     stats.stop()
     flighttrack.ft.stop()
 

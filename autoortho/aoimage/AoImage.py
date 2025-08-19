@@ -146,9 +146,11 @@ def open(filename):
 
 # init code
 if platform.system().lower() == 'linux':
-    _aoi_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),'aoimage.so')
+    _aoi_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'aoimage.so')
 elif platform.system().lower() == 'windows':
-    _aoi_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),'aoimage.dll')
+    _aoi_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'aoimage.dll')
+elif platform.system().lower() == 'darwin':
+    _aoi_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'aoimage.dylib')
 else:
     log.error("System is not supported")
     exit()

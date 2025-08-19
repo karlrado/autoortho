@@ -35,13 +35,9 @@ class ConfigUI(object):
     window = None
     running = False
     ready = None
-    splash_w = None
-
     def __init__(self, cfg):
         self.ready = threading.Event()
         self.ready.clear()
-        
-        self.start_splash()
 
         self.cfg = cfg
         self.dl = downloader.OrthoManager(
@@ -65,17 +61,6 @@ class ConfigUI(object):
             self.icon_path =os.path.join(CUR_PATH, 'imgs', 'ao-icon.ico')
         else:
             self.icon_path =os.path.join(CUR_PATH, 'imgs', 'ao-icon.png')
-
-    def start_splash(self):
-        splash_path = os.path.join(CUR_PATH, 'imgs', 'splash.png')
-        self.splash_w = sg.Window(
-                'Window Title', [[sg.Image(splash_path, subsample=2)]], 
-                transparent_color=sg.theme_background_color(), no_titlebar=True,
-                keep_on_top=True, finalize=True
-        )
-        event, values = self.splash_w.read(timeout=100)
-        return
-
 
     def setup(self):
         scenery_path = self.cfg.paths.scenery_path

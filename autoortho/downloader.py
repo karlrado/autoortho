@@ -17,6 +17,7 @@ from urllib.request import urlopen, Request, urlretrieve, urlcleanup
 from urllib.error import URLError, HTTPError
 from datetime import datetime, timezone, timedelta
 from packaging import version
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 from aoconfig import CFG
@@ -171,7 +172,7 @@ class Package(object):
         #return(str(self.__dict__))
 
 
-    def download(self, progress_callback=None):
+    def download(self, progress_callback=None, progress_state=None):
         retries = 0
         if self.downloaded:
             log.info(f"Already downloaded.")
@@ -182,10 +183,21 @@ class Package(object):
 
         # Store progress callback for use in _show_progress
         self.progress_callback = progress_callback
+        self.progress_state = progress_state
+        self._last_progress_emit_ts = 0
+        self._last_progress_emit_pcnt = -1
 
         for url in self.remote_urls:
             if progress_callback:
-                progress_callback({'status': f"Downloading {url}", 'pcnt_done': 0, 'MBps': 0})
+                init_progress = {
+                    'status': f"Downloading {url}",
+                    'pcnt_done': 0,
+                    'MBps': 0,
+                }
+                if isinstance(self.progress_state, dict):
+                    init_progress['files_done'] = self.progress_state.get('files_done', 0)
+                    init_progress['files_total'] = self.progress_state.get('files_total', 0)
+                progress_callback(init_progress)
             else:
                 cur_activity['status'] = f"Downloading {url}"
 
@@ -198,7 +210,7 @@ class Package(object):
                 log.info("match!")
                 posible_destpath = os.path.join(self.download_dir, match.group(1))
 
-            #if os.path.isfile(self.zf.path):
+            # If the file is already present, count it as done for overall progress
             if os.path.isfile(destpath) or os.path.isfile(posible_destpath):
                 log.info(f"{destpath} already exists.  Skip.")
                 #print(f"{self.zf.path} already exists.  Skip.")
@@ -206,6 +218,23 @@ class Package(object):
                 #self.downloaded = True
                 #return
                 #continue
+                if isinstance(self.progress_state, dict):
+                    self.progress_state['files_done'] = self.progress_state.get('files_done', 0) + 1
+                    if self.progress_callback:
+                        files_total = self.progress_state.get('files_total', 0)
+                        files_done = self.progress_state.get('files_done', 0)
+                        overall_pcnt = 0
+                        if files_total:
+                            overall_pcnt = round((files_done / files_total) * 100, 2)
+                        self.progress_callback({
+                            'status': f"Downloaded {files_done}/{files_total}",
+                            'pcnt_done': 100,
+                            'MBps': 0,
+                            'overall_pcnt': overall_pcnt,
+                            'files_done': files_done,
+                            'files_total': files_total,
+                        })
+                continue
             else:
                 while retries < self.max_retries:
                     try:
@@ -219,6 +248,23 @@ class Package(object):
                             self._show_progress
                         )
                         log.info(f"DONE downloading {url}")
+                        # Update overall file progress after each file completes
+                        if isinstance(self.progress_state, dict):
+                            self.progress_state['files_done'] = self.progress_state.get('files_done', 0) + 1
+                            if self.progress_callback:
+                                files_total = self.progress_state.get('files_total', 0)
+                                files_done = self.progress_state.get('files_done', 0)
+                                overall_pcnt = 0
+                                if files_total:
+                                    overall_pcnt = round((files_done / files_total) * 100, 2)
+                                self.progress_callback({
+                                    'status': f"Downloaded {files_done}/{files_total}",
+                                    'pcnt_done': 100,
+                                    'MBps': 0,
+                                    'overall_pcnt': overall_pcnt,
+                                    'files_done': files_done,
+                                    'files_total': files_total,
+                                })
                         break
 
                     except (HTTPError, URLError) as e:
@@ -245,7 +291,7 @@ class Package(object):
 
     def _show_progress(self, block_num, block_size, total_size):
         total_fetched = block_num * block_size
-        pcnt_done = round(total_fetched / total_size *100,2)
+        pcnt_done = round(total_fetched / total_size * 100, 2)
         elapsed = time.time() - self.dl_start_time
         if not elapsed:
             return
@@ -254,17 +300,41 @@ class Package(object):
         progress_data = {
             'pcnt_done': pcnt_done,
             'MBps': MBps,
-            'status': f"Downloading {self.dl_url}\n{pcnt_done:.2f}%   {MBps:.2f} MBps"
+            'status': f"Downloading {self.dl_url}\n{pcnt_done:.2f}%   {MBps:.2f} MBps",
         }
+
+        # Compute overall progress across all files if progress_state is present
+        if isinstance(self.progress_state, dict) and total_size > 0:
+            files_total = self.progress_state.get('files_total', 0)
+            files_done = self.progress_state.get('files_done', 0)
+            if files_total:
+                overall = ((files_done + (total_fetched / total_size)) / files_total) * 100
+                progress_data['overall_pcnt'] = round(overall, 2)
+                progress_data['files_done'] = files_done
+                progress_data['files_total'] = files_total
         
-        if hasattr(self, 'progress_callback') and self.progress_callback:
-            self.progress_callback(progress_data)
-        else:
-            # Fallback to global cur_activity for backward compatibility
-            cur_activity.update(progress_data)
+        should_emit = False
+        now = time.time()
+        if self._last_progress_emit_ts == 0:
+            should_emit = True
+        elif abs(pcnt_done - self._last_progress_emit_pcnt) >= 1:
+            should_emit = True
+        elif now - self._last_progress_emit_ts >= 0.25:
+            should_emit = True
+
+        if should_emit:
+            self._last_progress_emit_ts = now
+            self._last_progress_emit_pcnt = pcnt_done
+            if hasattr(self, 'progress_callback') and self.progress_callback:
+                self.progress_callback(progress_data)
+            else:
+                # Fallback to global cur_activity for backward compatibility
+                cur_activity.update(progress_data)
             
-        if block_num % 1000 == 0:
-            print(f"\r{pcnt_done:.2f}%   {MBps:.2f} MBps", end='')
+        # Avoid spamming stdout when a UI progress callback is present
+        if not getattr(self, 'progress_callback', None):
+            if block_num % 1000 == 0:
+                print(f"\r{pcnt_done:.2f}%   {MBps:.2f} MBps", end='')
 
     def check(self):
         log.info(f"Checking {self.name}")
@@ -357,6 +427,7 @@ class Release(object):
         self.release_dict = release_dict if release_dict else {}
         self.packages = {}
         self.info_path = os.path.join(self.install_dir, "z_autoortho", f"{self.name}_info.json")
+        self.subfolder_dir = os.path.join(self.install_dir, "z_autoortho", "scenery", f"z_ao_{self.name}")
         self.ortho_dirs = []
         self.info_ver = "v2"
 
@@ -489,16 +560,22 @@ class Release(object):
         self.cleaned = False
         self.parse()
 
-        for k,v in self.packages.items():
+        # Calculate total files to download across all packages
+        total_files = 0
+        for pkg in self.packages.values():
+            total_files += len(pkg.remote_urls)
+        progress_state = {'files_total': total_files, 'files_done': 0}
+
+        for k, v in self.packages.items():
             log.info(f"Downloading {k}")
             #if v.check():
             #    log.info(f"Local file exists and is valid.")
             #    continue 
 
-            v.download(progress_callback)
+            v.download(progress_callback, progress_state)
             if not v.check():
                 log.warning(f"{k} failed checks.  Retrying ...")
-                v.download(progress_callback)
+                v.download(progress_callback, progress_state)
                 if not v.check():
                     log.error(f"{k} failed again.  Exiting!")
                     return False
@@ -506,7 +583,7 @@ class Release(object):
         self.downloaded = True
         return True
 
-    def install(self):
+    def install(self, progress_callback=None):
         if self.installed:
             log.info(f"Already installed {self.name}")
             return True
@@ -518,18 +595,81 @@ class Release(object):
                 v.uninstall()
 
         self.parse()
-        for k,v in self.packages.items():
-            log.info(f"Installing {k}")
-            if not v.check():
-                log.warning(f"{k} fails checks!")
-                self.downloaded = False
-                return False
-                #continue
-            v.install()
+        # Verify and install all packages in parallel
+        if not self.verify_and_install_all(progress_callback):
+            log.error(f"Verification/Install failed for {self.name}")
+            self.downloaded = False
+            return False
         self.save()
         self.installed = True
         self.cleanup()
         return True
+
+    def verify_and_install_all(self, progress_callback=None):
+        """Verify and install all packages in parallel.
+
+        Emits 'verify' stage progress where each completed unit is a
+        package that has been verified and installed.
+        """
+        packages_to_process = []
+        for pkg in self.packages.values():
+            if pkg.zf and (pkg.zf.hashfile or os.path.exists(pkg.zf.path)):
+                packages_to_process.append(pkg)
+            else:
+                # If no archive present, treat as failure
+                log.error(f"Missing archive for {pkg.name}")
+
+        total = len(packages_to_process)
+        if total == 0:
+            return True
+
+        done = 0
+        if progress_callback:
+            progress_callback({
+                'stage': 'verify',
+                'verify_done': done,
+                'verify_total': total,
+                'verify_pcnt': 0,
+                'status': 'Starting verification',
+            })
+
+        success = True
+        max_workers = min(4, total)
+
+        def verify_then_install(pkg: Package) -> bool:
+            if not pkg.check():
+                return False
+            try:
+                pkg.install()
+                return True
+            except Exception as err:
+                log.error(f"Install error for {pkg.name}: {err}")
+                return False
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_pkg = {executor.submit(verify_then_install, pkg): pkg for pkg in packages_to_process}
+            for future in as_completed(future_to_pkg):
+                ok = False
+                try:
+                    ok = future.result()
+                except Exception as err:
+                    log.error(f"Verify/Install error: {err}")
+                    ok = False
+                if not ok:
+                    success = False
+
+                done += 1
+                if progress_callback:
+                    pcnt = int((done / total) * 100)
+                    progress_callback({
+                        'stage': 'verify',
+                        'verify_done': done,
+                        'verify_total': total,
+                        'verify_pcnt': pcnt,
+                        'status': f'Verified & Installed {done}/{total}',
+                    })
+
+        return success
 
     def cleanup(self):
         if self.cleaned:
@@ -541,29 +681,26 @@ class Release(object):
         self.cleaned = True
 
 
-    def uninstall(self):
+    def uninstall(self) -> bool:
         #self.cleanup()
-        #log.info(f"Removing {self.install_dir}")
-        #shutil.rmtree(self.install_dir)
-        for o in self.ortho_dirs:
-            if os.path.exists(o):
-                log.info(f"Removing {o}")
-                shutil.rmtree(o)
 
-        legacy_dirs = [
-            os.path.join(self.install_dir, "z_autoortho", "textures"),
-            os.path.join(self.install_dir, "z_autoortho", "_textures")
-        ]
-        for l in legacy_dirs:
-            if os.path.exists(l):
-                shutil.rmtree(l)
+        try:
+            log.info(f"Removing {self.subfolder_dir}")
 
-        # for k,v in self.packages.items():
-        #     log.debug(v)
-        #     log.info(f"Uninstall package: {k}")
-        #     v.uninstall()
+            if os.path.exists(self.subfolder_dir):
+                log.info(f"Removing {self.subfolder_dir}")
+                shutil.rmtree(self.subfolder_dir)
 
-        self.installed = False
+            if os.path.exists(self.info_path):
+                log.info(f"Removing {self.info_path}")
+                os.remove(self.info_path)
+
+            log.info(f"Release {self.name} uninstalled.")
+            self.installed = False
+        except Exception as err:
+            log.error(f"Failed to uninstall {self.name}: {err}")
+            return False
+        return True
         #self.downloaded = False
 
 
@@ -635,7 +772,7 @@ class Region(object):
             return
         elif self.local_rel:
             log.info("Local release detected.  Uninstalling...")
-            self.local_rel.uninstall()
+            # self.local_rel.uninstall()
             self.releases.pop(self.local_rel.ver)
             self.local_rel = None
 
@@ -643,7 +780,7 @@ class Region(object):
             log.error(f"Failed to download release {rel}")
             return False
 
-        if not rel.install():
+        if not rel.install(progress_callback=progress_callback):
             log.error(f"Failed to install release {rel}")
             return False
 
@@ -705,6 +842,7 @@ class OrthoManager(object):
         return data
 
     def find_regions(self):
+        self.regions = {}
         log.info(f"Looking for available regions ...")
         
         rel_data = self._get_release_data()

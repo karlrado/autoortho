@@ -53,12 +53,12 @@ debug = False
 
 [paths]
 # X-Plane install path
-xplane_path = 
+xplane_path =
 # Scenery install path (X-Plane Custom Scenery or other.)
 scenery_path =
 # Directory where satellite images are cached
 cache_dir = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "cache")}
-# Set directory for temporary downloading of scenery and other support files 
+# Set directory for temporary downloading of scenery and other support files
 download_dir = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "downloads")}
 # Changing log_file dir is currently not supported
 log_file = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "logs", "autoortho.log")}
@@ -68,12 +68,19 @@ log_file = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "logs", "au
 maptype_override =
 # Minimum zoom level to allow.  THIS WILL NOT INCREASE THE MAX QUALITY OF SATELLITE IMAGERY
 min_zoom = 12
+# Maximum zoom level to allow.  Higher values = more detail but larger downloads and more VRAM usage.
+# Optimal: 16 for most cases. Keep in mind that every extra ZL increases VRAM and potential network usage by 4x.
+max_zoom = 16
+# Maximum zoom level to allow near airports. Zoom level around airports used by default is 18.
+max_zoom_near_airports = 18
 # Max time to wait for images.  Higher numbers mean better quality, but more
 # stutters.  Lower numbers will be more responsive at the expense of
 # ocassional low quality tiles.
-maxwait = 5
-maptypes = ['Null', 'BI', 'GO2','NAIP', 'EOX', 'USGS', 'Firefly']
-fetch_threads = 32 
+maxwait = 0.5
+maptypes = ['Null', 'BI', 'NAIP', 'EOX', 'USGS', 'Firefly']
+fetch_threads = 32
+# Simheaven compatibility mode.
+simheaven_compat = False
 
 [pydds]
 # ISPC or STB for dds file compression
@@ -91,16 +98,19 @@ threading = True
 
 [flightdata]
 # Local port for map and stats
-webui_port = 5000 
+webui_port = 5000
 # UDP port XPlane listens on
 xplane_udp_port = 49000
 
 [cache]
 # Max size of the image disk cache in GB. Minimum of 10GB
 file_cache_size = 30
-
+# Max size of memory cache in GB. Minimum of 2GB.
+cache_mem_limit = 4
 # Max size of memory cache in GB. Minimmum of 2GB.
 cache_mem_limit = 4
+# Auto clean cache on AutoOrtho exit
+auto_clean_cache = False
 
 [windows]
 prefer_winfsp = True
@@ -121,13 +131,13 @@ prefer_winfsp = True
     def load(self):
         self.config.read_string(self._defaults)
         if os.path.isfile(self.conf_file):
-            print(f"Config file found {self.conf_file} reading...") 
-            log.info(f"Config file found {self.conf_file} reading...") 
+            print(f"Config file found {self.conf_file} reading...")
+            log.info(f"Config file found {self.conf_file} reading...")
             self.config.read(self.conf_file)
         else:
             print("No config file found. Using defaults...")
             log.info("No config file found. Using defaults...")
-        
+
         self.get_config()
         return True
 
@@ -145,7 +155,7 @@ prefer_winfsp = True
                 "z_autoortho",
                 "scenery"
         )
-      
+
         self.xplane_custom_scenery_path = os.path.abspath(os.path.join(
                 self.paths.xplane_path,
                 "Custom Scenery"
@@ -162,7 +172,7 @@ prefer_winfsp = True
         } for s in sceneries]
         print(self.scenery_mounts)
 
-        
+
         if not os.path.exists(self.ao_scenery_path):
             log.info(f"Creating dir {self.ao_scenery_path}")
             os.makedirs(self.ao_scenery_path)
@@ -172,7 +182,7 @@ prefer_winfsp = True
     def save(self):
         print("Saving config ... ")
         self.set_config()
-        
+
         with open(self.conf_file, 'w') as h:
             self.config.write(h)
         log.info(f"Wrote config file: {self.conf_file}")

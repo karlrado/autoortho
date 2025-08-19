@@ -1,0 +1,31 @@
+.SUFFIXES: .obj
+
+TARGET=main
+JPGT=/opt/homebrew/opt/jpeg-turbo
+
+HEADERS=$(wildcard *.h)
+OBJECTS=aoimage.o
+
+CC=clang
+LD=clang
+
+CFLAGS+=-O2 -Wall -fPIC -fdiagnostics-color -fvisibility=hidden \
+	-I$(JPGT)/include $(DEFINES)
+
+LDFLAGS=-dynamiclib -install_name @rpath/aoimage.dylib -undefined dynamic_lookup
+LIBS=-L$(JPGT)/lib -lturbojpeg
+
+all: $(TARGET)
+
+.c.o: $(HEADERS)
+	$(CC) $(CFLAGS) -c $<
+
+main: main.c aoimage.dylib $(HEADERS)
+	$(CC) $(CFLAGS) -o main \
+		main.c aoimage.c $(LIBS)
+
+aoimage.dylib: $(OBJECTS)
+	$(LD) -o aoimage.dylib $(LDFLAGS) $(OBJECTS) $(LIBS)
+
+clean:
+	rm -f $(OBJECTS) $(TARGET) aoimage.dylib

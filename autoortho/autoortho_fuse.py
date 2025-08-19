@@ -126,6 +126,130 @@ class AutoOrtho(Operations):
         full_path = self._full_path(path)
         return os.chown(full_path, uid, gid)
 
+    def _calculate_dds_size(self, row, col, maptype, zoom):
+        """Calculate the actual DDS file size based on tile parameters and current configuration."""
+        try:
+            # Convert parameters to the format expected by the tile system
+            row = int(row)
+            col = int(col)
+            zoom = int(zoom)
+            
+            # Replicate the max_zoom selection logic from TileCacher
+            if getortho.USING_KUBILUS_MESH:
+                uncapped_zoom = self.tc.target_zoom_level_near_airports if zoom == 18 else self.tc.target_zoom_level
+            else:
+                uncapped_zoom = self.tc.target_zoom_level_near_airports if zoom == 19 else self.tc.target_zoom_level
+
+            max_zoom = min(zoom + 1,uncapped_zoom)
+            
+            min_zoom = self.tc.min_zoom
+            
+            # Replicate tile dimension calculation logic from Tile.__init__
+            width = 16  # Default tile width in chunks
+            height = 16  # Default tile height in chunks
+            
+            tilezoom_diff = zoom - int(max_zoom)
+            
+            if tilezoom_diff >= 0:
+                chunks_per_row = width >> tilezoom_diff
+                chunks_per_col = height >> tilezoom_diff
+            else:
+                chunks_per_row = width << (-tilezoom_diff)
+                chunks_per_col = height << (-tilezoom_diff)
+            
+            # Calculate DDS dimensions in pixels
+            dds_width = chunks_per_row * 256
+            dds_height = chunks_per_col * 256
+            
+            # Replicate DDS size calculation logic from pydds.DDS.__init__
+            if CFG.pydds.format == 'BC3':
+                blocksize = 16
+            else:
+                blocksize = 8
+            
+            # Calculate total size including all mipmaps
+            curbytes = 128  # DDS header size
+            current_width = dds_width
+            current_height = dds_height
+            
+            while (current_width >= 1) and (current_height >= 1):
+                mipmap_size = max(1, (current_width * current_height >> 4)) * blocksize
+                curbytes += mipmap_size
+                current_width = current_width >> 1
+                current_height = current_height >> 1
+            
+            log.debug(f"Calculated DDS size for {row}_{col}_{maptype}_{zoom}: {curbytes} bytes "
+                     f"(dimensions: {dds_width}x{dds_height}, max_zoom: {max_zoom}, tilezoom_diff: {tilezoom_diff})")
+            
+            return curbytes
+            
+        except Exception as e:
+            log.warning(f"Failed to calculate DDS size for {row}_{col}_{maptype}_{zoom}: {e}, using fallback")
+            # Fallback to hardcoded values if calculation fails
+            if CFG.pydds.format == "BC1":
+                return 11184952
+            else:
+                return 22369776
+
+    def _compute_texture_size(self, tile_zl, target_zl):
+        """Compute the texture size for LOAD_CENTER based on tile vs target zoom level.
+
+        Base size is 4096 when target_zl == tile_zl. For each level higher than tile_zl,
+        size doubles; for each level lower, size halves.
+        """
+        try:
+            base_size = 4096
+            delta = int(target_zl) - int(tile_zl)
+            if delta >= 0:
+                size = base_size << delta
+            else:
+                size = base_size >> (-delta)
+            return max(1, int(size))
+        except Exception:
+            return 4096
+
+    def _update_ter_file_for_dds(self, dds_path, tile_zl, target_zl):
+        """Update the matching .ter file's LOAD_CENTER last value to reflect real texture size.
+
+        The .ter file is assumed to have the same base name as the .dds and reside under /terrain.
+        """
+        try:
+            # Build .ter relative and absolute paths
+            dds_base = os.path.splitext(os.path.basename(dds_path))[0]
+            ter_rel = f"/terrain/{dds_base}.ter"
+            ter_full = self._full_path(ter_rel)
+
+            if not os.path.exists(ter_full):
+                log.debug(f"TER update skipped, file not found: {ter_full}")
+                return
+
+            # Read original content
+            with open(ter_full, 'r', encoding='utf-8', errors='ignore', newline='') as f:
+                content = f.read()
+
+            # Determine new texture size
+            new_size = self._compute_texture_size(tile_zl, target_zl)
+
+            # Replace LOAD_CENTER's last integer with new_size (first occurrence)
+            pattern = re.compile(r"^(LOAD_CENTER\s+)([-+]?\d+(?:\.\d+)?)\s+([-+]?\d+(?:\.\d+)?)\s+([-+]?\d+(?:\.\d+)?)\s+(\d+)\s*$", re.MULTILINE)
+
+            def repl(m):
+                prefix, lat, lon, alt, size = m.groups()
+                if size == str(new_size):
+                    return m.group(0)
+                return f"{prefix}{lat} {lon} {alt} {new_size}"
+
+            new_content, n = pattern.subn(repl, content, count=1)
+
+            if n > 0 and new_content != content:
+                with open(ter_full, 'w', encoding='utf-8', newline='') as f:
+                    f.write(new_content)
+                log.debug(f"Updated LOAD_CENTER texture size in {ter_full} to {new_size}")
+            else:
+                log.debug(f"No LOAD_CENTER update needed for {ter_full}!  This should not happen.")
+        except Exception as e:
+            log.warning(f"Failed to update .ter file for {dds_path}: {e}")
+
     @lru_cache(maxsize=1024)
     def getattr(self, path, fh=None):
         log.debug(f"GETATTR {path}")
@@ -143,14 +267,11 @@ class AutoOrtho(Operations):
                 flighttrack.ft.start()
                 self.startup = False
 
-            #row, col, maptype, zoom = m.groups()
-            #log.debug(f"GETATTR: Fetch for {path}: %s" % str(m.groups()))
+            row, col, maptype, zoom = m.groups()
+            log.debug(f"GETATTR: Fetch for {path}: %s" % str(m.groups()))
 
-            if CFG.pydds.format == "BC1":
-                dds_size = 11184952
-            else:
-                #dds_size = 22369744
-                dds_size = 22369776
+            # Calculate dynamic DDS size based on actual tile parameters
+            dds_size = self._calculate_dds_size(row, col, maptype, zoom)
 
             attrs = {
                 'st_atime': 1649857250.382081, 
@@ -291,6 +412,13 @@ class AutoOrtho(Operations):
             return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
                 'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
                 'f_frsize', 'f_namemax'))
+        elif platform.system() == 'Darwin':
+            # macOS support
+            stv = os.statvfs(full_path)
+            #log.info(stv)
+            return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
+                'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
+                'f_frsize'))  # f_namemax not available on macOS
 
     def unlink(self, path):
         return os.unlink(self._full_path(path))
@@ -335,12 +463,23 @@ class AutoOrtho(Operations):
             row = int(row)
             col = int(col)
             zoom = int(zoom)
-            t = self.tc._open_tile(row, col, maptype, zoom) 
+            t = self.tc._open_tile(row, col, maptype, zoom)
+
+            # After opening the tile, update the matching .ter file's LOAD_CENTER size
+            try:
+                target_zl = getattr(t, 'max_zoom', zoom)
+                if target_zl != zoom:
+                    self._update_ter_file_for_dds(path, zoom, target_zl)
+                else:
+                    log.debug(f"TER update skipped for {path}: max zoom is already tile zoom")
+            except Exception as _err:
+                log.debug(f"TER update skipped for {path}: {_err}")
         elif platform.system() == 'Windows':
             h = os.open(full_path, flags|os.O_BINARY)
         elif path.endswith('AOISWORKING'):
             return h
         else:
+            # For macOS, Linux, and other Unix-like systems
             h = os.open(full_path, flags)
 
         log.debug(f"OPEN: FH= {h}")

@@ -7,9 +7,11 @@ import math
 import tempfile
 import platform
 import threading
+import concurrent.futures
 
 import subprocess
 import collections
+import uuid
 
 from io import BytesIO
 from urllib.request import urlopen, Request
@@ -31,6 +33,7 @@ MEMTRACE = False
 import logging
 log = logging.getLogger(__name__)
 
+import tracemalloc
 #from memory_profiler import profile
 
 
@@ -38,6 +41,140 @@ log = logging.getLogger(__name__)
 tile_stats = StatTracker(20, 12)
 mm_stats = StatTracker(0, 5)
 partial_stats = StatTracker()
+
+USING_KUBILUS_MESH = True
+
+class BandwidthLimiter:
+    """
+    Thread-safe bandwidth limiter using token bucket algorithm.
+    Provides smooth rate limiting across multiple download threads.
+    """
+    
+    def __init__(self, max_mbits_per_sec=0):
+        """
+        Initialize bandwidth limiter.
+        
+        Args:
+            max_mbits_per_sec (float): Maximum bandwidth in megabits per second.
+                                      0 means unlimited bandwidth.
+        """
+        self.max_mbits_per_sec = max_mbits_per_sec
+        self.max_bytes_per_sec = (max_mbits_per_sec * 1_000_000) // 8 if max_mbits_per_sec > 0 else 0
+        self.tokens = self.max_bytes_per_sec
+        self.last_update = time.time()
+        self.lock = threading.RLock()
+        self.total_bytes_downloaded = 0
+        self.window_start = time.time()
+        
+        log.info(f"BandwidthLimiter initialized: {max_mbits_per_sec} Mbits/s "
+                f"({self.max_bytes_per_sec} bytes/s)")
+    
+    def set_limit(self, max_mbits_per_sec):
+        """Update bandwidth limit dynamically."""
+        with self.lock:
+            self.max_mbits_per_sec = max_mbits_per_sec
+            self.max_bytes_per_sec = (max_mbits_per_sec * 1_000_000) // 8 if max_mbits_per_sec > 0 else 0
+            self.tokens = min(self.tokens, self.max_bytes_per_sec)
+            log.info(f"BandwidthLimiter limit updated: {max_mbits_per_sec} Mbits/s")
+    
+    def acquire_tokens(self, bytes_needed):
+        """
+        Acquire tokens for downloading bytes_needed amount of data.
+        Returns the delay (in seconds) that should be applied before the download.
+        
+        Args:
+            bytes_needed (int): Number of bytes that will be downloaded
+            
+        Returns:
+            float: Delay in seconds (0 if no delay needed)
+        """
+        if self.max_bytes_per_sec == 0:  # Unlimited bandwidth
+            return 0.0
+            
+        if bytes_needed <= 0:
+            return 0.0
+        
+        with self.lock:
+            now = time.time()
+            
+            # Refill tokens based on elapsed time
+            elapsed = now - self.last_update
+            if elapsed > 0:
+                tokens_to_add = elapsed * self.max_bytes_per_sec
+                self.tokens = min(self.max_bytes_per_sec, self.tokens + tokens_to_add)
+                self.last_update = now
+            
+            if self.tokens >= bytes_needed:
+                # We have enough tokens, consume them immediately
+                self.tokens -= bytes_needed
+                return 0.0
+            else:
+                # Not enough tokens, calculate delay needed
+                deficit = bytes_needed - self.tokens
+                delay = deficit / self.max_bytes_per_sec
+                
+                # Consume all available tokens
+                self.tokens = 0
+                
+                # Cap delay to reasonable maximum to prevent excessive blocking
+                delay = min(delay, 30.0)  # Max 30 second delay
+                
+                return delay
+    
+    def record_bytes(self, bytes_downloaded):
+        """
+        Record actual bytes downloaded for statistics.
+        
+        Args:
+            bytes_downloaded (int): Actual number of bytes downloaded
+        """
+        if bytes_downloaded <= 0:
+            return
+            
+        with self.lock:
+            self.total_bytes_downloaded += bytes_downloaded
+            
+            # Update statistics
+            now = time.time()
+            window_duration = now - self.window_start
+            
+            # Reset statistics window every 60 seconds
+            if window_duration >= 60.0:
+                if window_duration > 0:
+                    actual_mbits_per_sec = (self.total_bytes_downloaded * 8) / (window_duration * 1_000_000)
+                    set_stat('bandwidth_usage_mbits', round(actual_mbits_per_sec, 2))
+                    set_stat('bandwidth_limit_mbits', self.max_mbits_per_sec)
+                    
+                    log.debug(f"Bandwidth usage: {actual_mbits_per_sec:.2f} Mbits/s "
+                             f"(limit: {self.max_mbits_per_sec} Mbits/s)")
+                
+                # Reset window
+                self.total_bytes_downloaded = 0
+                self.window_start = now
+    
+    def get_current_usage(self):
+        """
+        Get current bandwidth usage statistics.
+        
+        Returns:
+            dict: Dictionary with current usage info
+        """
+        with self.lock:
+            now = time.time()
+            window_duration = now - self.window_start
+            
+            if window_duration > 0:
+                current_mbits_per_sec = (self.total_bytes_downloaded * 8) / (window_duration * 1_000_000)
+            else:
+                current_mbits_per_sec = 0.0
+                
+            return {
+                'current_mbits_per_sec': round(current_mbits_per_sec, 2),
+                'limit_mbits_per_sec': self.max_mbits_per_sec,
+                'tokens_available': self.tokens,
+                'max_tokens': self.max_bytes_per_sec
+            }
+
 
 def _is_jpeg(dataheader):
     # FFD8FF identifies image as a JPEG
@@ -91,6 +228,7 @@ class Getter(object):
         )
         self.session.mount('https://', adapter)
         self.session.mount('http://', adapter)
+        
 
         for i in range(num_workers):
             t = threading.Thread(target=self.worker, args=(i,), daemon=True)
@@ -110,12 +248,21 @@ class Getter(object):
         if stat_thread is not None:
             stat_thread.join()
 
+    def update_bandwidth_limit(self, max_mbits_per_sec):
+        """Update bandwidth limit dynamically without restarting"""
+        raise NotImplementedError
+        #if hasattr(self, 'bandwidth_limiter'):
+        #    self.bandwidth_limiter.set_limit(max_mbits_per_sec)
+        #    log.info(f"Updated bandwidth limit to {max_mbits_per_sec} Mbits/s")
+        #else:
+        #    log.warning("Bandwidth limiter not initialized, cannot update limit")
+
     def worker(self, idx):
         global STATS
         self.localdata.idx = idx
         while self.WORKING:
             try:
-                obj, args, kwargs = self.queue.get(timeout=30)
+                obj, args, kwargs = self.queue.get(timeout=5)
                 #log.debug(f"Got: {obj} {args} {kwargs}")
             except Empty:
                 #log.debug(f"timeout, continue")
@@ -155,6 +302,7 @@ class ChunkGetter(Getter):
 
         kwargs['idx'] = self.localdata.idx
         kwargs['session'] = self.session
+        #kwargs['bandwidth_limiter'] = self.bandwidth_limiter
         #log.debug(f"{obj}, {args}, {kwargs}")
         return obj.get(*args, **kwargs)
 
@@ -212,6 +360,11 @@ class Chunk(object):
             self.maptype = "EOX"
 
         self.cache_path = os.path.join(self.cache_dir, f"{self.chunk_id}.jpg")
+        
+        # FIXED: Check cache during initialization and set ready if found
+        if self.get_cache():
+            self.ready.set()
+            log.debug(f"Chunk {self} initialized with cached data")
 
     def __lt__(self, other):
         return self.priority < other.priority
@@ -235,7 +388,7 @@ class Chunk(object):
             else:
                 log.info(f"Loading file {self} not a JPEG! {data[:3]} path: {self.cache_path}")
                 self.data = b''
-            #    return False
+                return False  # FIXED: Explicitly return False for corrupted cache
         else:
             inc_stat('chunk_miss')
             return False
@@ -244,14 +397,68 @@ class Chunk(object):
         if not self.data:
             return
 
-        # Temporarily use an invalid cache file name so that it cannot be
-        # found while it is being written.
-        temp_filename = os.path.join(self.cache_dir, f"XX_{self.chunk_id}.jpg")
-        with open(temp_filename, 'wb') as h:
-            h.write(self.data)
-        os.rename(temp_filename, self.cache_path)
+        # Ensure cache directory exists
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+        except Exception:
+            pass
 
-    def get(self, idx=0, session=requests):
+        # Unique temp filename per writer to avoid collisions between threads/tiles
+        temp_filename = os.path.join(self.cache_dir, f"XX_{self.chunk_id}_{uuid.uuid4().hex}.tmp")
+
+        # Write data to the unique temp file first
+        try:
+            with open(temp_filename, 'wb') as h:
+                h.write(self.data)
+        except Exception as e:
+            # Could not write temp file
+            try:
+                if os.path.exists(temp_filename):
+                    os.remove(temp_filename)
+            except Exception:
+                pass
+            log.warning(f"Failed to save cache for {self}: {e}")
+            return
+
+        # Try to move into place. On Windows this can fail if another thread wins the race.
+        # Strategy:
+        #  - If destination already exists, just remove our temp and return (another thread won)
+        #  - Otherwise, attempt os.rename with a few retries for transient WinError 32
+        max_attempts = 3
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                if os.path.exists(self.cache_path):
+                    # Another writer got there first; clean up our temp
+                    os.remove(temp_filename)
+                    log.debug(f"Cache file already exists for {self}, skipping save (race) on attempt {attempt}")
+                    return
+                os.rename(temp_filename, self.cache_path)
+                return
+            except FileExistsError:
+                # Destination appeared between exists check and rename
+                try:
+                    os.remove(temp_filename)
+                except Exception:
+                    pass
+                log.debug(f"Another thread saved cache for {self}, removed temp file")
+                return
+            except OSError as e:
+                # WinError 32: file in use; WinError 2: not found (should be rare with unique temp)
+                if attempt < max_attempts and getattr(e, 'winerror', None) in (32,):
+                    time.sleep(0.05 * attempt)
+                    continue
+                # Final failure: clean up temp and warn
+                try:
+                    if os.path.exists(temp_filename):
+                        os.remove(temp_filename)
+                except Exception:
+                    pass
+                log.warning(f"Failed to save cache for {self}: {e}")
+                return
+
+    def get(self, idx=0, session=requests, bandwidth_limiter=None):
         log.debug(f"Getting {self}") 
 
         if self.get_cache():
@@ -300,6 +507,15 @@ class Chunk(object):
 
         log.debug(f"Requesting {self.url} ..")
 
+        # Apply bandwidth limiting before download
+        if bandwidth_limiter:
+            # Estimate chunk size (typical image tiles are 10-50KB)
+            estimated_size = 25000  # 25KB average estimate
+            delay = bandwidth_limiter.acquire_tokens(estimated_size)
+            if delay > 0:
+                log.debug(f"Bandwidth limiting: delaying {delay:.2f}s for {self}")
+                time.sleep(delay)
+
         use_requests = True
         
         resp = 0
@@ -347,6 +563,11 @@ class Chunk(object):
                 self.data = b''
 
             inc_stat('bytes_dl', len(self.data))
+            
+            # Record actual bytes downloaded for bandwidth tracking
+            if bandwidth_limiter and self.data:
+                bandwidth_limiter.record_bytes(len(self.data))
+                
         except Exception as err:
             log.warning(f"Failed to get chunk {self} on server {server}. Err: {err} URL: {self.url}")
             return False
@@ -384,8 +605,7 @@ class Tile(object):
     min_zoom = 12
     width = 16
     height = 16
-
-    max_mipmap = 4
+    baseline_zl = 12
 
     priority = -1
     #tile_condition = None
@@ -399,15 +619,14 @@ class Tile(object):
     refs = None
 
     maxchunk_wait = float(CFG.autoortho.maxwait)
-    print("Max chunk wait: ", maxchunk_wait)
     imgs = None
 
     def __init__(self, col, row, maptype, zoom, min_zoom=0, priority=0,
-            cache_dir=None):
+            cache_dir=None, max_zoom=None):
         self.row = int(row)
         self.col = int(col)
         self.maptype = maptype
-        self.zoom = int(zoom)
+        self.tilename_zoom = int(zoom)
         self.chunks = {}
         self.cache_file = (-1, None)
         self.ready = threading.Event()
@@ -423,11 +642,18 @@ class Tile(object):
         if min_zoom:
             self.min_zoom = int(min_zoom)
 
+
         if cache_dir:
             self.cache_dir = cache_dir
         else:
             self.cache_dir = CFG.paths.cache_dir
-        
+
+
+        # Set max zoom level - if not specified, use original tile zoom (no capping)
+        self.max_zoom = int(max_zoom) if max_zoom is not None else self.tilename_zoom
+
+        self.max_mipmap = self.max_zoom - self.min_zoom
+
         # Hack override maptype
         #self.maptype = "BI"
 
@@ -447,16 +673,170 @@ class Tile(object):
         else:
             use_ispc=False
 
-        self.dds = pydds.DDS(self.width*256, self.height*256, ispc=use_ispc,
+        # TODO VRAM usage optimization only getting the max ZL of the zone instead of the default max zoom
+        # This is very time consuming while loading flight, left commented out for now
+        # self.actual_max_zoom = self._detect_available_max_zoom()
+        self.tilezoom_diff = self.tilename_zoom - self.max_zoom
+
+        if self.tilezoom_diff >= 0:
+
+            self.chunks_per_row = self.width >> self.tilezoom_diff
+            self.chunks_per_col = self.height >> self.tilezoom_diff
+        else:
+            self.chunks_per_row = self.width << (-self.tilezoom_diff)
+            self.chunks_per_col = self.height << (-self.tilezoom_diff)
+
+        self.chunks_per_row = max(1, self.chunks_per_row)
+        self.chunks_per_col = max(1, self.chunks_per_col)
+
+        dds_width = self.chunks_per_row * 256
+        dds_height = self.chunks_per_col * 256
+        log.debug(f"Creating DDS at original size: {dds_width}x{dds_height} (ZL{self.max_zoom})")
+            
+        self.dds = pydds.DDS(dds_width, dds_height, ispc=use_ispc,
                 dxt_format=CFG.pydds.format)
-        self.id = f"{row}_{col}_{maptype}_{zoom}"
+
+        self.id = f"{row}_{col}_{maptype}_{self.tilename_zoom}"
+
+    def _detect_available_max_zoom(self):
+        """
+        Detect the actual maximum zoom level available for this tile by testing
+        a representative sample of chunks at different zoom levels.
+        Returns the highest zoom level where ANY chunks are available.
+        OPTIMIZED: Only test cache first, minimal downloads for detection.
+        """
+        # Don't test beyond our target zoom level
+        test_max = self.max_zoom  # max_zoom is now the direct target, not calculated from tile zoom
+        
+        log.info(f"Fast zoom detection for tile '{self.tilename_zoom}' (testing up to target ZL{test_max})")
+        
+        # OPTIMIZATION: Test in descending order but only check cache first for speed
+        for test_zoom in range(test_max, self.min_zoom - 1, -1):
+            availability_count = self._test_zoom_availability_fast(test_zoom)
+            
+            # If ANY chunks are available at this zoom level, use it
+            if availability_count > 0.0:
+                log.info(f"Fast detected max available zoom: ZL{test_zoom} (cache availability: {availability_count:.1%})")
+                return test_zoom
+        
+        # If no cache hits, assume target zoom is available (will fallback during actual download)
+        log.info(f"No cache hits found, assuming target zoom ZL{test_max} is available")
+        return test_max
+
+    def _test_zoom_availability_fast(self, test_zoom):
+        """
+        FAST zoom availability test - only checks cache, no downloads.
+        Returns the fraction of cached chunks (0.0 to 1.0).
+        """
+        # Calculate chunk dimensions for this zoom level
+        zoom_diff = self.tilename_zoom - test_zoom
+        test_width = max(1, self.width >> zoom_diff)
+        test_height = max(1, self.height >> zoom_diff)
+        
+        # Calculate coordinates for this zoom level
+        test_col = self.col >> zoom_diff if zoom_diff >= 0 else self.col << (-zoom_diff)
+        test_row = self.row >> zoom_diff if zoom_diff >= 0 else self.row << (-zoom_diff)
+        
+        # Sample strategy: test corner chunks + center chunk for efficiency
+        sample_positions = [
+            (0, 0),                                    # Top-left
+            (test_width - 1, 0),                      # Top-right  
+            (0, test_height - 1),                     # Bottom-left
+            (test_width - 1, test_height - 1),       # Bottom-right
+            (test_width // 2, test_height // 2)       # Center
+        ]
+        
+        # Remove duplicate positions for small tiles
+        sample_positions = list(set(sample_positions))
+        
+        log.debug(f"Fast testing ZL{test_zoom}: {test_width}x{test_height} chunks, sampling {len(sample_positions)} positions (cache only)")
+        
+        successful = 0
+        total = len(sample_positions)
+        
+        for i, (offset_col, offset_row) in enumerate(sample_positions):
+            chunk_col = test_col + offset_col
+            chunk_row = test_row + offset_row
+            
+            # Only try cache (NO downloads for speed)
+            test_chunk = Chunk(chunk_col, chunk_row, self.maptype, test_zoom, cache_dir=self.cache_dir)
+            
+            if test_chunk.get_cache():
+                successful += 1
+                log.debug(f"Fast ZL{test_zoom} chunk {i+1}/{total}: CACHED ({chunk_col},{chunk_row})")
+            else:
+                log.debug(f"Fast ZL{test_zoom} chunk {i+1}/{total}: NOT CACHED ({chunk_col},{chunk_row})")
+            
+            test_chunk.close()
+        
+        availability_rate = successful / total
+        log.debug(f"Fast ZL{test_zoom} cache availability: {successful}/{total} = {availability_rate:.1%}")
+        
+        return availability_rate
+
+    def _test_zoom_availability(self, test_zoom):
+        """
+        Test availability of chunks at a specific zoom level by attempting
+        to download a representative sample.
+        Returns the fraction of successful chunks (0.0 to 1.0).
+        """
+        # Calculate chunk dimensions for this zoom level
+        zoom_diff = self.tilename_zoom - test_zoom
+        test_width = max(1, self.width >> zoom_diff)
+        test_height = max(1, self.height >> zoom_diff)
+        
+        # Calculate coordinates for this zoom level
+        test_col = self.col >> zoom_diff if zoom_diff >= 0 else self.col << (-zoom_diff)
+        test_row = self.row >> zoom_diff if zoom_diff >= 0 else self.row << (-zoom_diff)
+        
+        # Sample strategy: test corner chunks + center chunk for efficiency
+        sample_positions = [
+            (0, 0),                                    # Top-left
+            (test_width - 1, 0),                      # Top-right  
+            (0, test_height - 1),                     # Bottom-left
+            (test_width - 1, test_height - 1),       # Bottom-right
+            (test_width // 2, test_height // 2)       # Center
+        ]
+        
+        # Remove duplicate positions for small tiles
+        sample_positions = list(set(sample_positions))
+        
+        log.debug(f"Testing ZL{test_zoom}: {test_width}x{test_height} chunks, sampling {len(sample_positions)} positions")
+        
+        successful = 0
+        total = len(sample_positions)
+        
+        for i, (offset_col, offset_row) in enumerate(sample_positions):
+            chunk_col = test_col + offset_col
+            chunk_row = test_row + offset_row
+            
+            # Try cache first (fast)
+            test_chunk = Chunk(chunk_col, chunk_row, self.maptype, test_zoom, cache_dir=self.cache_dir)
+            
+            if test_chunk.get_cache():
+                successful += 1
+                log.debug(f"ZL{test_zoom} chunk {i+1}/{total}: CACHED ({chunk_col},{chunk_row})")
+            else:
+                # Try actual download (slower, but more accurate)
+                if test_chunk.get():
+                    successful += 1
+                    log.debug(f"ZL{test_zoom} chunk {i+1}/{total}: DOWNLOADED ({chunk_col},{chunk_row})")
+                else:
+                    log.debug(f"ZL{test_zoom} chunk {i+1}/{total}: FAILED ({chunk_col},{chunk_row})")
+            
+            test_chunk.close()
+        
+        availability_rate = successful / total
+        log.debug(f"ZL{test_zoom} availability: {successful}/{total} = {availability_rate:.1%}")
+        
+        return availability_rate
 
 
     def __lt__(self, other):
         return self.priority < other.priority
 
     def __repr__(self):
-        return f"Tile({self.col}, {self.row}, {self.maptype}, {self.zoom}, {self.min_zoom}, {self.cache_dir})"
+        return f"Tile({self.col}, {self.row}, {self.maptype}, {self.tilename_zoom}, min_zoom={self.min_zoom}, max_zoom={self.max_zoom}, max_mm={self.max_mipmap})"
 
     @locked
     def _create_chunks(self, quick_zoom=0, min_zoom=None):
@@ -464,18 +844,21 @@ class Tile(object):
 
         if not self.chunks.get(zoom):
             self.chunks[zoom] = []
+            log.debug(f"Creating chunks for zoom {zoom}: {width}x{height} grid starting at ({col},{row})")
 
             for r in range(row, row+height):
                 for c in range(col, col+width):
-                    #chunk = Chunk(c, r, self.maptype, zoom, priority=self.priority)
+                    # FIXED: Create chunk and let it check cache during initialization
                     chunk = Chunk(c, r, self.maptype, zoom, cache_dir=self.cache_dir)
                     self.chunks[zoom].append(chunk)
+        else:
+            log.debug(f"Reusing existing {len(self.chunks[zoom])} chunks for zoom {zoom}")
 
     def _find_cache_file(self):
         #with self.tile_condition:
         with self.tile_lock:
-            for z in range(self.zoom, (self.min_zoom-1), -1):
-                cache_file = os.path.join(self.cache_dir, f"{self.row}_{self.col}_{self.maptype}_{self.zoom}_{z}.dds")
+            for z in range(self.max_zoom, (self.min_zoom-1), -1):
+                cache_file = os.path.join(self.cache_dir, f"{self.row}_{self.col}_{self.maptype}_{self.tilename_zoom}_{z}.dds")
                 if os.path.exists(cache_file):
                     log.info(f"Found cache for {cache_file}...")
                     self.cache_file = (z, cache_file)
@@ -486,33 +869,51 @@ class Tile(object):
 
 
     def _get_quick_zoom(self, quick_zoom=0, min_zoom=None):
-        if quick_zoom:
-            # Max difference in steps this tile can support
-            max_diff = min((self.zoom - int(quick_zoom)), self.max_mipmap)
-            if not min_zoom:
-                # Minimum zoom level allowed
-                min_zoom = max((self.zoom - max_diff), self.min_zoom)
+        """Calculate tile parameters for the given zoom level.
+        
+        Args:
+            quick_zoom: Target zoom level (0 means use max_zoom)
+            min_zoom: Minimum allowed zoom level
             
-            # Effective zoom level we will use 
-            quick_zoom = max(int(quick_zoom), min_zoom)
+        Returns:
+            Tuple of (col, row, width, height, zoom, zoom_diff)
+        """
+        # Handle simple case: no quick zoom specified
+        if not quick_zoom:
+            return (self.col, self.row, self.width, self.height, self.max_zoom, 0)
+        
+        quick_zoom = int(quick_zoom)
+        
+        # Calculate the maximum zoom difference this tile can support
+        max_supported_diff = min(self.max_zoom - quick_zoom, self.max_mipmap)
+        
+        # Determine minimum zoom level if not provided
+        if min_zoom is None:
+            min_zoom = max(self.max_zoom - max_supported_diff, self.min_zoom)
+        
+        # Clamp quick_zoom to minimum allowed value
+        effective_zoom = max(quick_zoom, min_zoom)
+        
+        # Calculate actual zoom difference (limited by max_mipmap)
+        zoom_diff = min(self.max_zoom - effective_zoom, self.max_mipmap)
 
-            # Effective difference in steps we will use
-            zoom_diff = min((self.zoom - int(quick_zoom)), self.max_mipmap)
-
-            col = int(self.col/pow(2,zoom_diff))
-            row = int(self.row/pow(2,zoom_diff))
-            width = int(self.width/pow(2,zoom_diff))
-            height = int(self.height/pow(2,zoom_diff))
-            zoom = int(quick_zoom)
-        else:
-            col = self.col
-            row = self.row
-            width = self.width
-            height = self.height
-            zoom = self.zoom
-            zoom_diff = 0
-
-        return (col, row, width, height, zoom, zoom_diff)
+        # Calculate tilename zoom difference
+        tilename_zoom_diff = self.tilename_zoom - effective_zoom
+        
+        # Scale coordinates and dimensions based on zoom difference
+        def scale_by_zoom_diff(value, diff):
+            """Scale a value by 2^diff (positive diff scales down, negative scales up)"""
+            if diff >= 0:
+                return value >> diff  
+            else:
+                return value << (-diff)  
+        
+        scaled_col = scale_by_zoom_diff(self.col, tilename_zoom_diff)
+        scaled_row = scale_by_zoom_diff(self.row, tilename_zoom_diff)
+        scaled_width = max(1, scale_by_zoom_diff(self.width, tilename_zoom_diff))
+        scaled_height = max(1, scale_by_zoom_diff(self.height, tilename_zoom_diff))
+        
+        return (scaled_col, scaled_row, scaled_width, scaled_height, effective_zoom, zoom_diff)
 
 
     def fetch(self, quick_zoom=0, background=False):
@@ -539,9 +940,9 @@ class Tile(object):
 
         mipmap = self.find_mipmap_pos(offset)
         log.debug(f"Get_bytes for mipmap {mipmap} ...")
-        if mipmap > 4:
+        if mipmap > self.max_mipmap:
             # Just get the entire mipmap
-            self.get_mipmap(4)
+            self.get_mipmap(self.max_mipmap)
             return True
 
         # Exit if already retrieved
@@ -556,29 +957,33 @@ class Tile(object):
         
         log.debug(f"Retrieving {length} bytes from mipmap {mipmap} offset {offset}")
 
-        if CFG.pydds.format == "BC1":
-            bytes_per_row = 524288 >> mipmap
-        else:
-            bytes_per_row = 1048576 >> mipmap
-
-        rows_per_mipmap = 16 >> mipmap
-
         # how deep are we in a mipmap
         mm_offset = max(0, offset - self.dds.mipmap_list[mipmap].startpos)
         log.debug(f"MM_offset: {mm_offset}  Offset {offset}.  Startpos {self.dds.mipmap_list[mipmap]}")
-    
-        if CFG.pydds.format == "BC1":
-            # Calculate which row 'offset' is in
-            startrow = mm_offset >> (19 - mipmap)
-            # Calculate which row 'offset+length' is in
-            endrow = (mm_offset + length) >> (19 - mipmap)
-        else:  
-            # Calculate which row 'offset' is in
-            startrow = mm_offset >> (20 - mipmap)
-            # Calculate which row 'offset+length' is in
-            endrow = (mm_offset + length) >> (20 - mipmap)
 
-        log.debug(f"Startrow: {startrow} Endrow: {endrow}")
+        # Dynamically compute bytes-per-chunk-row for this mip level based on actual DDS dimensions
+        base_width_px = max(4, int(self.dds.width) >> mipmap)
+        base_height_px = max(4, int(self.dds.height) >> mipmap)
+        blocksize = 8 if CFG.pydds.format == "BC1" else 16
+        blocks_per_row = max(1, base_width_px // 4)
+        bytes_per_row = blocks_per_row * blocksize
+        # Each chunk-row is 256 px tall → 64 blocks vertically
+        bytes_per_chunk_row = bytes_per_row * 64
+
+        # Compute start/end chunk-rows touched by the requested byte range
+        startrow = mm_offset // bytes_per_chunk_row
+        endrow = (mm_offset + max(0, length - 1)) // bytes_per_chunk_row
+
+        # Clamp to valid range of chunk rows for this mipmap
+        chunk_rows_in_mm = max(1, base_height_px // 256)
+        if startrow >= chunk_rows_in_mm:
+            startrow = chunk_rows_in_mm - 1
+        if endrow >= chunk_rows_in_mm:
+            endrow = chunk_rows_in_mm - 1
+        if endrow < startrow:
+            endrow = startrow
+
+        log.debug(f"Startrow: {startrow} Endrow: {endrow} bytes_per_chunk_row: {bytes_per_chunk_row} width_px: {base_width_px} height_px: {base_height_px}")
         
         new_im = self.get_img(mipmap, startrow, endrow,
                 maxwait=self.maxchunk_wait)
@@ -634,30 +1039,35 @@ class Tile(object):
             # If offset = 0, read the header
             log.debug("READ_DDS_BYTES: Read header")
             self.get_bytes(0, length)
-        #elif offset < 32768:
-        #elif offset < 65536:
-        elif offset < 131072:
-        #elif offset < 262144:
-        #elif offset < 1048576:
-            # How far into mipmap 0 do we go before just getting the whole thing
-            log.debug("READ_DDS_BYTES: Middle of mipmap 0")
-            self.get_bytes(0, length + offset)
-        elif (offset + length) < mipmap.endpos:
-            # Total length is within this mipmap.  Make sure we have it.
-            log.debug(f"READ_DDS_BYTES: Detected middle read for mipmap {mipmap.idx}")
-            if not mipmap.retrieved:
-                log.debug(f"READ_DDS_BYTES: Retrieve {mipmap.idx}")
-                self.get_mipmap(mipmap.idx)
         else:
-            log.debug(f"READ_DDS_BYTES: Start before this mipmap {mipmap.idx}")
-            # We already know we start before the end of this mipmap
-            # We must extend beyond the length.
-            
-            # Get bytes prior to this mipmap
-            self.get_bytes(offset, length)
+            # Dynamically scale the early-read heuristic based on actual mip-0 bytes per chunk-row
+            blocksize = 8 if CFG.pydds.format == "BC1" else 16
+            width_px_m0 = max(4, int(self.dds.width))
+            blocks_per_row_m0 = max(1, width_px_m0 // 4)
+            bytes_per_row_m0 = blocks_per_row_m0 * blocksize
+            bytes_per_chunk_row_m0 = bytes_per_row_m0 * 64
 
-            # Get the entire next mipmap
-            self.get_mipmap(mm_idx + 1)
+            # If we're still within the first chunk-row of mipmap 0, just fetch from the start
+            early_threshold = bytes_per_chunk_row_m0
+            if mm_idx == 0 and offset < early_threshold:
+                log.debug("READ_DDS_BYTES: Early region of mipmap 0 - fetching from start")
+                self.get_bytes(0, length + offset)
+            elif (offset + length) < mipmap.endpos:
+                # Total length is within this mipmap.  Make sure we have it.
+                log.debug(f"READ_DDS_BYTES: Detected middle read for mipmap {mipmap.idx}")
+                if not mipmap.retrieved:
+                    log.debug(f"READ_DDS_BYTES: Retrieve {mipmap.idx}")
+                    self.get_mipmap(mipmap.idx)
+            else:
+                log.debug(f"READ_DDS_BYTES: Start before this mipmap {mipmap.idx}")
+                # We already know we start before the end of this mipmap
+                # We must extend beyond the length.
+                
+                # Get bytes prior to this mipmap
+                self.get_bytes(offset, length)
+
+                # Get the entire next mipmap
+                self.get_mipmap(mm_idx + 1)
         
         self.bytes_read += length
         # Seek and return data
@@ -665,14 +1075,14 @@ class Tile(object):
         return self.dds.read(length)
 
     def write(self):
-        outfile = os.path.join(self.cache_dir, f"{self.row}_{self.col}_{self.maptype}_{self.zoom}_{self.zoom}.dds")
+        outfile = os.path.join(self.cache_dir, f"{self.row}_{self.col}_{self.maptype}_{self.tilename_zoom}_{self.tilename_zoom}.dds")
         self.ready.clear()
         self.dds.write(outfile)
         self.ready.set()
         return outfile
 
     def get_header(self):
-        outfile = os.path.join(self.cache_dir, f"{self.row}_{self.col}_{self.maptype}_{self.zoom}_{self.zoom}.dds")
+        outfile = os.path.join(self.cache_dir, f"{self.row}_{self.col}_{self.maptype}_{self.tilename_zoom}_{self.tilename_zoom}.dds")
         
         self.ready.clear()
         self.dds.write(outfile)
@@ -685,11 +1095,13 @@ class Tile(object):
         # Get an image for a particular mipmap
         #
 
-        # Get effective zoom
-        zoom = self.zoom - mipmap
-        log.debug(f"GET_IMG: Default zoom: {self.zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
-        col, row, width, height, zoom, mipmap = self._get_quick_zoom(zoom, min_zoom)
-        log.debug(f"Will use:  Zoom: {zoom},  Mipmap: {mipmap}")
+        # Get effective zoom  
+        zoom = min((self.max_zoom - mipmap), self.max_zoom)
+        log.debug(f"GET_IMG: Default tile zoom: {self.zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
+        col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(zoom, min_zoom)
+        log.debug(f"Will use:  Zoom: {zoom},  Zoom_diff: {zoom_diff}")        
+        
+        log.debug(f"GET_IMG: Final zoom {zoom} for mipmap {mipmap}, coords: {col}x{row}, size: {width}x{height}")
         
         # Do we already have this img?
         if mipmap in self.imgs:
@@ -697,7 +1109,7 @@ class Tile(object):
             return self.imgs.get(mipmap)
 
         log.debug(f"GET_IMG: MM List before { {x.idx:x.retrieved for x in self.dds.mipmap_list} }")
-        if self.dds.mipmap_list[mipmap].retrieved:
+        if mipmap < len(self.dds.mipmap_list) and self.dds.mipmap_list[mipmap].retrieved:
             log.debug(f"GET_IMG: We already have mipmap {mipmap} for {self}")
             return
 
@@ -708,26 +1120,32 @@ class Tile(object):
 
         startchunk = 0
         endchunk = None
-        # Determine start and end chunk
-        chunks_per_row = 16 >> mipmap
+        # Determine start and end chunk based on the actual zoom level we're using
+        # Use the width/height calculated for the capped zoom level
+        chunks_per_row = width  # width already accounts for capping
         if startrow:
             startchunk = startrow * chunks_per_row
         if endrow is not None:
             endchunk = (endrow * chunks_per_row) + chunks_per_row
+            
+        log.debug(f"GET_IMG: Chunk indices - start: {startchunk}, end: {endchunk}, chunks_per_row: {chunks_per_row}")
 
+        # Create chunks for the actual zoom level we'll download from
         self._create_chunks(zoom, min_zoom)
         chunks = self.chunks[zoom][startchunk:endchunk]
-        log.debug(f"Start chunk: {startchunk}  End chunk: {endchunk}  Chunklen {len(self.chunks[zoom])}")
+        log.debug(f"Start chunk: {startchunk}  End chunk: {endchunk}  Chunklen {len(self.chunks[zoom])} for zoom {zoom}")
 
         log.debug(f"GET_IMG: {self} : Retrieve mipmap for ZOOM: {zoom} MIPMAP: {mipmap}")
         data_updated = False
-        log.debug(f"GET_IMG: {self} submitting chunks.")
+        log.debug(f"GET_IMG: {self} submitting chunks for zoom {zoom}.")
         for chunk in chunks:
             if not chunk.ready.is_set():
-                #log.info(f"SUBMIT: {chunk}")
+                log.debug(f"GET_IMG: Submitting chunk {chunk} for zoom {zoom}")
                 chunk.priority = self.min_zoom - mipmap 
                 chunk_getter.submit(chunk)
                 data_updated = True
+            else:
+                log.debug(f"GET_IMG: Chunk {chunk} already ready - reusing for mipmap {mipmap}")
 
         # We've already determined this mipmap is not marked as 'retrieved' so we should create 
         # a new image, regardless here.
@@ -735,28 +1153,42 @@ class Tile(object):
         #    log.info("No updates to chunks.  Exit.")
         #    return False
 
-        log.debug(f"GET_IMG: Create new image: Zoom: {self.zoom} | {(256*width, 256*height)}")
+        # Calculate image dimensions based on the actual zoom level we're using for downloads
+        # This creates smaller textures that save VRAM when zoom is capped
+        img_width = 256 * width
+        img_height = 256 * height
         
-        new_im = AoImage.new('RGBA', (256*width,256*height), (66,77,55))
+        log.debug(f"GET_IMG: Using download dimensions {width}x{height} chunks = {img_width}x{img_height} pixels")
+        
+        log.debug(f"GET_IMG: Create new image: Zoom: {zoom} | {(img_width, img_height)}")
+        
+        new_im = AoImage.new('RGBA', (img_width, img_height), (66,77,55))
 
         log.debug(f"GET_IMG: Will use image {new_im}")
 
-        #chunks[0].ready.wait(maxwait)
-        #log.info(f"NUM CHUNKS: {len(chunks)}")
-        for chunk in chunks:
-            #chunk_ready = chunk.ready.is_set()
+        # Check if we have any chunks to process
+        if len(chunks) == 0:
+            log.warning(f"GET_IMG: No chunks created for zoom {zoom}, mipmap {mipmap}")
+            # Create a placeholder image with the expected dimensions
+            placeholder_img = AoImage.new('RGBA', (img_width, img_height), (128, 128, 128))
+            return placeholder_img
+            
+        
+        def process_chunk(chunk):
+            """Process a single chunk and return (chunk, chunk_img, start_x, start_y)"""
             chunk_ready = chunk.ready.wait(maxwait)
             
-            start_x = int((chunk.width) * (chunk.col - col))
-            start_y = int((chunk.height) * (chunk.row - row))
+            # Calculate position using native chunk size (no scaling)
+            start_x = int(chunk.width * (chunk.col - col))
+            start_y = int(chunk.height * (chunk.row - row))
 
             chunk_img = None
             if chunk_ready and chunk.data:
                 # We returned and have data!
                 log.debug(f"GET_IMG: Ready and found chunk data.")
                 chunk_img = AoImage.load_from_memory(chunk.data)
-            elif mipmap < 4 and not chunk_ready:
-                # Ran out of time, requesting mm 0-3.  Search for backup...
+            elif mipmap < self.max_mipmap and not chunk_ready:
+                # Ran out of time, requesting mm below max.  Search for backup...
                 log.debug(f"GET_IMG: Tile {self} not ready.  Try to find backup chunk.")
                 chunk_img = self.get_best_chunk(chunk.col, chunk.row, mipmap, zoom)
                 if chunk_img:
@@ -767,29 +1199,35 @@ class Tile(object):
                 log.debug(f"GET_IMG: Final retry for {chunk}")
                 inc_stat('retry_chunk_count')
                 chunk_ready = chunk.ready.wait(maxwait)
-                #chunk_ready = chunk.ready.is_set()
                 if chunk_ready and chunk.data:
                     log.debug(f"GET_IMG: Final retry for {chunk}, SUCCESS!")
-                    # We returned and have data!
                     chunk_img = AoImage.load_from_memory(chunk.data)
 
+            if not chunk_img and not chunk.data:
+                log.debug(f"GET_IMG: Empty chunk data.  Skip.")
+                STATS['chunk_missing_count'] = STATS.get('chunk_missing_count', 0) + 1
+            elif not chunk_img and chunk.data:
+                log.warning(f"GET_IMG: FAILED! {chunk}:  LEN: {len(chunk.data)}  HEADER: {chunk.data[:8]}")
+                
+            return (chunk, chunk_img, start_x, start_y)
+        
+        # Process all chunks in parallel instead of sequentially
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(chunks))) as executor:
+            # Submit all chunk processing tasks
+            future_to_chunk = {executor.submit(process_chunk, chunk): chunk for chunk in chunks}
+            
+            # Collect results and paste into image as they complete
+            for future in concurrent.futures.as_completed(future_to_chunk):
+                try:
+                    chunk, chunk_img, start_x, start_y = future.result()
+                    if chunk_img:
+                        # For adaptive system, chunks are already downloaded at the optimal zoom level
+                        # or retrieved from backup at appropriate resolution. Paste directly.
+                        new_im.paste(chunk_img, (start_x, start_y))
+                except Exception as exc:
+                    log.error(f"Chunk processing failed: {exc}")
 
-            if chunk_img:
-                new_im.paste(
-                    chunk_img,
-                    (
-                        start_x,
-                        start_y
-                    )
-                )
-            else:
-                if not chunk.data:
-                    log.debug(f"GET_IMG: Empty chunk data.  Skip.")
-                    STATS['chunk_missing_count'] = STATS.get('chunk_missing_count', 0) + 1
-                else:
-                    log.warning(f"GET_IMG: FAILED! {chunk}:  LEN: {len(chunk.data)}  HEADER: {chunk.data[:8]}")
-
-        if complete_img and mipmap <= 4:
+        if complete_img and mipmap <= self.max_mipmap:
             log.debug(f"GET_IMG: Save complete image for later...")
             self.imgs[mipmap] = new_im
 
@@ -798,8 +1236,10 @@ class Tile(object):
         return new_im
 
     def get_best_chunk(self, col, row, mm, zoom):
-        for i in range(mm+1, 5):
-
+        # For adaptive system, search up to actual_max_zoom level
+        max_search_zoom = self.max_zoom
+        
+        for i in range(mm + 1, self.max_mipmap + 1):
             # Difference between requested mm and found image mm level
             diff = i - mm
             
@@ -807,6 +1247,10 @@ class Tile(object):
             col_p = col >> diff
             row_p = row >> diff
             zoom_p = zoom - i
+            
+            # Don't search beyond our detected actual_max_zoom
+            if zoom_p > max_search_zoom:
+                continue
 
             scalefactor = 1 << diff
 
@@ -817,12 +1261,6 @@ class Tile(object):
             if not cached:
                 c.close()
                 continue
-            #     # Last mm.  Get a chunk
-            #     if not c.get():
-            #         return False
-            # elif not cached:
-            #     c.close()
-            #     continue
         
             log.debug(f"Found best chunk for {col}x{row}x{zoom} at {col_p}x{row_p}x{zoom_p}")
             # Offset into chunk
@@ -849,6 +1287,7 @@ class Tile(object):
             img_p.crop(crop_img, (col_offset * w_p, row_offset * h_p))
             chunk_img = crop_img.scale(scalefactor)
 
+            c.close()
             return chunk_img
 
         log.debug(f"No best chunk found for {col}x{row}x{zoom}!")
@@ -879,7 +1318,6 @@ class Tile(object):
         self.ready.clear()
         start_time = time.time()
         try:
-            #self.dds.gen_mipmaps(new_im, mipmap) 
             if mipmap == 0:
                 self.dds.gen_mipmaps(new_im, mipmap, 0) 
             else:
@@ -891,7 +1329,7 @@ class Tile(object):
         end_time = time.time()
         self.ready.set()
 
-        zoom = self.zoom - mipmap
+        zoom = self.max_zoom - mipmap
         tile_time = end_time - start_time
         mm_stats.set(mipmap, tile_time)
 
@@ -993,7 +1431,11 @@ class TileCacher(object):
         
         self.cache_dir = CFG.paths.cache_dir
         log.info(f"Cache dir: {self.cache_dir}")
-        self.min_zoom = CFG.autoortho.min_zoom
+        self.min_zoom = int(CFG.autoortho.min_zoom)
+        # Set target zoom level directly - much simpler than offset calculations
+        self.target_zoom_level = int(CFG.autoortho.max_zoom)  # Direct zoom level target, regardless of tile name
+        self.target_zoom_level_near_airports = int(CFG.autoortho.max_zoom_near_airports)
+        log.info(f"Target zoom level set to ZL{self.target_zoom_level}")
 
         self.clean_t = threading.Thread(target=self.clean, daemon=True)
         self.clean_t.start()
@@ -1002,6 +1444,13 @@ class TileCacher(object):
             # Windows doesn't handle FS cache the same way so enable here.
             self.enable_cache = True
             self.cache_tile_lim = 50
+    
+    def _get_target_zoom_level(self, default_zoom: int) -> int:
+        if USING_KUBILUS_MESH:
+            uncapped_target_zoom = self.target_zoom_level_near_airports if default_zoom == 18 else self.target_zoom_level
+        else:
+            uncapped_target_zoom = self.target_zoom_level_near_airports if default_zoom == 19 else self.target_zoom_level
+        return min(default_zoom + 1, uncapped_target_zoom)
 
     def _to_tile_id(self, row, col, map_type, zoom):
         if self.maptype_override:
@@ -1077,9 +1526,13 @@ class TileCacher(object):
             if not tile:
                 self.misses += 1
                 inc_stat('tile_mem_miss')
-                tile = Tile(col, row, map_type, zoom, 
-                    cache_dir = self.cache_dir,
-                    min_zoom = self.min_zoom)
+                # Use target zoom level directly - much cleaner than offset calculations
+                tile = Tile(
+                    col, row, map_type, zoom, 
+                    cache_dir=self.cache_dir,
+                    min_zoom=self.min_zoom,
+                    max_zoom=self._get_target_zoom_level(zoom),
+                )
                 self.tiles[idx] = tile
                 self.open_count[idx] = self.open_count.get(idx, 0) + 1
                 if self.open_count[idx] > 1:

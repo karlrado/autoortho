@@ -23,12 +23,16 @@ log = logging.getLogger(__name__)
 #_stb = CDLL("/usr/lib/x86_64-linux-gnu/libstb.so")
 if platform.system().lower() == 'linux':
     print("Linux detected")
-    _stb_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),'lib','linux','lib_stb_dxt.so')
-    _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),'lib','linux','libispc_texcomp.so')
+    _stb_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'linux', 'lib_stb_dxt.so')
+    _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'linux', 'libispc_texcomp.so')
 elif platform.system().lower() == 'windows':
     print("Windows detected")
-    _stb_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),'lib','windows','stb_dxt.dll')
-    _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),'lib','windows','ispc_texcomp.dll')
+    _stb_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'windows', 'stb_dxt.dll')
+    _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'windows', 'ispc_texcomp.dll')
+elif platform.system().lower() == 'darwin':
+    print("macOS detected")
+    _stb_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'macos', 'lib_stb_dxt.dylib')
+    _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'macos', 'libispc_texcomp.dylib')
 else:
     print("System is not supported")
     exit()
