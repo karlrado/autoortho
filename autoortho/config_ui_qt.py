@@ -239,6 +239,10 @@ class ConfigUI(QMainWindow):
         self.download_progress = {}
         self.uninstall_workers = {}
         self.simheaven_config_changed_session = False
+        self.cache_thread = None
+        self._closing = False
+        self._shutdown_in_progress = False
+        self._ready_to_close = False
 
         # Setup UI
         self.init_ui()
@@ -426,7 +430,7 @@ class ConfigUI(QMainWindow):
         self.run_button = StyledButton("Run", primary=True)
         self.run_button.clicked.connect(self.on_run)
 
-        self.save_button = StyledButton("Save")
+        self.save_button = StyledButton("Save Config")
         self.save_button.clicked.connect(self.on_save)
 
         self.quit_button = StyledButton("Quit")
@@ -763,6 +767,17 @@ class ConfigUI(QMainWindow):
         mem_cache_layout.addWidget(self.mem_cache_slider)
         mem_cache_layout.addWidget(self.mem_cache_label)
         cache_layout.addLayout(mem_cache_layout)
+
+        auto_clean_cache_layout = QHBoxLayout()
+        self.auto_clean_cache_check = QCheckBox("Auto clean cache on AutoOrtho exit")
+        self.auto_clean_cache_check.setChecked(self.cfg.cache.auto_clean_cache)
+        self.auto_clean_cache_check.setObjectName('auto_clean_cache')
+        self.auto_clean_cache_check.setToolTip(
+            "Automatically clean cache when AutoOrtho exits."
+        )
+
+        auto_clean_cache_layout.addWidget(self.auto_clean_cache_check)
+        cache_layout.addLayout(auto_clean_cache_layout)
 
         layout.addWidget(cache_group)
 
@@ -1402,8 +1417,13 @@ class ConfigUI(QMainWindow):
         else:
             self.update_status_bar("Configuration saved")
 
-    def on_clean_cache(self):
-        """Handle Clean Cache button click"""
+    def on_clean_cache(self, for_exit=False):
+        """Handle Clean Cache button click
+
+        Args:
+            for_exit (bool): When True, invoked from closeEvent - suppress dialogs
+                             and allow closeEvent to wait on the thread.
+        """
 
         if self.running:
             QMessageBox.warning(
@@ -1412,26 +1432,54 @@ class ConfigUI(QMainWindow):
                 "Cannot clean cache while AutoOrtho injection is running. Please stop AutoOrtho and try again."
             )
             return
-        self.update_status_bar("Cleaning cache...")
-        self.clean_cache_btn.setEnabled(False)
-        self.run_button.setEnabled(False)
 
-        # Run in separate thread
-        cache_thread = QThread()
-        cache_thread.run = lambda: self.clean_cache(
+        self._closing = for_exit
+        self.update_status_bar("Cleaning cache...")
+        if hasattr(self, 'clean_cache_btn'):
+            self.clean_cache_btn.setEnabled(False)
+        if hasattr(self, 'run_button'):
+            self.run_button.setEnabled(False)
+
+        # Run in separate thread and keep reference so we can wait on exit
+        self.cache_thread = QThread()
+        self.cache_thread.run = lambda: self.clean_cache(
             self.cfg.paths.cache_dir,
             int(self.file_cache_slider.value())
         )
-        cache_thread.finished.connect(lambda: self.on_cache_cleaned())
-        cache_thread.start()
+        self.cache_thread.finished.connect(lambda: self.on_cache_cleaned(for_exit))
+        self.cache_thread.start()
 
-    def on_cache_cleaned(self):
+    def on_cache_cleaned(self, for_exit=False):
         """Called when cache cleaning is complete"""
-        self.clean_cache_btn.setEnabled(True)
-        self.run_button.setEnabled(True)
-        QMessageBox.information(
-            self, "Cache Cleaned", "Cache cleaning completed!"
-        )
+        try:
+            if hasattr(self, 'clean_cache_btn'):
+                self.clean_cache_btn.setEnabled(True)
+            if hasattr(self, 'run_button'):
+                self.run_button.setEnabled(True)
+            if not for_exit:
+                QMessageBox.information(
+                    self, "Cache Cleaned", "Cache cleaning completed!"
+                )
+        finally:
+            # Clean up the thread reference
+            if self.cache_thread is not None:
+                try:
+                    self.cache_thread.quit()
+                except Exception:
+                    pass
+                try:
+                    self.cache_thread.wait()
+                except Exception:
+                    pass
+                try:
+                    self.cache_thread.deleteLater()
+                except Exception:
+                    pass
+                self.cache_thread = None
+            # If invoked during shutdown, finalize closing without blocking UI
+            if for_exit:
+                from PyQt6.QtCore import QTimer
+                QTimer.singleShot(0, self._finalize_shutdown)
 
     def on_install_scenery(self, region_id):
         """Handle scenery installation"""
@@ -1605,6 +1653,8 @@ class ConfigUI(QMainWindow):
         if self.cfg.autoortho.simheaven_compat != self.simheaven_compat_check.isChecked():
             self.cfg.autoortho.simheaven_compat = self.simheaven_compat_check.isChecked()
             self.simheaven_config_changed_session = True
+
+        self.cfg.cache.auto_clean_cache = self.auto_clean_cache_check.isChecked()
 
         # Windows specific
         if platform.system() == 'Windows' and hasattr(self, 'winfsp_check'):
@@ -1908,23 +1958,74 @@ class ConfigUI(QMainWindow):
         return True
 
     def closeEvent(self, event):
-        """Handle window close event"""
+        """Handle window close event without freezing UI during cache clean"""
         self.running = False
+
+        # If we're in the second pass (ready to close), just accept and exit
+        if self._ready_to_close:
+            event.accept()
+            return
+
+        # Stop periodic UI updates early
         if hasattr(self, 'log_timer'):
-            self.log_timer.stop()
-        # Stop all download workers
-        for worker in self.download_workers.values():
-            worker.terminate()
-            worker.wait()
-        # Stop all uninstall workers
-        for worker in self.uninstall_workers.values():
-            worker.terminate()
-            worker.wait()
+            try:
+                self.log_timer.stop()
+            except Exception:
+                pass
+
+        # Stop all background workers immediately
+        try:
+            for worker in self.download_workers.values():
+                worker.terminate()
+                worker.wait()
+        except Exception:
+            pass
+        try:
+            for worker in self.uninstall_workers.values():
+                worker.terminate()
+                worker.wait()
+        except Exception:
+            pass
         self.uninstall_workers.clear()
+
         # Clean up background mount processes
         if hasattr(self, 'unmount_sceneries'):
-            self.unmount_sceneries()
+            try:
+                self.unmount_sceneries()
+            except Exception:
+                pass
+
+        # If auto-clean is enabled and we haven't started shutdown cleaning yet,
+        # kick it off asynchronously and ignore this close event.
+        if self.cfg.cache.auto_clean_cache and not self._shutdown_in_progress:
+            self._shutdown_in_progress = True
+            self.update_status_bar("Auto cleaning cache before exit...")
+            # Fire off cleaning without blocking
+            self.on_clean_cache(for_exit=True)
+            # Prevent immediate close; we'll close when cleaning finishes
+            event.ignore()
+            # Optionally hide or disable the window to indicate shutdown
+            try:
+                self.setEnabled(False)
+            except Exception:
+                pass
+            return
+
+        # No auto-clean requested or already handled; proceed to close
         event.accept()
+
+    def _finalize_shutdown(self):
+        """Finalize app shutdown after async cache clean completes"""
+        self._ready_to_close = True
+        try:
+            # Trigger close again; closeEvent will accept immediately
+            self.close()
+        except Exception:
+            # As a fallback, force quit the application
+            from PyQt6.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app is not None:
+                app.quit()
 
 
 # This class needs to be imported from the parent module

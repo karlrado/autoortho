@@ -1,5 +1,7 @@
 ZIP?=zip
 VERSION?=0.0.0
+# Sanitize VERSION for use in filenames (replace any non-safe char with '-')
+SAFE_VERSION:=$(shell echo "$(VERSION)" | sed -e 's/[^A-Za-z0-9._-]/-/g')
 
 autoortho.pyz:
 	mkdir -p build/autoortho
@@ -7,8 +9,8 @@ autoortho.pyz:
 	python3 -m pip install -U -r ./build/autoortho/build-reqs.txt --target ./build/autoortho
 	cd build && python3 -m zipapp -p "/usr/bin/env python3" autoortho
 
-lin_bin: autoortho_lin_$(VERSION).bin
-autoortho_lin_$(VERSION).bin: autoortho/*.py
+lin_bin: autoortho_lin_$(SAFE_VERSION).bin
+autoortho_lin_$(SAFE_VERSION).bin: autoortho/*.py
 	docker run --rm -v `pwd`:/code ubuntu:jammy /bin/bash -c "cd /code; ./buildreqs.sh; time make bin VERSION=$(VERSION)"
 	mv autoortho_lin.bin $@
 
@@ -31,8 +33,8 @@ bin: autoortho/.version
 		--onefile \
 		./autoortho/__main__.py -o autoortho_lin.bin
 
-mac_bin: autoortho_mac_$(VERSION).bin
-autoortho_mac_$(VERSION).bin: autoortho/.version
+mac_bin: autoortho_mac_$(SAFE_VERSION).bin
+autoortho_mac_$(SAFE_VERSION).bin: autoortho/.version
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--macos-app-icon=autoortho/imgs/ao-icon.ico \
 		--enable-plugin=tk-inter \
@@ -79,14 +81,14 @@ __main__.dist: autoortho/.version
 		--disable-console \
 		./autoortho/__main__.py -o autoortho_win.exe
 
-win_exe: AutoOrtho_win_$(VERSION).exe
-AutoOrtho_win_$(VERSION).exe: __main__.dist
+win_exe: AutoOrtho_win_$(SAFE_VERSION).exe
+AutoOrtho_win_$(SAFE_VERSION).exe: __main__.dist
 	cp autoortho/imgs/ao-icon.ico .
 	makensis -DPRODUCT_VERSION=$(VERSION) installer.nsi
 	mv AutoOrtho.exe $@
 
-win_zip: autoortho_win_$(VERSION).zip
-autoortho_win_$(VERSION).zip: __main__.dist
+win_zip: autoortho_win_$(SAFE_VERSION).zip
+autoortho_win_$(SAFE_VERSION).zip: __main__.dist
 	mv __main__.dist autoortho_release
 	$(ZIP) $@ autoortho_release
 
