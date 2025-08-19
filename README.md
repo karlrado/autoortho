@@ -14,7 +14,7 @@ wherever you choose to in the world!
 This fork aims at continuin kubilus1 work and build upon their codebase, adding more functionalities to the program,
 updating the UI, fixing errors and updating the codebase to the newest technologies.
 
-You will also find more information about what's planned and the objectives ot this development in the (FAQ) [https://programmingdinosaur.github.io/autoortho4xplane/faq/] section
+You will also find more information about what's planned and the objectives ot this development in the [FAQ](https://programmingdinosaur.github.io/autoortho4xplane/faq/) section
 ---
 
 Please read and familiarize yourself with the documentation before asking
