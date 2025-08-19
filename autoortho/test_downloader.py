@@ -18,7 +18,7 @@ downloader.TESTMODE = True
 @pytest.fixture
 def scenery_v1(tmpdir):
     scenery_dir = os.path.join(tmpdir, 'Custom Scenery')
-    with open(os.path.join('autoortho','testfiles','infofiles','test_info_v1.json')) as h:
+    with open(os.path.join('.','testfiles','infofiles','test_info_v1.json')) as h:
         info = json.loads(h.read())
 
     os.makedirs(os.path.join(scenery_dir, 'z_autoortho', 'textures'))
