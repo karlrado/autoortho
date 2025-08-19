@@ -82,7 +82,7 @@ This is not supported. Use a local NTFS formatted drive.
 
 ## I have an issue that is not here.
 
-Please check the (issues page of the repository)[https://github.com/ProgrammingDinosaur/autoortho4xplane/issues]. 
+Please check the [issues page of the repository](https://github.com/ProgrammingDinosaur/autoortho4xplane/issues). 
 *Before submitting an issue please search for already existing issues for yopur problem, as it may be duplicated.*
 If your issue has not been reported please open a new one and include as much information as possible, for example:
 - Screenshots
@@ -98,7 +98,7 @@ After the issue is opened I'll gladly check it out as soon as my time allows. Ke
 ## Base Mesh Packages Problems
 
 ### I have an issue with some part of the mesh offered in the scenery packages
-Currently this fork still uses kubilus1 base mesh, as such support is not offered for it right now, this will change with the new custom mesh. For now refer to the (issues page of the kubilus scenery)[https://github.com/kubilus1/autoortho-scenery/issues] to see if your issue has been reported and hopefully a community fix has been shared.
+Currently this fork still uses kubilus1 base mesh, as such support is not offered for it right now, this will change with the new custom mesh. For now refer to the [issues page of the kubilus scenery](https://github.com/kubilus1/autoortho-scenery/issues) to see if your issue has been reported and hopefully a community fix has been shared.
 
 ## About this fork
 
@@ -109,7 +109,7 @@ As the AutoOrtho Continued name suggests the main idea of this fork is to contin
 ### What has been changed?
 
 This fork currently adds a revamped new UI, more autoortho options such as overriding max zoom, and quality of life features such as new imagery servers and download retries.
-For more detailed information of the changes of every release please refer to the (releases)[https://github.com/ProgrammingDinosaur/autoortho4xplane/releases]  page as detailed changelongs of every release are detailed there.
+For more detailed information of the changes of every release please refer to the [releases](https://github.com/ProgrammingDinosaur/autoortho4xplane/releases)  page as detailed changelongs of every release are detailed there.
 
 ### What's next?
 
@@ -120,7 +120,7 @@ While the scope of this fork may change over time and soem features might never 
 Things in backlog that are planned be implemented later on (order does not matter):
 - Predictive Tile caching with Simbrief integration: Have the program monitor your flight or via simbrief flightplan infer where you are heading to and start caching imagery from further tiles to speed up loading times and decrease stutters when you reach a new area.
 - Tile caching monitoring: See what tiles have been loaded and cached by the software.
-- Merge (hotbso changes)[https://github.com/hotbso/autoortho] to this fork to support seasons with AutoOrtho
+- Merge [hotbso changes](https://github.com/hotbso/autoortho) to this fork to support seasons with AutoOrtho
 
 ### When will those features be released?
 
