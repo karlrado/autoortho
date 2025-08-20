@@ -6,6 +6,8 @@ SAFE_VERSION:=$(shell echo "$(VERSION)" | sed -e 's/[^A-Za-z0-9._-]/-/g')
 autoortho.pyz:
 	mkdir -p build/autoortho
 	cp -r autoortho/* build/autoortho/.
+	sudo apt install pipx
+	pipx ensurepath	
 	python3 -m pip install -U -r ./build/autoortho/build-reqs.txt --target ./build/autoortho
 	cd build && python3 -m zipapp -p "/usr/bin/env python3" autoortho
 
