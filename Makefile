@@ -11,7 +11,7 @@ autoortho.pyz:
 
 lin_bin: autoortho_lin_$(SAFE_VERSION).bin
 autoortho_lin_$(SAFE_VERSION).bin: autoortho/*.py
-	docker run --rm -v `pwd`:/code ubuntu:jammy /bin/bash -c "cd /code; ./buildreqs.sh; time make bin VERSION=$(VERSION)"
+	docker run --rm -v `pwd`:/code ubuntu:24.04 /bin/bash -c "cd /code; ./buildreqs.sh; time make bin VERSION=$(VERSION)"
 	mv autoortho_lin.bin $@
 
 enter:
@@ -97,7 +97,7 @@ autoortho_win_$(SAFE_VERSION).zip: __main__.dist
 	$(ZIP) $@ autoortho_release
 
 testperf:
-	python3.10 -m nuitka --verbose --verbose-output=nuitka.log  --include-data-dir=./autoortho/lib=lib --include-data-dir=./autoortho/testfiles=testfiles --onefile ./autoortho/perftest.py
+	python3.12 -m nuitka --verbose --verbose-output=nuitka.log  --include-data-dir=./autoortho/lib=lib --include-data-dir=./autoortho/testfiles=testfiles --onefile ./autoortho/perftest.py
 
 %.txt: %.in
 	pip-compile $<
