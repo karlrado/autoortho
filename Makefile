@@ -11,7 +11,7 @@ autoortho.pyz:
 
 lin_bin: autoortho_lin_$(SAFE_VERSION).bin
 autoortho_lin_$(SAFE_VERSION).bin: autoortho/*.py
-	docker run --rm -v `pwd`:/code ubuntu:jammy /bin/bash -c "cd /code; ./buildreqs.sh; time make bin VERSION=$(VERSION)"
+	docker run --rm -v `pwd`:/code ubuntu:24.04 /bin/bash -c "cd /code; ./buildreqs.sh; time make bin VERSION=$(VERSION)"
 	mv autoortho_lin.bin $@
 
 enter:
@@ -24,13 +24,11 @@ bin: autoortho/.version
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--linux-icon=autoortho/imgs/ao-icon.ico \
 		--enable-plugin=pyside6 \
-		--enable-plugin=tk-inter \
-		--enable-plugin=eventlet \
 		--include-data-file=./autoortho/.version*=. \
 		--include-data-file=./autoortho/templates/*.html=templates/ \
 		--include-data-file=./autoortho/lib/linux/*.so=lib/linux/ \
 		--include-data-file=./autoortho/aoimage/*.so=aoimage/ \
-		--include-data-dir=./autoortho/imgs=autoortho/imgs \
+		--include-data-dir=./autoortho/imgs=imgs \
 		--onefile \
 		./autoortho/__main__.py -o autoortho_lin.bin
 
@@ -39,8 +37,6 @@ autoortho_mac_$(SAFE_VERSION).bin: autoortho/.version
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--macos-app-icon=autoortho/imgs/ao-icon.ico \
 		--enable-plugin=pyside6 \
-		--enable-plugin=tk-inter \
-		--enable-plugin=eventlet \
 		--include-data-file=./autoortho/.version*=. \
 		--include-data-file=./autoortho/templates/*.html=templates/ \
 		--include-data-file=./autoortho/lib/macos/*.dylib=lib/macos/ \
@@ -53,8 +49,6 @@ _autoortho_win.exe: autoortho/.version
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--mingw64 \
 		--disable-ccache \
-		--enable-plugin=tk-inter \
-		--enable-plugin=eventlet \
 		--enable-plugin=pyside6 \
 		--windows-icon-from-ico=autoortho/imgs/ao-icon.ico \
 		--assume-yes-for-downloads \
@@ -62,7 +56,7 @@ _autoortho_win.exe: autoortho/.version
 		--include-data-file=./autoortho/templates/*.html=templates/ \
 		--include-data-file=./autoortho/lib/windows/*=lib/windows/ \
 		--include-data-file=./autoortho/aoimage/*.dll=aoimage/ \
-		--include-data-dir=./autoortho/imgs=autoortho/imgs \
+		--include-data-dir=./autoortho/imgs=imgs \
 		--onefile \
 		--disable-console \
 		./autoortho/__main__.py -o autoortho_win.exe
@@ -72,7 +66,6 @@ __main__.dist: autoortho/.version
 		--mingw64 \
 		--disable-ccache \
 		--enable-plugin=tk-inter \
-		--enable-plugin=eventlet \
 		--enable-plugin=pyside6 \
 		--windows-icon-from-ico=autoortho/imgs/ao-icon.ico \
 		--assume-yes-for-downloads \
@@ -80,7 +73,7 @@ __main__.dist: autoortho/.version
 		--include-data-file=./autoortho/templates/*.html=templates/ \
 		--include-data-file=./autoortho/lib/windows/*=lib/windows/ \
 		--include-data-file=./autoortho/aoimage/*.dll=aoimage/ \
-		--include-data-dir=./autoortho/imgs=autoortho/imgs \
+		--include-data-dir=./autoortho/imgs=imgs \
 		--standalone \
 		--disable-console \
 		./autoortho/__main__.py -o autoortho_win.exe
@@ -97,7 +90,7 @@ autoortho_win_$(SAFE_VERSION).zip: __main__.dist
 	$(ZIP) $@ autoortho_release
 
 testperf:
-	python3.10 -m nuitka --verbose --verbose-output=nuitka.log  --include-data-dir=./autoortho/lib=lib --include-data-dir=./autoortho/testfiles=testfiles --onefile ./autoortho/perftest.py
+	python3.12 -m nuitka --verbose --verbose-output=nuitka.log  --include-data-dir=./autoortho/lib=lib --include-data-dir=./autoortho/testfiles=testfiles --onefile ./autoortho/perftest.py
 
 %.txt: %.in
 	pip-compile $<

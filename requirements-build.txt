@@ -4,13 +4,13 @@
 #
 #    pip-compile requirements-build.in
 #
-nuitka==2.4.8
+nuitka==2.7.12
     # via -r requirements-build.in
 ordered-set==4.1.0
     # via
     #   -r requirements-build.in
     #   nuitka
-zstandard==0.21.0
+zstandard==0.24.0
     # via
     #   -r requirements-build.in
     #   nuitka
