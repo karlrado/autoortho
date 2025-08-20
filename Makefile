@@ -6,7 +6,6 @@ SAFE_VERSION:=$(shell echo "$(VERSION)" | sed -e 's/[^A-Za-z0-9._-]/-/g')
 autoortho.pyz:
 	mkdir -p build/autoortho
 	cp -r autoortho/* build/autoortho/.
-	source .venv/bin/activate
 	python3 -m pip install -U -r ./build/autoortho/build-reqs.txt --target ./build/autoortho
 	cd build && python3 -m zipapp -p "/usr/bin/env python3" autoortho
 
@@ -22,8 +21,7 @@ autoortho/.version:
 	echo "$(VERSION)" > $@
 
 bin: autoortho/.version
-	source .venv/bin/activate
-	python3 -m nuitka --verbose --verbose-output=nuitka.log \
+	.venv/bin/python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--linux-icon=autoortho/imgs/ao-icon.ico \
 		--enable-plugin=pyside6 \
 		--include-data-file=./autoortho/.version*=. \
