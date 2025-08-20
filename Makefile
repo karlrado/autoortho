@@ -6,8 +6,8 @@ SAFE_VERSION:=$(shell echo "$(VERSION)" | sed -e 's/[^A-Za-z0-9._-]/-/g')
 autoortho.pyz:
 	mkdir -p build/autoortho
 	cp -r autoortho/* build/autoortho/.
-	python3.12 -m pip install -U -r ./build/autoortho/build-reqs.txt --target ./build/autoortho
-	cd build && python3.12 -m zipapp -p "/usr/bin/env python3.12" autoortho
+	python3 -m pip install -U -r ./build/autoortho/build-reqs.txt --target ./build/autoortho
+	cd build && python3 -m zipapp -p "/usr/bin/env python3" autoortho
 
 lin_bin: autoortho_lin_$(SAFE_VERSION).bin
 autoortho_lin_$(SAFE_VERSION).bin: autoortho/*.py
@@ -21,7 +21,7 @@ autoortho/.version:
 	echo "$(VERSION)" > $@
 
 bin: autoortho/.version
-	python3.12 -m nuitka --verbose --verbose-output=nuitka.log \
+	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--linux-icon=autoortho/imgs/ao-icon.ico \
 		--enable-plugin=pyside6 \
 		--include-data-file=./autoortho/.version*=. \
@@ -34,7 +34,7 @@ bin: autoortho/.version
 
 mac_bin: autoortho_mac_$(SAFE_VERSION).bin
 autoortho_mac_$(SAFE_VERSION).bin: autoortho/.version
-	python3.12 -m nuitka --verbose --verbose-output=nuitka.log \
+	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--macos-app-icon=autoortho/imgs/ao-icon.ico \
 		--enable-plugin=pyside6 \
 		--include-data-file=./autoortho/.version*=. \
@@ -46,7 +46,7 @@ autoortho_mac_$(SAFE_VERSION).bin: autoortho/.version
 		./autoortho/__main__.py -o $@
 
 _autoortho_win.exe: autoortho/.version
-	python3.12 -m nuitka --verbose --verbose-output=nuitka.log \
+	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--mingw64 \
 		--disable-ccache \
 		--enable-plugin=pyside6 \
@@ -62,7 +62,7 @@ _autoortho_win.exe: autoortho/.version
 		./autoortho/__main__.py -o autoortho_win.exe
 
 __main__.dist: autoortho/.version
-	python3.12 -m nuitka --verbose --verbose-output=nuitka.log \
+	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--mingw64 \
 		--disable-ccache \
 		--enable-plugin=pyside6 \
@@ -89,7 +89,7 @@ autoortho_win_$(SAFE_VERSION).zip: __main__.dist
 	$(ZIP) $@ autoortho_release
 
 testperf:
-	python3.12 -m nuitka --verbose --verbose-output=nuitka.log  --include-data-dir=./autoortho/lib=lib --include-data-dir=./autoortho/testfiles=testfiles --onefile ./autoortho/perftest.py
+	python3 -m nuitka --verbose --verbose-output=nuitka.log  --include-data-dir=./autoortho/lib=lib --include-data-dir=./autoortho/testfiles=testfiles --onefile ./autoortho/perftest.py
 
 %.txt: %.in
 	pip-compile $<
