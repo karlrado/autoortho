@@ -22,6 +22,7 @@ autoortho/.version:
 	echo "$(VERSION)" > $@
 
 bin: autoortho/.version
+	source .venv/bin/activate
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--linux-icon=autoortho/imgs/ao-icon.ico \
 		--enable-plugin=pyside6 \
