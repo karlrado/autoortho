@@ -28,14 +28,10 @@ log = logging.getLogger(__name__)
 import geocoder
 
 # Import PyQt6 modules
-try:
-    from PyQt6.QtWidgets import QApplication
-    import config_ui_qt as config_ui
-    USE_QT = True
-except ImportError:
-    import config_ui
-    USE_QT = False
 
+from PySide6.QtWidgets import QApplication
+import config_ui_qt as config_ui
+USE_QT = True
 class MountError(Exception):
     pass
 

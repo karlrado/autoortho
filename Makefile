@@ -23,9 +23,8 @@ autoortho/.version:
 bin: autoortho/.version
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--linux-icon=autoortho/imgs/ao-icon.ico \
+		--enable-plugin=pyside6 \
 		--enable-plugin=tk-inter \
-		--enable-plugin=qt-plugins \
-		--include-qt-plugins=sensible,styles,platforms,imageformats \
 		--enable-plugin=eventlet \
 		--include-data-file=./autoortho/.version*=. \
 		--include-data-file=./autoortho/templates/*.html=templates/ \
@@ -39,6 +38,7 @@ mac_bin: autoortho_mac_$(SAFE_VERSION).bin
 autoortho_mac_$(SAFE_VERSION).bin: autoortho/.version
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--macos-app-icon=autoortho/imgs/ao-icon.ico \
+		--enable-plugin=pyside6 \
 		--enable-plugin=tk-inter \
 		--enable-plugin=eventlet \
 		--include-data-file=./autoortho/.version*=. \
@@ -54,9 +54,8 @@ _autoortho_win.exe: autoortho/.version
 		--mingw64 \
 		--disable-ccache \
 		--enable-plugin=tk-inter \
-		--enable-plugin=qt-plugins \
-		--include-qt-plugins=sensible,styles,platforms,imageformats \
 		--enable-plugin=eventlet \
+		--enable-plugin=pyside6 \
 		--windows-icon-from-ico=autoortho/imgs/ao-icon.ico \
 		--assume-yes-for-downloads \
 		--include-data-file=./autoortho/.version*=./ \
@@ -73,9 +72,8 @@ __main__.dist: autoortho/.version
 		--mingw64 \
 		--disable-ccache \
 		--enable-plugin=tk-inter \
-		--enable-plugin=qt-plugins \
-		--include-qt-plugins=sensible,styles,platforms,imageformats \
 		--enable-plugin=eventlet \
+		--enable-plugin=pyside6 \
 		--windows-icon-from-ico=autoortho/imgs/ao-icon.ico \
 		--assume-yes-for-downloads \
 		--include-data-file=./autoortho/.version*=./ \
