@@ -11,7 +11,7 @@ autoortho.pyz:
 
 lin_bin: autoortho_lin_$(SAFE_VERSION).bin
 autoortho_lin_$(SAFE_VERSION).bin: autoortho/*.py
-	docker run --rm -v `pwd`:/code ubuntu:noble /bin/bash -c "cd /code; ./buildreqs.sh; time make bin VERSION=$(VERSION)"
+	docker run --rm -v `pwd`:/code ubuntu:noble /bin/bash -c "cd /code; ./buildreqs.sh; . .venv/bin/activate; time make bin VERSION=$(VERSION)"
 	mv autoortho_lin.bin $@
 
 enter:
