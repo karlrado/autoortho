@@ -19,7 +19,7 @@ You will also find more information about what's planned and the objectives ot t
 
 Please read and familiarize yourself with the documentation before asking
 questions.
----
+--- 
 
 * Documentation: (https://programmingdinosaur.github.io/autoortho4xplane/)
 * FAQ: (https://programmingdinosaur.github.io/autoortho4xplane/faq/)
