@@ -1,6 +1,6 @@
 refuse
 psutil
-PyQt6
+PySide6
 Flask
 flask-socketio
 eventlet

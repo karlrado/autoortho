@@ -10,16 +10,16 @@ import traceback
 import logging
 from packaging import version
 
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QPushButton, QLabel, QLineEdit, QCheckBox, QComboBox,
     QSlider, QTextEdit, QFileDialog, QMessageBox, QScrollArea,
     QSplashScreen, QGroupBox, QProgressBar, QStatusBar, QFrame, QSpinBox
 )
-from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QSize
+from PySide6.QtCore import (
+    Qt, QThread, Signal, QTimer, QSize
 )
-from PyQt6.QtGui import (
+from PySide6.QtGui import (
     QPixmap, QIcon
 )
 
@@ -33,9 +33,9 @@ CUR_PATH = os.path.dirname(os.path.realpath(__file__))
 
 class SceneryDownloadWorker(QThread):
     """Worker thread for downloading scenery"""
-    progress = pyqtSignal(str, dict)  # region_id, progress_data
-    finished = pyqtSignal(str, bool)  # region_id, success
-    error = pyqtSignal(str, str)  # region_id, error_message
+    progress = Signal(str, dict)  # region_id, progress_data
+    finished = Signal(str, bool)  # region_id, success
+    error = Signal(str, str)  # region_id, error_message
 
     def __init__(self, dl_manager, region_id, download_dir):
         super().__init__()
@@ -63,8 +63,8 @@ class SceneryDownloadWorker(QThread):
 
 class SceneryUninstallWorker(QThread):
     """Worker thread for uninstalling scenery"""
-    finished = pyqtSignal(str, bool)  # region_id, success
-    error = pyqtSignal(str, str)  # region_id, error_message
+    finished = Signal(str, bool)  # region_id, success
+    error = Signal(str, str)  # region_id, error_message
     
     def __init__(self, dl_manager, region_id):
         super().__init__()
@@ -213,9 +213,9 @@ class ModernSpinBox(QSpinBox):
 class ConfigUI(QMainWindow):
     """Main configuration UI window using PyQt6"""
 
-    status_update = pyqtSignal(str)
-    log_update = pyqtSignal(str)
-    show_error = pyqtSignal(str)
+    status_update = Signal(str)
+    log_update = Signal(str)
+    show_error = Signal(str)
 
     def __init__(self, cfg, *args, **kwargs):
         super().__init__()
@@ -1478,7 +1478,7 @@ class ConfigUI(QMainWindow):
                 self.cache_thread = None
             # If invoked during shutdown, finalize closing without blocking UI
             if for_exit:
-                from PyQt6.QtCore import QTimer
+                from PySide6.QtCore import QTimer
                 QTimer.singleShot(0, self._finalize_shutdown)
 
     def on_install_scenery(self, region_id):
@@ -2022,7 +2022,7 @@ class ConfigUI(QMainWindow):
             self.close()
         except Exception:
             # As a fallback, force quit the application
-            from PyQt6.QtWidgets import QApplication
+            from PySide6.QtWidgets import QApplication
             app = QApplication.instance()
             if app is not None:
                 app.quit()

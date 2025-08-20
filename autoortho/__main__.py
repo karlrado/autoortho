@@ -66,5 +66,22 @@ def setuplogs():
 import autoortho
 
 if __name__ == "__main__":
-    setuplogs()
-    autoortho.main()
+    try:
+        setuplogs()
+        autoortho.main()
+    except Exception as _fatal_err:
+        import traceback
+        logging.getLogger(__name__).exception("Fatal error during startup: %s", _fatal_err)
+        try:
+            if os.name == "nt":
+                import ctypes
+                log_path = os.path.join(os.path.expanduser("~"), ".autoortho-data", "logs", "autoortho.log")
+                msg = (
+                    "AutoOrtho failed to start.\n\n"
+                    + str(_fatal_err)
+                    + "\n\nSee log for details:\n"
+                    + log_path
+                )
+                ctypes.windll.user32.MessageBoxW(None, msg, "AutoOrtho Error", 0x00000010)
+        except Exception:
+            pass
