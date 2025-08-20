@@ -65,7 +65,6 @@ __main__.dist: autoortho/.version
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--mingw64 \
 		--disable-ccache \
-		--enable-plugin=tk-inter \
 		--enable-plugin=pyside6 \
 		--windows-icon-from-ico=autoortho/imgs/ao-icon.ico \
 		--assume-yes-for-downloads \
