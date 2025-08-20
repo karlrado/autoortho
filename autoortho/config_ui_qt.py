@@ -189,7 +189,7 @@ class ModernSpinBox(QSpinBox):
                 background-color: #5183bd;
             }
             QSpinBox::up-arrow {
-                image: url(autoortho/imgs/plus-16.png);
+                image: url(imgs/plus-16.png);
                 width: 12px;
                 height: 12px;
             }
@@ -203,7 +203,7 @@ class ModernSpinBox(QSpinBox):
                 background-color: #5183bd;
             }
             QSpinBox::down-arrow {
-                image: url(autoortho/imgs/minus-16.png);
+                image: url(imgs/minus-16.png);
                 width: 12px;
                 height: 12px;
             }
@@ -343,7 +343,7 @@ class ConfigUI(QMainWindow):
                 border: none;
             }
             QComboBox::down-arrow {
-                image: url(autoortho/imgs/arrow-204-16.png);
+                image: url(imgs/arrow-204-16.png);
                 width: 16px;
                 height: 16px;
                 margin-right: 10px;
