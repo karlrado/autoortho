@@ -6,12 +6,12 @@ SAFE_VERSION:=$(shell echo "$(VERSION)" | sed -e 's/[^A-Za-z0-9._-]/-/g')
 autoortho.pyz:
 	mkdir -p build/autoortho
 	cp -r autoortho/* build/autoortho/.
-	python3 -m pip install -U -r ./build/autoortho/build-reqs.txt --target ./build/autoortho
-	cd build && python3 -m zipapp -p "/usr/bin/env python3" autoortho
+	python3.12 -m pip install -U -r ./build/autoortho/build-reqs.txt --target ./build/autoortho
+	cd build && python3.12 -m zipapp -p "/usr/bin/env python3.12" autoortho
 
 lin_bin: autoortho_lin_$(SAFE_VERSION).bin
 autoortho_lin_$(SAFE_VERSION).bin: autoortho/*.py
-	docker run --rm -v `pwd`:/code ubuntu:24.04 /bin/bash -c "cd /code; ./buildreqs.sh; time make bin VERSION=$(VERSION)"
+	docker run --rm -v `pwd`:/code ubuntu:jammy /bin/bash -c "cd /code; ./buildreqs.sh; time make bin VERSION=$(VERSION)"
 	mv autoortho_lin.bin $@
 
 enter:
@@ -21,7 +21,7 @@ autoortho/.version:
 	echo "$(VERSION)" > $@
 
 bin: autoortho/.version
-	.venv/bin/python3 -m nuitka --verbose --verbose-output=nuitka.log \
+	python3.12 -m nuitka --verbose --verbose-output=nuitka.log \
 		--linux-icon=autoortho/imgs/ao-icon.ico \
 		--enable-plugin=pyside6 \
 		--include-data-file=./autoortho/.version*=. \
@@ -34,7 +34,7 @@ bin: autoortho/.version
 
 mac_bin: autoortho_mac_$(SAFE_VERSION).bin
 autoortho_mac_$(SAFE_VERSION).bin: autoortho/.version
-	python3 -m nuitka --verbose --verbose-output=nuitka.log \
+	python3.12 -m nuitka --verbose --verbose-output=nuitka.log \
 		--macos-app-icon=autoortho/imgs/ao-icon.ico \
 		--enable-plugin=pyside6 \
 		--include-data-file=./autoortho/.version*=. \
@@ -46,7 +46,7 @@ autoortho_mac_$(SAFE_VERSION).bin: autoortho/.version
 		./autoortho/__main__.py -o $@
 
 _autoortho_win.exe: autoortho/.version
-	python3 -m nuitka --verbose --verbose-output=nuitka.log \
+	python3.12 -m nuitka --verbose --verbose-output=nuitka.log \
 		--mingw64 \
 		--disable-ccache \
 		--enable-plugin=pyside6 \
@@ -62,7 +62,7 @@ _autoortho_win.exe: autoortho/.version
 		./autoortho/__main__.py -o autoortho_win.exe
 
 __main__.dist: autoortho/.version
-	python3 -m nuitka --verbose --verbose-output=nuitka.log \
+	python3.12 -m nuitka --verbose --verbose-output=nuitka.log \
 		--mingw64 \
 		--disable-ccache \
 		--enable-plugin=pyside6 \

@@ -9,13 +9,11 @@ export TZ=America/New_York
 apt-get update
 #apt-get install -y make curl patchelf python3.10 python3.10-tk zlib1g-dev \
 #    ccache python3.10-distutils python3.10-dev libjpeg-dev libturbojpeg0-dev build-essential
-apt-get install -y make curl patchelf python3-pip python3-tk zlib1g-dev \
-    ccache python3-setuptools python3-dev python3-venv libjpeg-dev libturbojpeg0-dev build-essential
+apt-get install -y make curl patchelf python3.12 python3.12-tk python3.12-pip zlib1g-dev \
+    ccache python3-setuptools python3-dev libjpeg-dev libturbojpeg0-dev build-essential
 
 #curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -U pip
-python3 -m pip install setuptools
-python3 -m pip install -r requirements-build.txt --no-use-pep517
-python3 -m pip install -r requirements.txt
+python3.12 -m pip install -U pip
+python3.12 -m pip install setuptools
+python3.12 -m pip install -r requirements-build.txt --no-use-pep517
+python3.12 -m pip install -r requirements.txt
