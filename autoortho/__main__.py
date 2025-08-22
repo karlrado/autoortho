@@ -3,6 +3,7 @@ import sys
 import logging
 import logging.handlers
 import atexit, signal, threading
+import platform
 from aoconfig import CFG
 
 # ---------------------------------------------------------------------------
@@ -62,6 +63,15 @@ def setuplogs():
     )
     log = logging.getLogger(__name__)
     log.info(f"Setup logs: {log_dir}, log level: {log_level}")
+
+
+# If SSL_CERT_DIR is not set, default to /etc/ssl/certs when available for Linux users.
+try:
+    if platform.system().lower() == 'linux' and "SSL_CERT_DIR" not in os.environ:
+        if os.environ.get("APPIMAGE") and os.path.isdir("/etc/ssl/certs"):
+            os.environ["SSL_CERT_DIR"] = "/etc/ssl/certs"
+except Exception:
+    pass
 
 import autoortho
 
