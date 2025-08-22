@@ -1,10 +1,11 @@
-name: Build
+name: Build (disabled)
 
 on:
-  pull_request:
+  workflow_dispatch:
 
 jobs:
-  build: 
-    uses: ./.github/workflows/build_release.yml
-    with:
-      version: ${{ github.head_ref || github.ref_name }}
+  disabled:
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - run: echo "Disabled"

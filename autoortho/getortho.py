@@ -394,7 +394,9 @@ class Chunk(object):
             return False
 
     def save_cache(self):
-        if not self.data:
+        # Snapshot data to avoid races with close() setting self.data = None
+        data = self.data
+        if not data:
             return
 
         # Ensure cache directory exists
@@ -409,7 +411,7 @@ class Chunk(object):
         # Write data to the unique temp file first
         try:
             with open(temp_filename, 'wb') as h:
-                h.write(self.data)
+                h.write(data)
         except Exception as e:
             # Could not write temp file
             try:

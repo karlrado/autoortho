@@ -1,0 +1,64 @@
+name: Release Stable
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  prepare-stable:
+    if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main' && startsWith(github.event.pull_request.head.ref, 'release/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      tag: ${{ steps.compute.outputs.tag }}
+      releasebody: ${{ steps.body.outputs.releasebody }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Compute stable tag and push if needed
+        id: compute
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+          VERSION="${BRANCH#release/}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Branch name must be release/x.y.z" >&2
+            exit 1
+          fi
+          TAG="$VERSION"
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "refs/tags/${TAG}$"; then
+            echo "Tag ${TAG} already exists; not recreating" >&2
+          else
+            git config user.name "github-actions"
+            git config user.email "github-actions@users.noreply.github.com"
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Capture PR body
+        id: body
+        run: |
+          echo 'releasebody<<EOF' >> "$GITHUB_OUTPUT"
+          printf "%s" "${{ github.event.pull_request.body }}" >> "$GITHUB_OUTPUT"
+          echo '' >> "$GITHUB_OUTPUT"
+          echo 'EOF' >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare-stable
+    uses: ./.github/workflows/build_release.yml
+    with:
+      version: ${{ needs.prepare-stable.outputs.tag }}
+      relname: ${{ needs.prepare-stable.outputs.tag }}
+      prerelease: false
+      internalver: ''
+      make_latest: true
+      releasebody: ${{ needs.prepare-stable.outputs.releasebody }}
+
+
