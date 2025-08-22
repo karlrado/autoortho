@@ -77,10 +77,11 @@ max_zoom_near_airports = 18
 # stutters.  Lower numbers will be more responsive at the expense of
 # ocassional low quality tiles.
 maxwait = 0.5
-maptypes = ['Null', 'BI', 'NAIP', 'EOX', 'USGS', 'Firefly']
-fetch_threads = 32
+maptypes = ['Null', 'BI', 'NAIP', 'EOX', 'USGS', 'Firefly', 'YNDX']
+fetch_threads = 32 
 # Simheaven compatibility mode.
 simheaven_compat = False
+
 
 [pydds]
 # ISPC or STB for dds file compression
