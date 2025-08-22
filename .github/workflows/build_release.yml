@@ -18,10 +18,20 @@ on:
         required: false
         type: string
         default: ''
+      make_latest:
+        required: false
+        type: boolean
+        default: false
+      releasebody:
+        required: false
+        type: string
+        default: ''
 
 jobs:
   build-linux:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     env:
       VERNAME: ${{ inputs.version }} 
@@ -56,10 +66,14 @@ jobs:
         files: autoortho_lin_*.bin
         tag_name: ${{ inputs.relname }}
         prerelease: ${{ inputs.prerelease }}
+        make_latest: ${{ inputs.make_latest }}
+        body: ${{ inputs.releasebody }}
 
 
   build-windows:
     runs-on: windows-latest
+    permissions:
+      contents: write
 
     env:
       VERNAME: ${{ inputs.version }} 
@@ -104,3 +118,5 @@ jobs:
           autoortho_win_*.zip
         tag_name: ${{ inputs.relname }}
         prerelease: ${{ inputs.prerelease }}
+        make_latest: ${{ inputs.make_latest }}
+        body: ${{ inputs.releasebody }}

@@ -9,7 +9,7 @@ on:
   #  - cron: '0 5 * * *'
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ develop ]
   #pull_request:
 
 jobs:

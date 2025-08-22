@@ -1,0 +1,64 @@
+name: Release Candidate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [ main ]
+
+jobs:
+  prepare-rc:
+    if: startsWith(github.event.pull_request.head.ref, 'release/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      tag: ${{ steps.compute.outputs.tag }}
+      releasebody: ${{ steps.body.outputs.releasebody }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Compute RC tag
+        id: compute
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+          VERSION="${BRANCH#release/}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Branch name must be release/x.y.z" >&2
+            exit 1
+          fi
+          # Count existing RC tags to increment
+          existing=$(git ls-remote --tags origin "refs/tags/${VERSION}-rc-*" | wc -l)
+          next=$((existing + 1))
+          TAG="${VERSION}-rc-${next}"
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release candidate $TAG"
+          git push origin "$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Capture PR body
+        id: body
+        run: |
+          echo 'releasebody<<EOF' >> "$GITHUB_OUTPUT"
+          printf "%s" "${{ github.event.pull_request.body }}" >> "$GITHUB_OUTPUT"
+          echo '' >> "$GITHUB_OUTPUT"
+          echo 'EOF' >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare-rc
+    uses: ./.github/workflows/build_release.yml
+    with:
+      version: ${{ needs.prepare-rc.outputs.tag }}
+      relname: ${{ needs.prepare-rc.outputs.tag }}
+      prerelease: true
+      internalver: ''
+      make_latest: false
+      releasebody: ${{ needs.prepare-rc.outputs.releasebody }}
+
+

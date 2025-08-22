@@ -394,7 +394,9 @@ class Chunk(object):
             return False
 
     def save_cache(self):
-        if not self.data:
+        # Snapshot data to avoid races with close() setting self.data = None
+        data = self.data
+        if not data:
             return
 
         # Ensure cache directory exists
@@ -409,7 +411,7 @@ class Chunk(object):
         # Write data to the unique temp file first
         try:
             with open(temp_filename, 'wb') as h:
-                h.write(self.data)
+                h.write(data)
         except Exception as e:
             # Could not write temp file
             try:
@@ -484,7 +486,8 @@ class Chunk(object):
             "ARC": f"http://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
             "NAIP": f"http://naip.maptiles.arcgis.com/arcgis/rest/services/NAIP/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
             "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-            "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{self.zoom}/{self.row}/{self.col}"
+            "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
+            "YNDX": f"https://sat{server_num+1:02d}.maps.yandex.net/tiles?l=sat&v=3.1814.0&x={self.col}&y={self.row}&z={self.zoom}"
         }
 
 
