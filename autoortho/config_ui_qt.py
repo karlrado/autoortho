@@ -9,6 +9,7 @@ import time
 import traceback
 import logging
 from packaging import version
+from utils import map_kubilus_region_to_simheaven_region
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -239,6 +240,7 @@ class ConfigUI(QMainWindow):
         self.download_progress = {}
         self.uninstall_workers = {}
         self.simheaven_config_changed_session = False
+        self.installed_packages = []
         self.cache_thread = None
         self._closing = False
         self._shutdown_in_progress = False
@@ -1199,6 +1201,7 @@ class ConfigUI(QMainWindow):
 
             pending_update = False
             if r.local_rel:
+                self.installed_packages.append(r.region_id)
                 version_label = QLabel(f"Current version: {r.local_rel.ver}")
                 item_layout.addWidget(version_label)
                 if version.parse(latest.ver) > version.parse(r.local_rel.ver):
@@ -1741,23 +1744,35 @@ class ConfigUI(QMainWindow):
                 lines = f.readlines()
             
             overlay_pattern = "Custom Scenery/yAutoOrtho_Overlays/"
-            simheaven_overlay_pattern = "Custom Scenery/simHeaven_X-World"
+            simheaven_overlay_pattern_xp11 = "Custom Scenery/simHeaven_X-{region_id}"
+            simheaven_overlay_pattern_xp12 = "Custom Scenery/simHeaven_X-World_{region_id}"
             
             # First, check if SimHeaven overlay pattern exists
-            simheaven_found = False
+            simheaven_found_required_libs = {x: False for x in self.installed_packages}
+            missing_simheaven_libs = []
             for line in lines:
                 line_stripped = line.strip()
-                if simheaven_overlay_pattern in line_stripped:
-                    simheaven_found = True
-                    log.info(f"Found SimHeaven overlay entry: {line_stripped}")
-                    break
-            
-            if not simheaven_found:
-                log.info("No SimHeaven overlay found in scenery_packs.ini - skipping AutoOrtho overlay modifications")
+                for region_id in self.installed_packages:
+                    simheaven_region = map_kubilus_region_to_simheaven_region(region_id)
+                    if simheaven_overlay_pattern_xp11.format(region_id=simheaven_region) in line_stripped or simheaven_overlay_pattern_xp12.format(region_id=simheaven_region) in line_stripped:
+                        simheaven_found_required_libs[region_id] = True
+                        log.info(f"Found SimHeaven overlay entry: {line_stripped}")
+                        continue
+
+            for region_id, found in simheaven_found_required_libs.items():
+                if not found:
+                    simheaven_region = map_kubilus_region_to_simheaven_region(region_id)
+                    missing_simheaven_libs.append(simheaven_region)
+                    log.error(f"SimHeaven overlay entry not found for {region_id}")
+
+            missing_simheaven_libs = set(missing_simheaven_libs) # Remove duplicates
+            if missing_simheaven_libs:
+                log.info("Required SimHeaven packages missing in scenery_packs.ini - skipping AutoOrtho overlay modifications")
                 QMessageBox.information(
                     self,
                     "SimHeaven Compatibility",
-                    "No SimHeaven scenery found in scenery_packs.ini - skipping AutoOrtho overlay modifications, make sure to install SimHeaven scenery and run X-Plane once."
+                    "Missing SimHeaven scenery in scenery_packs.ini - skipping AutoOrtho overlay modifications, make sure to install required SimHeaven scenery and run X-Plane once."
+                    f"Missing SimHeaven Packages: {', '.join(missing_simheaven_libs)}"
                 )
                 return
             
