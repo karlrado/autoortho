@@ -867,11 +867,12 @@ class ConfigUI(QMainWindow):
         maxwait_layout = QHBoxLayout()
         maxwait_label = QLabel("Max wait time (seconds):")
         maxwait_label.setToolTip(
-            "Maximum time to wait for imagery downloads before timing out.\n"
-            "Lower values = faster response but may miss imagery\n"
-            "Higher values = better reliability but slower response\n"
-            "Optimal: 5-15 seconds depending on internet speed\n"
-            "Slow internet: 15-30 seconds"
+            "Maximum time to wait for single imagery downloads before timing out.\n"
+            "Lower values = faster response but may have green or blank tiles\n"
+            "Higher values = better change at getting tiles but stutters and missing tiles while they load\n"
+            "Default: 0.5 seconds\n"
+            "Optimal: 2 seconds is a good compromise.\n"
+            "Increase this if you are using higher zoom levels and/or have a slow internet connection."
         )
         maxwait_layout.addWidget(maxwait_label)
         self.maxwait_slider = ModernSlider()
