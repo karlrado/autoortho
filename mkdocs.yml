@@ -1,5 +1,5 @@
-site_name: 'AutoOrtho'
-repo_url: https://github.com/kubilus1/autoortho
+site_name: 'AutoOrtho Continued'
+repo_url: https://github.com/ProgrammingDinosaur/autoortho4xplane
 theme:
   name: 'material'
   features:
