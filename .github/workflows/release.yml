@@ -1,14 +1,11 @@
-name: Release 
+name: Release (disabled)
 
 on:
-  push:
-    tags:
-      - '*'
+  workflow_dispatch:
 
 jobs:
-  build: 
-    uses: ./.github/workflows/build_release.yml
-    with:
-      version: ${{ github.head_ref || github.ref_name }}
-      relname: ${{ github.ref_name }}
-      prerelease: true
+  disabled:
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - run: echo "Disabled"
