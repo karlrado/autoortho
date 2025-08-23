@@ -474,10 +474,10 @@ class ConfigUI(QMainWindow):
 
         # Scenery path
         scenery_layout = QHBoxLayout()
-        scenery_label = QLabel("Custom Scenery folder:")
+        scenery_label = QLabel("Scenery Install Folder:") # Changed from "Custom Scenery folder:"
         scenery_label.setToolTip(
             "Directory where AutoOrtho scenery will be installed.\n"
-            "This should be a your X-Plane Custom Scenery folder."
+            "This should be a your X-Plane Custom Scenery folder or another location."
         )
         scenery_layout.addWidget(scenery_label)
         self.scenery_path_edit = QLineEdit(self.cfg.paths.scenery_path)
@@ -1388,6 +1388,19 @@ class ConfigUI(QMainWindow):
 
     def on_save(self):
         """Handle Save button click"""
+        # Check if the directory exists
+        scenery_path = self.scenery_path_edit.text()
+        if not os.path.isdir(scenery_path):
+            reply = QMessageBox.question(
+                self,
+                'Create Folder?',
+                f"The directory '{scenery_path}' does not exist. Do you want to create it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.No:
+                self.update_status_bar("Save cancelled.")
+                return
         # Check if program is already running
         if self.running:
             reply = QMessageBox.question(
@@ -1405,6 +1418,7 @@ class ConfigUI(QMainWindow):
         
         self.save_config()
         self.cfg.load()
+        self.refresh_scenery_list()
         
         # Update bandwidth limiter with new settings
         try:
