@@ -61,6 +61,14 @@ experimental ATM:
 
 ---
 
+## Configuring your scenery_packs.ini
+
+Use this image as a guide on how to order your X-Plane packages within the scenery_packs.ini file.
+
+[scenery_packs.ini_config](imgs/scenery_ini_guide.png)
+
+---
+
 ## Requirements and Compatibility
 
 To run from source, this project requires python3.x and all pre-requisites in the

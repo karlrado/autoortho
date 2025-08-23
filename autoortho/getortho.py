@@ -28,6 +28,8 @@ from aoimage import AoImage
 from aoconfig import CFG
 from aostats import STATS, StatTracker, set_stat, inc_stat, get_stat
 
+from utils.apple_token_service import apple_token_service
+
 MEMTRACE = False
 
 import logging
@@ -395,8 +397,7 @@ class Chunk(object):
 
     def save_cache(self):
         # Snapshot data to avoid races with close() setting self.data = None
-        data = self.data
-        if not data:
+        if not self.data:
             return
 
         # Ensure cache directory exists
@@ -411,7 +412,7 @@ class Chunk(object):
         # Write data to the unique temp file first
         try:
             with open(temp_filename, 'wb') as h:
-                h.write(data)
+                h.write(self.data)
         except Exception as e:
             # Could not write temp file
             try:
@@ -487,14 +488,9 @@ class Chunk(object):
             "NAIP": f"http://naip.maptiles.arcgis.com/arcgis/rest/services/NAIP/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
             "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
             "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-            "YNDX": f"https://sat{server_num+1:02d}.maps.yandex.net/tiles?l=sat&v=3.1814.0&x={self.col}&y={self.row}&z={self.zoom}"
+            "YNDX": f"https://sat{server_num+1:02d}.maps.yandex.net/tiles?l=sat&v=3.1814.0&x={self.col}&y={self.row}&z={self.zoom}",
+            "APPLE": f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v=10181&accessKey={apple_token_service.apple_token}"
         }
-
-
-        
-        #if self.maptype.upper() == "EOX":
-        #    session.headers.update({'referer': 'https://s2maps.eu/'})
-
 
         self.url = MAPTYPES[self.maptype.upper()]
         #log.debug(f"{self} getting {url}")
@@ -529,10 +525,25 @@ class Chunk(object):
                 #resp = session.get(self.url, stream=True)
                 resp = session.get(self.url)
                 status_code = resp.status_code
+
+                if self.maptype.upper() == "APPLE" and status_code == 403:
+                    log.warning(f"Failed with status {status_code} to get chunk {self} on server {server}.  Retrying with new Apple Maps token.")
+                    apple_token_service.reset_apple_maps_token()
+                    self.url = MAPTYPES[self.maptype.upper()]
+                    resp = session.get(self.url)
+                    status_code = resp.status_code
+
             else:
                 req = Request(self.url, headers=header)
                 resp = urlopen(req, timeout=5)
                 status_code = resp.status
+
+                if self.maptype.upper() == "APPLE" and status_code == 403:
+                    log.warning(f"Failed with status {status_code} to get chunk {self} on server {server}.  Retrying with new Apple Maps token.")
+                    apple_token_service.reset_apple_maps_token()
+                    self.url = MAPTYPES[self.maptype.upper()]
+                    resp = session.get(self.url)
+                    status_code = resp.status_code
 
             if status_code != 200:
                 log.warning(f"Failed with status {status_code} to get chunk {self} on server {server}.")
@@ -1427,6 +1438,8 @@ class TileCacher(object):
         self.maptype_override = CFG.autoortho.maptype_override
         if self.maptype_override:
             log.info(f"Maptype override set to {self.maptype_override}")
+            if self.maptype_override == "APPLE":
+                apple_token_service.reset_apple_maps_token()
         else:
             log.info(f"Maptype override not set, will use default.")
         log.info(f"Will use Compressor: {CFG.pydds.compressor}")

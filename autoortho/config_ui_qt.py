@@ -9,7 +9,7 @@ import time
 import traceback
 import logging
 from packaging import version
-from utils import map_kubilus_region_to_simheaven_region
+from utils.mappers import map_kubilus_region_to_simheaven_region
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -474,10 +474,10 @@ class ConfigUI(QMainWindow):
 
         # Scenery path
         scenery_layout = QHBoxLayout()
-        scenery_label = QLabel("Custom Scenery folder:")
+        scenery_label = QLabel("Scenery Install Folder:") # Changed from "Custom Scenery folder:"
         scenery_label.setToolTip(
             "Directory where AutoOrtho scenery will be installed.\n"
-            "This should be a your X-Plane Custom Scenery folder."
+            "This should be a your X-Plane Custom Scenery folder or another location."
         )
         scenery_layout.addWidget(scenery_label)
         self.scenery_path_edit = QLineEdit(self.cfg.paths.scenery_path)
@@ -596,12 +596,12 @@ class ConfigUI(QMainWindow):
             "• EOX: Good for Europe and some other regions\n"
             "• USGS: USA government imagery\n"
             "• Firefly: Alternative commercial source\n"
-            "Leave empty for automatic selection (recommended)"
+            "• YNDX: Yandex Maps"
         )
         maptype_layout.addWidget(maptype_label)
         self.maptype_combo = QComboBox()
         self.maptype_combo.addItems([
-            '', 'BI', 'GO2', 'NAIP', 'EOX', 'USGS', 'Firefly'
+            '', 'BI', 'GO2', 'NAIP', 'EOX', 'USGS', 'Firefly', 'YNDX'
         ])
         self.maptype_combo.setCurrentText(self.cfg.autoortho.maptype_override)
         self.maptype_combo.setObjectName('maptype_override')
@@ -654,7 +654,8 @@ class ConfigUI(QMainWindow):
         self.simheaven_compat_check.setToolTip(
             "Enable this if you are using SimHeaven scenery.\n"
             "This will disable AutoOrtho Overlays to use the SimHeaven "
-            "overlay instead."
+            "overlay instead. This is done by changing values within scenery_packs.ini.\n"
+            "Use with caution, this may cause issues with other scenery packs."
         )
         options_layout.addWidget(self.simheaven_compat_check)
 
@@ -1386,6 +1387,19 @@ class ConfigUI(QMainWindow):
 
     def on_save(self):
         """Handle Save button click"""
+        # Check if the directory exists
+        scenery_path = self.scenery_path_edit.text()
+        if not os.path.isdir(scenery_path):
+            reply = QMessageBox.question(
+                self,
+                'Create Folder?',
+                f"The directory '{scenery_path}' does not exist. Do you want to create it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.No:
+                self.update_status_bar("Save cancelled.")
+                return
         # Check if program is already running
         if self.running:
             reply = QMessageBox.question(
@@ -1403,6 +1417,7 @@ class ConfigUI(QMainWindow):
         
         self.save_config()
         self.cfg.load()
+        self.refresh_scenery_list()
         
         # Update bandwidth limiter with new settings
         try:
