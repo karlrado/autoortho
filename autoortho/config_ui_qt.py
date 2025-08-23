@@ -9,7 +9,7 @@ import time
 import traceback
 import logging
 from packaging import version
-from utils import map_kubilus_region_to_simheaven_region
+from utils.mappers import map_kubilus_region_to_simheaven_region
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -596,12 +596,13 @@ class ConfigUI(QMainWindow):
             "• EOX: Good for Europe and some other regions\n"
             "• USGS: USA government imagery\n"
             "• Firefly: Alternative commercial source\n"
-            "Leave empty for automatic selection (recommended)"
+            "• YNDX: Yandex Maps\n"
+            "• APPLE: Apple Maps\n"
         )
         maptype_layout.addWidget(maptype_label)
         self.maptype_combo = QComboBox()
         self.maptype_combo.addItems([
-            '', 'BI', 'GO2', 'NAIP', 'EOX', 'USGS', 'Firefly'
+            '', 'BI', 'GO2', 'NAIP', 'EOX', 'USGS', 'Firefly', 'YNDX'
         ])
         self.maptype_combo.setCurrentText(self.cfg.autoortho.maptype_override)
         self.maptype_combo.setObjectName('maptype_override')
@@ -654,7 +655,8 @@ class ConfigUI(QMainWindow):
         self.simheaven_compat_check.setToolTip(
             "Enable this if you are using SimHeaven scenery.\n"
             "This will disable AutoOrtho Overlays to use the SimHeaven "
-            "overlay instead."
+            "overlay instead. This is done by changing values within scenery_packs.ini.\n"
+            "Use with caution, this may cause issues with other scenery packs."
         )
         options_layout.addWidget(self.simheaven_compat_check)
 
