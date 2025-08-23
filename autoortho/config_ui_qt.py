@@ -596,8 +596,7 @@ class ConfigUI(QMainWindow):
             "• EOX: Good for Europe and some other regions\n"
             "• USGS: USA government imagery\n"
             "• Firefly: Alternative commercial source\n"
-            "• YNDX: Yandex Maps\n"
-            "• APPLE: Apple Maps\n"
+            "• YNDX: Yandex Maps"
         )
         maptype_layout.addWidget(maptype_label)
         self.maptype_combo = QComboBox()
