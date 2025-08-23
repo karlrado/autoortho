@@ -1240,7 +1240,6 @@ class Tile(object):
                         new_im.paste(chunk_img, (start_x, start_y))
                 except Exception as exc:
                     log.error(f"Chunk processing failed: {exc}")
-                    raise
 
         if complete_img and mipmap <= self.max_mipmap:
             log.debug(f"GET_IMG: Save complete image for later...")
