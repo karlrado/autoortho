@@ -11,7 +11,6 @@ import concurrent.futures
 
 import subprocess
 import collections
-import uuid
 
 from io import BytesIO
 from urllib.request import urlopen, Request
@@ -400,14 +399,12 @@ class Chunk(object):
         if not self.data:
             return
 
-        # Ensure cache directory exists
-        try:
-            os.makedirs(self.cache_dir, exist_ok=True)
-        except Exception:
-            pass
-
-        # Unique temp filename per writer to avoid collisions between threads/tiles
-        temp_filename = os.path.join(self.cache_dir, f"XX_{self.chunk_id}_{uuid.uuid4().hex}.tmp")
+        # Temporarily use an invalid cache file name so that it cannot be
+        # found while it is being written.
+        temp_filename = os.path.join(self.cache_dir, f"XX_{self.chunk_id}.jpg")
+        with open(temp_filename, 'wb') as h:
+            h.write(self.data)
+        os.rename(temp_filename, self.cache_path)
 
         # Write data to the unique temp file first
         try:
@@ -1187,8 +1184,7 @@ class Tile(object):
             placeholder_img = AoImage.new('RGBA', (img_width, img_height), (128, 128, 128))
             return placeholder_img
             
-        
-        def process_chunk(chunk):
+        for chunk in chunks:
             """Process a single chunk and return (chunk, chunk_img, start_x, start_y)"""
             chunk_ready = chunk.ready.wait(maxwait)
             
@@ -1217,29 +1213,13 @@ class Tile(object):
                     log.debug(f"GET_IMG: Final retry for {chunk}, SUCCESS!")
                     chunk_img = AoImage.load_from_memory(chunk.data)
 
-            if not chunk_img and not chunk.data:
+            if chunk_img:
+                new_im.paste(chunk_img, (start_x, start_y))
+            elif not chunk_img and not chunk.data:
                 log.debug(f"GET_IMG: Empty chunk data.  Skip.")
                 STATS['chunk_missing_count'] = STATS.get('chunk_missing_count', 0) + 1
             elif not chunk_img and chunk.data:
                 log.warning(f"GET_IMG: FAILED! {chunk}:  LEN: {len(chunk.data)}  HEADER: {chunk.data[:8]}")
-                
-            return (chunk, chunk_img, start_x, start_y)
-        
-        # Process all chunks in parallel instead of sequentially
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(chunks))) as executor:
-            # Submit all chunk processing tasks
-            future_to_chunk = {executor.submit(process_chunk, chunk): chunk for chunk in chunks}
-            
-            # Collect results and paste into image as they complete
-            for future in concurrent.futures.as_completed(future_to_chunk):
-                try:
-                    chunk, chunk_img, start_x, start_y = future.result()
-                    if chunk_img:
-                        # For adaptive system, chunks are already downloaded at the optimal zoom level
-                        # or retrieved from backup at appropriate resolution. Paste directly.
-                        new_im.paste(chunk_img, (start_x, start_y))
-                except Exception as exc:
-                    log.error(f"Chunk processing failed: {exc}")
 
         if complete_img and mipmap <= self.max_mipmap:
             log.debug(f"GET_IMG: Save complete image for later...")

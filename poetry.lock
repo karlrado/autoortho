@@ -487,6 +487,18 @@ files = [
 ]
 
 [[package]]
+name = "mfusepy"
+version = "3.0.0"
+description = "Ctypes bindings for the high-level API in libfuse 2 and 3"
+optional = false
+python-versions = ">=3.9"
+groups = ["main"]
+files = [
+    {file = "mfusepy-3.0.0-py3-none-any.whl", hash = "sha256:1f8d487ac2c1138b1642955ef92e253685943c97e6f3f5b0e910ab8e04c6312d"},
+    {file = "mfusepy-3.0.0.tar.gz", hash = "sha256:eddade33e427bac9c455464cd0a7d12d63c033255ec6b1e0d6ada143a945c6f2"},
+]
+
+[[package]]
 name = "packaging"
 version = "24.2"
 description = "Core utilities for Python packages"
@@ -680,21 +692,6 @@ files = [
 decorator = "*"
 
 [[package]]
-name = "refuse"
-version = "0.0.4"
-description = "Simple cross-plattform ctypes bindings for libfuse / FUSE for macOS / WinFsp"
-optional = false
-python-versions = ">=3.5"
-groups = ["main"]
-files = [
-    {file = "refuse-0.0.4-py3-none-any.whl", hash = "sha256:6da3519eec1278d142e611a9149755bdf7b4f645500752c335555cb6f8495a43"},
-    {file = "refuse-0.0.4.tar.gz", hash = "sha256:b760e0711b3ed3b00621ce2ffead8f1bb838ffc66df559a64b46d74e2636e69a"},
-]
-
-[package.extras]
-dev = ["Sphinx", "coverage", "pytest", "python-language-server[all]", "setuptools", "sphinx-rtd-theme", "twine", "wheel"]
-
-[[package]]
 name = "requests"
 version = "2.32.5"
 description = "Python HTTP for Humans."
@@ -816,4 +813,4 @@ h11 = ">=0.9.0,<1"
 [metadata]
 lock-version = "2.1"
 python-versions = "3.12.*"
-content-hash = "3b797fe65ef0eb8d41b0c28b8d1ceb4cff61e9f7b33e161480fec2c37dd15a10"
+content-hash = "662d87f0d438a347be6bbeaa55ef143cb2455e0302e197f7a87187c90ec08b9d"
