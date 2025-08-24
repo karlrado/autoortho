@@ -48,6 +48,11 @@ uses.  For example:
 ```
 SSL_CERT_DIR=/etc/ssl/certs ./autoortho_lin.bin
 ```
+Note - Possibly fixed in 1.1.0 and newer See [Issue #11](https://github.com/ProgrammingDinosaur/autoortho4xplane/issues/11)
+
+### FUSE errors ands trange behaviors on ARCH based systems.
+Arch and some other systems keep FUSE2 and FUSE3 seperate when it comes to their userspace binaries (the part AutoOrtho calls to mount and map folders). Other systems like Debian based platforms (e.g. Linux Mint, Ubuntu, Etc) just use FUSE3 binaries/libraries for both FUSE2 and FUSE3 support risking breaking compatability for select usecases. Luckely AutoOrtho is not one of these, but this leaves Arch support broken for now. A solution has been identified in a python FUSE support project that expands support to FUSE3 nativly.
+Until resolved - a Debian based release might be your best bet. The Linux version of X-Plane 12 itself is developed on LTS releases of ubuntu, so that or their Linux Mint counterparts might be a safe starting point if you must have ortho under linux.
 
 ### On Linux this does not start/gives a FUSE error
 Make sure that your `/etc/fuse.conf` files is set to `user_allow_other`.  You may need to uncomment a line.
