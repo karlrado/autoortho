@@ -255,8 +255,9 @@ class Chunk(object):
             return False
 
     def save_cache(self):
-        # Snapshot data to avoid races with close() setting self.data = None
-        if not self.data:
+        # Snapshot data to avoid races with close() mutating self.data
+        data = self.data
+        if not data:
             return
 
         # Ensure cache directory exists
@@ -271,7 +272,7 @@ class Chunk(object):
         # Write data to the unique temp file first
         try:
             with open(temp_filename, 'wb') as h:
-                h.write(self.data)
+                h.write(data)
         except Exception as e:
             # Could not write temp file
             try:
@@ -898,7 +899,7 @@ class Tile(object):
             placeholder_img = AoImage.new('RGBA', (img_width, img_height), (128, 128, 128))
             return placeholder_img
             
-        for chunk in chunks:
+        def process_chunk(chunk):
             """Process a single chunk and return (chunk, chunk_img, start_x, start_y)"""
             chunk_ready = chunk.ready.wait(maxwait)
             
@@ -927,22 +928,29 @@ class Tile(object):
                     log.debug(f"GET_IMG: Final retry for {chunk}, SUCCESS!")
                     chunk_img = AoImage.load_from_memory(chunk.data)
 
-            if chunk_img:
-                new_im.paste(chunk_img, (start_x, start_y))
-                # Free temporary chunk image immediately after paste
-                try:
-                    if hasattr(chunk_img, "close"):
-                        chunk_img.close()
-                except Exception:
-                    log.warning(f"Failed to close chunk image: {chunk_img}")
-                    pass
-                finally:
-                    chunk_img = None
-            elif not chunk_img and not chunk.data:
+            if not chunk_img and not chunk.data:
                 log.debug(f"GET_IMG: Empty chunk data.  Skip.")
                 STATS['chunk_missing_count'] = STATS.get('chunk_missing_count', 0) + 1
             elif not chunk_img and chunk.data:
                 log.warning(f"GET_IMG: FAILED! {chunk}:  LEN: {len(chunk.data)}  HEADER: {chunk.data[:8]}")
+                
+            return (chunk, chunk_img, start_x, start_y)
+        
+        # Process all chunks in parallel instead of sequentially
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(chunks))) as executor:
+            # Submit all chunk processing tasks
+            future_to_chunk = {executor.submit(process_chunk, chunk): chunk for chunk in chunks}
+            
+            # Collect results and paste into image as they complete
+            for future in concurrent.futures.as_completed(future_to_chunk):
+                try:
+                    chunk, chunk_img, start_x, start_y = future.result()
+                    if chunk_img:
+                        # For adaptive system, chunks are already downloaded at the optimal zoom level
+                        # or retrieved from backup at appropriate resolution. Paste directly.
+                        new_im.paste(chunk_img, (start_x, start_y))
+                except Exception as exc:
+                    log.error(f"Chunk processing failed: {exc}")
 
         if complete_img and mipmap <= self.max_mipmap:
             log.debug(f"GET_IMG: Save complete image for later...")
