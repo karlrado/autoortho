@@ -213,6 +213,7 @@ class Package(object):
             # If the file is already present, count it as done for overall progress
             if os.path.isfile(destpath) or os.path.isfile(posible_destpath):
                 log.info(f"{destpath} already exists.  Skip.")
+                self.zf.files.append(destpath)
                 #print(f"{self.zf.path} already exists.  Skip.")
                 #self.zf.assembled = True
                 #self.downloaded = True

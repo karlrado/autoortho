@@ -266,71 +266,53 @@ AOIAPI int32_t aoimage_scale(const aoimage_t *s_img, aoimage_t *d_img, uint32_t 
            && (s_img->width == s_img->height)
            && (0 == (s_img->width & 0x03)));
 
-    uint32_t slen = s_img->width * s_img->height;
-    uint32_t dlen = slen * 16 * factor;
-   
-    //fprintf(stderr, "malloc(%d)\n", (dlen*4)); fflush(stderr); 
-    uint32_t *dest = malloc(dlen*4);
-    if (NULL == dest) {
-		sprintf(d_img->errmsg, "can't malloc %d bytes", dlen);
+    if (factor == 0) {
+        strcpy(d_img->errmsg, "invalid scale factor");
         d_img->ptr = NULL;
         return FALSE;
     }
 
-    //const uint8_t *srptr = s_img->ptr;      // source row start
-    //const uint8_t *send = srptr + slen;
-   
-    // Start destination image pointer at the start 
-    uint32_t *dptr = dest;
+    uint32_t src_w = s_img->width;
+    uint32_t src_h = s_img->height;
+    uint32_t dst_w = src_w * factor;
+    uint32_t dst_h = src_h * factor;
 
-    // Length of one row of the source image
-    int d_stride = s_img->width * factor;
-    //fprintf(stderr, "%d %d %d\n", slen, dlen, d_stride); fflush(stderr);
-    int s_stride = s_img->width;
-    //fprintf(stderr, "%p %d %d %d\n", srptr, slen, dlen, d_stride); fflush(stderr);
-
-    const uint32_t *sptr = s_img->ptr;
-    
-    int d_idx;
-    int s_col_count = 0;
-
-    // Iterate over source image
-    for (int i=0; i<slen; i++) {
-        
-        s_col_count++;
-
-        // Grab 32 bits
-        uint32_t s_rgba = sptr[i];
-        for (int j=0; j<factor; j++) {
-            //col
-            for (int k=0; k<factor; k++) {
-                //row
-                d_idx = ((d_stride * k) + j);
-                //fprintf(stderr, "D_IDX: %d D_STRIDE: %d k: %d  j: %d    %d  %d \n", d_idx, d_stride, k, j, (d_stride * k), (d_stride * k) + j); fflush(stderr);
-                dptr[d_idx] = s_rgba;
-            }
-        }
-        
-        dptr += factor;
-
-        if (s_col_count == s_stride) {
-            dptr += d_stride * (factor - 1);
-            s_col_count = 0;
-            //fprintf(stderr, "STARTROW %d %p %p\n", i, sptr, dptr); fflush(stderr);
-        } 
-
+    unsigned long long num_pixels = (unsigned long long)dst_w * (unsigned long long)dst_h;
+    unsigned long long num_bytes = num_pixels * 4ULL;
+    if (num_pixels == 0ULL || (num_bytes / 4ULL) != num_pixels) {
+        strcpy(d_img->errmsg, "scale overflow");
+        d_img->ptr = NULL;
+        return FALSE;
     }
 
-    d_img->ptr = dest;
-    d_img->width = s_img->width * factor;
-    d_img->height = s_img->height * factor;
+    uint32_t *dest = (uint32_t *)malloc((size_t)num_bytes);
+    if (NULL == dest) {
+        sprintf(d_img->errmsg, "can't malloc %llu bytes", num_bytes);
+        d_img->ptr = NULL;
+        return FALSE;
+    }
+
+    const uint32_t *src = (const uint32_t *)s_img->ptr;
+    for (uint32_t sy = 0; sy < src_h; ++sy) {
+        for (uint32_t sx = 0; sx < src_w; ++sx) {
+            uint32_t px = src[sy * src_w + sx];
+            uint32_t dy0 = sy * factor;
+            uint32_t dx0 = sx * factor;
+            uint32_t base = dy0 * dst_w + dx0;
+            for (uint32_t fy = 0; fy < factor; ++fy) {
+                uint32_t row_base = base + fy * dst_w;
+                for (uint32_t fx = 0; fx < factor; ++fx) {
+                    dest[row_base + fx] = px;
+                }
+            }
+        }
+    }
+
+    d_img->ptr = (uint8_t *)dest;
+    d_img->width = dst_w;
+    d_img->height = dst_h;
     d_img->stride = 4 * d_img->width;
     d_img->channels = 4;
-
-    //fprintf(stderr, "start: %p end: %p  expected: %p len: %d diff: %d \n", dest, dptr, (dest + dlen), dlen, (dest+dlen) - dptr); fflush(stderr);
-    //assert(dptr == (dest + dlen));
-    //fprintf(stderr, "width: %d height: %d \n", d_img->width, d_img->height); fflush(stderr);
-    //assert((s_img->width * s_img->height * 4) << factor == d_img->width * d_img->height * 4);
     return TRUE;
 }
 

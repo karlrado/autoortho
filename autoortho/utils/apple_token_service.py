@@ -42,4 +42,3 @@ class AppleTokenService:
             raise RuntimeError(f"Failed to retrieve Apple Maps token: {e}")
 
 apple_token_service = AppleTokenService()
-        
