@@ -1419,13 +1419,7 @@ class ConfigUI(QMainWindow):
         self.save_config()
         self.cfg.load()
         self.refresh_scenery_list()
-        
-        # Update bandwidth limiter with new settings
-        try:
-            new_bandwidth = float(self.cfg.autoortho.max_bandwidth_mbits)
-            # getortho.chunk_getter.update_bandwidth_limit(new_bandwidth) Removed as it needed an import that was not thaaat necessary
-        except (ValueError, AttributeError) as e:
-            log.warning(f"Could not update bandwidth limit: {e}")
+
         
         if self.running:
             self.update_status_bar("Configuration saved - some changes may require restart")
