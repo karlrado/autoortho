@@ -20,6 +20,7 @@ import winsetup
 import macsetup
 import flighttrack
 
+from utils.constants import MAPTYPES
 from version import __version__
 
 import logging
@@ -139,7 +140,7 @@ def diagnose(CFG):
 
     log.info(f"Checking maptypes:")
     import getortho
-    for maptype in CFG.autoortho.maptypes:
+    for maptype in MAPTYPES:
         with tempfile.TemporaryDirectory() as tmpdir:
             c = getortho.Chunk(2176, 3232, maptype, 13, cache_dir=tmpdir)
             ret = c.get()

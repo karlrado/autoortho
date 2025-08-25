@@ -9,6 +9,7 @@ import time
 import traceback
 import logging
 from packaging import version
+from utils.constants import MAPTYPES
 from utils.mappers import map_kubilus_region_to_simheaven_region
 
 from PySide6.QtWidgets import (
@@ -601,9 +602,7 @@ class ConfigUI(QMainWindow):
         )
         maptype_layout.addWidget(maptype_label)
         self.maptype_combo = QComboBox()
-        self.maptype_combo.addItems([
-            '', 'BI', 'GO2', 'NAIP', 'EOX', 'USGS', 'Firefly', 'YNDX', 'APPLE'
-        ])
+        self.maptype_combo.addItems(MAPTYPES)
         self.maptype_combo.setCurrentText(self.cfg.autoortho.maptype_override)
         self.maptype_combo.setObjectName('maptype_override')
         self.maptype_combo.setToolTip(
