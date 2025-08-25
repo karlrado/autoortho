@@ -11,6 +11,7 @@ import concurrent.futures
 
 import subprocess
 import collections
+import uuid
 
 from io import BytesIO
 from urllib.request import urlopen, Request
@@ -258,12 +259,14 @@ class Chunk(object):
         if not self.data:
             return
 
-        # Temporarily use an invalid cache file name so that it cannot be
-        # found while it is being written.
-        temp_filename = os.path.join(self.cache_dir, f"XX_{self.chunk_id}.jpg")
-        with open(temp_filename, 'wb') as h:
-            h.write(self.data)
-        os.rename(temp_filename, self.cache_path)
+        # Ensure cache directory exists
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+        except Exception:
+            pass
+
+        # Unique temp filename per writer to avoid collisions between threads/tiles
+        temp_filename = os.path.join(self.cache_dir, f"XX_{self.chunk_id}_{uuid.uuid4().hex}.tmp")
 
         # Write data to the unique temp file first
         try:
@@ -279,24 +282,18 @@ class Chunk(object):
             log.warning(f"Failed to save cache for {self}: {e}")
             return
 
-        # Try to move into place. On Windows this can fail if another thread wins the race.
-        # Strategy:
-        #  - If destination already exists, just remove our temp and return (another thread won)
-        #  - Otherwise, attempt os.rename with a few retries for transient WinError 32
+        # Try to move into place atomically with a few retries for WinError 32
         max_attempts = 3
-        attempt = 0
-        while True:
-            attempt += 1
+        for attempt in range(1, max_attempts + 1):
             try:
                 if os.path.exists(self.cache_path):
                     # Another writer got there first; clean up our temp
                     os.remove(temp_filename)
                     log.debug(f"Cache file already exists for {self}, skipping save (race) on attempt {attempt}")
                     return
-                os.rename(temp_filename, self.cache_path)
+                os.replace(temp_filename, self.cache_path)
                 return
             except FileExistsError:
-                # Destination appeared between exists check and rename
                 try:
                     os.remove(temp_filename)
                 except Exception:
@@ -304,11 +301,9 @@ class Chunk(object):
                 log.debug(f"Another thread saved cache for {self}, removed temp file")
                 return
             except OSError as e:
-                # WinError 32: file in use; WinError 2: not found (should be rare with unique temp)
-                if attempt < max_attempts and getattr(e, 'winerror', None) in (32,):
+                if getattr(e, 'winerror', None) in (32,) and attempt < max_attempts:
                     time.sleep(0.05 * attempt)
                     continue
-                # Final failure: clean up temp and warn
                 try:
                     if os.path.exists(temp_filename):
                         os.remove(temp_filename)
@@ -934,6 +929,15 @@ class Tile(object):
 
             if chunk_img:
                 new_im.paste(chunk_img, (start_x, start_y))
+                # Free temporary chunk image immediately after paste
+                try:
+                    if hasattr(chunk_img, "close"):
+                        chunk_img.close()
+                except Exception:
+                    log.warning(f"Failed to close chunk image: {chunk_img}")
+                    pass
+                finally:
+                    chunk_img = None
             elif not chunk_img and not chunk.data:
                 log.debug(f"GET_IMG: Empty chunk data.  Skip.")
                 STATS['chunk_missing_count'] = STATS.get('chunk_missing_count', 0) + 1
@@ -951,7 +955,7 @@ class Tile(object):
     def get_best_chunk(self, col, row, mm, zoom):
         # For adaptive system, search up to actual_max_zoom level
         max_search_zoom = self.max_zoom
-        
+
         for i in range(mm + 1, self.max_mipmap + 1):
             # Difference between requested mm and found image mm level
             diff = i - mm
@@ -965,7 +969,7 @@ class Tile(object):
             if zoom_p > max_search_zoom:
                 continue
 
-            scalefactor = 1 << diff
+            scalefactor = min(1 << diff, 16)
 
             # Check if we have a cached chunk
             c = Chunk(col_p, row_p, self.maptype, zoom_p, cache_dir=self.cache_dir)
@@ -983,8 +987,8 @@ class Tile(object):
             log.debug(f"Col_Offset: {col_offset}, Row_Offset: {row_offset}, Scale_Factor: {scalefactor}")
 
             # Pixel width
-            w_p = 256 >> diff
-            h_p = 256 >> diff
+            w_p = max(1, 256 >> diff)
+            h_p = max(1, 256 >> diff)
 
             log.debug(f"Pixel Size: {w_p}x{h_p}")
 
@@ -1000,6 +1004,7 @@ class Tile(object):
             img_p.crop(crop_img, (col_offset * w_p, row_offset * h_p))
             chunk_img = crop_img.scale(scalefactor)
 
+            # Close the cache chunk to free memory before returning
             c.close()
             return chunk_img
 
