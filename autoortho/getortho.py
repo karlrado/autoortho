@@ -662,9 +662,6 @@ class Tile(object):
 
         # Set max zoom level - if not specified, use original tile zoom (no capping)
         self.max_zoom = int(max_zoom) if max_zoom is not None else self.tilename_zoom
-
-        self.max_mipmap = self.max_zoom - self.min_zoom
-
         # Hack override maptype
         #self.maptype = "BI"
 
@@ -696,6 +693,13 @@ class Tile(object):
         else:
             self.chunks_per_row = self.width << (-self.tilezoom_diff)
             self.chunks_per_col = self.height << (-self.tilezoom_diff)
+
+
+        if self.tilezoom_diff < 0:
+            self.max_mipmap = min(self.max_zoom - self.min_zoom, 5) # Enforce a maximum of 5 mipmaps (8192 -> 256 max)
+        else:
+            self.max_mipmap = min(self.max_zoom - self.min_zoom, 4) # Enforce a maximum of 4 mipmaps (4096 -> 256 max)
+
 
         self.chunks_per_row = max(1, self.chunks_per_row)
         self.chunks_per_col = max(1, self.chunks_per_col)
@@ -986,7 +990,10 @@ class Tile(object):
         endrow = (mm_offset + max(0, length - 1)) // bytes_per_chunk_row
 
         # Clamp to valid range of chunk rows for this mipmap
-        chunk_rows_in_mm = max(1, base_height_px // 256)
+        chunk_rows_in_mm = base_height_px // 256
+        if chunk_rows_in_mm == 0:
+            log.error(f"Chunk rows in mipmap {mipmap} is 0!  Base height: {base_height_px}  Mipmap: {mipmap}")
+
         if startrow >= chunk_rows_in_mm:
             startrow = chunk_rows_in_mm - 1
         if endrow >= chunk_rows_in_mm:
