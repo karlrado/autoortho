@@ -70,7 +70,7 @@ def setupmount(mountpoint, systemtype):
         if not ret:
             raise MountError(f"Failed to setup mount point {mountpoint}!")
 
-    elif systemtype == "mac-FUSE":
+    elif systemtype == "macOS":
         ret = macsetup.setup_macfuse_mount(mountpoint)
         if not ret:
             raise MountError(f"Failed to setup mount point {mountpoint}!")
@@ -184,7 +184,7 @@ class AOMount:
         for scenery in self.cfg.scenery_mounts:
             t = threading.Thread(
                 target=self.domount,
-                daemon=False,
+                daemon=True if platform.system() == 'Darwin' else False,
                 args=(
                     scenery.get('root'),
                     scenery.get('mount'),
@@ -259,12 +259,13 @@ class AOMount:
                             nothreads
                     )
             elif platform.system() == 'Darwin':
-                systemtype, libpath = macsetup.find_mac_libs()
+                # systemtype, libpath = macsetup.find_mac_libs()
+                systemtype = "macOS"
                 with setupmount(mountpoint, systemtype) as mount:
                     log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
                     import autoortho_fuse
                     import mfusepy
-                    mfusepy._libfuse = ctypes.CDLL(libpath)
+                    # mfusepy._libfuse = ctypes.CDLL(libpath)
                     autoortho_fuse.run(
                             autoortho_fuse.AutoOrtho(root),
                             mount,
@@ -287,15 +288,38 @@ class AOMount:
             time.sleep(5)
 
     def unmount(self, mountpoint):
-        mounted = True
-        while mounted:
-            print(f"Shutting down {mountpoint}")
-            print("Send poison pill ...")
-            mounted = os.path.isfile(os.path.join(
-                mountpoint,
-                ".poison"
-            ))
+        log.info(f"Shutting down {mountpoint}")
+        poison_path = os.path.join(mountpoint, ".poison")
+
+        # Trigger getattr('.poison') to invoke fuse_exit inside the FUSE thread
+        try:
+            os.lstat(poison_path)
+        except FileNotFoundError:
+            # The file doesn't need to exist; getattr handler keys on the suffix
+            pass
+        except Exception as exc:
+            log.debug(f"Poison trigger stat failed: {exc}")
+
+        # Wait briefly for the mount to go away naturally
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if not os.path.ismount(mountpoint):
+                break
             time.sleep(0.5)
+
+        # macOS can linger; force unmount if still mounted
+        if platform.system() == 'Darwin' and os.path.ismount(mountpoint):
+            try:
+                import subprocess
+                log.info(f"Force unmounting {mountpoint} via diskutil")
+                subprocess.run(
+                    ["diskutil", "unmount", "force", mountpoint],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as exc:
+                log.warning(f"Force unmount attempt failed: {exc}")
 
 
 class AOMountUI(AOMount, config_ui.ConfigUI):
