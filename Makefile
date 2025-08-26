@@ -37,7 +37,7 @@ AutoOrtho.app: autoortho/.version
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--standalone \
 		--macos-create-app-bundle \
-		--target-arch=arm64 \
+		--macos-target-arch=arm64 \
 		--macos-app-icon=autoortho/imgs/ao-icon.icns \
 		--enable-plugin=pyside6 \
 		--include-data-file=./autoortho/.version*=. \
