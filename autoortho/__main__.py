@@ -16,6 +16,23 @@ def _global_shutdown(signum=None, frame=None):
         return
     _global_shutdown._done = True
 
+    log = logging.getLogger(__name__)
+    try:
+        log.info("Shutdown requested. Draining background threads...")
+        alive = threading.enumerate()
+        # Report alive threads for diagnostics
+        for t in alive:
+            if t is threading.current_thread():
+                continue
+            log.info(
+                "Thread alive: name=%s ident=%s daemon=%s",
+                t.name,
+                t.ident,
+                t.daemon,
+            )
+    except Exception:
+        pass
+
     try:
         from autoortho.getortho import shutdown as _go_shutdown
         _go_shutdown()
@@ -23,13 +40,33 @@ def _global_shutdown(signum=None, frame=None):
         pass
 
     # Join remaining non-daemon threads (best effort)
-    for t in threading.enumerate():
-        if t is threading.current_thread() or t.daemon:
-            continue
-        try:
-            t.join(timeout=2)
-        except Exception:
-            pass
+    try:
+        for t in threading.enumerate():
+            if t is threading.current_thread() or t.daemon:
+                continue
+            try:
+                t.join(timeout=2)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # macOS sometimes leaves background workers around; if only daemon
+    # threads remain, or stubborn non-daemon threads won't join, force exit.
+    try:
+        remaining = [
+            t for t in threading.enumerate()
+            if t is not threading.current_thread()
+        ]
+        non_daemons = [t for t in remaining if not t.daemon]
+        if platform.system() == "Darwin" and non_daemons:
+            log.warning(
+                "Force exiting on macOS; non-daemon threads still alive: %s",
+                [t.name for t in non_daemons],
+            )
+            os._exit(0)
+    except Exception:
+        pass
 
 
 # Register the hooks as early as possible

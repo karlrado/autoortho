@@ -32,18 +32,24 @@ bin: autoortho/.version
 		--onefile \
 		./autoortho/__main__.py -o autoortho_lin.bin
 
-mac_bin: autoortho_mac_$(SAFE_VERSION).bin
-autoortho_mac_$(SAFE_VERSION).bin: autoortho/.version
+mac_app: AutoOrtho.app
+AutoOrtho.app: autoortho/.version
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
-		--macos-app-icon=autoortho/imgs/ao-icon.ico \
+		--standalone \
+		--target-arch-bundle \
+		--macos-target-arch=arm64 \
+		--macos-app-icon=autoortho/imgs/ao-icon.icns \
 		--enable-plugin=pyside6 \
 		--include-data-file=./autoortho/.version*=. \
 		--include-data-file=./autoortho/templates/*.html=templates/ \
 		--include-data-file=./autoortho/lib/macos/*.dylib=lib/macos/ \
 		--include-data-file=./autoortho/aoimage/*.dylib=aoimage/ \
 		--include-data-dir=./autoortho/imgs=imgs \
-		--onefile \
-		./autoortho/__main__.py -o $@
+		./autoortho/__main__.py -o AutoOrtho.app
+
+mac_zip: AutoOrtho_mac_$(SAFE_VERSION).zip
+AutoOrtho_mac_$(SAFE_VERSION).zip: AutoOrtho.app
+	$(ZIP) -r $@ AutoOrtho.app
 
 _autoortho_win.exe: autoortho/.version
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \

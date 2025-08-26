@@ -10,9 +10,11 @@ CC=clang
 LD=clang
 
 CFLAGS+=-O2 -Wall -fPIC -fdiagnostics-color -fvisibility=hidden \
+	-arch arm64 -mmacosx-version-min=11.0 \
 	-I$(JPGT)/include $(DEFINES)
 
-LDFLAGS=-dynamiclib -install_name @rpath/aoimage.dylib -undefined dynamic_lookup
+LDFLAGS=-dynamiclib -install_name @rpath/aoimage.dylib -undefined dynamic_lookup \
+	-arch arm64 -mmacosx-version-min=11.0 -Wl,-rpath,$(JPGT)/lib
 LIBS=-L$(JPGT)/lib -lturbojpeg
 
 all: $(TARGET)

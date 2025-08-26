@@ -31,13 +31,17 @@ elif platform.system().lower() == 'windows':
     _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'windows', 'ispc_texcomp.dll')
 elif platform.system().lower() == 'darwin':
     print("macOS detected")
-    _stb_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'macos', 'lib_stb_dxt.dylib')
+    _stb_path = None
     _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'macos', 'libispc_texcomp.dylib')
 else:
     print("System is not supported")
     exit()
 
-_stb = CDLL(_stb_path)
+if _stb_path:
+    _stb = CDLL(_stb_path)
+else:
+    _stb = None
+
 _ispc = CDLL(_ispc_path)
 
 DDSD_CAPS = 0x00000001          # dwCaps/dwCaps2 is enabled. 
