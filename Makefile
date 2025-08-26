@@ -38,6 +38,7 @@ AutoOrtho.app: autoortho/.version
 		--standalone \
 		--macos-create-app-bundle \
 		--macos-target-arch=arm64 \
+		--macos-app-name=AutoOrtho \
 		--macos-app-icon=autoortho/imgs/ao-icon.icns \
 		--enable-plugin=pyside6 \
 		--include-data-file=./autoortho/.version*=. \
