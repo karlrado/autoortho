@@ -109,8 +109,8 @@ try:
         if os.environ.get("APPIMAGE") and os.path.isdir("/etc/ssl/certs"):
             os.environ["SSL_CERT_DIR"] = "/etc/ssl/certs"
     if platform.system().lower() == "darwin" and ".app" in sys.argv[0]:
-        app = Path(sys.argv[0]).resolve()
-        pem = app.parents[1] / "Resources" / "certifi" / "cacert.pem"
+        macos_dir = Path(sys.argv[0]).resolve().parents[0]  # .../Contents/MacOS
+        pem = macos_dir / "certifi" / "cacert.pem"
         if pem.exists():
             os.environ.setdefault("SSL_CERT_FILE", str(pem))
 except Exception:
