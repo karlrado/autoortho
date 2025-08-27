@@ -93,13 +93,13 @@ jobs:
         chmod -RN . || true
         chflags -R nouchg,noschg . || true
         chmod  -R u+rwX .
-        # Stage dylibs cleanly
-        rm -rf build/_stage_libs && mkdir -p build/_stage_libs
-        cp -L autoortho/lib/macos/*.dylib build/_stage_libs/
-        xattr -c build/_stage_libs/*.dylib || true
-        chmod -RN build/_stage_libs || true
-        chflags -R nouchg,noschg build/_stage_libs || true
-        chmod u+rwX build/_stage_libs/*.dylib
+        CACERT=$(python3 -c "import certifi; print(certifi.where())")
+        mkdir -p build/_stage_cert
+        cp -L "$CACERT" build/_stage_cert/cacert.pem
+        xattr -c build/_stage_cert/cacert.pem || true
+        chmod -RN build/_stage_cert || true
+        chflags -R nouchg,noschg build/_stage_cert || true
+        chmod u+rwX build/_stage_cert/cacert.pem
 
     - name: Optionally set internal version separately
       if: ${{ inputs.internalver != '' }}
