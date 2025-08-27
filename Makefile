@@ -25,9 +25,8 @@ bin: autoortho/.version
 		--linux-icon=autoortho/imgs/ao-icon.ico \
 		--enable-plugin=pyside6 \
 		--include-data-file=./autoortho/.version*=. \
-		--include-data-file=./autoortho/lib/linux/*.so=lib/linux/ \
-		--include-data-file=./autoortho/aoimage/*.so=aoimage/ \
 		--onefile \
+		--user-package-configuration-file=nuitka-package.config.yml \
 		./autoortho/__main__.py -o autoortho_lin.bin
 
 mac_app: AutoOrtho.app
@@ -40,8 +39,7 @@ AutoOrtho.app: autoortho/.version
 		--macos-app-icon=autoortho/imgs/ao-icon.icns \
 		--enable-plugin=pyside6 \
 		--include-data-file=./autoortho/.version*=. \
-		--include-data-file=./build/_stage_libs/*.dylib=lib/macos/ \
-		--include-data-file=./autoortho/aoimage/*.dylib=aoimage/ \
+		--user-package-configuration-file=nuitka-package.config.yml \
 		./autoortho/__main__.py -o AutoOrtho.app
 
 mac_zip: AutoOrtho_mac_$(SAFE_VERSION).zip
@@ -56,8 +54,7 @@ _autoortho_win.exe: autoortho/.version
 		--windows-icon-from-ico=autoortho/imgs/ao-icon.ico \
 		--assume-yes-for-downloads \
 		--include-data-file=./autoortho/.version*=./ \
-		--include-data-file=./autoortho/lib/windows/*=lib/windows/ \
-		--include-data-file=./autoortho/aoimage/*.dll=aoimage/ \
+		--user-package-configuration-file=nuitka-package.config.yml \
 		--onefile \
 		--disable-console \
 		./autoortho/__main__.py -o autoortho_win.exe
@@ -70,8 +67,7 @@ __main__.dist: autoortho/.version
 		--windows-icon-from-ico=autoortho/imgs/ao-icon.ico \
 		--assume-yes-for-downloads \
 		--include-data-file=./autoortho/.version*=./ \
-		--include-data-file=./autoortho/lib/windows/*=lib/windows/ \
-		--include-data-file=./autoortho/aoimage/*.dll=aoimage/ \
+		--user-package-configuration-file=nuitka-package.config.yml \
 		--standalone \
 		--disable-console \
 		./autoortho/__main__.py -o autoortho_win.exe
