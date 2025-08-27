@@ -31,10 +31,7 @@ bin: autoortho/.version
 
 mac_app: AutoOrtho.app
 AutoOrtho.app: autoortho/.version
-	CACERT=$(python - <<'PY'
-	import certifi; print(certifi.where())
-	PY
-	)
+	CACERT=$$(python3 -c "import certifi; print(certifi.where())") ; \
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--standalone \
 		--macos-create-app-bundle \
@@ -46,7 +43,7 @@ AutoOrtho.app: autoortho/.version
 		--macos-sign-identity=- \
 		--user-package-configuration-file=nuitka-package.config.yml \
 		--noinclude-data-files=certifi/cacert.pem \
- 		--include-data-file="$CACERT"=Resources/certifi/cacert.pem \
+ 		--include-data-file="$$CACERT"=Resources/certifi/cacert.pem \
 		./autoortho/__main__.py -o AutoOrtho.app
 
 mac_zip: AutoOrtho_mac_$(SAFE_VERSION).zip
