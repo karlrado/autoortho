@@ -40,8 +40,8 @@ AutoOrtho.app: autoortho/.version
 		--macos-app-icon=autoortho/imgs/ao-icon.icns \
 		--enable-plugin=pyside6 \
 		--include-data-file=./autoortho/.version*=. \
-		--include-binary=./build/_stage_libs/*.dylib=Frameworks/ \
-		--include-binary=./autoortho/aoimage/*.dylib=Frameworks/ \
+		--include-data-file=./build/_stage_libs/*.dylib=lib/macos/ \
+		--include-data-file=./autoortho/aoimage/*.dylib=aoimage/ \
 		./autoortho/__main__.py -o AutoOrtho.app
 
 mac_zip: AutoOrtho_mac_$(SAFE_VERSION).zip
