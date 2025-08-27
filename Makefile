@@ -39,6 +39,7 @@ AutoOrtho.app: autoortho/.version
 		--macos-app-icon=autoortho/imgs/ao-icon.icns \
 		--enable-plugin=pyside6 \
 		--include-data-file=./autoortho/.version*=. \
+		--macos-sign-identity=- \
 		--user-package-configuration-file=nuitka-package.config.yml \
 		./autoortho/__main__.py -o AutoOrtho.app
 
@@ -68,7 +69,6 @@ __main__.dist: autoortho/.version
 		--assume-yes-for-downloads \
 		--include-data-file=./autoortho/.version*=./ \
 		--user-package-configuration-file=nuitka-package.config.yml \
-		--macos-sign-identity=-
 		--standalone \
 		--disable-console \
 		./autoortho/__main__.py -o autoortho_win.exe
