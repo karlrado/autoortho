@@ -41,8 +41,8 @@ AutoOrtho.app: autoortho/.version
 		--include-data-file=./autoortho/.version*=. \
 		--macos-sign-identity=- \
 		--user-package-configuration-file=nuitka-package.config.yml \
-		--noinclude-certifi \
-		--include-data-file=./build/_stage_cert/cacert.pem=../Resources/certifi/cacert.pem \
+		--noinclude-data-files=certifi/cacert.pem \
+		--include-data-file=./build/_stage_cert/cacert.pem=../Resources/certifi/cacert.pem
 		./autoortho/__main__.py -o AutoOrtho.app
 
 mac_zip: AutoOrtho_mac_$(SAFE_VERSION).zip
