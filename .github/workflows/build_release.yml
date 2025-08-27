@@ -102,7 +102,6 @@ jobs:
         chmod u+rwX build/_stage_cert/cacert.pem
         export CODESIGN_ALLOCATE="$(xcrun -f codesign_allocate)"
         xcrun --version
-        codesign -vv
 
     - name: Optionally set internal version separately
       if: ${{ inputs.internalver != '' }}
