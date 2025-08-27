@@ -43,7 +43,7 @@ AutoOrtho.app: autoortho/.version
 		--user-package-configuration-file=nuitka-package.config.yml \
 		--noinclude-data-files=certifi/cacert.pem \
 		--include-data-file=./build/_stage_cert/cacert.pem=certifi/cacert.pem \
-		./autoortho/__main__.py -o AutoOrtho.app
+		./autoortho/__main__.py
 
 mac_zip: AutoOrtho_mac_$(SAFE_VERSION).zip
 AutoOrtho_mac_$(SAFE_VERSION).zip: AutoOrtho.app
