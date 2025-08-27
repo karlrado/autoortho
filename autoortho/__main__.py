@@ -5,6 +5,7 @@ import logging.handlers
 import atexit, signal, threading
 import platform
 from aoconfig import CFG
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Global cleanup hook – ensures we release worker threads, caches & C buffers
@@ -107,6 +108,11 @@ try:
     if platform.system().lower() == 'linux' and "SSL_CERT_DIR" not in os.environ:
         if os.environ.get("APPIMAGE") and os.path.isdir("/etc/ssl/certs"):
             os.environ["SSL_CERT_DIR"] = "/etc/ssl/certs"
+    if platform.system().lower() == "darwin" and ".app" in sys.argv[0]:
+        app = Path(sys.argv[0]).resolve()
+        pem = app.parents[1] / "Resources" / "certifi" / "cacert.pem"
+        if pem.exists():
+            os.environ.setdefault("SSL_CERT_FILE", str(pem))
 except Exception:
     pass
 

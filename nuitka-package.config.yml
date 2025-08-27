@@ -49,3 +49,14 @@
         suffixes:
           - 'dll'
         when: 'win32'
+
+  data-files:
+    # Block the auto-include under MacOS
+    - noinclude:
+        patterns: ["certifi/cacert.pem"]
+
+    # Re-include into Resources
+    - from_filenames:
+        filenames: ["${python:import certifi; print(certifi.where())}"]
+        dest_path: Resources/certifi
+        when: macos
