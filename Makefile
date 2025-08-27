@@ -2,6 +2,9 @@ ZIP?=zip
 VERSION?=0.0.0
 # Sanitize VERSION for use in filenames (replace any non-safe char with '-')
 SAFE_VERSION:=$(shell echo "$(VERSION)" | sed -e 's/[^A-Za-z0-9._-]/-/g')
+.PHONY: mac_app
+SHELL := /bin/bash
+.ONESHELL:
 
 autoortho.pyz:
 	mkdir -p build/autoortho
@@ -31,19 +34,17 @@ bin: autoortho/.version
 
 mac_app: AutoOrtho.app
 AutoOrtho.app: autoortho/.version
-	python3 -m nuitka --verbose --verbose-output=nuitka.log \
+	sudo python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--standalone \
 		--macos-create-app-bundle \
+		--macos-app-name=AutoOrtho \
 		--macos-target-arch=arm64 \
 		--macos-app-name=AutoOrtho \
 		--macos-app-icon=autoortho/imgs/ao-icon.icns \
 		--enable-plugin=pyside6 \
-		--include-data-file=./autoortho/.version*=. \
-		--macos-sign-identity=- \
+		--include-data-file=autoortho/.version=autoortho/.version \
 		--user-package-configuration-file=nuitka-package.config.yml \
-		--noinclude-data-files=certifi/cacert.pem \
-		--include-data-file=./build/_stage_cert/cacert.pem=certifi/cacert.pem \
-		./autoortho/__main__.py
+		./autoortho/__main__.py -o AutoOrtho.app
 
 mac_zip: AutoOrtho_mac_$(SAFE_VERSION).zip
 AutoOrtho_mac_$(SAFE_VERSION).zip: AutoOrtho.app

@@ -89,19 +89,6 @@ jobs:
       run: |
         python3 -m pip install -U -r requirements.txt
         python3 -m pip install -U -r requirements-build.txt
-        xattr -rc .
-        chmod -RN . || true
-        chflags -R nouchg,noschg . || true
-        chmod  -R u+rwX .
-        CACERT=$(python3 -c "import certifi; print(certifi.where())")
-        mkdir -p build/_stage_cert
-        cp -L "$CACERT" build/_stage_cert/cacert.pem
-        xattr -c build/_stage_cert/cacert.pem || true
-        chmod -RN build/_stage_cert || true
-        chflags -R nouchg,noschg build/_stage_cert || true
-        chmod u+rwX build/_stage_cert/cacert.pem
-        export CODESIGN_ALLOCATE="$(xcrun -f codesign_allocate)"
-        xcrun --version
 
     - name: Optionally set internal version separately
       if: ${{ inputs.internalver != '' }}
