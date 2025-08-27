@@ -5,6 +5,7 @@ import sys
 from ctypes import *
 import platform
 
+from utils.dylibs_loader import aoimage_lib_path
 import logging
 log = logging.getLogger(__name__)
 
@@ -144,17 +145,9 @@ def open(filename):
 
     return new
 
-# init code
-if platform.system().lower() == 'linux':
-    _aoi_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'aoimage.so')
-elif platform.system().lower() == 'windows':
-    _aoi_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'aoimage.dll')
-elif platform.system().lower() == 'darwin':
-    _aoi_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'aoimage.dylib')
-else:
-    log.error("System is not supported")
-    exit()
 
+# init code
+_aoi_path = aoimage_lib_path()
 _aoi = CDLL(_aoi_path)
 _aoi.aoimage_read_jpg.argtypes = (c_char_p, POINTER(AoImage))
 _aoi.aoimage_write_jpg.argtypes = (c_char_p, POINTER(AoImage), c_int32)

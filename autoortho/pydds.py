@@ -3,39 +3,22 @@
 import os
 import sys
 import math
+import platform
+import threading
 from io import BytesIO
 from binascii import hexlify
 from ctypes import *
 #from PIL import Image
 from aoimage import AoImage as Image
-
-import platform
-import threading
-
-#from functools import lru_cache, cache
-
-#from memory_profiler import profile
+from utils.dylibs_loader import compressor_lib_path
 from aoconfig import CFG
 
 import logging
 log = logging.getLogger(__name__)
 
-#_stb = CDLL("/usr/lib/x86_64-linux-gnu/libstb.so")
-if platform.system().lower() == 'linux':
-    print("Linux detected")
-    _stb_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'linux', 'lib_stb_dxt.so')
-    _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'linux', 'libispc_texcomp.so')
-elif platform.system().lower() == 'windows':
-    print("Windows detected")
-    _stb_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'windows', 'stb_dxt.dll')
-    _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'windows', 'ispc_texcomp.dll')
-elif platform.system().lower() == 'darwin':
-    print("macOS detected")
-    _stb_path = None
-    _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'macos', 'libispc_texcomp.dylib')
-else:
-    print("System is not supported")
-    exit()
+# _stb = CDLL("/usr/lib/x86_64-linux-gnu/libstb.so")
+_stb_path = compressor_lib_path( "STB")
+_ispc_path = compressor_lib_path("ISPC")
 
 if _stb_path:
     _stb = CDLL(_stb_path)

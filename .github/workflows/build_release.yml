@@ -93,7 +93,8 @@ jobs:
         chmod -RN . || true
         chflags -R nouchg,noschg . || true
         chmod  -R u+rwX .
-        # Stage dylibs cleanly
+
+        # Stage dylibs (key fix)
         rm -rf build/_stage_libs && mkdir -p build/_stage_libs
         cp -L autoortho/lib/macos/*.dylib build/_stage_libs/
         xattr -c build/_stage_libs/*.dylib || true
