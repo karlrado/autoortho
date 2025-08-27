@@ -21,6 +21,7 @@ autoortho/.version:
 	echo "$(VERSION)" > $@
 
 bin: autoortho/.version
+	python3 -m pyside6.rcc autoortho/utils/resources.qrc -o autoortho/utils/resources_rc.py
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--linux-icon=autoortho/imgs/ao-icon.ico \
 		--enable-plugin=pyside6 \
@@ -32,6 +33,7 @@ bin: autoortho/.version
 
 mac_app: AutoOrtho.app
 AutoOrtho.app: autoortho/.version
+	python3 -m pyside6.rcc autoortho/utils/resources.qrc -o autoortho/utils/resources_rc.py
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--standalone \
 		--macos-create-app-bundle \
@@ -49,6 +51,7 @@ AutoOrtho_mac_$(SAFE_VERSION).zip: AutoOrtho.app
 	$(ZIP) -r $@ AutoOrtho.app
 
 _autoortho_win.exe: autoortho/.version
+	python3 -m pyside6.rcc autoortho/utils/resources.qrc -o autoortho/utils/resources_rc.py
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--mingw64 \
 		--disable-ccache \
@@ -63,6 +66,7 @@ _autoortho_win.exe: autoortho/.version
 		./autoortho/__main__.py -o autoortho_win.exe
 
 __main__.dist: autoortho/.version
+	python3 -m pyside6.rcc autoortho/utils/resources.qrc -o autoortho/utils/resources_rc.py
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--mingw64 \
 		--disable-ccache \
