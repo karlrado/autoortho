@@ -9,9 +9,9 @@ import time
 import traceback
 import logging
 from packaging import version
+import utils.resources_rc
 from utils.constants import MAPTYPES
 from utils.mappers import map_kubilus_region_to_simheaven_region
-from utils import resources_rc
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
