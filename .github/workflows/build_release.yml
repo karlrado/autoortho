@@ -93,6 +93,13 @@ jobs:
         chmod -RN . || true
         chflags -R nouchg,noschg . || true
         chmod  -R u+rwX .
+        # Stage dylibs cleanly
+        rm -rf build/_stage_libs && mkdir -p build/_stage_libs
+        cp -L autoortho/lib/macos/*.dylib build/_stage_libs/
+        xattr -c build/_stage_libs/*.dylib || true
+        chmod -RN build/_stage_libs || true
+        chflags -R nouchg,noschg build/_stage_libs || true
+        chmod u+rwX build/_stage_libs/*.dylib
 
     - name: Optionally set internal version separately
       if: ${{ inputs.internalver != '' }}
