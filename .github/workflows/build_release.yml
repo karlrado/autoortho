@@ -100,10 +100,9 @@ jobs:
         chmod -RN build/_stage_cert || true
         chflags -R nouchg,noschg build/_stage_cert || true
         chmod u+rwX build/_stage_cert/cacert.pem
-      # Make sure codesign can find codesign_allocate
-      export CODESIGN_ALLOCATE="$(xcrun -f codesign_allocate)"
-      xcrun --version
-      codesign -vv
+        export CODESIGN_ALLOCATE="$(xcrun -f codesign_allocate)"
+        xcrun --version
+        codesign -vv
 
     - name: Optionally set internal version separately
       if: ${{ inputs.internalver != '' }}
