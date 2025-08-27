@@ -68,6 +68,7 @@ __main__.dist: autoortho/.version
 		--assume-yes-for-downloads \
 		--include-data-file=./autoortho/.version*=./ \
 		--user-package-configuration-file=nuitka-package.config.yml \
+		--macos-sign-identity=-
 		--standalone \
 		--disable-console \
 		./autoortho/__main__.py -o autoortho_win.exe
