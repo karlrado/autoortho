@@ -11,6 +11,7 @@ import logging
 from packaging import version
 from utils.constants import MAPTYPES
 from utils.mappers import map_kubilus_region_to_simheaven_region
+from utils import resources_rc
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -191,7 +192,7 @@ class ModernSpinBox(QSpinBox):
                 background-color: #5183bd;
             }
             QSpinBox::up-arrow {
-                image: url(imgs/plus-16.png);
+                image: url(:/imgs/plus-16.png);
                 width: 12px;
                 height: 12px;
             }
@@ -205,7 +206,7 @@ class ModernSpinBox(QSpinBox):
                 background-color: #5183bd;
             }
             QSpinBox::down-arrow {
-                image: url(imgs/minus-16.png);
+                image: url(:/imgs/minus-16.png);
                 width: 12px;
                 height: 12px;
             }
@@ -346,7 +347,7 @@ class ConfigUI(QMainWindow):
                 border: none;
             }
             QComboBox::down-arrow {
-                image: url(imgs/arrow-204-16.png);
+                image: url(:/imgs/arrow-204-16.png);
                 width: 16px;
                 height: 16px;
                 margin-right: 10px;
@@ -388,9 +389,9 @@ class ConfigUI(QMainWindow):
 
         # Set icon
         if platform.system() == 'Windows':
-            icon_path = os.path.join(CUR_PATH, 'imgs', 'ao-icon.ico')
+            icon_path = ":/imgs/ao-icon.ico"
         else:
-            icon_path = os.path.join(CUR_PATH, 'imgs', 'ao-icon.png')
+            icon_path = ":/imgs/ao-icon.png"
         self.setWindowIcon(QIcon(icon_path))
 
         # Create central widget
@@ -404,7 +405,7 @@ class ConfigUI(QMainWindow):
 
         # Add banner
         banner_label = QLabel()
-        banner_pixmap = QPixmap(os.path.join(CUR_PATH, 'imgs', 'banner1.png'))
+        banner_pixmap = QPixmap(":/imgs/banner1.png")
         banner_label.setPixmap(
             banner_pixmap.scaled(
                 QSize(400, 100),

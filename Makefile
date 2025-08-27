@@ -25,10 +25,8 @@ bin: autoortho/.version
 		--linux-icon=autoortho/imgs/ao-icon.ico \
 		--enable-plugin=pyside6 \
 		--include-data-file=./autoortho/.version*=. \
-		--include-data-file=./autoortho/templates/*.html=templates/ \
 		--include-data-file=./autoortho/lib/linux/*.so=lib/linux/ \
 		--include-data-file=./autoortho/aoimage/*.so=aoimage/ \
-		--include-data-dir=./autoortho/imgs=imgs \
 		--onefile \
 		./autoortho/__main__.py -o autoortho_lin.bin
 
@@ -39,14 +37,11 @@ AutoOrtho.app: autoortho/.version
 		--macos-create-app-bundle \
 		--macos-target-arch=arm64 \
 		--macos-app-name=AutoOrtho \
-		--macos-sign-identity=auto \
 		--macos-app-icon=autoortho/imgs/ao-icon.icns \
 		--enable-plugin=pyside6 \
 		--include-data-file=./autoortho/.version*=. \
-		--include-data-file=./autoortho/templates/*.html=templates/ \
 		--include-data-file=./autoortho/lib/macos/*.dylib=lib/macos/ \
 		--include-data-file=./autoortho/aoimage/*.dylib=aoimage/ \
-		--include-data-dir=./autoortho/imgs=imgs \
 		./autoortho/__main__.py -o AutoOrtho.app
 
 mac_zip: AutoOrtho_mac_$(SAFE_VERSION).zip
@@ -61,10 +56,8 @@ _autoortho_win.exe: autoortho/.version
 		--windows-icon-from-ico=autoortho/imgs/ao-icon.ico \
 		--assume-yes-for-downloads \
 		--include-data-file=./autoortho/.version*=./ \
-		--include-data-file=./autoortho/templates/*.html=templates/ \
 		--include-data-file=./autoortho/lib/windows/*=lib/windows/ \
 		--include-data-file=./autoortho/aoimage/*.dll=aoimage/ \
-		--include-data-dir=./autoortho/imgs=imgs \
 		--onefile \
 		--disable-console \
 		./autoortho/__main__.py -o autoortho_win.exe
@@ -77,10 +70,8 @@ __main__.dist: autoortho/.version
 		--windows-icon-from-ico=autoortho/imgs/ao-icon.ico \
 		--assume-yes-for-downloads \
 		--include-data-file=./autoortho/.version*=./ \
-		--include-data-file=./autoortho/templates/*.html=templates/ \
 		--include-data-file=./autoortho/lib/windows/*=lib/windows/ \
 		--include-data-file=./autoortho/aoimage/*.dll=aoimage/ \
-		--include-data-dir=./autoortho/imgs=imgs \
 		--standalone \
 		--disable-console \
 		./autoortho/__main__.py -o autoortho_win.exe

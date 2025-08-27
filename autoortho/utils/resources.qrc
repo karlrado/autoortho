@@ -1,0 +1,19 @@
+<RCC>
+  <qresource prefix="/imgs">
+    <!-- images -->
+    <file>../imgs/ao-icon.png</file>
+    <file>../imgs/plus-16.png</file>
+    <file>../imgs/minus-16.png</file>
+    <file>../imgs/arrow-204-16.png</file>
+    <file>../imgs/banner1.png</file>
+    <file>../imgs/flight1.png</file>
+    </qresource>
+  <qresource prefix="/templates">
+    <!-- html templates (if you want them embedded, too) -->
+    <file>../templates/index.html</file>
+    <file>../templates/header.html</file>
+    <file>../templates/footer.html</file>
+    <file>../templates/map.html</file>
+    <file>../templates/stats.html</file>
+  </qresource>
+</RCC>
