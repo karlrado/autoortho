@@ -32,23 +32,29 @@ bin: autoortho/.version
 		--user-package-configuration-file=nuitka-package.config.yml \
 		./autoortho/__main__.py -o autoortho_lin.bin
 
-mac_app: AutoOrtho.app
-AutoOrtho.app: autoortho/.version
+__main__.app: autoortho/.version
 	sudo python3 -m nuitka --verbose --verbose-output=nuitka.log \
+		--assume-yes-for-downloads \
 		--standalone \
 		--macos-create-app-bundle \
-		--macos-app-name=AutoOrtho \
 		--macos-target-arch=arm64 \
 		--macos-app-name=AutoOrtho \
 		--macos-app-icon=autoortho/imgs/ao-icon.icns \
 		--enable-plugin=pyside6 \
 		--include-data-file=autoortho/.version=autoortho/.version \
 		--user-package-configuration-file=nuitka-package.config.yml \
-		./autoortho/__main__.py -o AutoOrtho.app
+		./autoortho/__main__.py
 
-mac_zip: AutoOrtho_mac_$(SAFE_VERSION).zip
+AutoOrtho.app: __main__.app
+	sudo chown -R "$(USER)":staff __main__.app
+	rm -rf AutoOrtho.app
+	mv __main__.app AutoOrtho.app
+
+mac_app: AutoOrtho.app
+
 AutoOrtho_mac_$(SAFE_VERSION).zip: AutoOrtho.app
 	$(ZIP) -r $@ AutoOrtho.app
+mac_zip: AutoOrtho_mac_$(SAFE_VERSION).zip
 
 _autoortho_win.exe: autoortho/.version
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
@@ -97,7 +103,5 @@ serve_docs:
 	docker run -p 8000:8000 -v `pwd`:/docs squidfunk/mkdocs-material
 
 clean:
-	-rm -rf build
-	-rm -rf __main__.dist
-	-rm -rf __main__.build
+	rm -rf __main__.app AutoOrtho.app *.zip *.build *.dist build dist
 	
