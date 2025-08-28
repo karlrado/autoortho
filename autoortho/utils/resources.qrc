@@ -9,12 +9,4 @@
     <file alias="banner1.png">../imgs/banner1.png</file>
     <file alias="flight1.png">../imgs/flight1.png</file>
     </qresource>
-  <qresource prefix="/templates">
-    <!-- html templates (if you want them embedded, too) -->
-    <file>../templates/index.html</file>
-    <file>../templates/header.html</file>
-    <file>../templates/footer.html</file>
-    <file>../templates/map.html</file>
-    <file>../templates/stats.html</file>
-  </qresource>
 </RCC>
