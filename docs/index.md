@@ -9,7 +9,7 @@ Assumptions:
 
 ### Steps:
 
-1. Download the most recent packaged release (autortho_lin_####.bin) [from here](https://github.com/kubilus1/autoortho/releases/latest)
+1. Download the most recent packaged release (autortho_lin_####.bin) [from here](https://github.com/ProgrammingDinosaur/autoortho/releases/latest)
 3. Make executable if needed `chmod +x autoortho_lin.bin` 
 4. Run the program `./autoortho_lin.bin`
 5. Configure your settings and paths for your system 
@@ -34,7 +34,7 @@ Assumptions:
 
 ### Zip File Steps:
 
-1. Download the most recent packaged release (autoortho_win_####.zip) [from here](https://github.com/kubilus1/autoortho/releases/latest)
+1. Download the most recent packaged release (autoortho_win_####.zip) [from here](https://github.com/ProgrammingDinosaur/autoortho/releases/latest)
 2. Extract the downloaded directory.
 4. Run `autoortho_win.exe` from within the extracted dir.
 5. Configure your settings and paths for your system 
@@ -48,7 +48,7 @@ Assumptions:
 Alternatively, there is now an installer that can be used.  This is
 experimental ATM:
 
-1. Download the most recent packaged release (AutoOrtho_####.exe) [from here](https://github.com/kubilus1/autoortho/releases/latest)
+1. Download the most recent packaged release (AutoOrtho_####.exe) [from here](https://github.com/ProgrammingDinosaur/autoortho/releases/latest)
 2. Run the program.
 3. If there is a prior install you will be prompted to uninstall first.  Do
    this.
@@ -59,7 +59,28 @@ experimental ATM:
 8. Configure your scenery_packs.ini file appropriately 
 9. Run X-Plane and choose a location for an ortho set you have downloaded
 
+## MacOS Setup
+Assumptions:
+
+* You have installed X-Plane 11.50+
+* You have an Apple Silicon Computer (AutoOrtho Mac only supports arm64)
+* FUSE is installed, MacFuse and Fuse-T are supported. 
+
+### Steps:
+
+1. If you haven't install MacFuse or Fuse-T. Fuse-T was used for testing the mac binary but both should work.
+2. Download the most recent packaged release (autortho_mac_####.zip) [from here](https://github.com/ProgrammingDinosaur/autoortho/releases/latest)
+3. Unzip on the location you want.
+3. Run the program `AutoOrtho.App`
+4. **Important** This program is currently unsigned, a warning will appear on first run, you need to go into Settings -> Privacy and Security -> Allow `AutoOrtho.App` execution -> Open Anyway.
+5. Configure your settings and paths for your system 
+6. Download and setup an ortho set from the 'Scenery' tab.
+7. Click 'Run' to run the program
+8. Configure your scenery_packs.ini file appropriately
+9. Run X-Plane and choose a location for an ortho set you have downloaded
+
 ---
+
 
 ## Configuring your scenery_packs.ini
 

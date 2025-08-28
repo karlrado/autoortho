@@ -37,10 +37,9 @@ else:
     print("System is not supported")
     exit()
 
+_stb = None
 if _stb_path:
     _stb = CDLL(_stb_path)
-else:
-    _stb = None
 
 _ispc = CDLL(_ispc_path)
 
