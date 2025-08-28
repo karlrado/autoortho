@@ -1703,7 +1703,8 @@ class ConfigUI(QMainWindow):
             )
 
             # DDS settings
-            self.cfg.pydds.compressor = self.compressor_combo.currentText()
+            if not self.system == "darwin":
+                self.cfg.pydds.compressor = self.compressor_combo.currentText()
             self.cfg.pydds.format = self.format_combo.currentText()
 
             # General settings
