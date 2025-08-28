@@ -1,52 +1,54 @@
-# Makefile for building aoimage.dylib and vendoring libturbojpeg
-# Location: autoortho/aoimage/
+PKGROOT      := ..
+VENDORED_TJ  := $(PKGROOT)/lib/macos/libturbojpeg.0.dylib
+# This is the path aoimage.dylib should record for turbojpeg:
+TJ_ID        := @loader_path/../lib/macos/libturbojpeg.0.dylib
 
-# --- Config ----------------------------------------------------------------
-JPGT       ?= /opt/homebrew/opt/jpeg-turbo              # Homebrew prefix
-MIN_MACOS   = 11.0
-ARCH        = arm64
+# Pointer to the turbojpeg.h file location in build system
+TJ_INC       := /opt/homebrew/opt/jpeg-turbo/include
 
-PKGROOT     = ..
-VENDORED_TJ = $(PKGROOT)/lib/macos/libturbojpeg.0.dylib
-TJ_ID       = @loader_path/../lib/macos/libturbojpeg.0.dylib  # recorded in dependents
+CC           := clang
+ARCH         := arm64
+MIN_MACOS    := 11.0
 
-CC          = clang
-LD          = clang
+CFLAGS      += -O2 -Wall -fPIC -fvisibility=hidden -fdiagnostics-color \
+               -arch $(ARCH) -mmacosx-version-min=$(MIN_MACOS) \
+               -I$(TJ_INC)
 
-CFLAGS     += -O2 -Wall -fPIC -fdiagnostics-color -fvisibility=hidden \
-              -arch $(ARCH) -mmacosx-version-min=$(MIN_MACOS) \
-              -I$(JPGT)/include $(DEFINES)
+LDFLAGS     := -dynamiclib -undefined dynamic_lookup \
+               -arch $(ARCH) -mmacosx-version-min=$(MIN_MACOS) \
+               -Wl,-install_name,@rpath/aoimage.dylib \
+               -Wl,-rpath,@loader_path \
+               -Wl,-rpath,@loader_path/../lib/macos \
+               -Wl,-headerpad_max_install_names
 
-# aoimage.dylib should be relocatable and able to find vendored libs
-LDFLAGS    := -dynamiclib \
-              -Wl,-install_name,@rpath/aoimage.dylib \
-              -Wl,-rpath,@loader_path \
-              -Wl,-rpath,@loader_path/../lib/macos \
-              -Wl,-headerpad_max_install_names \
-              -undefined dynamic_lookup \
-              -arch $(ARCH) -mmacosx-version-min=$(MIN_MACOS)
-
-# --- Targets ---------------------------------------------------------------
-.PHONY: all clean
+.PHONY: all clean check
 all: aoimage.dylib
 
-aoimage.o: aoimage.c
-	$(CC) $(CFLAGS) -c $< -o $@
+.check_tj_header:
+	@hdr="$(TJ_INC)/turbojpeg.h"; \
+	if [ ! -f "$$hdr" ]; then \
+	  echo "ERROR: turbojpeg.h not found in TJ_INC ($(TJ_INC))."; \
+	  echo "Set TJ_INC to a directory that contains turbojpeg.h (vendored or system)."; \
+	  exit 1; \
+	fi
 
-# Build the dylib against the vendored turbojpeg
-aoimage.dylib: aoimage.o $(VENDORED_TJ)
-	$(LD) -o $@ $(LDFLAGS) aoimage.o $(VENDORED_TJ)
+aoimage.o: aoimage.c aoimage.h .check_tj_header
+	$(CC) $(CFLAGS) -c aoimage.c -o $@
 
-# Vendor libturbojpeg: resolve Homebrew symlink, copy, set install name
-$(VENDORED_TJ):
-	@tj_in="$(JPGT)/lib/libturbojpeg.0.dylib"; \
-	tj_real="$$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); print(p.resolve())' "$$tj_in")"; \
-	[ -f "$$tj_real" ] || { echo "ERROR: $$tj_in not found"; exit 1; }; \
-	install -d "$(@D)"; \
-	echo "Copy $$tj_real -> $@"; \
-	install -m 0644 "$$tj_real" "$@"; \
-	echo "Set install name to $(TJ_ID)"; \
-	install_name_tool -id "$(TJ_ID)" "$@"
+.prepare_tj: $(VENDORED_TJ)
+	@test -f "$(VENDORED_TJ)" || { echo "Missing: $(VENDORED_TJ)"; exit 1; }
+	@cur_id="$$(otool -D '$(VENDORED_TJ)' 2>/dev/null | tail -n +2)"; \
+	if [ "$$cur_id" != "$(TJ_ID)" ]; then \
+	  echo "Setting install name on $(VENDORED_TJ) -> $(TJ_ID)"; \
+	  install_name_tool -id "$(TJ_ID)" "$(VENDORED_TJ)"; \
+	fi
+	@touch $@
+
+aoimage.dylib: aoimage.o .prepare_tj
+	$(CC) -o $@ $(LDFLAGS) aoimage.o $(VENDORED_TJ)
+
+check: aoimage.dylib
+	@echo "==> aoimage.dylib depends on:"; otool -L aoimage.dylib | sed 's/^/  /'
 
 clean:
-	rm -f aoimage.o aoimage.dylib
+	rm -f aoimage.o aoimage.dylib .prepare_tj
