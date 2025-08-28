@@ -2,7 +2,7 @@
   dlls:
     - from_filenames:
         relative_path: 'lib/macos'
-        prefixes: ['libispc_texcomp', 'lib_stb_dxt', 'libturbojpeg']
+        prefixes: ['libispc_texcomp', 'lib_stb_dxt']
         suffixes: ['dylib']
         when: 'macos'
     - from_filenames:
