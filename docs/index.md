@@ -72,7 +72,7 @@ Assumptions:
 2. Download the most recent packaged release (autortho_mac_####.zip) [from here](https://github.com/ProgrammingDinosaur/autoortho/releases/latest)
 3. Unzip on the location you want.
 3. Run the program `AutoOrtho.App`
-4. **Important** This program is currently unsigned, a warning will appear on first run, you need to go into Settings -> Privacy and Security to allow `AutoOrtho.App` execution from unknown developer.
+4. **Important** This program is currently unsigned, a warning will appear on first run, you need to go into Settings -> Privacy and Security -> Allow `AutoOrtho.App` execution -> Open Anyway.
 5. Configure your settings and paths for your system 
 6. Download and setup an ortho set from the 'Scenery' tab.
 7. Click 'Run' to run the program
