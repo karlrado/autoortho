@@ -225,6 +225,7 @@ class ConfigUI(QMainWindow):
         self.cfg = cfg
         self.ready = threading.Event()
         self.ready.clear()
+        self.system = platform.system().lower()
 
         self.dl = downloader.OrthoManager(
             self.cfg.paths.scenery_path,
@@ -388,7 +389,7 @@ class ConfigUI(QMainWindow):
         """)
 
         # Set icon
-        if platform.system() == 'Windows':
+        if self.system == 'windows':
             icon_path = ":/imgs/ao-icon.ico"
         else:
             icon_path = ":/imgs/ao-icon.png"
@@ -933,28 +934,34 @@ class ConfigUI(QMainWindow):
         dds_group.setLayout(dds_layout)
 
         # Compressor
-        compressor_layout = QHBoxLayout()
-        compressor_label = QLabel("Compressor:")
-        compressor_label.setToolTip(
-            "Algorithm used for DDS texture compression:\n"
-            "• ISPC: Intel's high-performance compressor (recommended)\n"
-            "  - Faster compression, better quality\n"
-            "  - Requires modern CPU\n"
-            "• STB: Standard compressor (compatibility)\n"
-            "  - Slower but works on all systems\n"
-            "  - Use if ISPC causes issues"
-        )
-        compressor_layout.addWidget(compressor_label)
-        self.compressor_combo = QComboBox()
-        self.compressor_combo.addItems(['ISPC', 'STB'])
-        self.compressor_combo.setCurrentText(self.cfg.pydds.compressor)
-        self.compressor_combo.setObjectName('compressor')
-        self.compressor_combo.setToolTip(
-            "Select compression algorithm (ISPC recommended)"
-        )
-        compressor_layout.addWidget(self.compressor_combo)
-        compressor_layout.addStretch()
-        dds_layout.addLayout(compressor_layout)
+        supported_compressors = ['ISPC'] if self.system == "darwin" else ['ISPC', 'STB']
+        if not self.system == "darwin":
+            compressor_layout = QHBoxLayout()
+            compressor_label = QLabel("Compressor:")
+            compressor_label.setToolTip(
+                "Algorithm used for DDS texture compression:\n"
+                "• ISPC: Intel's high-performance compressor (recommended)\n"
+                "  - Faster compression, better quality\n"
+                "  - Requires modern CPU\n"
+                "• STB: Standard compressor (compatibility)\n"
+                "  - Slower but works on all systems\n"
+                "  - Use if ISPC causes issues"
+            )
+            compressor_layout.addWidget(compressor_label)
+            self.compressor_combo = QComboBox()
+            self.compressor_combo.addItems(supported_compressors)
+            self.compressor_combo.setCurrentText(self.cfg.pydds.compressor)
+            self.compressor_combo.setObjectName('compressor')
+            self.compressor_combo.setToolTip(
+                "Select compression algorithm (ISPC recommended)"
+            )
+            compressor_layout.addWidget(self.compressor_combo)
+            compressor_layout.addStretch()
+            dds_layout.addLayout(compressor_layout)
+        else:
+            if self.cfg.pydds.compressor not in supported_compressors:
+                self.cfg.pydds.compressor = "ISPC"
+                QMessageBox.warning(self, "Warning", "ISPC is the only supported compressor on MacOS, your current compressor has been changed to ISPC.")
 
         # Format
         format_layout = QHBoxLayout()
@@ -1054,7 +1061,7 @@ class ConfigUI(QMainWindow):
         fuse_layout.addWidget(self.threading_check)
 
         # Windows specific
-        if platform.system() == 'Windows':
+        if self.system == 'windows':
             self.winfsp_check = QCheckBox("Prefer WinFSP over Dokan")
             self.winfsp_check.setChecked(self.cfg.windows.prefer_winfsp)
             self.winfsp_check.setObjectName('prefer_winfsp')
@@ -1671,7 +1678,7 @@ class ConfigUI(QMainWindow):
         self.cfg.cache.auto_clean_cache = self.auto_clean_cache_check.isChecked()
 
         # Windows specific
-        if platform.system() == 'Windows' and hasattr(self, 'winfsp_check'):
+        if self.system == 'windows' and hasattr(self, 'winfsp_check'):
             self.cfg.windows.prefer_winfsp = self.winfsp_check.isChecked()
 
         # Save Settings tab values
