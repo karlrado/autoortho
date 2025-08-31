@@ -80,6 +80,8 @@ maxwait = 0.5
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False
+# Using custom generated Ortho4XP tiles along with AutoOrtho.
+using_custom_tiles = False
 
 [pydds]
 # ISPC or STB for dds file compression
@@ -164,10 +166,17 @@ prefer_winfsp = True
         if os.path.exists(self.ao_scenery_path):
             sceneries = os.listdir(self.ao_scenery_path)
             print(f"Found sceneries: {sceneries}")
+        
+        if platform.system() == "Darwin":
+            try:
+                if ".DS_Store" in sceneries:
+                    sceneries.remove(".DS_Store")
+            except Exception as e:
+                log.error(f"Error removing .DS_Store from sceneries: {e}")
 
         self.scenery_mounts = [{
-            "root":os.path.join(self.ao_scenery_path, s),
-            "mount":os.path.join(self.xplane_custom_scenery_path, s)
+            "root": os.path.join(self.ao_scenery_path, s),
+            "mount": os.path.join(self.xplane_custom_scenery_path, s),
         } for s in sceneries]
         print(self.scenery_mounts)
 

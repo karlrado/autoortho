@@ -664,53 +664,22 @@ class ConfigUI(QMainWindow):
 
         self.simheaven_compat_check.stateChanged.connect(self.on_simheaven_compat_check)
 
+        # add space between options
+        options_layout.addSpacing(10)
 
-        #self.using_custom_tiles_check = QCheckBox("Advanced Custom Tiles Options")
-        #self.using_custom_tiles_check.setChecked(self.cfg.autoortho.using_custom_tiles)
-        #self.using_custom_tiles_check.setObjectName('using_custom_tiles')
-        #self.using_custom_tiles_check.setToolTip(
-        #    "Enable this if you are using custom build Ortho4XP tiles instead of base scenery packages from autoortho and want more control over the zoom levels.\n"
-        #    "This will allow you to set custom zoom levels based on your tiles for this session.\n"
-        #    "IMPORTANT: Make sure you setup the zoom levels to the ones matching your tiles, otherwise you may experience issues with the scenery. "
-        #    "You can still use custom tiles without this option, but all tiles will be capped to general max zoom level you set in advanced settings, "
-        #    "even if they are airport tiles that should be at higher zoom levels."
-        #)
+        self.using_custom_tiles_check = QCheckBox("Using Custom Tiles")
+        self.using_custom_tiles_check.setChecked(self.cfg.autoortho.using_custom_tiles)
+        self.using_custom_tiles_check.setObjectName('using_custom_tiles')
+        self.using_custom_tiles_check.setToolTip(
+            "Enable this if you are using custom build Ortho4XP tiles instead or along with base scenery packages from autoortho.\n"
+            "NOTE: By using this option the Max Zoom near airports setting will be ignored and all tiles will be capped to the general max zoom level you set in advanced settings."
+        )
 
-        #self.using_custom_tiles_check.stateChanged.connect(lambda state: on_using_custom_tiles_check(state))
-        #options_layout.addWidget(self.using_custom_tiles_check)
+        self.using_custom_tiles_check.stateChanged.connect(lambda state: self.on_using_custom_tiles_check(state))
+        options_layout.addWidget(self.using_custom_tiles_check)
 
 
         layout.addWidget(options_group)
-
-        # TODO: Add custom tiles config here
-        #custom_tiles_group = QGroupBox("Advanced Custom Tiles Setup")
-        #custom_tiles_layout = QVBoxLayout()
-        #custom_tiles_group.setLayout(custom_tiles_layout)
-
-        #custom_tiles_label = QLabel("Advanced Custom Tiles Setup")
-        #custom_tiles_label.setToolTip(
-        #        "This is only used if you are using custom tiles.\n"
-        #        "Settting this values will allow autoortho to correctly identify the tiles near airports from your custom tiles, allowing you to control their max zoom levels "
-        #        "depending on whether they are near airport tiles or not via the two sliders in Advanced Settings.\n"
-        #        "If you are not sure what values your tiles are built to, just uncheck the Advanced Custom Tiles Options box "
-        #        "and let autoortho cap your tiles to the general max zoom level you set in advanced settings."
-        #)
-        #custom_tiles_layout.addWidget(custom_tiles_label)
-
-        #custom_tiles_doc_label = QLabel("Please make sure you read the documentation on how add custom built tiles to AutoOrtho, "
-        #"you can find it here: https://programmingdinosaur.github.io/autoortho4xplane/details#adding-your-own-created-sceneries",openExternalLinks=True)
-        #custom_tiles_layout.addWidget(custom_tiles_doc_label)
-
-        #custom_tiles_general_zoom_label = QLabel("General zoom level your custom Ortho4XP tiles were built for:")
-        #custom_tiles_layout.addWidget(custom_tiles_general_zoom_label)
-        #self.custom_tiles_general_zoom_combo = QComboBox()
-        #self.custom_tiles_general_zoom_combo.addItems(['12', '13', '14', '15', '16', '17', '18', '19'])
-        #self.custom_tiles_general_zoom_combo.setCurrentText(str("baa"))
-        #self.custom_tiles_general_zoom_combo.setObjectName('custom_tiles_general_zoom')
-        #self.custom_tiles_general_zoom_combo.setToolTip(
-        #    "Drag to adjust minimum zoom level for custom tiles"
-        #)
-        #custom_tiles_layout.addWidget(self.custom_tiles_general_zoom_combo)
     
         # Set the content widget to the scroll area
         scroll_area.setWidget(setup_content)
@@ -737,11 +706,68 @@ class ConfigUI(QMainWindow):
 
         # Create the actual content widget
         settings_content = QWidget()
-        layout = QVBoxLayout()
-        layout.setSpacing(15)
-        settings_content.setLayout(layout)
+        self.settings_layout = QVBoxLayout()
+        self.settings_layout.setSpacing(15)
+        settings_content.setLayout(self.settings_layout)
 
-        # Cache settings group
+        self.refresh_settings_tab()
+        
+
+        # Set the content widget to the scroll area
+        scroll_area.setWidget(settings_content)
+
+        # Create the main layout for the tab
+        tab_layout = QVBoxLayout()
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.addWidget(scroll_area)
+        settings_widget.setLayout(tab_layout)
+
+        self.tabs.addTab(settings_widget, "Advanced Settings")
+
+    def create_scenery_tab(self):
+        """Create the scenery management tab"""
+        scenery_widget = QWidget()
+        layout = QVBoxLayout()
+        scenery_widget.setLayout(layout)
+
+        # Create scroll area for scenery list
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+
+        self.scenery_content = QWidget()
+        self.scenery_layout = QVBoxLayout()
+        self.scenery_content.setLayout(self.scenery_layout)
+
+        scroll_area.setWidget(self.scenery_content)
+        layout.addWidget(scroll_area)
+
+        # Refresh scenery list
+        self.refresh_scenery_list()
+
+        self.tabs.addTab(scenery_widget, "Scenery")
+
+    def create_logs_tab(self):
+        """Create the logs tab"""
+        logs_widget = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(10, 10, 10, 10)
+        logs_widget.setLayout(layout)
+
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        layout.addWidget(self.log_text)
+
+        self.tabs.addTab(logs_widget, "Logs")
+
+    def refresh_settings_tab(self):
+        """Refresh the settings tab"""
+        while self.settings_layout.count():
+            child = self.settings_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
         cache_group = QGroupBox("Cache Settings")
         cache_layout = QVBoxLayout()
         cache_group.setLayout(cache_layout)
@@ -784,7 +810,7 @@ class ConfigUI(QMainWindow):
         auto_clean_cache_layout.addWidget(self.auto_clean_cache_check)
         cache_layout.addLayout(auto_clean_cache_layout)
 
-        layout.addWidget(cache_group)
+        self.settings_layout.addWidget(cache_group)
 
         # AutoOrtho Settings group
         autoortho_group = QGroupBox("AutoOrtho Settings")
@@ -818,16 +844,21 @@ class ConfigUI(QMainWindow):
         min_zoom_layout.addWidget(self.min_zoom_label)
         autoortho_layout.addLayout(min_zoom_layout)
 
-        max_zoom_layout = QHBoxLayout()
-        max_zoom_label = QLabel("Maximum zoom level:")
-        max_zoom_label.setToolTip(
+        max_zoom_tooltip = (
             "Maximum zoom level for imagery downloads.\n"
             "Higher values = more detail but larger downloads and more VRAM usage.\n"
-            "Optimal: 16 for most cases. Keep in mind that every extra ZL increases VRAM and potential network usage by 4x."
+            "Optimal: 16 for most cases. Keep in mind that every extra ZL increases VRAM and potential network usage by 4x.\n"
         )
+        if self.cfg.autoortho.using_custom_tiles:
+            max_zoom_tooltip += "IMPORTANT: You are using custom tiles, you can set this to 19 if your tiles are built for higher ZL it.\n"
+            "But be aware that in-game zoom level will be capped to tile default zoom level + 1 (only X-Plane 12)."
+
+        max_zoom_layout = QHBoxLayout()
+        max_zoom_label = QLabel("Maximum zoom level:")
+        max_zoom_label.setToolTip(max_zoom_tooltip)
         max_zoom_layout.addWidget(max_zoom_label)
         self.max_zoom_slider = ModernSlider()
-        self.max_zoom_slider.setRange(12, 17) # Max X-Plane allows is tile zoom + 1 , 17 accounts for kubilus mesh
+        self.max_zoom_slider.setRange(12, 17 if not self.cfg.autoortho.using_custom_tiles else 19) # Max X-Plane allows is tile zoom + 1 , 17 accounts for kubilus mesh
         self.max_zoom_slider.setValue(int(self.cfg.autoortho.max_zoom))
         self.max_zoom_slider.setObjectName('max_zoom')
         self.max_zoom_slider.setToolTip(
@@ -866,7 +897,9 @@ class ConfigUI(QMainWindow):
         )
         max_zoom_near_airports_layout.addWidget(self.max_zoom_near_airports_slider)
         max_zoom_near_airports_layout.addWidget(self.max_zoom_near_airports_label)
-        autoortho_layout.addLayout(max_zoom_near_airports_layout)
+
+        if not self.cfg.autoortho.using_custom_tiles:
+            autoortho_layout.addLayout(max_zoom_near_airports_layout)
 
         # Max wait time
         maxwait_layout = QHBoxLayout()
@@ -926,7 +959,15 @@ class ConfigUI(QMainWindow):
         threads_layout.addStretch()
         autoortho_layout.addLayout(threads_layout)
 
-        layout.addWidget(autoortho_group)
+        if self.cfg.autoortho.using_custom_tiles:
+            self.info_label = QLabel("Note: You are using custom tiles, Max Zoom near airports setting is not available, all tiles will be capped to the general max zoom level you set.")
+            self.info_label.setStyleSheet("color: #6da4e3; font-size: 14; font-weight: italic;")
+            # wrap text
+            self.info_label.setWordWrap(True)
+            self.info_label.setMaximumWidth(autoortho_layout.parent().width())
+            autoortho_layout.addWidget(self.info_label)
+
+        self.settings_layout.addWidget(autoortho_group)
 
         # DDS Compression Settings group
         dds_group = QGroupBox("DDS Compression Settings")
@@ -987,7 +1028,7 @@ class ConfigUI(QMainWindow):
         format_layout.addStretch()
         dds_layout.addLayout(format_layout)
 
-        layout.addWidget(dds_group)
+        self.settings_layout.addWidget(dds_group)
 
         # General Settings group
         general_group = QGroupBox("General Settings")
@@ -1024,7 +1065,7 @@ class ConfigUI(QMainWindow):
         )
         general_layout.addWidget(self.debug_check)
 
-        layout.addWidget(general_group)
+        self.settings_layout.addWidget(general_group)
 
         # Scenery Settings group
         scenery_group = QGroupBox("Scenery Settings")
@@ -1042,7 +1083,7 @@ class ConfigUI(QMainWindow):
         )
         scenery_layout.addWidget(self.noclean_check)
 
-        layout.addWidget(scenery_group)
+        self.settings_layout.addWidget(scenery_group)
 
         # FUSE Settings group
         fuse_group = QGroupBox("FUSE Settings")
@@ -1073,7 +1114,7 @@ class ConfigUI(QMainWindow):
             )
             fuse_layout.addWidget(self.winfsp_check)
 
-        layout.addWidget(fuse_group)
+        self.settings_layout.addWidget(fuse_group)
 
         # Flight Data Settings group
         flightdata_group = QGroupBox("Flight Data Settings")
@@ -1120,58 +1161,9 @@ class ConfigUI(QMainWindow):
         xplane_port_layout.addStretch()
         flightdata_layout.addLayout(xplane_port_layout)
 
-        layout.addWidget(flightdata_group)
+        self.settings_layout.addWidget(flightdata_group)
 
-        layout.addStretch()
-
-        # Set the content widget to the scroll area
-        scroll_area.setWidget(settings_content)
-
-        # Create the main layout for the tab
-        tab_layout = QVBoxLayout()
-        tab_layout.setContentsMargins(0, 0, 0, 0)
-        tab_layout.addWidget(scroll_area)
-        settings_widget.setLayout(tab_layout)
-
-        self.tabs.addTab(settings_widget, "Advanced Settings")
-
-    def create_scenery_tab(self):
-        """Create the scenery management tab"""
-        scenery_widget = QWidget()
-        layout = QVBoxLayout()
-        scenery_widget.setLayout(layout)
-
-        # Create scroll area for scenery list
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-
-        self.scenery_content = QWidget()
-        self.scenery_layout = QVBoxLayout()
-        self.scenery_content.setLayout(self.scenery_layout)
-
-        scroll_area.setWidget(self.scenery_content)
-        layout.addWidget(scroll_area)
-
-        # Refresh scenery list
-        self.refresh_scenery_list()
-
-        self.tabs.addTab(scenery_widget, "Scenery")
-
-    def create_logs_tab(self):
-        """Create the logs tab"""
-        logs_widget = QWidget()
-        layout = QVBoxLayout()
-        layout.setContentsMargins(10, 10, 10, 10)
-        logs_widget.setLayout(layout)
-
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        layout.addWidget(self.log_text)
-
-        self.tabs.addTab(logs_widget, "Logs")
+        self.settings_layout.addStretch()
 
     def refresh_scenery_list(self):
         """Refresh the scenery list display"""
@@ -1676,6 +1668,7 @@ class ConfigUI(QMainWindow):
             self.simheaven_config_changed_session = True
 
         self.cfg.cache.auto_clean_cache = self.auto_clean_cache_check.isChecked()
+        self.cfg.autoortho.using_custom_tiles = self.using_custom_tiles_check.isChecked()
 
         # Windows specific
         if self.system == 'windows' and hasattr(self, 'winfsp_check'):
@@ -1730,6 +1723,15 @@ class ConfigUI(QMainWindow):
         self.ready.set()
         self.refresh_scenery()
 
+    def on_using_custom_tiles_check(self, state):
+        """Handle using custom tiles check"""
+        if state == False and self.cfg.autoortho.using_custom_tiles == True:
+            self.cfg.autoortho.using_custom_tiles = state
+            if int(self.cfg.autoortho.max_zoom) > 17:
+                log.info(f"Max zoom being capped to 17 after custom tiles disabled")
+                self.cfg.autoortho.max_zoom = 17
+            
+        self.refresh_settings_tab()
 
     def apply_simheaven_compat(self, use_simheaven_overlay=False):
         """

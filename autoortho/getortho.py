@@ -44,8 +44,6 @@ tile_stats = StatTracker(20, 12)
 mm_stats = StatTracker(0, 5)
 partial_stats = StatTracker()
 
-USING_KUBILUS_MESH = True
-
 
 def _is_jpeg(dataheader):
     # FFD8FF identifies image as a JPEG
@@ -539,9 +537,11 @@ class Tile(object):
 
 
         if self.tilezoom_diff < 0:
-            self.max_mipmap = min(self.max_zoom - self.min_zoom, 5) # Enforce a maximum of 5 mipmaps (8192 -> 256 max)
+            if self.tilezoom_diff < -1:
+                raise ValueError(f"Tilezoom_diff is {self.tilezoom_diff} which is less than -1, which is not supported by X-Plane.")
+            self.max_mipmap = 5 # Enforce a maximum of 5 mipmaps (8192 -> 256 max)
         else:
-            self.max_mipmap = min(self.max_zoom - self.min_zoom, 4) # Enforce a maximum of 4 mipmaps (4096 -> 256 max)
+            self.max_mipmap = 4 # Enforce a maximum of 4 mipmaps (4096 -> 256 max)
 
         self.chunks_per_row = max(1, self.chunks_per_row)
         self.chunks_per_col = max(1, self.chunks_per_col)
@@ -1175,10 +1175,10 @@ class TileCacher(object):
             self.cache_tile_lim = 50
     
     def _get_target_zoom_level(self, default_zoom: int) -> int:
-        if USING_KUBILUS_MESH:
-            uncapped_target_zoom = self.target_zoom_level_near_airports if default_zoom == 18 else self.target_zoom_level
+        if CFG.autoortho.using_custom_tiles:
+            uncapped_target_zoom = self.target_zoom_level
         else:
-            uncapped_target_zoom = self.target_zoom_level_near_airports if default_zoom == 19 else self.target_zoom_level
+            uncapped_target_zoom = self.target_zoom_level_near_airports if default_zoom == 18 else self.target_zoom_level
         return min(default_zoom + 1, uncapped_target_zoom)
 
     def _to_tile_id(self, row, col, map_type, zoom):
