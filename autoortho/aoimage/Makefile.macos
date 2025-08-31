@@ -1,31 +1,36 @@
-.SUFFIXES: .obj
+# Makefile (autoortho/aoimage) — build aoimage.dylib with static libturbojpeg
+# Uses lib/maclibturbojpeg.a relative to this directory. No Homebrew path recorded.
 
-TARGET=main
-JPGT=/opt/homebrew/opt/jpeg-turbo
+PKGROOT     := ..
+STATIC_TJ   := lib/maclibturbojpeg.a
+TJ_INC     ?= /opt/homebrew/opt/jpeg-turbo/include
 
-HEADERS=$(wildcard *.h)
-OBJECTS=aoimage.o
+CC          := clang
+ARCH        := arm64
+MIN_MACOS   := 11.0
 
-CC=clang
-LD=clang
+CFLAGS     += -O2 -Wall -fPIC -fvisibility=hidden -fdiagnostics-color \
+              -arch $(ARCH) -mmacosx-version-min=$(MIN_MACOS) \
+              -I$(TJ_INC)
 
-CFLAGS+=-O2 -Wall -fPIC -fdiagnostics-color -fvisibility=hidden \
-	-I$(JPGT)/include $(DEFINES)
+# aoimage.dylib remains relocatable; no rpath needed for turbojpeg since it's static
+LDFLAGS    := -dynamiclib -undefined dynamic_lookup \
+              -arch $(ARCH) -mmacosx-version-min=$(MIN_MACOS) \
+              -Wl,-install_name,@rpath/aoimage.dylib \
+              -Wl,-headerpad_max_install_names
 
-LDFLAGS=-dynamiclib -install_name @rpath/aoimage.dylib -undefined dynamic_lookup
-LIBS=-L$(JPGT)/lib -lturbojpeg
+.PHONY: all clean
+all: aoimage.dylib
 
-all: $(TARGET)
+aoimage.o: aoimage.c aoimage.h
+	@test -f "$(TJ_INC)/turbojpeg.h" || { \
+	  echo "ERROR: turbojpeg.h not found under TJ_INC=$(TJ_INC)"; exit 1; }
+	$(CC) $(CFLAGS) -c aoimage.c -o $@
 
-.c.o: $(HEADERS)
-	$(CC) $(CFLAGS) -c $<
-
-main: main.c aoimage.dylib $(HEADERS)
-	$(CC) $(CFLAGS) -o main \
-		main.c aoimage.c $(LIBS)
-
-aoimage.dylib: $(OBJECTS)
-	$(LD) -o aoimage.dylib $(LDFLAGS) $(OBJECTS) $(LIBS)
+# Link statically: include code from lib/libturbojpeg.a into aoimage.dylib
+aoimage.dylib: aoimage.o $(STATIC_TJ)
+	@test -f "$(STATIC_TJ)" || { echo "ERROR: missing $(STATIC_TJ)"; exit 1; }
+	$(CC) -o $@ $(LDFLAGS) aoimage.o $(STATIC_TJ)
 
 clean:
-	rm -f $(OBJECTS) $(TARGET) aoimage.dylib
+	rm -f aoimage.o aoimage.dylib

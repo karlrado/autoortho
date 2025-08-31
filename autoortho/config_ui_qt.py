@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+from ast import If
 import os
 import sys
 import pathlib
@@ -8,7 +9,11 @@ import threading
 import time
 import traceback
 import logging
+import re
+import webbrowser
+import requests
 from packaging import version
+import utils.resources_rc
 from utils.constants import MAPTYPES
 from utils.mappers import map_kubilus_region_to_simheaven_region
 
@@ -82,6 +87,29 @@ class SceneryUninstallWorker(QThread):
             self.error.emit(self.region_id, str(err))
             log.error(tb)
 
+
+class UpdateCheckWorker(QThread):
+    """Worker thread to check for updates from GitHub releases"""
+    result = Signal(object)  # tuple(latest_version_str, html_url) or None
+    error = Signal(str)
+
+    def run(self):
+        try:
+            api_url = "https://api.github.com/repos/ProgrammingDinosaur/autoortho4xplane/releases/latest"
+            headers = {
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "autoortho4xplane-update-check"
+            }
+            resp = requests.get(api_url, timeout=7, headers=headers)
+            if resp.status_code != 200:
+                self.result.emit(None)
+                return
+            data = resp.json()
+            tag = data.get("tag_name") or data.get("name") or ""
+            html_url = data.get("html_url") or "https://github.com/ProgrammingDinosaur/autoortho4xplane/releases"
+            self.result.emit((tag, html_url))
+        except Exception as err:
+            self.error.emit(str(err))
 
 class StyledButton(QPushButton):
     """Custom styled button with hover effects"""
@@ -191,7 +219,7 @@ class ModernSpinBox(QSpinBox):
                 background-color: #5183bd;
             }
             QSpinBox::up-arrow {
-                image: url(imgs/plus-16.png);
+                image: url(:/imgs/plus-16.png);
                 width: 12px;
                 height: 12px;
             }
@@ -205,7 +233,7 @@ class ModernSpinBox(QSpinBox):
                 background-color: #5183bd;
             }
             QSpinBox::down-arrow {
-                image: url(imgs/minus-16.png);
+                image: url(:/imgs/minus-16.png);
                 width: 12px;
                 height: 12px;
             }
@@ -224,6 +252,7 @@ class ConfigUI(QMainWindow):
         self.cfg = cfg
         self.ready = threading.Event()
         self.ready.clear()
+        self.system = platform.system().lower()
 
         self.dl = downloader.OrthoManager(
             self.cfg.paths.scenery_path,
@@ -261,6 +290,12 @@ class ConfigUI(QMainWindow):
         self.log_timer.start(1000)
 
         self.ready.set()
+
+        # Kick off asynchronous update check shortly after startup
+        try:
+            QTimer.singleShot(250, self.start_update_check)
+        except Exception:
+            pass
 
     def init_ui(self):
         """Initialize the user interface"""
@@ -346,7 +381,7 @@ class ConfigUI(QMainWindow):
                 border: none;
             }
             QComboBox::down-arrow {
-                image: url(imgs/arrow-204-16.png);
+                image: url(:/imgs/arrow-204-16.png);
                 width: 16px;
                 height: 16px;
                 margin-right: 10px;
@@ -387,10 +422,10 @@ class ConfigUI(QMainWindow):
         """)
 
         # Set icon
-        if platform.system() == 'Windows':
-            icon_path = os.path.join(CUR_PATH, 'imgs', 'ao-icon.ico')
+        if self.system == 'windows':
+            icon_path = ":/imgs/ao-icon.ico"
         else:
-            icon_path = os.path.join(CUR_PATH, 'imgs', 'ao-icon.png')
+            icon_path = ":/imgs/ao-icon.png"
         self.setWindowIcon(QIcon(icon_path))
 
         # Create central widget
@@ -404,7 +439,7 @@ class ConfigUI(QMainWindow):
 
         # Add banner
         banner_label = QLabel()
-        banner_pixmap = QPixmap(os.path.join(CUR_PATH, 'imgs', 'banner1.png'))
+        banner_pixmap = QPixmap(":/imgs/banner1.png")
         banner_label.setPixmap(
             banner_pixmap.scaled(
                 QSize(400, 100),
@@ -662,53 +697,22 @@ class ConfigUI(QMainWindow):
 
         self.simheaven_compat_check.stateChanged.connect(self.on_simheaven_compat_check)
 
+        # add space between options
+        options_layout.addSpacing(10)
 
-        #self.using_custom_tiles_check = QCheckBox("Advanced Custom Tiles Options")
-        #self.using_custom_tiles_check.setChecked(self.cfg.autoortho.using_custom_tiles)
-        #self.using_custom_tiles_check.setObjectName('using_custom_tiles')
-        #self.using_custom_tiles_check.setToolTip(
-        #    "Enable this if you are using custom build Ortho4XP tiles instead of base scenery packages from autoortho and want more control over the zoom levels.\n"
-        #    "This will allow you to set custom zoom levels based on your tiles for this session.\n"
-        #    "IMPORTANT: Make sure you setup the zoom levels to the ones matching your tiles, otherwise you may experience issues with the scenery. "
-        #    "You can still use custom tiles without this option, but all tiles will be capped to general max zoom level you set in advanced settings, "
-        #    "even if they are airport tiles that should be at higher zoom levels."
-        #)
+        self.using_custom_tiles_check = QCheckBox("Using Custom Tiles")
+        self.using_custom_tiles_check.setChecked(self.cfg.autoortho.using_custom_tiles)
+        self.using_custom_tiles_check.setObjectName('using_custom_tiles')
+        self.using_custom_tiles_check.setToolTip(
+            "Enable this if you are using custom build Ortho4XP tiles instead or along with base scenery packages from autoortho.\n"
+            "NOTE: By using this option the Max Zoom near airports setting will be ignored and all tiles will be capped to the general max zoom level you set in advanced settings."
+        )
 
-        #self.using_custom_tiles_check.stateChanged.connect(lambda state: on_using_custom_tiles_check(state))
-        #options_layout.addWidget(self.using_custom_tiles_check)
+        self.using_custom_tiles_check.stateChanged.connect(self.on_using_custom_tiles_check)
+        options_layout.addWidget(self.using_custom_tiles_check)
 
 
         layout.addWidget(options_group)
-
-        # TODO: Add custom tiles config here
-        #custom_tiles_group = QGroupBox("Advanced Custom Tiles Setup")
-        #custom_tiles_layout = QVBoxLayout()
-        #custom_tiles_group.setLayout(custom_tiles_layout)
-
-        #custom_tiles_label = QLabel("Advanced Custom Tiles Setup")
-        #custom_tiles_label.setToolTip(
-        #        "This is only used if you are using custom tiles.\n"
-        #        "Settting this values will allow autoortho to correctly identify the tiles near airports from your custom tiles, allowing you to control their max zoom levels "
-        #        "depending on whether they are near airport tiles or not via the two sliders in Advanced Settings.\n"
-        #        "If you are not sure what values your tiles are built to, just uncheck the Advanced Custom Tiles Options box "
-        #        "and let autoortho cap your tiles to the general max zoom level you set in advanced settings."
-        #)
-        #custom_tiles_layout.addWidget(custom_tiles_label)
-
-        #custom_tiles_doc_label = QLabel("Please make sure you read the documentation on how add custom built tiles to AutoOrtho, "
-        #"you can find it here: https://programmingdinosaur.github.io/autoortho4xplane/details#adding-your-own-created-sceneries",openExternalLinks=True)
-        #custom_tiles_layout.addWidget(custom_tiles_doc_label)
-
-        #custom_tiles_general_zoom_label = QLabel("General zoom level your custom Ortho4XP tiles were built for:")
-        #custom_tiles_layout.addWidget(custom_tiles_general_zoom_label)
-        #self.custom_tiles_general_zoom_combo = QComboBox()
-        #self.custom_tiles_general_zoom_combo.addItems(['12', '13', '14', '15', '16', '17', '18', '19'])
-        #self.custom_tiles_general_zoom_combo.setCurrentText(str("baa"))
-        #self.custom_tiles_general_zoom_combo.setObjectName('custom_tiles_general_zoom')
-        #self.custom_tiles_general_zoom_combo.setToolTip(
-        #    "Drag to adjust minimum zoom level for custom tiles"
-        #)
-        #custom_tiles_layout.addWidget(self.custom_tiles_general_zoom_combo)
     
         # Set the content widget to the scroll area
         scroll_area.setWidget(setup_content)
@@ -735,11 +739,69 @@ class ConfigUI(QMainWindow):
 
         # Create the actual content widget
         settings_content = QWidget()
-        layout = QVBoxLayout()
-        layout.setSpacing(15)
-        settings_content.setLayout(layout)
+        self.settings_layout = QVBoxLayout()
+        self.settings_layout.setSpacing(15)
+        settings_content.setLayout(self.settings_layout)
 
-        # Cache settings group
+        self.refresh_settings_tab()
+        
+
+        # Set the content widget to the scroll area
+        scroll_area.setWidget(settings_content)
+
+        # Create the main layout for the tab
+        tab_layout = QVBoxLayout()
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.addWidget(scroll_area)
+        settings_widget.setLayout(tab_layout)
+
+        self.tabs.addTab(settings_widget, "Advanced Settings")
+
+    def create_scenery_tab(self):
+        """Create the scenery management tab"""
+        scenery_widget = QWidget()
+        layout = QVBoxLayout()
+        scenery_widget.setLayout(layout)
+
+        # Create scroll area for scenery list
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+
+        self.scenery_content = QWidget()
+        self.scenery_layout = QVBoxLayout()
+        self.scenery_content.setLayout(self.scenery_layout)
+
+        scroll_area.setWidget(self.scenery_content)
+        layout.addWidget(scroll_area)
+
+        # Refresh scenery list
+        self.refresh_scenery_list()
+
+        self.tabs.addTab(scenery_widget, "Scenery")
+
+    def create_logs_tab(self):
+        """Create the logs tab"""
+        logs_widget = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(10, 10, 10, 10)
+        logs_widget.setLayout(layout)
+
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        layout.addWidget(self.log_text)
+
+        self.tabs.addTab(logs_widget, "Logs")
+
+    def refresh_settings_tab(self):
+        """Refresh the settings tab"""
+        print(f"{self.cfg.autoortho.using_custom_tiles}")
+        while self.settings_layout.count():
+            child = self.settings_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
         cache_group = QGroupBox("Cache Settings")
         cache_layout = QVBoxLayout()
         cache_group.setLayout(cache_layout)
@@ -782,7 +844,7 @@ class ConfigUI(QMainWindow):
         auto_clean_cache_layout.addWidget(self.auto_clean_cache_check)
         cache_layout.addLayout(auto_clean_cache_layout)
 
-        layout.addWidget(cache_group)
+        self.settings_layout.addWidget(cache_group)
 
         # AutoOrtho Settings group
         autoortho_group = QGroupBox("AutoOrtho Settings")
@@ -816,16 +878,21 @@ class ConfigUI(QMainWindow):
         min_zoom_layout.addWidget(self.min_zoom_label)
         autoortho_layout.addLayout(min_zoom_layout)
 
-        max_zoom_layout = QHBoxLayout()
-        max_zoom_label = QLabel("Maximum zoom level:")
-        max_zoom_label.setToolTip(
+        max_zoom_tooltip = (
             "Maximum zoom level for imagery downloads.\n"
             "Higher values = more detail but larger downloads and more VRAM usage.\n"
-            "Optimal: 16 for most cases. Keep in mind that every extra ZL increases VRAM and potential network usage by 4x."
+            "Optimal: 16 for most cases. Keep in mind that every extra ZL increases VRAM and potential network usage by 4x.\n"
         )
+        if self.cfg.autoortho.using_custom_tiles:
+            max_zoom_tooltip += "IMPORTANT: You are using custom tiles, you can set this to 19 if your tiles are built for higher ZL it.\n"
+            "But be aware that in-game zoom level will be capped to tile default zoom level + 1 (only X-Plane 12)."
+
+        max_zoom_layout = QHBoxLayout()
+        max_zoom_label = QLabel("Maximum zoom level:")
+        max_zoom_label.setToolTip(max_zoom_tooltip)
         max_zoom_layout.addWidget(max_zoom_label)
         self.max_zoom_slider = ModernSlider()
-        self.max_zoom_slider.setRange(12, 17) # Max X-Plane allows is tile zoom + 1 , 17 accounts for kubilus mesh
+        self.max_zoom_slider.setRange(12, 17 if not self.cfg.autoortho.using_custom_tiles else 19) # Max X-Plane allows is tile zoom + 1 , 17 accounts for kubilus mesh
         self.max_zoom_slider.setValue(int(self.cfg.autoortho.max_zoom))
         self.max_zoom_slider.setObjectName('max_zoom')
         self.max_zoom_slider.setToolTip(
@@ -864,7 +931,9 @@ class ConfigUI(QMainWindow):
         )
         max_zoom_near_airports_layout.addWidget(self.max_zoom_near_airports_slider)
         max_zoom_near_airports_layout.addWidget(self.max_zoom_near_airports_label)
-        autoortho_layout.addLayout(max_zoom_near_airports_layout)
+
+        if not self.cfg.autoortho.using_custom_tiles:
+            autoortho_layout.addLayout(max_zoom_near_airports_layout)
 
         # Max wait time
         maxwait_layout = QHBoxLayout()
@@ -924,7 +993,17 @@ class ConfigUI(QMainWindow):
         threads_layout.addStretch()
         autoortho_layout.addLayout(threads_layout)
 
-        layout.addWidget(autoortho_group)
+        if self.cfg.autoortho.using_custom_tiles:
+            self.info_label = QLabel(
+                "Note: You are using custom tiles. Max zoom near airports setting is incompatible with custom tiles, all tiles will be capped to the general max zoom level you set.\n\n"
+                "You can use tiles with different zoom levels, they will be automatically capped to the maximum zoom level they support, even if a higher max zoom level than they support is set.\n"
+            )
+            self.info_label.setStyleSheet("color: #6da4e3; font-size: 14; font-weight: italic; font-weight: bold; text-align: justify;")
+            # wrap text
+            self.info_label.setWordWrap(True)
+            autoortho_layout.addWidget(self.info_label)
+
+        self.settings_layout.addWidget(autoortho_group)
 
         # DDS Compression Settings group
         dds_group = QGroupBox("DDS Compression Settings")
@@ -932,28 +1011,34 @@ class ConfigUI(QMainWindow):
         dds_group.setLayout(dds_layout)
 
         # Compressor
-        compressor_layout = QHBoxLayout()
-        compressor_label = QLabel("Compressor:")
-        compressor_label.setToolTip(
-            "Algorithm used for DDS texture compression:\n"
-            "• ISPC: Intel's high-performance compressor (recommended)\n"
-            "  - Faster compression, better quality\n"
-            "  - Requires modern CPU\n"
-            "• STB: Standard compressor (compatibility)\n"
-            "  - Slower but works on all systems\n"
-            "  - Use if ISPC causes issues"
-        )
-        compressor_layout.addWidget(compressor_label)
-        self.compressor_combo = QComboBox()
-        self.compressor_combo.addItems(['ISPC', 'STB'])
-        self.compressor_combo.setCurrentText(self.cfg.pydds.compressor)
-        self.compressor_combo.setObjectName('compressor')
-        self.compressor_combo.setToolTip(
-            "Select compression algorithm (ISPC recommended)"
-        )
-        compressor_layout.addWidget(self.compressor_combo)
-        compressor_layout.addStretch()
-        dds_layout.addLayout(compressor_layout)
+        supported_compressors = ['ISPC'] if self.system == "darwin" else ['ISPC', 'STB']
+        if not self.system == "darwin":
+            compressor_layout = QHBoxLayout()
+            compressor_label = QLabel("Compressor:")
+            compressor_label.setToolTip(
+                "Algorithm used for DDS texture compression:\n"
+                "• ISPC: Intel's high-performance compressor (recommended)\n"
+                "  - Faster compression, better quality\n"
+                "  - Requires modern CPU\n"
+                "• STB: Standard compressor (compatibility)\n"
+                "  - Slower but works on all systems\n"
+                "  - Use if ISPC causes issues"
+            )
+            compressor_layout.addWidget(compressor_label)
+            self.compressor_combo = QComboBox()
+            self.compressor_combo.addItems(supported_compressors)
+            self.compressor_combo.setCurrentText(self.cfg.pydds.compressor)
+            self.compressor_combo.setObjectName('compressor')
+            self.compressor_combo.setToolTip(
+                "Select compression algorithm (ISPC recommended)"
+            )
+            compressor_layout.addWidget(self.compressor_combo)
+            compressor_layout.addStretch()
+            dds_layout.addLayout(compressor_layout)
+        else:
+            if self.cfg.pydds.compressor not in supported_compressors:
+                self.cfg.pydds.compressor = "ISPC"
+                QMessageBox.warning(self, "Warning", "ISPC is the only supported compressor on MacOS, your current compressor has been changed to ISPC.")
 
         # Format
         format_layout = QHBoxLayout()
@@ -979,7 +1064,7 @@ class ConfigUI(QMainWindow):
         format_layout.addStretch()
         dds_layout.addLayout(format_layout)
 
-        layout.addWidget(dds_group)
+        self.settings_layout.addWidget(dds_group)
 
         # General Settings group
         general_group = QGroupBox("General Settings")
@@ -1016,7 +1101,7 @@ class ConfigUI(QMainWindow):
         )
         general_layout.addWidget(self.debug_check)
 
-        layout.addWidget(general_group)
+        self.settings_layout.addWidget(general_group)
 
         # Scenery Settings group
         scenery_group = QGroupBox("Scenery Settings")
@@ -1034,7 +1119,7 @@ class ConfigUI(QMainWindow):
         )
         scenery_layout.addWidget(self.noclean_check)
 
-        layout.addWidget(scenery_group)
+        self.settings_layout.addWidget(scenery_group)
 
         # FUSE Settings group
         fuse_group = QGroupBox("FUSE Settings")
@@ -1053,7 +1138,7 @@ class ConfigUI(QMainWindow):
         fuse_layout.addWidget(self.threading_check)
 
         # Windows specific
-        if platform.system() == 'Windows':
+        if self.system == 'windows':
             self.winfsp_check = QCheckBox("Prefer WinFSP over Dokan")
             self.winfsp_check.setChecked(self.cfg.windows.prefer_winfsp)
             self.winfsp_check.setObjectName('prefer_winfsp')
@@ -1065,7 +1150,7 @@ class ConfigUI(QMainWindow):
             )
             fuse_layout.addWidget(self.winfsp_check)
 
-        layout.addWidget(fuse_group)
+        self.settings_layout.addWidget(fuse_group)
 
         # Flight Data Settings group
         flightdata_group = QGroupBox("Flight Data Settings")
@@ -1112,58 +1197,9 @@ class ConfigUI(QMainWindow):
         xplane_port_layout.addStretch()
         flightdata_layout.addLayout(xplane_port_layout)
 
-        layout.addWidget(flightdata_group)
+        self.settings_layout.addWidget(flightdata_group)
 
-        layout.addStretch()
-
-        # Set the content widget to the scroll area
-        scroll_area.setWidget(settings_content)
-
-        # Create the main layout for the tab
-        tab_layout = QVBoxLayout()
-        tab_layout.setContentsMargins(0, 0, 0, 0)
-        tab_layout.addWidget(scroll_area)
-        settings_widget.setLayout(tab_layout)
-
-        self.tabs.addTab(settings_widget, "Advanced Settings")
-
-    def create_scenery_tab(self):
-        """Create the scenery management tab"""
-        scenery_widget = QWidget()
-        layout = QVBoxLayout()
-        scenery_widget.setLayout(layout)
-
-        # Create scroll area for scenery list
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-
-        self.scenery_content = QWidget()
-        self.scenery_layout = QVBoxLayout()
-        self.scenery_content.setLayout(self.scenery_layout)
-
-        scroll_area.setWidget(self.scenery_content)
-        layout.addWidget(scroll_area)
-
-        # Refresh scenery list
-        self.refresh_scenery_list()
-
-        self.tabs.addTab(scenery_widget, "Scenery")
-
-    def create_logs_tab(self):
-        """Create the logs tab"""
-        logs_widget = QWidget()
-        layout = QVBoxLayout()
-        layout.setContentsMargins(10, 10, 10, 10)
-        logs_widget.setLayout(layout)
-
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        layout.addWidget(self.log_text)
-
-        self.tabs.addTab(logs_widget, "Logs")
+        self.settings_layout.addStretch()
 
     def refresh_scenery_list(self):
         """Refresh the scenery list display"""
@@ -1668,9 +1704,10 @@ class ConfigUI(QMainWindow):
             self.simheaven_config_changed_session = True
 
         self.cfg.cache.auto_clean_cache = self.auto_clean_cache_check.isChecked()
+        self.cfg.autoortho.using_custom_tiles = self.using_custom_tiles_check.isChecked()
 
         # Windows specific
-        if platform.system() == 'Windows' and hasattr(self, 'winfsp_check'):
+        if self.system == 'windows' and hasattr(self, 'winfsp_check'):
             self.cfg.windows.prefer_winfsp = self.winfsp_check.isChecked()
 
         # Save Settings tab values
@@ -1695,7 +1732,8 @@ class ConfigUI(QMainWindow):
             )
 
             # DDS settings
-            self.cfg.pydds.compressor = self.compressor_combo.currentText()
+            if not self.system == "darwin":
+                self.cfg.pydds.compressor = self.compressor_combo.currentText()
             self.cfg.pydds.format = self.format_combo.currentText()
 
             # General settings
@@ -1721,6 +1759,17 @@ class ConfigUI(QMainWindow):
         self.ready.set()
         self.refresh_scenery()
 
+    def on_using_custom_tiles_check(self, state):
+        """Handle using custom tiles check"""
+        if state == False: 
+            if self.cfg.autoortho.using_custom_tiles == True and int(self.cfg.autoortho.max_zoom) > 17:
+                log.info(f"Max zoom being capped to 17 after custom tiles disabled")
+                self.cfg.autoortho.max_zoom = 17
+            self.cfg.autoortho.using_custom_tiles = False
+        else:
+            self.cfg.autoortho.using_custom_tiles = True
+
+        self.refresh_settings_tab()
 
     def apply_simheaven_compat(self, use_simheaven_overlay=False):
         """
@@ -1837,6 +1886,60 @@ class ConfigUI(QMainWindow):
         for r in self.dl.regions.values():
             latest = r.get_latest_release()
             latest.parse()
+
+    def _parse_version(self, text):
+        """Extract and parse a semantic version from arbitrary text.
+        Returns packaging.version.Version or None if not found.
+        """
+        try:
+            if not text:
+                return None
+            match = re.search(r"\d+(?:\.\d+){1,3}(?:[-._]rc[-._]?\d+)?", str(text), re.IGNORECASE)
+            if not match:
+                return None
+            ver_str = match.group(0)
+            # Normalize rc format for packaging.version
+            ver_str = re.sub(r"[-._]rc[-._]?(\d+)", r"rc\1", ver_str, flags=re.IGNORECASE)
+            return version.parse(ver_str)
+        except Exception:
+            return None
+
+    def start_update_check(self):
+        """Start background update check against GitHub releases"""
+        try:
+            self._update_worker = UpdateCheckWorker()
+            self._update_worker.result.connect(self.on_update_check_result)
+            self._update_worker.error.connect(lambda e: None)
+            self._update_worker.start()
+        except Exception:
+            pass
+
+    def on_update_check_result(self, data):
+        """Handle result from update check worker"""
+        try:
+            if not data:
+                return
+            latest_tag, html_url = data
+            from version import __version__ as current_version
+            latest_ver = self._parse_version(latest_tag)
+            current_ver = self._parse_version(current_version)
+            if latest_ver is None or current_ver is None:
+                return
+            if latest_ver > current_ver:
+                reply = QMessageBox.question(
+                    self,
+                    "Update Available",
+                    "An Update for AutoOrtho is Available. Do you want to go to the download page?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    try:
+                        webbrowser.open(html_url or "https://github.com/ProgrammingDinosaur/autoortho4xplane/releases")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def update_logs(self):
         """Update log display"""

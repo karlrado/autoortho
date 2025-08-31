@@ -1,82 +1,208 @@
+# winsetup.py
 import os
 import sys
-import time
-from aoconfig import CFG
-
+import glob
 import logging
-log = logging.getLogger(__name__)
-
+import shutil
+import subprocess
+from ctypes import CDLL
 from ctypes.util import find_library
 
+from aoconfig import CFG
+
+log = logging.getLogger(__name__)
+
+try:
+    import winreg as reg
+except ImportError:
+    log.error("Failed to import winreg")
+
+_PLACEHOLDER = ".AO_PLACEHOLDER"
+_ALLOWED_PLACEHOLDER = {"Earth nav data", "terrain", "textures", _PLACEHOLDER, "desktop.ini"}
+
+
+def _looks_like_placeholder(path):
+    try:
+        entries = set(os.listdir(path))
+    except Exception:
+        return False
+    # Empty or subset of allowed placeholder files/dirs
+    return entries.issubset(_ALLOWED_PLACEHOLDER)
+
+
+def _is_64bit_python():
+    return sys.maxsize > 0xFFFFFFFF
+
+
+def _arch():
+    return "x64" if _is_64bit_python() else "x86"
+
+
+def _try_load(dll_path):
+    """Try to load a DLL in a safe way and return a canonical path on success."""
+    try:
+        # On Py 3.8+ add directory to the DLL search path to resolve dependencies
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(os.path.dirname(dll_path))
+        CDLL(dll_path)
+        return os.path.abspath(dll_path)
+    except Exception as e:
+        log.debug(f"Probe load failed for {dll_path}: {e}")
+        return None
+
+def _find_winfsp_from_registry():
+    if not reg:
+        return None
+    try:
+        with reg.OpenKey(reg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WinFsp", 0, reg.KEY_READ | reg.KEY_WOW64_32KEY) as k:
+            install_dir, _ = reg.QueryValueEx(k, "InstallDir")
+        if not install_dir or not os.path.isdir(install_dir):
+            return None
+        # WinFsp 2.x places binaries under SxS\sxs.*\bin; also check legacy bin
+        candidates = []
+        # Legacy:
+        legacy = os.path.join(install_dir, "bin", f"winfsp-{_arch()}.dll")
+        candidates.append(legacy)
+        # SxS:
+        sxs_glob = os.path.join(install_dir, "SxS", "sxs.*", "bin", f"winfsp-{_arch()}.dll")
+        candidates.extend(glob.glob(sxs_glob))
+        for c in candidates:
+            if os.path.exists(c):
+                loaded = _try_load(c)
+                if loaded:
+                    return loaded
+        return None
+    except Exception as e:
+        log.debug(f"WinFsp registry probe failed: {e}")
+        return None
+
+
+def _find_dokan_fuse():
+    # Try common names for Dokan FUSE wrapper (v2 and legacy)
+    for name in ("dokanfuse2.dll", "dokanfuse.dll"):
+        p = find_library(name)
+        if p:
+            loaded = _try_load(p if os.path.isabs(p) else name)
+            if loaded:
+                return loaded
+        # Fallback to system locations
+        system32 = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32", name)
+        if os.path.exists(system32):
+            loaded = _try_load(system32)
+            if loaded:
+                return loaded
+    return None
+
+
 def find_win_libs():
+    """
+    Return (mode, dll_path) where mode is 'winfsp-FUSE' or 'dokan-FUSE'.
+    Sets FUSE_LIBRARY_PATH to the discovered DLL.
+    """
     fuse_libs = []
 
-    # Find dokan
     log.info("Looking for Dokan ...")
-    _lib_dokan= find_library('dokanfuse2.dll')
-    if _lib_dokan:
-        log.info(f"Dokan found at {_lib_dokan}")
-        fuse_libs.append(("dokan-FUSE", _lib_dokan))
+    dokan = _find_dokan_fuse()
+    if dokan:
+        log.info(f"Dokan found at {dokan}")
+        fuse_libs.append(("dokan-FUSE", dokan))
     else:
-        log.info("Dokan not found.") 
+        log.info("Dokan not found.")
 
     log.info("Looking for WinFSP ...")
-    # Find WinFSP
-    try:
-        import _winreg as reg
-    except ImportError:
-        import winreg as reg
-    def Reg32GetValue(rootkey, keyname, valname):
-        key, val = None, None
-        try:
-            key = reg.OpenKey(rootkey, keyname, 0, reg.KEY_READ | reg.KEY_WOW64_32KEY)
-            val = str(reg.QueryValueEx(key, valname)[0])
-        except WindowsError:
-            pass
-        finally:
-            if key is not None:
-                reg.CloseKey(key)
-        return val
-    _lib_winfsp = Reg32GetValue(reg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WinFsp", r"InstallDir")
-    if _lib_winfsp:
-        _lib_winfsp += r"bin\winfsp-%s.dll" % ("x64" if sys.maxsize > 0xffffffff else "x86")
-        if os.path.exists(_lib_winfsp):
-            log.info(f"Found WinFSP at {_lib_winfsp}")
-            fuse_libs.append(("winfsp-FUSE", _lib_winfsp))
+    winfsp = _find_winfsp_from_registry()
+    if winfsp:
+        log.info(f"Found WinFSP at {winfsp}")
+        fuse_libs.append(("winfsp-FUSE", winfsp))
     else:
         log.info("WinFSP not found.")
 
     if not fuse_libs:
-        log.error(f"No required Windows libs detected!  Please install DokanyV2 or WinFSP.")
+        log.error("No required Windows libs detected! Please install Dokan or WinFsp.")
         return None, None
 
-    if CFG.windows.prefer_winfsp:
-        fuse_libs.reverse()
-    
-    fusemode, fuselib = fuse_libs[0]
+    # Honor preference but keep loadability: pick preferred if present, else fallback.
+    prefer_winfsp = getattr(CFG, "windows", None) and getattr(CFG.windows, "prefer_winfsp", False)
+    ordered = sorted(
+        fuse_libs,
+        key=lambda x: (0 if (prefer_winfsp and x[0].startswith("winfsp"))
+                       or (not prefer_winfsp and x[0].startswith("dokan")) else 1)
+    )
+    fusemode, fuselib = ordered[0]
+    os.environ["FUSE_LIBRARY_PATH"] = fuselib  # many FUSE shims honor this
+
     log.info(f"Will use detected {fusemode} with libs {fuselib}")
-    os.environ['FUSE_LIBRARY_PATH'] = fuselib
     return fusemode, fuselib
 
 
 def setup_winfsp_mount(path):
+    """
+    Ensure mountpoint is in a WinFsp-safe state:
+    - It must NOT exist before mount.
+    - If it exists and looks like our placeholder, remove it.
+    - Otherwise, refuse to proceed to avoid data loss.
+    """
+    path = os.path.expanduser(path)
     if os.path.lexists(path):
-        # Windows cannot reliably determine if a directory exists or is empty or not (what a mess) so prompt before doing anything more.
-        log.warning(f"Mount point {path} exists.  WinFSP requires mount point does not already exist. Attempting to rename {path} to {path}_bkp")
-
-        if os.path.lexists(f"{path}_bkp"):
-            log.error(f"Mount point ({path}) already exists, user must manually cleanup.")
+        if not os.path.isdir(path):
+            log.error(f"Mount point ({path}) exists but is not a directory.")
             return False
-
-        os.rename(
-            path,
-            f"{path}_bkp"
-        )
-        
+        if _looks_like_placeholder(path):
+            log.info(f"Removing placeholder directory before WinFsp mount: {path}")
+            try:
+                shutil.rmtree(path)
+            except Exception as e:
+                log.error(f"Failed to remove placeholder {path}: {e}")
+                return False
+        else:
+            log.error(
+                f"Mount point ({path}) already exists and is not a known placeholder. "
+                "WinFsp requires it to not exist; please move or rename it manually."
+            )
+            return False
+    # At this point the path must NOT exist; WinFsp will create/delete it.
     return True
+
 
 def setup_dokan_mount(path):
-    if not os.path.lexists(path):
-        log.info(f"Creating mountpoint for Dokan: {path}")
-        os.makedirs(path)
+    """
+    For Dokan FUSE directory mounts, require an existing, empty directory.
+    (Most Dokan apps mount to a drive letter; directory mounts should be empty.)
+    """
+    path = os.path.expanduser(path)
+    if os.path.lexists(path):
+        if not os.path.isdir(path):
+            log.error(f"Mount point {path} exists but is not a directory.")
+            return False
+        # Treat placeholder as “empty enough”
+        if not _looks_like_placeholder(path):
+            if os.listdir(path):  # non-empty and not our placeholder
+                log.error(f"Mount point {path} exists and is not empty.")
+                return False
+    else:
+        try:
+            os.makedirs(path, exist_ok=True)
+            log.info(f"Created mountpoint for Dokan: {path}")
+        except OSError as e:
+            log.error(f"Failed creating mountpoint {path}: {e}")
+            return False
     return True
+
+def force_unmount(path):
+    """
+    Best-effort force unmount on Windows for both WinFsp and Dokan.
+    No exception if not installed.
+    """
+    try:        # Dokan: dokanctl.exe /u <mount> (drive letter or mount dir)
+        if shutil.which("dokanctl.exe"):
+            subprocess.run(["dokanctl.exe", "/u", path],
+                           check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # WinFsp: fsptool-x64.exe umount <path> (on modern WinFsp installs)
+        # Fall back to launcher if needed.
+        for tool in ("fsptool-x64.exe", "fsptool.exe", "launchctl-x64.exe", "launchctl.exe"):
+            if shutil.which(tool):
+                subprocess.run([tool, "umount", path],
+                               check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                break
+    except Exception as e:
+        log.debug(f"force_unmount({path}) failed (ignored): {e}")

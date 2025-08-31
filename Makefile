@@ -2,6 +2,9 @@ ZIP?=zip
 VERSION?=0.0.0
 # Sanitize VERSION for use in filenames (replace any non-safe char with '-')
 SAFE_VERSION:=$(shell echo "$(VERSION)" | sed -e 's/[^A-Za-z0-9._-]/-/g')
+.PHONY: mac_app
+SHELL := /bin/bash
+.ONESHELL:
 
 autoortho.pyz:
 	mkdir -p build/autoortho
@@ -26,24 +29,34 @@ bin: autoortho/.version
 		--enable-plugin=pyside6 \
 		--include-data-file=./autoortho/.version*=. \
 		--include-data-file=./autoortho/templates/*.html=templates/ \
-		--include-data-file=./autoortho/lib/linux/*.so=lib/linux/ \
-		--include-data-file=./autoortho/aoimage/*.so=aoimage/ \
-		--include-data-dir=./autoortho/imgs=imgs \
 		--onefile \
+		--user-package-configuration-file=nuitka-package.config.yml \
 		./autoortho/__main__.py -o autoortho_lin.bin
 
-mac_bin: autoortho_mac_$(SAFE_VERSION).bin
-autoortho_mac_$(SAFE_VERSION).bin: autoortho/.version
-	python3 -m nuitka --verbose --verbose-output=nuitka.log \
-		--macos-app-icon=autoortho/imgs/ao-icon.ico \
+__main__.app: autoortho/.version
+	sudo python3 -m nuitka --verbose --verbose-output=nuitka.log \
+		--assume-yes-for-downloads \
+		--standalone \
+		--macos-create-app-bundle \
+		--macos-target-arch=arm64 \
+		--macos-app-name=AutoOrtho \
+		--macos-app-icon=autoortho/imgs/ao-icon.icns \
 		--enable-plugin=pyside6 \
-		--include-data-file=./autoortho/.version*=. \
+		--include-data-file=autoortho/.version=autoortho/.version \
 		--include-data-file=./autoortho/templates/*.html=templates/ \
-		--include-data-file=./autoortho/lib/macos/*.dylib=lib/macos/ \
-		--include-data-file=./autoortho/aoimage/*.dylib=aoimage/ \
-		--include-data-dir=./autoortho/imgs=imgs \
-		--onefile \
-		./autoortho/__main__.py -o $@
+		--user-package-configuration-file=nuitka-package.config.yml \
+		./autoortho/__main__.py
+
+AutoOrtho.app: __main__.app
+	sudo chown -R "$(USER)":staff __main__.app
+	rm -rf AutoOrtho.app
+	mv __main__.app AutoOrtho.app
+
+mac_app: AutoOrtho.app
+
+AutoOrtho_mac_$(SAFE_VERSION).zip: AutoOrtho.app
+	$(ZIP) -r $@ AutoOrtho.app
+mac_zip: AutoOrtho_mac_$(SAFE_VERSION).zip
 
 _autoortho_win.exe: autoortho/.version
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
@@ -54,9 +67,7 @@ _autoortho_win.exe: autoortho/.version
 		--assume-yes-for-downloads \
 		--include-data-file=./autoortho/.version*=./ \
 		--include-data-file=./autoortho/templates/*.html=templates/ \
-		--include-data-file=./autoortho/lib/windows/*=lib/windows/ \
-		--include-data-file=./autoortho/aoimage/*.dll=aoimage/ \
-		--include-data-dir=./autoortho/imgs=imgs \
+		--user-package-configuration-file=nuitka-package.config.yml \
 		--onefile \
 		--disable-console \
 		./autoortho/__main__.py -o autoortho_win.exe
@@ -70,9 +81,7 @@ __main__.dist: autoortho/.version
 		--assume-yes-for-downloads \
 		--include-data-file=./autoortho/.version*=./ \
 		--include-data-file=./autoortho/templates/*.html=templates/ \
-		--include-data-file=./autoortho/lib/windows/*=lib/windows/ \
-		--include-data-file=./autoortho/aoimage/*.dll=aoimage/ \
-		--include-data-dir=./autoortho/imgs=imgs \
+		--user-package-configuration-file=nuitka-package.config.yml \
 		--standalone \
 		--disable-console \
 		./autoortho/__main__.py -o autoortho_win.exe
@@ -98,7 +107,5 @@ serve_docs:
 	docker run -p 8000:8000 -v `pwd`:/docs squidfunk/mkdocs-material
 
 clean:
-	-rm -rf build
-	-rm -rf __main__.dist
-	-rm -rf __main__.build
+	rm -rf __main__.app AutoOrtho.app *.zip *.build *.dist build dist
 	

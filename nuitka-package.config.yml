@@ -1,0 +1,34 @@
+- module-name: 'autoortho'
+  dlls:
+    - from_filenames:
+        relative_path: 'lib/macos'
+        prefixes: ['libispc_texcomp', 'lib_stb_dxt']
+        suffixes: ['dylib']
+        when: 'macos'
+    - from_filenames:
+        relative_path: 'aoimage' 
+        prefixes: ['aoimage']
+        suffixes: ['dylib']
+        when: 'macos'
+
+    - from_filenames:
+        relative_path: 'lib/linux'
+        prefixes: ['libispc_texcomp', 'lib_stb_dxt']
+        suffixes: ['so']
+        when: 'linux'
+    - from_filenames:
+        relative_path: 'aoimage'
+        prefixes: ['aoimage']
+        suffixes: ['so']
+        when: 'linux'
+
+    - from_filenames:
+        relative_path: 'lib/windows'
+        prefixes: ['ispc_texcomp', 'stb_dxt']
+        suffixes: ['dll']
+        when: 'win32'
+    - from_filenames:
+        relative_path: 'aoimage'
+        prefixes: ['aoimage']
+        suffixes: ['dll']
+        when: 'win32'

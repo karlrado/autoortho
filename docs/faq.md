@@ -85,6 +85,14 @@ That is a false positive.  Unfortunately, Windows is very dev and opensource unf
 ### I get an error when running with scenery installed on a non-local drive or non-NTFS formatted drive when using Windows
 This is not supported. Use a local NTFS formatted drive.
 
+---
+
+## MacOS issues
+
+### Flight crashes during loading, X-Plane logs show no detailed errors.
+AutoOrtho Tile Setup and imagery download can take up lots of time while loading the flight and X-Plane freezes in the meantime. MacOS doesn't like the app being frozen and if you click on it or change apps often the system might force close it. Crashing the Simulator.
+Solution: Retry loading and stay on the loading screen (be patient)
+
 ## I have an issue that is not here.
 
 Please check the [issues page of the repository](https://github.com/ProgrammingDinosaur/autoortho4xplane/issues). 
