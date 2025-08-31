@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+from ast import If
 import os
 import sys
 import pathlib
@@ -8,6 +9,9 @@ import threading
 import time
 import traceback
 import logging
+import re
+import webbrowser
+import requests
 from packaging import version
 import utils.resources_rc
 from utils.constants import MAPTYPES
@@ -83,6 +87,29 @@ class SceneryUninstallWorker(QThread):
             self.error.emit(self.region_id, str(err))
             log.error(tb)
 
+
+class UpdateCheckWorker(QThread):
+    """Worker thread to check for updates from GitHub releases"""
+    result = Signal(object)  # tuple(latest_version_str, html_url) or None
+    error = Signal(str)
+
+    def run(self):
+        try:
+            api_url = "https://api.github.com/repos/ProgrammingDinosaur/autoortho4xplane/releases/latest"
+            headers = {
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "autoortho4xplane-update-check"
+            }
+            resp = requests.get(api_url, timeout=7, headers=headers)
+            if resp.status_code != 200:
+                self.result.emit(None)
+                return
+            data = resp.json()
+            tag = data.get("tag_name") or data.get("name") or ""
+            html_url = data.get("html_url") or "https://github.com/ProgrammingDinosaur/autoortho4xplane/releases"
+            self.result.emit((tag, html_url))
+        except Exception as err:
+            self.error.emit(str(err))
 
 class StyledButton(QPushButton):
     """Custom styled button with hover effects"""
@@ -263,6 +290,12 @@ class ConfigUI(QMainWindow):
         self.log_timer.start(1000)
 
         self.ready.set()
+
+        # Kick off asynchronous update check shortly after startup
+        try:
+            QTimer.singleShot(250, self.start_update_check)
+        except Exception:
+            pass
 
     def init_ui(self):
         """Initialize the user interface"""
@@ -675,7 +708,7 @@ class ConfigUI(QMainWindow):
             "NOTE: By using this option the Max Zoom near airports setting will be ignored and all tiles will be capped to the general max zoom level you set in advanced settings."
         )
 
-        self.using_custom_tiles_check.stateChanged.connect(lambda state: self.on_using_custom_tiles_check(state))
+        self.using_custom_tiles_check.stateChanged.connect(self.on_using_custom_tiles_check)
         options_layout.addWidget(self.using_custom_tiles_check)
 
 
@@ -960,11 +993,13 @@ class ConfigUI(QMainWindow):
         autoortho_layout.addLayout(threads_layout)
 
         if self.cfg.autoortho.using_custom_tiles:
-            self.info_label = QLabel("Note: You are using custom tiles, Max Zoom near airports setting is not available, all tiles will be capped to the general max zoom level you set.")
-            self.info_label.setStyleSheet("color: #6da4e3; font-size: 14; font-weight: italic;")
+            self.info_label = QLabel(
+                "Note: You are using custom tiles. Max zoom near airports setting is incompatible with custom tiles, all tiles will be capped to the general max zoom level you set.\n\n"
+                "You can use tiles with different zoom levels, they will be automatically capped to the maximum zoom level they support, even if a higher max zoom level than they support is set.\n"
+            )
+            self.info_label.setStyleSheet("color: #6da4e3; font-size: 14; font-weight: italic; font-weight: bold; text-align: justify;")
             # wrap text
             self.info_label.setWordWrap(True)
-            self.info_label.setMaximumWidth(autoortho_layout.parent().width())
             autoortho_layout.addWidget(self.info_label)
 
         self.settings_layout.addWidget(autoortho_group)
@@ -1725,12 +1760,14 @@ class ConfigUI(QMainWindow):
 
     def on_using_custom_tiles_check(self, state):
         """Handle using custom tiles check"""
-        if state == False and self.cfg.autoortho.using_custom_tiles == True:
-            self.cfg.autoortho.using_custom_tiles = state
-            if int(self.cfg.autoortho.max_zoom) > 17:
+        if state == Qt.CheckState.Unchecked: 
+            if self.cfg.autoortho.using_custom_tiles == True and int(self.cfg.autoortho.max_zoom) > 17:
                 log.info(f"Max zoom being capped to 17 after custom tiles disabled")
                 self.cfg.autoortho.max_zoom = 17
-            
+            self.cfg.autoortho.using_custom_tiles = False
+        else:
+            self.cfg.autoortho.using_custom_tiles = True
+
         self.refresh_settings_tab()
 
     def apply_simheaven_compat(self, use_simheaven_overlay=False):
@@ -1848,6 +1885,60 @@ class ConfigUI(QMainWindow):
         for r in self.dl.regions.values():
             latest = r.get_latest_release()
             latest.parse()
+
+    def _parse_version(self, text):
+        """Extract and parse a semantic version from arbitrary text.
+        Returns packaging.version.Version or None if not found.
+        """
+        try:
+            if not text:
+                return None
+            match = re.search(r"\d+(?:\.\d+){1,3}(?:[-._]rc[-._]?\d+)?", str(text), re.IGNORECASE)
+            if not match:
+                return None
+            ver_str = match.group(0)
+            # Normalize rc format for packaging.version
+            ver_str = re.sub(r"[-._]rc[-._]?(\d+)", r"rc\1", ver_str, flags=re.IGNORECASE)
+            return version.parse(ver_str)
+        except Exception:
+            return None
+
+    def start_update_check(self):
+        """Start background update check against GitHub releases"""
+        try:
+            self._update_worker = UpdateCheckWorker()
+            self._update_worker.result.connect(self.on_update_check_result)
+            self._update_worker.error.connect(lambda e: None)
+            self._update_worker.start()
+        except Exception:
+            pass
+
+    def on_update_check_result(self, data):
+        """Handle result from update check worker"""
+        try:
+            if not data:
+                return
+            latest_tag, html_url = data
+            from version import __version__ as current_version
+            latest_ver = self._parse_version(latest_tag)
+            current_ver = self._parse_version(current_version)
+            if latest_ver is None or current_ver is None:
+                return
+            if latest_ver > current_ver:
+                reply = QMessageBox.question(
+                    self,
+                    "Update Available",
+                    "An Update for AutoOrtho is Available. Do you want to go to the download page?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    try:
+                        webbrowser.open(html_url or "https://github.com/ProgrammingDinosaur/autoortho4xplane/releases")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def update_logs(self):
         """Update log display"""
