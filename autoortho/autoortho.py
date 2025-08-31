@@ -94,10 +94,6 @@ def setupmount(mountpoint, systemtype):
 
 
 def diagnose(CFG):
-    if platform.system() == 'Windows':
-        systemtype, libpath = winsetup.find_win_libs()
-    else:
-        systemtype = "Linux-FUSE"
 
     location = geocoder.ip("me")
 
@@ -246,9 +242,9 @@ class AOMount:
                 systemtype, libpath = winsetup.find_win_libs()
                 with setupmount(mountpoint, systemtype) as mount:
                     log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
-                    import autoortho_fuse
                     import mfusepy
                     mfusepy._libfuse = ctypes.CDLL(libpath)
+                    import autoortho_fuse
                     autoortho_fuse.run(
                             autoortho_fuse.AutoOrtho(root),
                             mount,
