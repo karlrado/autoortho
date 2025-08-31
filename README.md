@@ -34,7 +34,7 @@ questions.
 
 * Documentation: (https://programmingdinosaur.github.io/autoortho4xplane/)
 * FAQ: (https://programmingdinosaur.github.io/autoortho4xplane/faq)
-* Discussions and help: (https://github.com/kubilus1/autoortho/discussions)
+* Discussions and help: (https://github.com/ProgrammingDinosaur/autoortho4xplane/discussions)
 * Latest release: (https://github.com/ProgrammingDinosaur/autoortho4xplane/releases)
 
 ---
