@@ -10,6 +10,7 @@ import errno
 import ctypes
 import platform
 import threading
+import shutil
 import stat
 
 import flighttrack
