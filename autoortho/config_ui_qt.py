@@ -797,6 +797,7 @@ class ConfigUI(QMainWindow):
 
     def refresh_settings_tab(self):
         """Refresh the settings tab"""
+        print(f"{self.cfg.autoortho.using_custom_tiles}")
         while self.settings_layout.count():
             child = self.settings_layout.takeAt(0)
             if child.widget():
@@ -1760,7 +1761,7 @@ class ConfigUI(QMainWindow):
 
     def on_using_custom_tiles_check(self, state):
         """Handle using custom tiles check"""
-        if state == Qt.CheckState.Unchecked: 
+        if state == False: 
             if self.cfg.autoortho.using_custom_tiles == True and int(self.cfg.autoortho.max_zoom) > 17:
                 log.info(f"Max zoom being capped to 17 after custom tiles disabled")
                 self.cfg.autoortho.max_zoom = 17
