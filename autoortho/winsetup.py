@@ -13,9 +13,9 @@ from aoconfig import CFG
 log = logging.getLogger(__name__)
 
 try:
-    import winreg as reg  # Py3
-except Exception:
-    reg = None  # Should not happen on supported Windows
+    import winreg as reg
+except ImportError:
+    log.error("Failed to import winreg")
 
 _PLACEHOLDER = ".AO_PLACEHOLDER"
 _ALLOWED_PLACEHOLDER = {"Earth nav data", "terrain", "textures", _PLACEHOLDER, "desktop.ini"}
@@ -54,7 +54,7 @@ def _find_winfsp_from_registry():
     if not reg:
         return None
     try:
-        with reg.OpenKey(reg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WinFsp") as k:
+        with reg.OpenKey(reg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WinFsp", 0, reg.KEY_READ | reg.KEY_WOW64_32KEY) as k:
             install_dir, _ = reg.QueryValueEx(k, "InstallDir")
         if not install_dir or not os.path.isdir(install_dir):
             return None
