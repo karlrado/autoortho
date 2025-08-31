@@ -39,67 +39,58 @@ class MountError(Exception):
 class AutoOrthoError(Exception):
     pass
 
+
 @contextmanager
 def setupmount(mountpoint, systemtype):
     mountpoint = os.path.expanduser(mountpoint)
-
     placeholder_path = os.path.join(mountpoint, ".AO_PLACEHOLDER")
+    created_mount_dir = False
+    had_placeholder = False
 
-    # Stash placeholder
-    if os.path.isdir(mountpoint):
-        log.info(f"Existing mountpoint detected: {mountpoint}")
-        if os.path.lexists(placeholder_path):
-            log.info(f"Detected placeholder dir.  Removing: {mountpoint}")
-            shutil.rmtree(mountpoint)
+    # Preflight: ensure mount dir is a directory and not currently mounted
+    if os.path.ismount(mountpoint):
+        raise MountError(f"{mountpoint} is already mounted")
+    if not os.path.exists(mountpoint):
+        os.makedirs(mountpoint, exist_ok=True)
+        created_mount_dir = True
+    elif not os.path.isdir(mountpoint):
+        raise MountError(f"{mountpoint} exists but is not a directory")
 
-    # Setup
-    log.info(f"Setting up mountpoint: {mountpoint}")
+    # If it's not empty and doesn't look like our placeholder, refuse
+    if os.listdir(mountpoint):
+        if os.path.exists(placeholder_path):
+            had_placeholder = True
+        else:
+            raise MountError(f"Mount point {mountpoint} exists and is not empty")
+
+    # Platform-specific setup
     if systemtype == "Linux-FUSE":
-        if not os.path.exists(mountpoint):
-            os.makedirs(mountpoint)
-        if not os.path.isdir(mountpoint):
-            raise MountError(f"Failed to setup mount point {mountpoint}!")
-
+        pass
     elif systemtype == "dokan-FUSE":
-        ret = winsetup.setup_dokan_mount(mountpoint)
-        if not ret:
+        if not winsetup.setup_dokan_mount(mountpoint):
             raise MountError(f"Failed to setup mount point {mountpoint}!")
-
     elif systemtype == "winfsp-FUSE":
-        ret = winsetup.setup_winfsp_mount(mountpoint)
-        if not ret:
+        if not winsetup.setup_winfsp_mount(mountpoint):
             raise MountError(f"Failed to setup mount point {mountpoint}!")
-
     elif systemtype == "macOS":
-        ret = macsetup.setup_macfuse_mount(mountpoint)
-        if not ret:
+        if not macsetup.setup_macfuse_mount(mountpoint):
             raise MountError(f"Failed to setup mount point {mountpoint}!")
-
     else:
-        log.error(f"Unknown mount type of {systemtype}!")
-        time.sleep(5)
         raise MountError(f"Unknown system type: {systemtype} for mount {mountpoint}")
 
-    yield mountpoint
-
-    # Cleanup
-    if os.path.lexists(mountpoint):
-        log.info(f"Cleaning up mountpoint: {mountpoint}")
-        os.rmdir(mountpoint)
-
-    # Restore placeholder
-    log.info(f"Restoring placeholder for mountpoint: {mountpoint}")
-    structure = [
-        os.path.join(mountpoint, 'Earth nav data'),
-        os.path.join(mountpoint, 'terrain'),
-        os.path.join(mountpoint, 'textures'),
-    ]
-
-    for d in structure:
-        os.makedirs(d)
-
-    Path(placeholder_path).touch()
-    log.info(f"Mount point {mountpoint} exiting.")
+    try:
+        yield mountpoint
+    finally:
+        # Do not remove if still mounted; just try to present placeholder content.
+        try:
+            if os.path.ismount(mountpoint):
+                log.debug(f"Skipping cleanup: still mounted: {mountpoint}")
+            else:
+                for d in ('Earth nav data', 'terrain', 'textures'):
+                    os.makedirs(os.path.join(mountpoint, d), exist_ok=True)
+                Path(placeholder_path).touch()
+        except Exception as e:
+            log.warning(f"Placeholder restore failed for {mountpoint}: {e}")
 
 
 def diagnose(CFG):
@@ -184,7 +175,7 @@ class AOMount:
         for scenery in self.cfg.scenery_mounts:
             t = threading.Thread(
                 target=self.domount,
-                daemon=True if platform.system() == 'Darwin' else False,
+                daemon=False,
                 args=(
                     scenery.get('root'),
                     scenery.get('mount'),
@@ -211,10 +202,15 @@ class AOMount:
             diagnose(self.cfg)
 
             while self.mounts_running:
-                time.sleep(1)
+                for t in list(self.mount_threads):
+                    if not t.is_alive():
+                        log.error(f"Mount thread {t.name or t.ident} died; failing all mounts.")
+                        self.mounts_running = False
+                        break
+                time.sleep(0.5)
 
         except (KeyboardInterrupt, SystemExit) as err:
-            self.running = False
+            self.mounts_running = False
             log.info(f"Exiting due to {err}")
         finally:
             log.info("Shutting down ...")
@@ -256,6 +252,7 @@ class AOMount:
                     autoortho_fuse.run(
                             autoortho_fuse.AutoOrtho(root),
                             mount,
+                            mount.split('/')[-1],
                             nothreads
                     )
             elif platform.system() == 'Darwin':
@@ -269,6 +266,7 @@ class AOMount:
                     autoortho_fuse.run(
                             autoortho_fuse.AutoOrtho(root),
                             mount,
+                            mount.split('/')[-1],
                             nothreads
                     )
             else:
@@ -280,44 +278,54 @@ class AOMount:
                     autoortho_fuse.run(
                             autoortho_fuse.AutoOrtho(root),
                             mount,
+                            mount.split('/')[-1],
                             nothreads
                     )
 
         except Exception as err:
-            log.error(f"Exception detected when running FUSE mount: {err}.  Exiting...")
+            log.exception(f"Exception in FUSE mount: {err}")
+            # Per your spec, a failure while X-Plane is running should terminate everything.
             time.sleep(5)
+            os._exit(2)
 
     def unmount(self, mountpoint):
         log.info(f"Shutting down {mountpoint}")
         poison_path = os.path.join(mountpoint, ".poison")
 
-        # Trigger getattr('.poison') to invoke fuse_exit inside the FUSE thread
         try:
-            os.lstat(poison_path)
+            os.lstat(poison_path)  # triggers getattr('.poison') -> fuse_exit
         except FileNotFoundError:
-            # The file doesn't need to exist; getattr handler keys on the suffix
             pass
         except Exception as exc:
             log.debug(f"Poison trigger stat failed: {exc}")
 
-        # Wait briefly for the mount to go away naturally
         deadline = time.time() + 10
         while time.time() < deadline:
             if not os.path.ismount(mountpoint):
                 break
             time.sleep(0.5)
 
-        # macOS can linger; force unmount if still mounted
-        if platform.system() == 'Darwin' and os.path.ismount(mountpoint):
+        if os.path.ismount(mountpoint):
             try:
                 import subprocess
-                log.info(f"Force unmounting {mountpoint} via diskutil")
-                subprocess.run(
-                    ["diskutil", "unmount", "force", mountpoint],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                if platform.system() == 'Darwin':
+                    log.info(f"Force unmounting {mountpoint} via diskutil")
+                    subprocess.run(["diskutil", "unmount", "force", mountpoint],
+                                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                elif platform.system() == 'Linux':
+                    log.info(f"Force unmounting {mountpoint} via fusermount -u -z")
+                    if shutil.which("fusermount"):
+                        subprocess.run(["fusermount", "-u", "-z", mountpoint],
+                                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        subprocess.run(["umount", "-l", mountpoint],
+                                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                elif platform.system() == 'Windows':
+                    # Prefer a helper function you control; Dokan/WinFsp both offer APIs/CLIs
+                    try:
+                        winsetup.force_unmount(mountpoint)  # implement this in winsetup for both backends
+                    except Exception as exc:
+                        log.warning(f"Windows force unmount failed: {exc}")
             except Exception as exc:
                 log.warning(f"Force unmount attempt failed: {exc}")
 

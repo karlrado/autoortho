@@ -4,21 +4,17 @@
 
 import os
 import re
-import sys
 import time
 import math
-import types
 import errno
-import signal
-import random
-import psutil
 import ctypes
 import platform
 import threading
-import itertools
+import stat
 
 import flighttrack
 
+from collections import defaultdict
 from functools import wraps, lru_cache
 
 from aoconfig import CFG
@@ -79,6 +75,8 @@ class AutoOrtho(Operations):
 
     startup = True
 
+    VIRTUAL_DIRS = {"/textures", "/terrain", "/Earth nav data"}
+
 
     def __init__(self, root, cache_dir='.cache'):
         log.info(f"ROOT: {root}")
@@ -93,11 +91,55 @@ class AutoOrtho(Operations):
     
         #self.path_condition = threading.Condition()
         #self.read_lock = threading.Lock()
+        self.open_paths = []
+        self.read_paths = []
+        self.path_dict = {}
+        self.tile_dict = {}
+        self.fh_locks = {}
+        self.default_uid = -1
+        self.default_gid = -1
+        self.startup = True
         self._lock = threading.RLock()
-
+        self._tile_locks = defaultdict(threading.Lock)
+        self._size_cache = {}
+        self._ft_started = False
+        self._ft_start_lock = threading.Lock()
 
     # Helpers
     # =======
+    def _ensure_flighttrack_started(self, reason_path=None):
+        """Start flight tracking exactly once, when first DDS is touched."""
+        if self._ft_started:
+            return
+        with self._ft_start_lock:
+            if self._ft_started:
+                return
+            try:
+                # Be defensive: running may be a bool or something like multiprocessing.Value
+                running_attr = getattr(flighttrack.ft, "running", False)
+                running = bool(getattr(running_attr, "value", running_attr))
+            except Exception:
+                running = False
+
+            if not running:
+                if reason_path:
+                    log.info(f"First DDS access at {reason_path}. Starting flight tracker.")
+                else:
+                    log.info("Starting flight tracker.")
+                try:
+                    flighttrack.ft.start()
+                except Exception as e:
+                    # Keep the FS alive even if flighttrack fails; just log loudly.
+                    log.warning(f"Failed to start flight tracker: {e}")
+                    # Do NOT mark _ft_started; we'll retry once on next DDS trigger.
+                    return
+            else:
+                log.debug("Flight tracker already running.")
+
+            self._ft_started = True
+
+    def _is_write(self, flags):
+        return bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_TRUNC | os.O_APPEND))
 
     def _full_path(self, partial):
         if partial.startswith("/"):
@@ -105,6 +147,30 @@ class AutoOrtho(Operations):
         path = os.path.abspath(os.path.join(self.root, partial))
         return path
 
+    def _dir_attrs(self):
+        now = int(time.time())
+        return {
+            'st_mode': stat.S_IFDIR | 0o755,
+            'st_nlink': 2,
+            'st_size': 0,
+            'st_uid': self.default_uid,
+            'st_gid': self.default_gid,
+            'st_atime': now, 'st_mtime': now, 'st_ctime': now,
+        }
+
+    def _tile_key(self, row, col, maptype, zoom):
+        return (row, col, maptype, zoom)
+
+    def _failfast(self, msg, exc=None):
+        log.error(msg)
+        if exc:
+            log.exception("cause:", exc_info=exc)
+        try:
+            fuse_ptr = ctypes.c_void_p(_libfuse.fuse_get_context().contents.fuse)
+            _libfuse.fuse_exit(fuse_ptr)
+        except Exception as e:
+            log.error(f"fuse_exit failed: {e}")
+        raise FuseOSError(errno.EIO)
 
     # Filesystem methods
     # ==================
@@ -126,23 +192,20 @@ class AutoOrtho(Operations):
         full_path = self._full_path(path)
         return os.chown(full_path, uid, gid)
 
-    def _calculate_dds_size(self, row, col, maptype, zoom):
+    @lru_cache(maxsize=1024)
+    def _calculate_dds_size(self, zoom):
         """Calculate the actual DDS file size based on tile parameters and current configuration."""
         try:
             # Convert parameters to the format expected by the tile system
-            row = int(row)
-            col = int(col)
             zoom = int(zoom)
             
             # Replicate the max_zoom selection logic from TileCacher
-            if getortho.USING_KUBILUS_MESH:
-                uncapped_zoom = self.tc.target_zoom_level_near_airports if zoom == 18 else self.tc.target_zoom_level
+            if CFG.autoortho.using_custom_tiles:
+                uncapped_target_zoom = self.tc.target_zoom_level
             else:
-                uncapped_zoom = self.tc.target_zoom_level_near_airports if zoom == 19 else self.tc.target_zoom_level
+                uncapped_target_zoom = self.tc.target_zoom_level_near_airports if zoom == 18 else self.tc.target_zoom_level
 
-            max_zoom = min(zoom + 1,uncapped_zoom)
-            
-            min_zoom = self.tc.min_zoom
+            max_zoom = min(zoom + 1,uncapped_target_zoom)
             
             # Replicate tile dimension calculation logic from Tile.__init__
             width = 16  # Default tile width in chunks
@@ -178,13 +241,13 @@ class AutoOrtho(Operations):
                 current_width = current_width >> 1
                 current_height = current_height >> 1
             
-            log.debug(f"Calculated DDS size for {row}_{col}_{maptype}_{zoom}: {curbytes} bytes "
+            log.debug(f"Calculated DDS size for zoom {zoom}: {curbytes} bytes "
                      f"(dimensions: {dds_width}x{dds_height}, max_zoom: {max_zoom}, tilezoom_diff: {tilezoom_diff})")
             
             return curbytes
             
         except Exception as e:
-            log.warning(f"Failed to calculate DDS size for {row}_{col}_{maptype}_{zoom}: {e}, using fallback")
+            log.warning(f"Failed to calculate DDS size for {zoom}: {e}, using fallback")
             # Fallback to hardcoded values if calculation fails
             if CFG.pydds.format == "BC1":
                 return 11184952
@@ -195,119 +258,70 @@ class AutoOrtho(Operations):
     @lru_cache(maxsize=1024)
     def getattr(self, path, fh=None):
         log.debug(f"GETATTR {path}")
+        if path in self.VIRTUAL_DIRS:
+            return self._dir_attrs()
 
+        if path == "/":
+            # Reflect the real root when possible; otherwise synthesize
+            try:
+                st = os.lstat(self.root)
+                attrs = {k: getattr(st, k) for k in ('st_atime','st_ctime','st_gid','st_mode','st_mtime','st_nlink','st_size','st_uid')}
+                return attrs
+            except Exception:
+                return self._dir_attrs()
 
         m = self.dds_re.match(path)
-        #if m and not exists:
         if m:
-            log.debug(f"GETATTR: {path}: MATCH!")
-            #if self.startup:
-            #if not flighttrack.ft.running.value:
-            if not flighttrack.ft.running:
-                # First matched file
-                log.info(f"First matched DDS file {path} detected.  Start flight tracker.")
-                flighttrack.ft.start()
-                self.startup = False
-
+            self._ensure_flighttrack_started(reason_path=path)
             row, col, maptype, zoom = m.groups()
-            log.debug(f"GETATTR: Fetch for {path}: %s" % str(m.groups()))
+            key = (int(row), int(col), maptype, int(zoom))
+            dds_size = self._size_cache.get(key)
+            log.debug("GETATTR: Fetch for path: %s", path)
+            if dds_size is None:
+                dds_size = self._calculate_dds_size(zoom)
+            now = int(time.time())
+            return {
+                'st_mode': stat.S_IFREG | 0o644,
+                'st_nlink': 1,
+                'st_size': dds_size,
+                'st_uid': self.default_uid,
+                'st_gid': self.default_gid,
+                'st_atime': now, 'st_mtime': now, 'st_ctime': now,
+                'st_blksize': 32768,
+            }
 
-            # Calculate dynamic DDS size based on actual tile parameters
-            dds_size = self._calculate_dds_size(row, col, maptype, zoom)
+        if path.endswith(".poison") or path.endswith("AOISWORKING"):
+            return {'st_mode': stat.S_IFREG | 0o644, 'st_nlink': 1, 'st_size': 0,
+                    'st_uid': self.default_uid, 'st_gid': self.default_gid,
+                    'st_atime': 0, 'st_mtime': 0, 'st_ctime': 0, 'st_blksize': 32768}
 
-            attrs = {
-                'st_atime': 1649857250.382081, 
-                'st_ctime': 1649857251.726115, 
-                'st_gid': self.default_gid,
-                'st_uid': self.default_uid,
-                #'st_mode': 33204,
-                'st_mode': 33206,
-                'st_mtime': 1649857251.726115, 
-                'st_nlink': 1, 
-                'st_size': dds_size, 
-                'st_blksize': 32768
-                #'st_blksize': 16384
-                #'st_blksize': 8192
-                #'st_blksize': 4096
-                # Windows specific stuff
-                #'st_ino': 844424931910150,
-                #'st_dev': 1421433975
-            }
-        elif path.endswith(".poison"):
-            log.info("Poison pill.  Exiting!")
-            fuse_ptr = ctypes.c_void_p(_libfuse.fuse_get_context().contents.fuse)
-            #threading.Thread(target=do_fuse_exit, args=(fuse_ptr,)).start()
-            do_fuse_exit(fuse_ptr)
-            
-            attrs = {
-                'st_atime': 1649857250.382081, 
-                'st_ctime': 1649857251.726115, 
-                'st_gid': self.default_gid,
-                'st_uid': self.default_uid,
-                'st_mode': 33206,
-                'st_mtime': 1649857251.726115, 
-                'st_nlink': 1, 
-                'st_size': 0, 
-                'st_blksize': 32768
-            }
-            return attrs
-        elif path.endswith('AOISWORKING'):
-            attrs = {
-                'st_atime': 1649857250.382081, 
-                'st_ctime': 1649857251.726115, 
-                'st_gid': self.default_gid,
-                'st_uid': self.default_uid,
-                'st_mode': 33206,
-                'st_mtime': 1649857251.726115, 
-                'st_nlink': 1, 
-                'st_size': 0, 
-                'st_blksize': 32768
-            }
-            return attrs
-        else:
-            full_path = self._full_path(path)
-            exists = os.path.exists(full_path)
-            log.debug(f"GETATTR FULLPATH {full_path}  Exists? {exists}")
-            full_path = self._full_path(path)
+        full_path = self._full_path(path)
+        try:
             st = os.lstat(full_path)
-            log.debug(f"GETATTR: Orig stat: {st}")
-            attrs = dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
-                        'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid', 'st_ino', 'st_dev'))
+        except FileNotFoundError:
+            # If someone probes directories under /textures before they exist physically, treat as empty/dir as needed.
+            if path.startswith("/textures/"):
+                return self._dir_attrs()  # conservative
+            raise
+        return {k: getattr(st, k) for k in ('st_atime','st_ctime','st_gid','st_mode','st_mtime','st_nlink','st_size','st_uid')}
 
-            #if os.path.isdir(full_path):
-            #    attrs['st_nlink'] = 2
-
-        #attrs['st_uid'] = self.default_uid
-        #attrs['st_gid'] = self.default_gid
-        
-        #attrs['st_mode'] = 33204
-
-        #log.info(f"GETATTR: FH: {fh}")
-        log.debug(f"GETATTR: {path}: {attrs}")
-
-        return attrs
-
-    @lru_cache
+    @lru_cache(maxsize=1024)
     def readdir(self, path, fh):
-        #log.info(f"READDIR: {path} {fh}")
-        if path in ["/textures"]:
-            return ['.', '..', '.AOISWORKING', '24832_12416_BI16.dds']
-        elif path in ["/terrain"]:
-            return ['.', '..', '.AOISWORKING']
+        if path == "/":
+            try:
+                base = set(os.listdir(self.root))
+            except Exception:
+                base = set()
+            base |= {"Earth nav data", "terrain", "textures"}
+            return ['.', '..', *sorted(base)]
 
-        if path not in self.path_dict:
-            full_path = self._full_path(path)
-            dirents = ['.', '..']
-            if os.path.isdir(full_path):
-                dirents.extend(os.listdir(full_path))
-            #self.path_dict[path] = dirents
-        else:
-            dirents = self.path_dict.get(path)
+        if path == "/textures":
+            return ['.', '..', 'AOISWORKING']
 
-        log.debug(f"DIRENTS: {dirents}")
-        return dirents
-        #for r in dirents:
-        #    yield r
+        full_path = self._full_path(path)
+        if os.path.isdir(full_path):
+            return ['.', '..', *os.listdir(full_path)]
+        return ['.', '..']
 
     def readlink(self, path):
         pathname = os.readlink(self._full_path(path))
@@ -329,38 +343,23 @@ class AutoOrtho(Operations):
 
     @lru_cache
     def statfs(self, path):
-        #log.info(f"STATFS: {path}")
-        full_path = self._full_path(path)
+        base = self.root
         if platform.system() == 'Windows':
-            stats = {
-                    'f_bavail':47602498, 
-                    'f_bfree':47602498,
-                    'f_blocks':124699647, 
-                    'f_favail':1000000, 
-                    'f_ffree':1000000, 
-                    'f_files':999, 
-                    'f_frsize':4096,
-                    'f_flag':1024,
-                    'f_bsize':4096 
+            total, used, free = shutil.disk_usage(base)
+            bsize = 4096
+            return {
+                'f_bsize': bsize, 'f_frsize': bsize,
+                'f_blocks': total // bsize, 'f_bfree': free // bsize, 'f_bavail': free // bsize,
+                'f_files': 1_000_000, 'f_ffree': 900_000, 'f_favail': 900_000,
+                'f_flag': 0
             }
-            return stats
-            # st = os.stat(full_path)
-            # return dict((key, getattr(st, key)) for key in ('f_bavail', 'f_bfree',
-            #     'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
-            #     'f_frsize', 'f_namemax'))
-        elif platform.system() == 'Linux':
-            stv = os.statvfs(full_path)
-            #log.info(stv)
-            return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
-                'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
-                'f_frsize', 'f_namemax'))
-        elif platform.system() == 'Darwin':
-            # macOS support
-            stv = os.statvfs(full_path)
-            #log.info(stv)
-            return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
-                'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
-                'f_frsize'))  # f_namemax not available on macOS
+        else:
+            stv = os.statvfs(base)
+            keys = ('f_bavail','f_bfree','f_blocks','f_bsize','f_favail','f_ffree','f_files','f_flag','f_frsize')
+            out = {k: getattr(stv, k) for k in keys if hasattr(stv, k)}
+            if hasattr(stv, 'f_namemax'):
+                out['f_namemax'] = stv.f_namemax
+            return out
 
     def unlink(self, path):
         return os.unlink(self._full_path(path))
@@ -380,43 +379,28 @@ class AutoOrtho(Operations):
     # File methods
     # ============
 
-
     #@locked
     def open(self, path, flags):
-        #h = self.fh 
-        #self.fh += 1
-        h = 0
-
-        #log.info(f"READ CACHE {self.read.cache_info()}")
-        #log.info(f"ATTR CACHE {self.getattr.cache_info()}")
-        #log.info(f"DIR CACHE {self.readdir.cache_info()}")
-        log.debug(f"OPEN: {path}, {flags}")
-        full_path = self._full_path(path)
-        log.debug(f"OPEN: FULL PATH: {full_path}")
-
-        dsf_m = self.dsf_re.match(path)
-        if dsf_m:
-            log.info(f"OPEN: Detected DSF open: {path}")
-        #dsf_m = self.dsf_re.match(path)
-        #ter_m = self.ter_re.match(path)
-        dds_m = self.dds_re.match(path)
-        if dds_m:
-            row, col, maptype, zoom = dds_m.groups()
+        if self.dds_re.match(path):
+            self._ensure_flighttrack_started(reason_path=path)
+            row, col, maptype, zoom = self.dds_re.match(path).groups()
             row = int(row)
             col = int(col)
             zoom = int(zoom)
             t = self.tc._open_tile(row, col, maptype, zoom)
+            try:
+                self._size_cache[(row, col, maptype, zoom)] = t.dds.total_size
+            except Exception:
+                pass
+            return 0
 
-        elif platform.system() == 'Windows':
-            h = os.open(full_path, flags|os.O_BINARY)
-        elif path.endswith('AOISWORKING'):
-            return h
-        else:
-            # For macOS, Linux, and other Unix-like systems
-            h = os.open(full_path, flags)
+        full_path = self._full_path(path)
+        if path.endswith('AOISWORKING'):
+            return 0
 
-        log.debug(f"OPEN: FH= {h}")
-        return h
+        if platform.system() == 'Windows':
+            return os.open(full_path, flags | os.O_BINARY)
+        return os.open(full_path, flags)
 
     def _create(self, path, mode, fi=None):
         uid, gid, pid = fuse_get_context()
@@ -429,47 +413,34 @@ class AutoOrtho(Operations):
     #@lru_cache
     def read(self, path, length, offset, fh):
         log.debug(f"READ: {path} {offset} {length} {fh}")
-        #if length > 32768:
-        #    log.info(f"READ: {path} {offset} {length} {fh}")
-        data = None
-        
-        #full_path = self._full_path(path)
-        #log.debug(f"FULL PATH: {full_path}")
-        #exists = os.path.exists(full_path)
-        
-        #ter_m = self.ter_re.match(path)
-        dds_m = self.dds_re.match(path)
-        if dds_m:
-            # with self.path_condition:
-            #     while path in self.read_paths:
-            #         log.debug(f"WAIT ON READ: DDS file {path}")
-            #         self.path_condition.wait()
-            #     
-            #     # Add current path we are reading
-            #     self.read_paths.append(path)
-
-            row, col, maptype, zoom = dds_m.groups()
+        m = self.dds_re.match(path)
+        if m:
+            row, col, maptype, zoom = m.groups()
             row = int(row)
             col = int(col)
             zoom = int(zoom)
-            log.debug(f"READ: DDS file {path}, offset {offset}, length {length} (%s) " % str(dds_m.groups()))
-            
-            t = self.tc._get_tile(row, col, maptype, zoom) 
-            data = t.read_dds_bytes(offset, length)
-        
-            # Indicate we are done reading
-            # with self.path_condition:
-            #     self.read_paths.remove(path)
-            #     self.path_condition.notify_all()
-            return data
+            key = self._tile_key(row, col, maptype, zoom)
+            lock = self._tile_locks[key]
+            if not lock.acquire(timeout=CFG.fuse.build_timeout if hasattr(CFG.fuse, 'build_timeout') else 60):
+                self._failfast(f"Tile build lock timeout for {key}")
+            try:
+                t = self.tc._get_tile(row, col, maptype, zoom)
+                data = t.read_dds_bytes(offset, length)
+                if data is None:
+                    self._failfast(f"Tile read returned None for {key}")
+                return data
+            except Exception as e:
+                self._failfast(f"Tile read/build failed for {key}", e)
+            finally:
+                lock.release()
 
-        if not data:
-            with self.fh_locks.setdefault(fh, threading.Lock()):
-                os.lseek(fh, offset, os.SEEK_SET)
-                data = os.read(fh, length)
-                log.debug(f"READ: Read {len(data)} bytes.")
-
-        return data
+        # Regular file passthrough
+        with self.fh_locks.setdefault(fh, threading.Lock()):
+            os.lseek(fh, offset, os.SEEK_SET)
+            try:
+                return os.read(fh, length)
+            except OSError as e:
+                raise FuseOSError(e.errno)
 
     def _write(self, path, buf, offset, fh):
         os.lseek(fh, offset, os.SEEK_SET)
@@ -481,48 +452,34 @@ class AutoOrtho(Operations):
         with open(full_path, 'r+') as f:
             f.truncate(length)
 
-    def _flush(self, path, fh):
-        log.info(f"FLUSH")
-        m = self.dds_re.match(path)
-        if m:
-            log.info(f"RELEASE: {path}")
+    def flush(self, path, fh):
+        # No-op for virtual DDS files; fsync real files.
+        if self.dds_re.match(path):
             return 0
-        else:
-            return os.fsync(fh)
+        try:
+            os.fsync(fh)
+        except OSError as e:
+            raise FuseOSError(e.errno)
+        return 0
 
-    def _releasedir(self, path, fh):
+    def releasedir(self, path, fh):
         log.debug(f"RELEASEDIR: {path}")
         return 0
 
     #@locked
     def release(self, path, fh):
         log.debug(f"RELEASE: {path}")
-        #dsf_m = self.dsf_re.match(path)
-        #ter_m = self.ter_re.match(path)
-        dsf_m = self.dsf_re.match(path)
-        if dsf_m:
-            log.info(f"RELEASE: Detected DSF close: {path}")
-
-        dds_m = self.dds_re.match(path)
-        if dds_m:
-            log.debug(f"RELEASE DDS: {path}")
-            row, col, maptype, zoom = dds_m.groups()
+        if self.dds_re.match(path):
+            row, col, maptype, zoom = self.dds_re.match(path).groups()
             row = int(row)
             col = int(col)
             zoom = int(zoom)
             self.tc._close_tile(row, col, maptype, zoom)
-
-            #self.tc._close_tile(f"{row}_{col}_{maptype}_{zoom}")
-            #t = self.tc._get_tile(row, col, maptype, zoom) 
-            #t.refs -= 1
-            #with self.path_condition:
-            #    if path in self.open_paths:
-            #        log.debug(f"RELEASE: {path}")
-            #        self.open_paths.remove(path)
-            #        self.path_condition.notify_all()
             return 0
-        else:
+        try:
             return os.close(fh)
+        finally:
+            self.fh_locks.pop(fh, None)
 
     def fsync(self, path, fdatasync, fh):
         log.info(f"FSYNC: {path}")
@@ -543,41 +500,32 @@ def do_fuse_exit(fuse_ptr=None):
     _libfuse.fuse_exit(fuse_ptr)
 
 
-def run(ao, mountpoint, nothreads=False):
+def run(ao, mountpoint, name="", nothreads=False):
     log.info(f"MOUNT: {mountpoint}")
-
-    FUSE(
-        ao,
-        os.path.abspath(mountpoint), 
-        nothreads=nothreads, 
-        foreground=True, 
+    kwargs = dict(
+        nothreads=nothreads,
+        foreground=True,
         allow_other=True,
-        #nonempty=True,
-        #auto_cache=True,
-        #max_read=32768,
-        #max_read=16384,
-        #kernel_cache=True,
-        uid=-1,
-        gid=-1,
-        #debug=True,
-        #mode="0777",
-        #umask="777",
-        #FileSecurity="O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;WD)",
-        #FileSecurity="D:P(A;;FA;;;OW)",
-        #FileSecurity="D:P(A;;0x1200A9;;;WD)",
-        #FileSecurity="D:P(A;OICI;FA;;;WD)(A;OICI;FA;;;BU)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)",
-        #FileSecurity="O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;WD)",
-        #umask=0,
-        #create_dir_umask=0,
-        #max_background=4,
-        #kernel_cache=False,
-        #max_readahead=0,
-        #sync_read=True,
-        #async_read=False,
-        #max_readahead=8192,
-        #max_readahead=0,
-        #max_read=262144,
-        #default_permissions=True,
-        #direct_io=True
+        # Keep negative cache off to avoid ENOENT sticking while a tile is being built
+        negative_timeout=0,
+        # Moderate cache for attrs/entries; DDS content doesn't change once built
+        attr_timeout=30,
+        entry_timeout=30,
+        # Align with typical read patterns (helps Linux/macOS)
+        max_read=262144,        # 256 KiB
+        max_readahead=1048576,  # 1 MiB
+        kernel_cache=True,
+        auto_cache=True,
+        uid=-1, gid=-1,
     )
+
+    if platform.system() == 'Darwin':
+        kwargs.update(dict(volname=name, local=True))
+    # Windows-specific knobs (WinFsp/Dokan accept different names via mfusepy)
+    if platform.system() == 'Windows':
+        kwargs.update(dict(VolumeName=name, FileSystemName=name))
+    else:
+        kwargs.update(dict(uid=os.getuid(), gid=os.getgid()))
+
+    FUSE(ao, os.path.abspath(mountpoint), **kwargs)
     log.info(f"FUSE: Exiting mount {mountpoint}")
