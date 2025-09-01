@@ -317,7 +317,7 @@ class AOMount:
                         subprocess.run(["umount", "-l", mountpoint],
                                     check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 elif platform.system() == 'Windows':
-                    # Prefer a helper function you control; Dokan/WinFsp both offer APIs/CLIs
+                    log.info(f"Force unmounting {mountpoint} via winsetup.force_unmount")
                     try:
                         winsetup.force_unmount(mountpoint)  # implement this in winsetup for both backends
                     except Exception as exc:
