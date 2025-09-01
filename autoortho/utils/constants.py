@@ -1,3 +1,3 @@
 """module to hold constants used throughout the project"""
 
-MAPTYPES = ['Null', 'BI', 'NAIP', 'EOX', 'USGS', 'Firefly', 'YNDX', 'APPLE']
+MAPTYPES = ['Use tile default', 'BI', 'NAIP', 'EOX', 'USGS', 'Firefly', 'GO2', 'ARC', 'YNDX', 'APPLE']

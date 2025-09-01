@@ -65,7 +65,7 @@ log_file = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "logs", "au
 
 [autoortho]
 # Override map type with a different source
-maptype_override =
+maptype_override = Use tile default
 # Minimum zoom level to allow.  THIS WILL NOT INCREASE THE MAX QUALITY OF SATELLITE IMAGERY
 min_zoom = 12
 # Maximum zoom level to allow.  Higher values = more detail but larger downloads and more VRAM usage.
