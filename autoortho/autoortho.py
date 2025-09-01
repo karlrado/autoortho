@@ -243,8 +243,8 @@ class AOMount:
                 with setupmount(mountpoint, systemtype) as mount:
                     log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
                     import mfusepy
-                    mfusepy._libfuse = ctypes.CDLL(libpath)
                     import autoortho_fuse
+                    mfusepy._libfuse = ctypes.CDLL(libpath)
                     autoortho_fuse.run(
                             autoortho_fuse.AutoOrtho(root),
                             mount,
