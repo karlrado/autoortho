@@ -41,7 +41,9 @@ def tilemeters(lat_deg, zoom):
     x = 64120000 / (pow(2, zoom))
     return (x, y)
 
-MEMTRACE=False
+
+MEMTRACE = False
+
 
 def locked(fn):
     @wraps(fn)
@@ -50,6 +52,77 @@ def locked(fn):
             result = fn(self, *args, **kwargs)
         return result
     return wrapped
+
+
+def _fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
+    system = platform.system()
+    if os.name == 'posix':
+        profiles = [
+            dict(
+        nothreads=nothreads,
+        foreground=True,
+        allow_other=True,
+        uid=os.getuid(),
+        gid=os.getgid(),
+        )
+        ]
+
+    if system == 'Linux':
+        profiles = [
+        dict(
+            nothreads=nothreads,
+            foreground=True,
+            allow_other=True,
+            negative_timeout=0,
+            attr_timeout=30,
+            entry_timeout=30,
+            kernel_cache=True,
+            auto_cache=True,
+            max_read=262_144,
+            max_readahead=1_048_576,
+            default_permissions=True,
+        ),
+        dict(
+            nothreads=nothreads,
+            foreground=True,
+            allow_other=True,
+            negative_timeout=0,
+            attr_timeout=30,
+            entry_timeout=30,
+            kernel_cache=True,
+            auto_cache=True,
+            max_read=262_144,
+            default_permissions=True,
+        )]
+    elif system == 'Darwin':
+        profiles = [
+        dict(
+            nothreads=nothreads,
+            foreground=True,
+            allow_other=True,
+            negative_timeout=0,
+            attr_timeout=30,
+            entry_timeout=30,
+            kernel_cache=True,
+            volname=mount_name,
+            local=True,
+            rdonly=True,
+        )
+        ]
+
+    elif system == 'Windows':
+        profiles = [
+        dict(
+            nothreads=nothreads,
+            foreground=True,
+            allow_other=True,
+            uid=-1,
+            gid=-1,
+            VolumeName=mount_name,
+            FileSystemName=mount_name,
+        )]
+
+    return profiles
 
 
 class AutoOrtho(Operations):
@@ -70,7 +143,6 @@ class AutoOrtho(Operations):
     startup = True
 
     VIRTUAL_DIRS = {"/textures", "/terrain", "/Earth nav data"}
-
 
     def __init__(self, root, cache_dir='.cache'):
         log.info(f"ROOT: {root}")
@@ -101,6 +173,7 @@ class AutoOrtho(Operations):
 
     # Helpers
     # =======
+
     def _ensure_flighttrack_started(self, reason_path=None):
         """Start flight tracking exactly once, when first DDS is touched."""
         if self._ft_started:
@@ -496,30 +569,23 @@ def do_fuse_exit(fuse_ptr=None):
 
 def run(ao, mountpoint, name="", nothreads=False):
     log.info(f"MOUNT: {mountpoint}")
-    kwargs = dict(
-        nothreads=nothreads,
-        foreground=True,
-        allow_other=True,
-        # Keep negative cache off to avoid ENOENT sticking while a tile is being built
-        negative_timeout=0,
-        # Moderate cache for attrs/entries; DDS content doesn't change once built
-        attr_timeout=30,
-        entry_timeout=30,
-        # Align with typical read patterns (helps Linux/macOS)
-        max_read=262144,        # 256 KiB
-        max_readahead=1048576,  # 1 MiB
-        kernel_cache=True,
-        auto_cache=True,
-        uid=-1, gid=-1,
-    )
+    possible_profiles = _fuse_option_profiles_by_os(nothreads, name)
 
-    if platform.system() == 'Darwin':
-        kwargs.update(dict(volname=name, local=True))
-    # Windows-specific knobs (WinFsp/Dokan accept different names via mfusepy)
-    if platform.system() == 'Windows':
-        kwargs.update(dict(VolumeName=name, FileSystemName=name))
-    else:
-        kwargs.update(dict(uid=os.getuid(), gid=os.getgid()))
-
-    FUSE(ao, os.path.abspath(mountpoint), **kwargs)
-    log.info(f"FUSE: Exiting mount {mountpoint}")
+    for idx,profile in enumerate(possible_profiles):
+        try:
+            log.info(f"Loading FUSE with options: "
+                    f"{', '.join(sorted(map(str, profile.keys())))}")
+            FUSE(ao, os.path.abspath(mountpoint), **profile)
+            log.info(f"FUSE: Exiting mount {mountpoint}")
+            return
+        except Exception as e:
+            log.error(f"FUSE mount failed with error: {e}")
+            if idx != len(possible_profiles) - 1:
+                log.info(f"Retrying with next profile")
+                continue
+            else:
+                log.error(f"FUSE mount failed with non-negotiable error: {e}")
+                raise e
+    # Nothing more to fix automatically -> real error
+    log.error(f"FUSE mount failed with non-negotiable error: {e}")
+    raise e
