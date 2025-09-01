@@ -399,8 +399,8 @@ def main():
         # Just mount specific requested dirs
         root = args.root
         mountpoint = args.mountpoint
-        print("root:", root)
-        print("mountpoint:", mountpoint)
+        log.info("root:", root)
+        log.info("mountpoint:", mountpoint)
         aom = AOMount(CFG)
         aom.domount(
             root,

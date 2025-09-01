@@ -2,6 +2,7 @@
 
 #from __future__ import with_statement
 
+from multiprocessing import get_context
 import os
 import re
 import time
@@ -26,7 +27,7 @@ from mfusepy import FUSE, FuseOSError, Operations, fuse_get_context, _libfuse
 
 import getortho
 
-print(f"LIBFUSE: {id(_libfuse)} : {_libfuse}")
+current_system = platform.system()
 
 def deg2num(lat_deg, lon_deg, zoom):
   lat_rad = math.radians(lat_deg)
@@ -53,76 +54,71 @@ def locked(fn):
         return result
     return wrapped
 
-
-def _fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
-    system = platform.system()
+def fuse_config_by_os() -> dict:
+    overrides = {}
     if os.name == 'posix':
-        profiles = [
-            dict(
+        overrides.update(dict(
+            uid=os.getuid(),
+            gid=os.getgid(),
+        ))
+    if current_system == 'Linux':
+        overrides.update(dict(
+            negative_timeout=0,
+            attr_timeout=30,
+            entry_timeout=30,
+            kernel_cache=True,
+            auto_cache=True,
+            max_readahead=1_048_576,
+        ))
+    elif current_system == 'Darwin':
+        overrides.update(dict(
+            negative_timeout=0,
+            attr_timeout=30,
+            entry_timeout=30,
+            kernel_cache=True,
+        ))
+    elif current_system == 'Windows':
+        overrides.update(dict(
+            uid=-1,
+            gid=-1,
+        ))
+    return overrides
+
+def fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
+
+    options = dict(
         nothreads=nothreads,
         foreground=True,
         allow_other=True,
-        uid=os.getuid(),
-        gid=os.getgid(),
-        )
-        ]
+    )
 
-    if system == 'Linux':
-        profiles = [
-        dict(
+    if current_system == 'Linux':
+        options.update(dict(
             nothreads=nothreads,
             foreground=True,
             allow_other=True,
-            negative_timeout=0,
-            attr_timeout=30,
-            entry_timeout=30,
-            kernel_cache=True,
-            auto_cache=True,
-            max_read=262_144,
-            max_readahead=1_048_576,
             default_permissions=True,
-        ),
-        dict(
+        ))
+    elif current_system == 'Darwin':
+        options.update(dict(
             nothreads=nothreads,
             foreground=True,
             allow_other=True,
-            negative_timeout=0,
-            attr_timeout=30,
-            entry_timeout=30,
-            kernel_cache=True,
-            auto_cache=True,
-            max_read=262_144,
-            default_permissions=True,
-        )]
-    elif system == 'Darwin':
-        profiles = [
-        dict(
-            nothreads=nothreads,
-            foreground=True,
-            allow_other=True,
-            negative_timeout=0,
-            attr_timeout=30,
-            entry_timeout=30,
-            kernel_cache=True,
             volname=mount_name,
             local=True,
             rdonly=True,
-        )
-        ]
+        ))
 
-    elif system == 'Windows':
-        profiles = [
-        dict(
+    elif current_system == 'Windows':
+        options.update(dict(
             nothreads=nothreads,
             foreground=True,
             allow_other=True,
-            uid=-1,
-            gid=-1,
             VolumeName=mount_name,
             FileSystemName=mount_name,
-        )]
+        ))
 
-    return profiles
+    return options
 
 
 class AutoOrtho(Operations):
@@ -173,6 +169,54 @@ class AutoOrtho(Operations):
 
     # Helpers
     # =======
+
+    def init_with_config(self, conn_info, config_3):
+        """Called by libfuse during mount. Configure read sizes and caching.
+
+        - Prefer configuring sizes here over mount options to avoid unknown-option
+          issues across different libfuse builds.
+        """
+
+        # Conn Info Overrides
+        overrides = fuse_config_by_os()
+        
+        # Configure kernel connection limits when available
+        try:
+            if conn_info is not None:
+                if hasattr(conn_info, 'max_read') and "max_read" in overrides:
+                    conn_info.max_read = overrides.get('max_read')
+                    log.debug(f"FUSE: set conn.max_read={overrides.get('max_read')}")
+                if hasattr(conn_info, 'max_readahead') and "max_readahead" in overrides:
+                    conn_info.max_readahead = overrides.get('max_readahead')
+                    log.debug(f"FUSE: set conn.max_readahead={overrides.get('max_readahead')}")
+        except Exception as e:
+            log.warning(f"FUSE: failed to apply conn_info tuning: {e}")
+
+        try:
+            if config_3 is not None:
+                if hasattr(config_3, 'kernel_cache') and "kernel_cache" in overrides:
+                    config_3.kernel_cache = overrides.get('kernel_cache')
+                    log.debug(f"FUSE: set config.kernel_cache={overrides.get('kernel_cache')}")
+                if hasattr(config_3, 'auto_cache') and "auto_cache" in overrides:
+                    config_3.auto_cache = overrides.get('auto_cache')
+                    log.debug(f"FUSE: set config.auto_cache={overrides.get('auto_cache')}")
+                if hasattr(config_3, 'attr_timeout') and "attr_timeout" in overrides:
+                    config_3.attr_timeout = overrides.get('attr_timeout')
+                    log.debug(f"FUSE: set config.attr_timeout={overrides.get('attr_timeout')}")
+                if hasattr(config_3, 'entry_timeout') and "entry_timeout" in overrides:
+                    config_3.entry_timeout = overrides.get('entry_timeout')
+                    log.debug(f"FUSE: set config.entry_timeout={overrides.get('entry_timeout')}")
+                if hasattr(config_3, 'negative_timeout') and "negative_timeout" in overrides:
+                    config_3.negative_timeout = overrides.get('negative_timeout')
+                    log.debug(f"FUSE: set config.negative_timeout={overrides.get('negative_timeout')}")
+                if hasattr(config_3, 'uid') and "uid" in overrides:
+                    config_3.uid = overrides.get('uid')
+                    log.debug(f"FUSE: set config.uid={overrides.get('uid')}")
+                if hasattr(config_3, 'gid') and "gid" in overrides:
+                    config_3.gid = overrides.get('gid')
+                    log.debug(f"FUSE: set config.gid={overrides.get('gid')}")
+        except Exception as e:
+            log.warning(f"FUSE: failed to apply fuse_config tuning: {e}")
 
     def _ensure_flighttrack_started(self, reason_path=None):
         """Start flight tracking exactly once, when first DDS is touched."""
@@ -559,33 +603,24 @@ class AutoOrtho(Operations):
 
 
 def do_fuse_exit(fuse_ptr=None):
-    print("fuse_exit called")
+    log.info("fuse_exit called")
     #time.sleep(1)
     if not fuse_ptr:
         fuse_ptr = ctypes.c_void_p(_libfuse.fuse_get_context().contents.fuse)
-    print(fuse_ptr)
     _libfuse.fuse_exit(fuse_ptr)
 
 
 def run(ao, mountpoint, name="", nothreads=False):
     log.info(f"MOUNT: {mountpoint}")
-    possible_profiles = _fuse_option_profiles_by_os(nothreads, name)
+    options = fuse_option_profiles_by_os(nothreads, name)
 
-    for idx,profile in enumerate(possible_profiles):
-        try:
-            log.info(f"Loading FUSE with options: "
-                    f"{', '.join(sorted(map(str, profile.keys())))}")
-            FUSE(ao, os.path.abspath(mountpoint), **profile)
-            log.info(f"FUSE: Exiting mount {mountpoint}")
-            return
-        except Exception as e:
-            log.error(f"FUSE mount failed with error: {e}")
-            if idx != len(possible_profiles) - 1:
-                log.info(f"Retrying with next profile")
-                continue
-            else:
-                log.error(f"FUSE mount failed with non-negotiable error: {e}")
-                raise e
-    # Nothing more to fix automatically -> real error
-    log.error(f"FUSE mount failed with non-negotiable error: {e}")
-    raise e
+    log.info(f"Starting FUSE mount")
+    log.debug(f"Loading FUSE with options: "
+            f"{', '.join(sorted(map(str, options.keys())))}")
+    try:
+        FUSE(ao, os.path.abspath(mountpoint), **options)
+        log.info(f"FUSE: Exiting mount {mountpoint}")
+        return
+    except Exception as e:
+        log.error(f"FUSE mount failed with non-negotiable error: {e}")
+        raise e
