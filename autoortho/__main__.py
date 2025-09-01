@@ -25,7 +25,7 @@ def _global_shutdown(signum=None, frame=None):
         for t in alive:
             if t is threading.current_thread():
                 continue
-            log.info(
+            log.debug(
                 "Thread alive: name=%s ident=%s daemon=%s",
                 t.name,
                 t.ident,

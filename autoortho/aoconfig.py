@@ -65,7 +65,7 @@ log_file = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "logs", "au
 
 [autoortho]
 # Override map type with a different source
-maptype_override =
+maptype_override = Use tile default
 # Minimum zoom level to allow.  THIS WILL NOT INCREASE THE MAX QUALITY OF SATELLITE IMAGERY
 min_zoom = 12
 # Maximum zoom level to allow.  Higher values = more detail but larger downloads and more VRAM usage.
@@ -132,11 +132,9 @@ prefer_winfsp = True
     def load(self):
         self.config.read_string(self._defaults)
         if os.path.isfile(self.conf_file):
-            print(f"Config file found {self.conf_file} reading...")
             log.info(f"Config file found {self.conf_file} reading...")
             self.config.read(self.conf_file)
         else:
-            print("No config file found. Using defaults...")
             log.info("No config file found. Using defaults...")
 
         self.get_config()
@@ -165,7 +163,7 @@ prefer_winfsp = True
         sceneries = []
         if os.path.exists(self.ao_scenery_path):
             sceneries = os.listdir(self.ao_scenery_path)
-            print(f"Found sceneries: {sceneries}")
+            log.info(f"Found sceneries: {sceneries}")
         
         if platform.system() == "Darwin":
             try:
@@ -178,7 +176,6 @@ prefer_winfsp = True
             "root": os.path.join(self.ao_scenery_path, s),
             "mount": os.path.join(self.xplane_custom_scenery_path, s),
         } for s in sceneries]
-        print(self.scenery_mounts)
 
 
         if not os.path.exists(self.ao_scenery_path):
@@ -188,13 +185,12 @@ prefer_winfsp = True
 
 
     def save(self):
-        print("Saving config ... ")
+        log.info("Saving config ... ")
         self.set_config()
 
         with open(self.conf_file, 'w') as h:
             self.config.write(h)
         log.info(f"Wrote config file: {self.conf_file}")
-        print(f"Wrote config file: {self.conf_file}")
 
 
     def set_config(self):

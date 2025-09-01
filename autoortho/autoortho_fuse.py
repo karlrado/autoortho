@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 #from __future__ import with_statement
-
 import os
 import re
 import time
@@ -26,7 +25,7 @@ from mfusepy import FUSE, FuseOSError, Operations, fuse_get_context, _libfuse
 
 import getortho
 
-print(f"LIBFUSE: {id(_libfuse)} : {_libfuse}")
+current_system = platform.system()
 
 def deg2num(lat_deg, lon_deg, zoom):
   lat_rad = math.radians(lat_deg)
@@ -41,7 +40,9 @@ def tilemeters(lat_deg, zoom):
     x = 64120000 / (pow(2, zoom))
     return (x, y)
 
-MEMTRACE=False
+
+MEMTRACE = False
+
 
 def locked(fn):
     @wraps(fn)
@@ -50,6 +51,77 @@ def locked(fn):
             result = fn(self, *args, **kwargs)
         return result
     return wrapped
+
+def fuse_config_by_os() -> dict:
+    overrides = {"connection": {}, "config": {}}
+    if os.name == 'posix':
+        overrides["config"].update(dict(
+            uid=os.getuid(),
+            gid=os.getgid(),
+            set_uid=1,
+            set_gid=1,
+        ))
+    if current_system == 'Linux':
+        overrides['config'].update(dict(
+            negative_timeout=0,
+            attr_timeout=30,
+            entry_timeout=30,
+            kernel_cache=True,
+            auto_cache=True,
+        ))
+        overrides["connection"].update(dict(
+            max_readahead=1_048_576,
+        ))
+    elif current_system == 'Darwin':
+        overrides["config"].update(dict(
+            negative_timeout=0,
+            attr_timeout=30,
+            entry_timeout=30,
+            kernel_cache=True,
+        ))
+    elif current_system == 'Windows':
+        overrides["config"].update(dict(
+            uid=-1,
+            gid=-1,
+            set_uid=1,
+            set_gid=1,
+        ))
+    return overrides
+
+def fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
+
+    options = dict(
+        nothreads=nothreads,
+        foreground=True,
+        allow_other=True,
+    )
+    if current_system == 'Linux':
+        options.update(dict(
+            nothreads=nothreads,
+            foreground=True,
+            allow_other=True,
+            default_permissions=True,
+        ))
+    elif current_system == 'Darwin':
+        options.update(dict(
+            nothreads=nothreads,
+            foreground=True,
+            allow_other=True,
+            volname=mount_name,
+            local=True,
+            rdonly=True,
+        ))
+
+    elif current_system == 'Windows':
+        options.update(dict(
+            nothreads=nothreads,
+            foreground=True,
+            allow_other=True,
+            VolumeName=mount_name,
+            FileSystemName=mount_name,
+        ))
+
+    return options
 
 
 class AutoOrtho(Operations):
@@ -71,7 +143,6 @@ class AutoOrtho(Operations):
 
     VIRTUAL_DIRS = {"/textures", "/terrain", "/Earth nav data"}
 
-
     def __init__(self, root, cache_dir='.cache'):
         log.info(f"ROOT: {root}")
         self.dds_re = re.compile(r".*/(\d+)[-_](\d+)[-_]((?!ZL)\S*)(\d{2}).dds")
@@ -89,7 +160,7 @@ class AutoOrtho(Operations):
         self.read_paths = []
         self.path_dict = {}
         self.tile_dict = {}
-        self.fh_locks = {}
+        self.fh_locks = defaultdict(threading.Lock)
         self.default_uid = -1
         self.default_gid = -1
         self.startup = True
@@ -101,6 +172,33 @@ class AutoOrtho(Operations):
 
     # Helpers
     # =======
+
+    def init_with_config(self, conn_info, config_3):
+        """Called by libfuse during mount. Configure read sizes and caching.
+
+        - Prefer configuring sizes here over mount options to avoid unknown-option
+          issues across different libfuse builds.
+        """
+
+        # Conn Info Overrides
+        overrides = fuse_config_by_os()
+        
+        # Configure kernel connection limits when available
+        try:
+            if conn_info is not None:
+                for k, v in overrides["connection"].items():
+                    if hasattr(conn_info, k):
+                        setattr(conn_info, k, v)
+                        log.info(f"FUSE: set conn.{k}={v}")
+
+            if config_3 is not None:
+                for k, v in overrides["config"].items():
+                    if hasattr(config_3, k):
+                        setattr(config_3, k, v)
+                        log.info(f"FUSE: set config.{k}={v}")
+        except Exception as e:
+            log.warning(f"FUSE: failed to apply fuse_config tuning: {e}")
+
     def _ensure_flighttrack_started(self, reason_path=None):
         """Start flight tracking exactly once, when first DDS is touched."""
         if self._ft_started:
@@ -170,7 +268,7 @@ class AutoOrtho(Operations):
     # ==================
 
     def _access(self, path, mode):
-        log.info(f"ACCESS: {path}")
+        log.debug(f"ACCESS: {path}")
         #m = re.match(".*/(\d+)[-_](\d+)[-_](\D*)(\d+).dds", path)
         #if m:
         #    log.info(f"ACCESS: Found DDS file {path}: %s " % str(m.groups()))
@@ -285,6 +383,12 @@ class AutoOrtho(Operations):
             }
 
         if path.endswith(".poison") or path.endswith("AOISWORKING"):
+
+            if path.endswith(".poison"):
+                log.info("Poison pill.  Exiting!")
+                fuse_ptr = ctypes.c_void_p(_libfuse.fuse_get_context().contents.fuse)
+                do_fuse_exit(fuse_ptr=fuse_ptr)
+
             return {'st_mode': stat.S_IFREG | 0o644, 'st_nlink': 1, 'st_size': 0,
                     'st_uid': self.default_uid, 'st_gid': self.default_gid,
                     'st_atime': 0, 'st_mtime': 0, 'st_ctime': 0, 'st_blksize': 32768}
@@ -441,7 +545,7 @@ class AutoOrtho(Operations):
         return os.write(fh, buf)
 
     def truncate(self, path, length, fh=None):
-        log.info(f"TRUNCATE")
+        log.debug(f"TRUNCATE")
         full_path = self._full_path(path)
         with open(full_path, 'r+') as f:
             f.truncate(length)
@@ -476,50 +580,53 @@ class AutoOrtho(Operations):
             self.fh_locks.pop(fh, None)
 
     def fsync(self, path, fdatasync, fh):
-        log.info(f"FSYNC: {path}")
+        log.debug(f"FSYNC: {path}")
         return self.flush(path, fh)
 
 
     def close(self, path, fh):
-        log.info(f"CLOSE: {path}")
+        log.debug(f"CLOSE: {path}")
         return 0
 
 
 def do_fuse_exit(fuse_ptr=None):
-    print("fuse_exit called")
+    log.info("fuse_exit called")
     #time.sleep(1)
     if not fuse_ptr:
         fuse_ptr = ctypes.c_void_p(_libfuse.fuse_get_context().contents.fuse)
-    print(fuse_ptr)
     _libfuse.fuse_exit(fuse_ptr)
 
 
 def run(ao, mountpoint, name="", nothreads=False):
     log.info(f"MOUNT: {mountpoint}")
-    kwargs = dict(
-        nothreads=nothreads,
-        foreground=True,
-        allow_other=True,
-        # Keep negative cache off to avoid ENOENT sticking while a tile is being built
-        negative_timeout=0,
-        # Moderate cache for attrs/entries; DDS content doesn't change once built
-        attr_timeout=30,
-        entry_timeout=30,
-        # Align with typical read patterns (helps Linux/macOS)
-        max_read=262144,        # 256 KiB
-        max_readahead=1048576,  # 1 MiB
-        kernel_cache=True,
-        auto_cache=True,
-        uid=-1, gid=-1,
-    )
+    options = fuse_option_profiles_by_os(nothreads, name)
 
-    if platform.system() == 'Darwin':
-        kwargs.update(dict(volname=name, local=True))
-    # Windows-specific knobs (WinFsp/Dokan accept different names via mfusepy)
-    if platform.system() == 'Windows':
-        kwargs.update(dict(VolumeName=name, FileSystemName=name))
-    else:
-        kwargs.update(dict(uid=os.getuid(), gid=os.getgid()))
+    log.info(f"Starting FUSE mount")
+    log.debug(f"Loading FUSE with options: "
+            f"{', '.join(sorted(map(str, options.keys())))}")
 
-    FUSE(ao, os.path.abspath(mountpoint), **kwargs)
-    log.info(f"FUSE: Exiting mount {mountpoint}")
+    def _attempt_mount(opts: dict) -> None:
+        FUSE(ao, os.path.abspath(mountpoint), **opts)
+
+    try:
+        _attempt_mount(dict(options))
+        log.info(f"FUSE: Exiting mount {mountpoint}")
+        return
+    except Exception as e:
+        last_err = e
+        log.debug(f"Initial FUSE mount failed: {e}")
+
+        if current_system == 'Linux':
+            degraded_opts = dict(options)
+            if degraded_opts.pop('default_permissions', None) is not None:
+                try:
+                    log.info("Retrying FUSE mount without default_permissions")
+                    _attempt_mount(degraded_opts)
+                    log.info(f"FUSE: Exiting mount {mountpoint}")
+                    return
+                except Exception as e3:
+                    last_err = e3
+                    log.debug(f"Retry without default_permissions failed: {e3}")
+
+        log.error(f"FUSE mount failed with non-negotiable error: {last_err}")
+        raise last_err

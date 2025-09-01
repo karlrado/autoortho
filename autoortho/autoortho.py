@@ -128,6 +128,8 @@ def diagnose(CFG):
     log.info(f"Checking maptypes:")
     import getortho
     for maptype in MAPTYPES:
+        if maptype == "Use tile default":
+            continue
         with tempfile.TemporaryDirectory() as tmpdir:
             c = getortho.Chunk(2176, 3232, maptype, 13, cache_dir=tmpdir)
             ret = c.get()
@@ -243,8 +245,8 @@ class AOMount:
                 with setupmount(mountpoint, systemtype) as mount:
                     log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
                     import mfusepy
-                    mfusepy._libfuse = ctypes.CDLL(libpath)
                     import autoortho_fuse
+                    mfusepy._libfuse = ctypes.CDLL(libpath)
                     autoortho_fuse.run(
                             autoortho_fuse.AutoOrtho(root),
                             mount,
@@ -317,7 +319,7 @@ class AOMount:
                         subprocess.run(["umount", "-l", mountpoint],
                                     check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 elif platform.system() == 'Windows':
-                    # Prefer a helper function you control; Dokan/WinFsp both offer APIs/CLIs
+                    log.info(f"Force unmounting {mountpoint} via winsetup.force_unmount")
                     try:
                         winsetup.force_unmount(mountpoint)  # implement this in winsetup for both backends
                     except Exception as exc:
@@ -399,8 +401,8 @@ def main():
         # Just mount specific requested dirs
         root = args.root
         mountpoint = args.mountpoint
-        print("root:", root)
-        print("mountpoint:", mountpoint)
+        log.info("root:", root)
+        log.info("mountpoint:", mountpoint)
         aom = AOMount(CFG)
         aom.domount(
             root,

@@ -238,7 +238,10 @@ class Chunk(object):
             # Get data
             data = cache_file.read_bytes()
             # Update modified data
-            cache_file.touch()
+            try:
+                os.utime(self.cache_path, None)
+            except (FileNotFoundError, PermissionError):
+                pass 
 
             if _is_jpeg(data[:3]):
                 #print(f"Found cache that is JPEG for {self}")
@@ -300,8 +303,15 @@ class Chunk(object):
                 log.debug(f"Another thread saved cache for {self}, removed temp file")
                 return
             except OSError as e:
-                if getattr(e, 'winerror', None) in (32,) and attempt < max_attempts:
+                if getattr(e, 'winerror', None) in (5, 32, 33) and attempt < max_attempts:
                     time.sleep(0.05 * attempt)
+                    if os.path.exists(self.cache_path):
+                        try:
+                            if os.path.exists(temp_filename):
+                                os.remove(temp_filename)
+                        except Exception:
+                            pass
+                        return
                     continue
                 try:
                     if os.path.exists(temp_filename):
@@ -1245,7 +1255,7 @@ class TileCacher(object):
         return tile
 
     def _open_tile(self, row, col, map_type, zoom):
-        if self.maptype_override:
+        if self.maptype_override and self.maptype_override != "Use tile default":
             map_type = self.maptype_override
         idx = self._to_tile_id(row, col, map_type, zoom)
 

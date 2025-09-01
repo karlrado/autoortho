@@ -15,8 +15,7 @@ import requests
 import getortho
 
 #getortho.ISPC = False
-maptypes_all = ['Null', 'BI', 'GO2', 'NAIP', 'Arc', 'EOX', 'USGS', 'Firefly']
-maptypes = ['Null', 'BI', 'GO2', 'NAIP', 'EOX', 'USGS', 'Firefly']
+maptypes = ['BI', 'GO2', 'NAIP', 'EOX', 'USGS', 'ARC', 'Firefly']
 
 
 @pytest.fixture
@@ -26,11 +25,6 @@ def chunk(tmpdir):
 def test_chunk_get(chunk):
     ret = chunk.get()
     assert ret == True
-
-def test_null_chunk(tmpdir):
-    c = getortho.Chunk(2176, 3232, 'Null', 13, cache_dir=tmpdir)
-    ret = c.get()
-    assert ret
 
 def test_chunk_getter(tmpdir):
     c = getortho.Chunk(2176, 3232, 'EOX', 13, cache_dir=tmpdir)
@@ -59,7 +53,7 @@ def tile(tmpdir):
     return t
 
 def test_get_bytes(tmpdir):
-    tile = getortho.Tile(2176, 3232, 'Null', 13, cache_dir=tmpdir)
+    tile = getortho.Tile(2176, 3232, 'BI', 13, cache_dir=tmpdir)
     # Requesting just more than a 4x4 even row of blocks worth
     ret = tile.get_bytes(0, 131208)
     assert ret
@@ -77,7 +71,7 @@ def test_get_bytes(tmpdir):
 
 
 def test_get_bytes_mip1(tmpdir):
-    tile = getortho.Tile(2176, 3232, 'Null', 13, cache_dir=tmpdir)
+    tile = getortho.Tile(2176, 3232, 'BI', 13, cache_dir=tmpdir)
     #ret = tile.get_bytes(8388672, 4194304)
     mmstart = tile.dds.mipmap_list[1].startpos
     ret = tile.get_bytes(mmstart, 1024)
@@ -92,7 +86,7 @@ def test_get_bytes_mip1(tmpdir):
 
 
 def test_get_bytes_mip_end(tmpdir):
-    tile = getortho.Tile(2176, 3232, 'Null', 13, cache_dir=tmpdir)
+    tile = getortho.Tile(2176, 3232, 'BI', 13, cache_dir=tmpdir)
     #ret = tile.get_bytes(8388672, 4194304)
     mmend = tile.dds.mipmap_list[0].endpos
     ret = tile.get_bytes(mmend-1024, 1024)
@@ -108,7 +102,7 @@ def test_get_bytes_mip_end(tmpdir):
 
 
 def test_get_bytes_mip_span(tmpdir):
-    tile = getortho.Tile(2176, 3232, 'Null', 13, cache_dir=tmpdir)
+    tile = getortho.Tile(2176, 3232, 'BI', 13, cache_dir=tmpdir)
     #ret = tile.get_bytes(8388672, 4194304)
     mm0end = tile.dds.mipmap_list[0].endpos
     mm1start = tile.dds.mipmap_list[1].startpos
@@ -129,7 +123,7 @@ def test_get_bytes_mip_span(tmpdir):
 
 
 def test_get_bytes_row_span(tmpdir):
-    tile = getortho.Tile(2176, 3232, 'Null', 13, cache_dir=tmpdir)
+    tile = getortho.Tile(2176, 3232, 'BI', 13, cache_dir=tmpdir)
     #ret = tile.get_bytes(8388672, 4194304)
     mm1start = tile.dds.mipmap_list[1].startpos
     ret = tile.get_bytes(mm1start + 261144, 4096)
@@ -144,7 +138,7 @@ def test_get_bytes_row_span(tmpdir):
 
 
 def test_find_mipmap_pos():
-    tile = getortho.Tile(2176, 3232, 'Null', 13)
+    tile = getortho.Tile(2176, 3232, 'BI', 13)
 
     mm0start = tile.dds.mipmap_list[0].startpos
     m = tile.find_mipmap_pos(mm0start + 1)
@@ -160,7 +154,7 @@ def test_find_mipmap_pos():
 
 
 def test_read_bytes(tmpdir):
-    tile = getortho.Tile(2176, 3232, 'Null', 13, cache_dir=tmpdir)
+    tile = getortho.Tile(2176, 3232, 'BI', 13, cache_dir=tmpdir)
     data0 = tile.read_dds_bytes(0, 131073)
     assert data0[128:136] != b'\x00'*8
     data1 = tile.read_dds_bytes(131073,100000)
@@ -180,7 +174,7 @@ def test_read_bytes(tmpdir):
 
 
 def test_get_mipmap(tmpdir):
-    tile = getortho.Tile(2176, 3232, 'Null', 13, cache_dir=tmpdir)
+    tile = getortho.Tile(2176, 3232, 'BI', 13, cache_dir=tmpdir)
     tile.min_zoom = 5
     ret = tile.get_mipmap(6)
     testfile = tile.write()
@@ -188,19 +182,19 @@ def test_get_mipmap(tmpdir):
 
 
 def test_get_bytes_all(tmpdir):
-    tile = getortho.Tile(2176, 3232, 'Null', 13, cache_dir=tmpdir)
+    tile = getortho.Tile(2176, 3232, 'BI', 13, cache_dir=tmpdir)
     ret = tile.get_bytes(0, 131072)
     #ret = tile.get()
     testfile = tile.write()
     assert ret
 
 def test_get_header(tmpdir):
-    tile = getortho.Tile(2176, 3232, 'Null', 13, cache_dir=tmpdir)
+    tile = getortho.Tile(2176, 3232, 'BI', 13, cache_dir=tmpdir)
     ret = tile.get_header()
     assert ret
 
-def _test_get_null_tile(tmpdir):
-    tile = getortho.Tile(2176, 3232, 'Null', 13, cache_dir=tmpdir)
+def _test_get_BI_tile(tmpdir):
+    tile = getortho.Tile(2176, 3232, 'BI', 13, cache_dir=tmpdir)
     ret = tile.get()
     assert ret
 
@@ -300,8 +294,8 @@ def _test_tile_close(tmpdir):
 
 def test_get_bytes_mm4_mm0(tmpdir):
     tile = getortho.Tile(17408, 25856, 'BI', 16, cache_dir=tmpdir)
-    #tile = getortho.Tile(21760, 32320, 'Null', 16, cache_dir=tmpdir)
-    #tile = getortho.Tile(2176, 3232, 'Null', 13, cache_dir=tmpdir)
+    #tile = getortho.Tile(21760, 32320, 'BI', 16, cache_dir=tmpdir)
+    #tile = getortho.Tile(2176, 3232, 'BI', 13, cache_dir=tmpdir)
     #ret = tile.get_bytes(8388672, 4194304)
     mmstart = tile.dds.mipmap_list[4].startpos
     ret = tile.read_dds_bytes(mmstart, 1024)

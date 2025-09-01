@@ -626,12 +626,14 @@ class ConfigUI(QMainWindow):
         maptype_label = QLabel("Map type override:")
         maptype_label.setToolTip(
             "Force AutoOrtho to use a specific imagery source:\n"
+            "• Use tile default: Use source based on the tile default. For example display ARC if using custom ARC tiles.\n"
             "• BI (Bing): High quality, good worldwide coverage\n"
-            "• GO2 (Google): Excellent quality, some restrictions\n"
             "• NAIP: Very high quality for USA only\n"
             "• EOX: Good for Europe and some other regions\n"
             "• USGS: USA government imagery\n"
             "• Firefly: Alternative commercial source\n"
+            "• GO2: Google Maps\n"
+            "• ARC: ArcGIS\n"
             "• YNDX: Yandex Maps\n"
             "• APPLE: Apple Maps"
         )
@@ -641,7 +643,7 @@ class ConfigUI(QMainWindow):
         self.maptype_combo.setCurrentText(self.cfg.autoortho.maptype_override)
         self.maptype_combo.setObjectName('maptype_override')
         self.maptype_combo.setToolTip(
-            "Select a specific map provider or leave empty for auto-selection"
+            "Select a specific map provider. Use Auto to use the source based on the tile default (base scenery uses BI)."
         )
         maptype_layout.addWidget(self.maptype_combo)
         maptype_layout.addStretch()
@@ -797,7 +799,6 @@ class ConfigUI(QMainWindow):
 
     def refresh_settings_tab(self):
         """Refresh the settings tab"""
-        print(f"{self.cfg.autoortho.using_custom_tiles}")
         while self.settings_layout.count():
             child = self.settings_layout.takeAt(0)
             if child.widget():
