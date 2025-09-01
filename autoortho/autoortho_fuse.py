@@ -54,94 +54,25 @@ def locked(fn):
     return wrapped
 
 
-_UNKNOWN_PATTERNS = (
-    r"unknown option\(s\)\s*:?\s*(.*)",
-    r"unrecognized mount option\s+'([^']+)'",
-    r"invalid option\s+--\s*'([^']+)'",
-)
-
-
-def _extract_unknown_opts(err_text: str) -> set[str]:
-    """
-    Extract option names that the underlying FUSE/lib rejected.
-    Handles forms like:
-    "fuse: unknown option(s): -o max_readahead=1048576"
-    "unrecognized mount option 'kernel_cache'"
-    Returns names without values (e.g., {'max_readahead', 'kernel_cache'}).
-    """
-    names: set[str] = set()
-
-    # Generic scan of '-o name[=value]' fragments shown in many error messages
-    for m in re.finditer(r"-o\s*([a-zA-Z0-9_\-]+)(?:=[^,\s']+)?", err_text):
-        names.add(m.group(1).strip())
-
-    # Pattern-specific captures
-    for pat in _UNKNOWN_PATTERNS:
-        m = re.search(pat, err_text, flags=re.IGNORECASE)
-        if not m:
-            continue
-        payload = m.group(1)
-        # Split on comma/space and trim quotes/backticks
-        tokens = re.split(r"[,\s]+", payload.strip())
-        for t in tokens:
-            t = t.strip().strip("`\"'").removeprefix("-o").strip()
-            if not t:
-                continue
-            names.add(t.split("=", 1)[0])
-
-    # Classic “allow_other only allowed if user_allow_other is set …”
-    if "allow_other" in err_text and "only allowed" in err_text:
-        names.add("allow_other")
-
-    return names
-
-def _drop_unknowns(opts: dict, unknown: set[str]) -> int:
-    """
-    Remove unknown options from kwargs (handles underscore/hyphen variants).
-    Returns how many were removed.
-    """
-    removed = 0
-    keys = list(opts.keys())
-    for bad in unknown:
-        # try exact key
-        for k in keys:
-            if k == bad:
-                opts.pop(k, None); removed += 1
-        # try underscore/hyphen variants
-        alt = bad.replace("-", "_")
-        if alt in opts:
-            opts.pop(alt, None); removed += 1
-        alt2 = bad.replace("_", "-")
-        if alt2 in opts:
-            opts.pop(alt2, None); removed += 1
-    return removed
-
-
-def _maybe_drop_allow_other_on_policy_error(err_text: str, opts: dict) -> bool:
-    """Linux/macFUSE policy often forbids allow_other unless configured."""
-    if ("allow_other" in opts) and (
-        "user_allow_other" in err_text
-        or "only allowed" in err_text
-        or "privileged option" in err_text
-    ):
-        log.warning("Dropping 'allow_other' due to host policy.")
-        opts.pop("allow_other", None)
-        return True
-    return False
-
-
-def _recommended_options_for_os(nothreads: bool, mount_name: str) -> dict:
-    base = dict(
+def _fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
+    system = platform.system()
+    if os.name == 'posix':
+        profiles = [
+            dict(
         nothreads=nothreads,
         foreground=True,
         allow_other=True,
-    )
-    system = platform.system()
-    if os.name == 'posix':
-        base.update(uid=os.getuid(), gid=os.getgid())
+        uid=os.getuid(),
+        gid=os.getgid(),
+        )
+        ]
 
     if system == 'Linux':
-        base.update(dict(
+        profiles = [
+        dict(
+            nothreads=nothreads,
+            foreground=True,
+            allow_other=True,
             negative_timeout=0,
             attr_timeout=30,
             entry_timeout=30,
@@ -150,10 +81,25 @@ def _recommended_options_for_os(nothreads: bool, mount_name: str) -> dict:
             max_read=262_144,
             max_readahead=1_048_576,
             default_permissions=True,
-        ))
+        ),
+        dict(
+            nothreads=nothreads,
+            foreground=True,
+            allow_other=True,
+            negative_timeout=0,
+            attr_timeout=30,
+            entry_timeout=30,
+            kernel_cache=True,
+            auto_cache=True,
+            max_read=262_144,
+            default_permissions=True,
+        )]
     elif system == 'Darwin':
-
-        base.update(dict(
+        profiles = [
+        dict(
+            nothreads=nothreads,
+            foreground=True,
+            allow_other=True,
             negative_timeout=0,
             attr_timeout=30,
             entry_timeout=30,
@@ -161,14 +107,22 @@ def _recommended_options_for_os(nothreads: bool, mount_name: str) -> dict:
             volname=mount_name,
             local=True,
             rdonly=True,
-        ))
+        )
+        ]
+
     elif system == 'Windows':
-        base.update(dict(
-            uid=-1, gid=-1,
+        profiles = [
+        dict(
+            nothreads=nothreads,
+            foreground=True,
+            allow_other=True,
+            uid=-1,
+            gid=-1,
             VolumeName=mount_name,
             FileSystemName=mount_name,
-        ))
-    return base
+        )]
+
+    return profiles
 
 
 class AutoOrtho(Operations):
@@ -615,35 +569,23 @@ def do_fuse_exit(fuse_ptr=None):
 
 def run(ao, mountpoint, name="", nothreads=False):
     log.info(f"MOUNT: {mountpoint}")
-    opts = _recommended_options_for_os(nothreads, name)
-    dropped = set()
-    attempts = 0
-    last_err = None
+    possible_profiles = _fuse_option_profiles_by_os(nothreads, name)
 
-    while True:
-        attempts += 1
+    for idx,profile in enumerate(possible_profiles):
         try:
-            log.info(f"FUSE attempt {attempts} with options: "
-                     f"{', '.join(sorted(map(str, opts.keys())))}")
-            FUSE(ao, os.path.abspath(mountpoint), **opts)
+            log.info(f"Loading FUSE with options: "
+                    f"{', '.join(sorted(map(str, profile.keys())))}")
+            FUSE(ao, os.path.abspath(mountpoint), **profile)
             log.info(f"FUSE: Exiting mount {mountpoint}")
             return
         except Exception as e:
-            msg = str(e)
-            last_err = e
-
-            if _maybe_drop_allow_other_on_policy_error(msg, opts):
+            log.error(f"FUSE mount failed with error: {e}")
+            if idx != len(possible_profiles) - 1:
+                log.info(f"Retrying with next profile")
                 continue
-
-            unknown = _extract_unknown_opts(msg)
-            unknown -= dropped
-            if unknown:
-                removed = _drop_unknowns(opts, unknown)
-                if removed:
-                    log.warning(f"Removed unsupported options: {sorted(unknown)}; retrying.")
-                    dropped |= unknown
-                    continue
-
-            # Nothing more to fix automatically -> real error
-            log.error(f"FUSE mount failed with non-negotiable error: {e}")
-            raise last_err
+            else:
+                log.error(f"FUSE mount failed with non-negotiable error: {e}")
+                raise e
+    # Nothing more to fix automatically -> real error
+    log.error(f"FUSE mount failed with non-negotiable error: {e}")
+    raise e
