@@ -383,6 +383,12 @@ class AutoOrtho(Operations):
             }
 
         if path.endswith(".poison") or path.endswith("AOISWORKING"):
+
+            if path.endswith(".poison"):
+                log.info("Poison pill.  Exiting!")
+                fuse_ptr = ctypes.c_void_p(_libfuse.fuse_get_context().contents.fuse)
+                do_fuse_exit(fuse_ptr=fuse_ptr)
+
             return {'st_mode': stat.S_IFREG | 0o644, 'st_nlink': 1, 'st_size': 0,
                     'st_uid': self.default_uid, 'st_gid': self.default_gid,
                     'st_atime': 0, 'st_mtime': 0, 'st_ctime': 0, 'st_blksize': 32768}
