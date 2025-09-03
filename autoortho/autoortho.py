@@ -50,18 +50,44 @@ def setupmount(mountpoint, systemtype):
     # Preflight: ensure mount dir is a directory and not currently mounted
     if os.path.ismount(mountpoint):
         raise MountError(f"{mountpoint} is already mounted")
-    if not os.path.exists(mountpoint):
-        os.makedirs(mountpoint, exist_ok=True)
-        created_mount_dir = True
-    elif not os.path.isdir(mountpoint):
-        raise MountError(f"{mountpoint} exists but is not a directory")
+    # For WinFsp, the directory must NOT exist; let winsetup handle removal of placeholders.
+    if systemtype != "winfsp-FUSE":
+        if not os.path.exists(mountpoint):
+            os.makedirs(mountpoint, exist_ok=True)
+            created_mount_dir = True
+        elif not os.path.isdir(mountpoint):
+            raise MountError(f"{mountpoint} exists but is not a directory")
 
-    # If it's not empty and doesn't look like our placeholder, refuse
-    if os.listdir(mountpoint):
-        if os.path.exists(placeholder_path):
-            had_placeholder = True
-        else:
-            raise MountError(f"Mount point {mountpoint} exists and is not empty")
+        # If it's not empty and doesn't look like our placeholder, refuse
+        if os.listdir(mountpoint):
+            if os.path.exists(placeholder_path):
+                had_placeholder = True
+                # Remove our placeholder content to ensure an empty dir for FUSE
+                try:
+                    for name in ('Earth nav data', 'terrain', 'textures'):
+                        p = os.path.join(mountpoint, name)
+                        if os.path.isdir(p) and not os.path.islink(p):
+                            shutil.rmtree(p, ignore_errors=True)
+                        elif os.path.exists(p):
+                            try:
+                                os.remove(p)
+                            except Exception:
+                                pass
+                    # Remove the placeholder marker file/dir last
+                    try:
+                        if os.path.isdir(placeholder_path) and not os.path.islink(placeholder_path):
+                            shutil.rmtree(placeholder_path, ignore_errors=True)
+                        elif os.path.exists(placeholder_path):
+                            os.remove(placeholder_path)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    log.warning(f"Failed to cleanup placeholder content at {mountpoint}: {e}")
+                # After cleanup, verify directory is now empty
+                if os.listdir(mountpoint):
+                    raise MountError(f"Mount point {mountpoint} is not empty after cleanup")
+            else:
+                raise MountError(f"Mount point {mountpoint} exists and is not empty")
 
     # Platform-specific setup
     if systemtype == "Linux-FUSE":
