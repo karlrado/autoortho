@@ -9,27 +9,27 @@ from ctypes import *
 #from PIL import Image
 from aoimage import AoImage as Image
 
-import platform
 import threading
 
 #from functools import lru_cache, cache
 
 #from memory_profiler import profile
 from aoconfig import CFG
+from utils.constants import system_type
 
 import logging
 log = logging.getLogger(__name__)
 
 #_stb = CDLL("/usr/lib/x86_64-linux-gnu/libstb.so")
-if platform.system().lower() == 'linux':
+if system_type == 'linux':
     print("Linux detected")
     _stb_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'linux', 'lib_stb_dxt.so')
     _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'linux', 'libispc_texcomp.so')
-elif platform.system().lower() == 'windows':
+elif system_type == 'windows':
     print("Windows detected")
     _stb_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'windows', 'stb_dxt.dll')
     _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'windows', 'ispc_texcomp.dll')
-elif platform.system().lower() == 'darwin':
+elif system_type == 'darwin':
     print("macOS detected")
     _stb_path = None
     _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'macos', 'libispc_texcomp.dylib')
