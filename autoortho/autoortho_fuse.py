@@ -60,7 +60,12 @@ def fuse_config_by_os() -> dict:
             set_gid=1,
         ))
     if system_type == 'linux':
-        pass
+        overrides["config"].update(dict(
+            uid=os.getuid(),
+            gid=os.getgid(),
+            set_uid=1,
+            set_gid=1,
+        ))
     elif system_type == 'darwin':
         overrides["config"].update(dict(
             negative_timeout=0,

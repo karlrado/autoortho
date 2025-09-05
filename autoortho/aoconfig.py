@@ -4,7 +4,7 @@ import os
 import ast
 import pprint
 import configparser
-import platform
+from types import SimpleNamespace
 from utils.constants import system_type
 
 import logging
