@@ -63,14 +63,10 @@ def fuse_config_by_os() -> dict:
         ))
     if current_system == 'Linux':
         overrides['config'].update(dict(
-            negative_timeout=0,
-            attr_timeout=30,
-            entry_timeout=30,
-            kernel_cache=True,
-            auto_cache=True,
-        ))
-        overrides["connection"].update(dict(
-            max_readahead=1_048_576,
+            uid = -1,
+            gid = -1,
+            set_uid = 1,
+            set_gid = 1,
         ))
     elif current_system == 'Darwin':
         overrides["config"].update(dict(
@@ -100,7 +96,6 @@ def fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
             nothreads=nothreads,
             foreground=True,
             allow_other=True,
-            default_permissions=True,
         ))
     elif current_system == 'Darwin':
         options.update(dict(
@@ -186,16 +181,22 @@ class AutoOrtho(Operations):
         # Configure kernel connection limits when available
         try:
             if conn_info is not None:
-                for k, v in overrides["connection"].items():
-                    if hasattr(conn_info, k):
-                        setattr(conn_info, k, v)
-                        log.info(f"FUSE: set conn.{k}={v}")
+                if overrides["connection"]:
+                    for k, v in overrides["connection"].items():
+                        if hasattr(conn_info, k):
+                            setattr(conn_info, k, v)
+                            log.info(f"FUSE: set conn.{k}={v}")
+                else:
+                    log.info(f"FUSE: no connection overrides")
 
             if config_3 is not None:
-                for k, v in overrides["config"].items():
-                    if hasattr(config_3, k):
-                        setattr(config_3, k, v)
-                        log.info(f"FUSE: set config.{k}={v}")
+                if overrides["config"]:
+                    for k, v in overrides["config"].items():
+                        if hasattr(config_3, k):
+                            setattr(config_3, k, v)
+                            log.info(f"FUSE: set config.{k}={v}")
+                else:
+                    log.info(f"FUSE: no config overrides")
         except Exception as e:
             log.warning(f"FUSE: failed to apply fuse_config tuning: {e}")
 
@@ -605,28 +606,10 @@ def run(ao, mountpoint, name="", nothreads=False):
     log.debug(f"Loading FUSE with options: "
             f"{', '.join(sorted(map(str, options.keys())))}")
 
-    def _attempt_mount(opts: dict) -> None:
-        FUSE(ao, os.path.abspath(mountpoint), **opts)
-
     try:
-        _attempt_mount(dict(options))
+        FUSE(ao, os.path.abspath(mountpoint), **options)
         log.info(f"FUSE: Exiting mount {mountpoint}")
         return
     except Exception as e:
-        last_err = e
-        log.debug(f"Initial FUSE mount failed: {e}")
-
-        if current_system == 'Linux':
-            degraded_opts = dict(options)
-            if degraded_opts.pop('default_permissions', None) is not None:
-                try:
-                    log.info("Retrying FUSE mount without default_permissions")
-                    _attempt_mount(degraded_opts)
-                    log.info(f"FUSE: Exiting mount {mountpoint}")
-                    return
-                except Exception as e3:
-                    last_err = e3
-                    log.debug(f"Retry without default_permissions failed: {e3}")
-
-        log.error(f"FUSE mount failed with non-negotiable error: {last_err}")
-        raise last_err
+        log.error(f"FUSE mount failed with non-negotiable error: {e}")
+        raise
