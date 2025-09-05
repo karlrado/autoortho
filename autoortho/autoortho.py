@@ -20,7 +20,7 @@ import winsetup
 import macsetup
 import flighttrack
 
-from utils.constants import MAPTYPES
+from utils.constants import MAPTYPES, system_type
 from version import __version__
 
 import logging
@@ -266,7 +266,7 @@ class AOMount:
         root = os.path.expanduser(root)
 
         try:
-            if platform.system() == 'Windows':
+            if system_type == 'windows':
                 systemtype, libpath = winsetup.find_win_libs()
                 with setupmount(mountpoint, systemtype) as mount:
                     log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
@@ -279,7 +279,7 @@ class AOMount:
                             mount.split('/')[-1],
                             nothreads
                     )
-            elif platform.system() == 'Darwin':
+            elif system_type == 'darwin':
                 # systemtype, libpath = macsetup.find_mac_libs()
                 systemtype = "macOS"
                 with setupmount(mountpoint, systemtype) as mount:
@@ -332,11 +332,11 @@ class AOMount:
         if os.path.ismount(mountpoint):
             try:
                 import subprocess
-                if platform.system() == 'Darwin':
+                if system_type == 'darwin':
                     log.info(f"Force unmounting {mountpoint} via diskutil")
                     subprocess.run(["diskutil", "unmount", "force", mountpoint],
                                 check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                elif platform.system() == 'Linux':
+                elif system_type == 'linux':
                     log.info(f"Force unmounting {mountpoint} via fusermount -u -z")
                     if shutil.which("fusermount"):
                         subprocess.run(["fusermount", "-u", "-z", mountpoint],
@@ -344,7 +344,7 @@ class AOMount:
                     else:
                         subprocess.run(["umount", "-l", mountpoint],
                                     check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                elif platform.system() == 'Windows':
+                elif system_type == 'windows':
                     log.info(f"Force unmounting {mountpoint} via winsetup.force_unmount")
                     try:
                         winsetup.force_unmount(mountpoint)  # implement this in winsetup for both backends

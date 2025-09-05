@@ -17,6 +17,7 @@ import tempfile
 import autoortho
 import aostats
 from aoconfig import CFG
+from utils.constants import system_type
 
 import logging
 #logging.basicConfig()
@@ -52,7 +53,7 @@ def scenery_dir(tmpdir):
 #@pytest.fixture(scope="module")
 #def mount(tmpdir_factory):
 #@pytest.mark.parametrize("prefer_winfsp", [True, False])
-if platform.system() == "Windows":
+if system_type == "windows":
     mount_params = [False, True]
 else:
     mount_params = [False]

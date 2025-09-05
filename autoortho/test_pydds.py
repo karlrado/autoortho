@@ -5,16 +5,17 @@ import ctypes
 import platform
 
 import pydds
-
 import pytest
 #from PIL import Image
 from aoimage import AoImage as Image
+from utils.constants import system_type
+
 #TESTPNG=os.path.join('testfiles', 'test_tile.png')
 TESTJPG=os.path.join('testfiles', 'test_tile2.jpg')
 
 
 def file_disksize(path):
-    if platform.system().lower() == 'windows':
+    if system_type == 'windows':
         filesizehigh = ctypes.c_ulonglong(0) # not sure about this... something about files >4gb
         ondisk_size = ctypes.windll.kernel32.GetCompressedFileSizeW(ctypes.c_wchar_p(path),ctypes.pointer(filesizehigh))
     else:
@@ -59,7 +60,7 @@ def test_empty_dds(tmpdir):
     assert expectedbytes == actualbytes
 
     # Windows and Mac don't support sparse files well, unfortunately.
-    if not platform.system().lower() in ['windows', 'darwin']:
+    if not system_type in ['windows', 'darwin']:
         # Sparse file should have allocated space smaller than filesize
         ondisk_size = file_disksize(outpath)
         assert ondisk_size < expectedbytes

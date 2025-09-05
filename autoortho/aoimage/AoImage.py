@@ -3,8 +3,8 @@
 import os
 import sys
 from ctypes import *
-import platform
 
+from utils.constants import system_type
 import logging
 log = logging.getLogger(__name__)
 
@@ -145,11 +145,11 @@ def open(filename):
     return new
 
 # init code
-if platform.system().lower() == 'linux':
+if system_type == 'linux':
     _aoi_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'aoimage.so')
-elif platform.system().lower() == 'windows':
+elif system_type == 'windows':
     _aoi_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'aoimage.dll')
-elif platform.system().lower() == 'darwin':
+elif system_type == 'darwin':
     _aoi_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'aoimage.dylib')
 else:
     log.error("System is not supported")

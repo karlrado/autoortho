@@ -6,6 +6,7 @@ import atexit, signal, threading
 import platform
 from aoconfig import CFG
 from pathlib import Path
+from utils.constants import system_type
 
 # ---------------------------------------------------------------------------
 # Global cleanup hook – ensures we release worker threads, caches & C buffers
@@ -60,7 +61,7 @@ def _global_shutdown(signum=None, frame=None):
             if t is not threading.current_thread()
         ]
         non_daemons = [t for t in remaining if not t.daemon]
-        if platform.system() == "Darwin" and non_daemons:
+        if system_type == "darwin" and non_daemons:
             log.warning(
                 "Force exiting on macOS; non-daemon threads still alive: %s",
                 [t.name for t in non_daemons],
@@ -105,10 +106,10 @@ def setuplogs():
 
 # If SSL_CERT_DIR is not set, default to /etc/ssl/certs when available for Linux users.
 try:
-    if platform.system().lower() == 'linux' and "SSL_CERT_DIR" not in os.environ:
+    if system_type == 'linux' and "SSL_CERT_DIR" not in os.environ:
         if os.environ.get("APPIMAGE") and os.path.isdir("/etc/ssl/certs"):
             os.environ["SSL_CERT_DIR"] = "/etc/ssl/certs"
-    if platform.system().lower() == "darwin" and ".app" in sys.argv[0]:
+    if system_type == "darwin" and ".app" in sys.argv[0]:
         macos_dir = Path(sys.argv[0]).resolve().parents[0]  # .../Contents/MacOS
         pem = macos_dir / "certifi" / "cacert.pem"
         if pem.exists():
