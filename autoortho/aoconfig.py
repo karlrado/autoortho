@@ -5,6 +5,7 @@ import ast
 import pprint
 import configparser
 import platform
+from utils.constants import system_type
 
 import logging
 log = logging.getLogger(__name__)
@@ -165,7 +166,7 @@ prefer_winfsp = True
             sceneries = os.listdir(self.ao_scenery_path)
             log.info(f"Found sceneries: {sceneries}")
         
-        if platform.system() == "Darwin":
+        if system_type == "darwin":
             try:
                 if ".DS_Store" in sceneries:
                     sceneries.remove(".DS_Store")

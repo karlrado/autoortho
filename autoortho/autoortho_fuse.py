@@ -7,7 +7,6 @@ import time
 import math
 import errno
 import ctypes
-import platform
 import threading
 import shutil
 import stat
@@ -18,14 +17,13 @@ from collections import defaultdict
 from functools import wraps, lru_cache
 
 from aoconfig import CFG
+from utils.constants import system_type
 import logging
 log = logging.getLogger(__name__)
 
 from mfusepy import FUSE, FuseOSError, Operations, fuse_get_context, _libfuse
 
 import getortho
-
-current_system = platform.system()
 
 def deg2num(lat_deg, lon_deg, zoom):
   lat_rad = math.radians(lat_deg)
@@ -61,21 +59,16 @@ def fuse_config_by_os() -> dict:
             set_uid=1,
             set_gid=1,
         ))
-    if current_system == 'Linux':
-        overrides['config'].update(dict(
-            uid = -1,
-            gid = -1,
-            set_uid = 1,
-            set_gid = 1,
-        ))
-    elif current_system == 'Darwin':
+    if system_type == 'linux':
+        pass
+    elif system_type == 'darwin':
         overrides["config"].update(dict(
             negative_timeout=0,
             attr_timeout=30,
             entry_timeout=30,
             kernel_cache=True,
         ))
-    elif current_system == 'Windows':
+    elif system_type == 'windows':
         overrides["config"].update(dict(
             uid=-1,
             gid=-1,
@@ -91,13 +84,13 @@ def fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
         foreground=True,
         allow_other=True,
     )
-    if current_system == 'Linux':
+    if system_type == 'linux':
         options.update(dict(
             nothreads=nothreads,
             foreground=True,
             allow_other=True,
         ))
-    elif current_system == 'Darwin':
+    elif system_type == 'darwin':
         options.update(dict(
             nothreads=nothreads,
             foreground=True,
@@ -107,7 +100,7 @@ def fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
             rdonly=True,
         ))
 
-    elif current_system == 'Windows':
+    elif system_type == 'windows':
         options.update(dict(
             nothreads=nothreads,
             foreground=True,
@@ -156,8 +149,6 @@ class AutoOrtho(Operations):
         self.path_dict = {}
         self.tile_dict = {}
         self.fh_locks = defaultdict(threading.Lock)
-        self.default_uid = -1
-        self.default_gid = -1
         self.startup = True
         self._lock = threading.RLock()
         self._tile_locks = defaultdict(threading.Lock)
@@ -194,6 +185,10 @@ class AutoOrtho(Operations):
                     for k, v in overrides["config"].items():
                         if hasattr(config_3, k):
                             setattr(config_3, k, v)
+                            if k == "uid":
+                                self.default_uid = v
+                            if k == "gid":
+                                self.default_gid = v
                             log.info(f"FUSE: set config.{k}={v}")
                 else:
                     log.info(f"FUSE: no config overrides")
@@ -443,7 +438,7 @@ class AutoOrtho(Operations):
     @lru_cache
     def statfs(self, path):
         base = self.root
-        if platform.system() == 'Windows':
+        if system_type == 'windows':
             total, used, free = shutil.disk_usage(base)
             bsize = 4096
             return {
@@ -497,7 +492,7 @@ class AutoOrtho(Operations):
         if path.endswith('AOISWORKING'):
             return 0
 
-        if platform.system() == 'Windows':
+        if system_type == 'windows':
             return os.open(full_path, flags | os.O_BINARY)
         return os.open(full_path, flags)
 

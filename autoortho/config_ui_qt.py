@@ -14,7 +14,7 @@ import webbrowser
 import requests
 from packaging import version
 import utils.resources_rc
-from utils.constants import MAPTYPES
+from utils.constants import MAPTYPES, system_type
 from utils.mappers import map_kubilus_region_to_simheaven_region
 
 from PySide6.QtWidgets import (
@@ -252,7 +252,7 @@ class ConfigUI(QMainWindow):
         self.cfg = cfg
         self.ready = threading.Event()
         self.ready.clear()
-        self.system = platform.system().lower()
+        self.system = system_type
 
         self.dl = downloader.OrthoManager(
             self.cfg.paths.scenery_path,

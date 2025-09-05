@@ -5,7 +5,6 @@ import sys
 import time
 import math
 import tempfile
-import platform
 import threading
 import concurrent.futures
 
@@ -27,8 +26,9 @@ from aoimage import AoImage
 
 from aoconfig import CFG
 from aostats import STATS, StatTracker, set_stat, inc_stat, get_stat
-
+from utils.constants import system_type
 from utils.apple_token_service import apple_token_service
+
 
 MEMTRACE = False
 
@@ -1179,7 +1179,7 @@ class TileCacher(object):
         self.clean_t = threading.Thread(target=self.clean, daemon=True)
         self.clean_t.start()
 
-        if platform.system() == 'Windows':
+        if system_type == 'windows':
             # Windows doesn't handle FS cache the same way so enable here.
             self.enable_cache = True
             self.cache_tile_lim = 50
