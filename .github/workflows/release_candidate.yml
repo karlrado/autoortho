@@ -32,8 +32,8 @@ jobs:
             echo "Branch name must be release/x.y.z" >&2
             exit 1
           fi
-          # Count existing RC tags to increment
-          existing=$(git ls-remote --tags origin "refs/tags/${VERSION}-rc-*" | wc -l)
+          # Count existing RC tags to increment (exclude peeled tag lines)
+          existing=$(git ls-remote --tags --refs origin "refs/tags/${VERSION}-rc-*" | wc -l)
           next=$((existing + 1))
           TAG="${VERSION}-rc-${next}"
           git config user.name "github-actions"
