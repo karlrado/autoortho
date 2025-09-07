@@ -77,6 +77,35 @@ def _find_winfsp_from_registry():
         return None
 
 
+def _find_winfsp_tools_from_registry():
+    """
+    Try to locate WinFsp CLI tools (fsptool/launchctl) from the registry InstallDir.
+    Returns a list of absolute paths to candidate executables.
+    """
+    if not reg:
+        return []
+    tools = []
+    try:
+        with reg.OpenKey(reg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WinFsp", 0, reg.KEY_READ | reg.KEY_WOW64_32KEY) as k:
+            install_dir, _ = reg.QueryValueEx(k, "InstallDir")
+        if not install_dir or not os.path.isdir(install_dir):
+            return []
+        # Legacy bin and SxS bin
+        bin_dirs = [
+            os.path.join(install_dir, "bin"),
+        ]
+        bin_dirs.extend(glob.glob(os.path.join(install_dir, "SxS", "sxs.*", "bin")))
+        exe_names = ("fsptool-x64.exe", "fsptool.exe", "launchctl-x64.exe", "launchctl.exe")
+        for b in bin_dirs:
+            for exe in exe_names:
+                cand = os.path.join(b, exe)
+                if os.path.exists(cand):
+                    tools.append(cand)
+    except Exception as e:
+        log.debug(f"WinFsp tools registry probe failed: {e}")
+    return tools
+
+
 def _find_dokan_fuse():
     # Try common names for Dokan FUSE wrapper (v2 and legacy)
     for name in ("dokanfuse2.dll", "dokanfuse.dll"):
@@ -197,12 +226,21 @@ def force_unmount(path):
         if shutil.which("dokanctl.exe"):
             subprocess.run(["dokanctl.exe", "/u", path],
                            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # WinFsp: fsptool-x64.exe umount <path> (on modern WinFsp installs)
-        # Fall back to launcher if needed.
-        for tool in ("fsptool-x64.exe", "fsptool.exe", "launchctl-x64.exe", "launchctl.exe"):
-            if shutil.which(tool):
+        # WinFsp: fsptool umount <path>
+        # Prefer PATH tools, then registry-located tools
+        candidates = []
+        for t in ("fsptool-x64.exe", "fsptool.exe", "launchctl-x64.exe", "launchctl.exe"):
+            p = shutil.which(t)
+            if p:
+                candidates.append(p)
+        if not candidates:
+            candidates.extend(_find_winfsp_tools_from_registry())
+        for tool in candidates:
+            try:
                 subprocess.run([tool, "umount", path],
                                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 break
+            except Exception:
+                continue
     except Exception as e:
         log.debug(f"force_unmount({path}) failed (ignored): {e}")

@@ -49,7 +49,41 @@ def setupmount(mountpoint, systemtype):
 
     # Preflight: ensure mount dir is a directory and not currently mounted
     if os.path.ismount(mountpoint):
-        raise MountError(f"{mountpoint} is already mounted")
+        log.warning(f"{mountpoint} is already mounted; attempting to unmount")
+        try:
+            if systemtype in ("winfsp-FUSE", "dokan-FUSE"):
+                try:
+                    winsetup.force_unmount(mountpoint)
+                except Exception as exc:
+                    log.debug(f"Windows force_unmount preflight failed: {exc}")
+            elif systemtype == "macOS":
+                try:
+                    import subprocess
+                    subprocess.run(["diskutil", "unmount", "force", mountpoint],
+                                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception as exc:
+                    log.debug(f"macOS preflight unmount failed: {exc}")
+            elif systemtype == "Linux-FUSE":
+                try:
+                    import subprocess
+                    if shutil.which("fusermount"):
+                        subprocess.run(["fusermount", "-u", "-z", mountpoint],
+                                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        subprocess.run(["umount", "-l", mountpoint],
+                                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception as exc:
+                    log.debug(f"Linux preflight unmount failed: {exc}")
+        except Exception as exc:
+            log.debug(f"Preflight unmount exception (ignored): {exc}")
+        # Wait briefly for unmount to complete
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if not os.path.ismount(mountpoint):
+                break
+            time.sleep(0.5)
+        if os.path.ismount(mountpoint):
+            raise MountError(f"{mountpoint} is already mounted")
     # For WinFsp, the directory must NOT exist; let winsetup handle removal of placeholders.
     if systemtype != "winfsp-FUSE":
         if not os.path.exists(mountpoint):

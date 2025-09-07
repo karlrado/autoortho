@@ -109,8 +109,6 @@ xplane_udp_port = 49000
 file_cache_size = 30
 # Max size of memory cache in GB. Minimum of 2GB.
 cache_mem_limit = 4
-# Max size of memory cache in GB. Minimmum of 2GB.
-cache_mem_limit = 4
 # Auto clean cache on AutoOrtho exit
 auto_clean_cache = False
 
