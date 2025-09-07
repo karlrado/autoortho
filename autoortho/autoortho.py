@@ -489,6 +489,19 @@ def main():
 
     log.info("AutoOrtho exit.")
 
+    # Ensure global shutdown runs after FUSE on macOS.
+    # Drain workers; force-exit if threads remain.
+    try:
+        from autoortho.__main__ import _global_shutdown as __global_shutdown
+        __global_shutdown()
+    except Exception:
+        pass
+
+    # macOS: final safeguard. Force-terminate to avoid lingering
+    # macFUSE C-threads.
+    if system_type == "darwin":
+        os._exit(0)
+
 
 if __name__ == '__main__':
     main()
