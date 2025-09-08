@@ -237,6 +237,8 @@ class Chunk(object):
             cache_file = Path(self.cache_path)
             # Get data
             data = cache_file.read_bytes()
+
+            cache_file.touch()
             # Update modified data
             try:
                 os.utime(self.cache_path, None)

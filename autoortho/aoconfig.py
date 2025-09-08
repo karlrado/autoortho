@@ -15,17 +15,26 @@ class SectionParser(object):
     false = ['false', '0', 'no', 'off']
 
     def __init__(self, /, **kwargs):
-        for k,v in kwargs.items():
-            # Detect booleans
-            if v.lower() in self.true:
-                v = True
-            elif v.lower() in self.false:
-                v = False
-            # Detect list
-            elif v.startswith('[') and v.endswith(']'):
-                v = ast.literal_eval(v)
+        for k, v in kwargs.items():
+            # Normalize to string for parsing while tolerating None
+            sv = '' if v is None else str(v)
+            s = sv.strip()
 
-            self.__dict__.update({k:v})
+            # Detect booleans
+            if s.lower() in self.true:
+                parsed_val = True
+            elif s.lower() in self.false:
+                parsed_val = False
+            # Detect list
+            elif s.startswith('[') and s.endswith(']'):
+                try:
+                    parsed_val = ast.literal_eval(s)
+                except Exception:
+                    parsed_val = s
+            else:
+                parsed_val = s
+
+            self.__dict__.update({k: parsed_val})
 
     def __repr__(self):
         items = (f"{k}={v!r}" for k, v in self.__dict__.items())
@@ -109,8 +118,6 @@ xplane_udp_port = 49000
 file_cache_size = 30
 # Max size of memory cache in GB. Minimum of 2GB.
 cache_mem_limit = 4
-# Max size of memory cache in GB. Minimmum of 2GB.
-cache_mem_limit = 4
 # Auto clean cache on AutoOrtho exit
 auto_clean_cache = False
 
@@ -142,8 +149,95 @@ prefer_winfsp = True
         return True
 
 
+    def _load_defaults_parser(self):
+        """Create a ConfigParser loaded with internal defaults."""
+        defaults_cp = configparser.ConfigParser(strict=False, allow_no_value=True, comment_prefixes='/')
+        defaults_cp.read_string(self._defaults)
+        return defaults_cp
+
+    def _is_value_valid_for_default(self, current_value, default_value):
+        """Validate current_value against the type implied by default_value.
+
+        Returns True if current_value looks valid for the default's type; False otherwise.
+        """
+        s = '' if current_value is None else str(current_value).strip()
+        d = '' if default_value is None else str(default_value).strip()
+
+        # If default is an empty string, accept any value (including empty)
+        if d == '':
+            return True
+
+        # Boolean
+        if d.lower() in (SectionParser.true + SectionParser.false):
+            return s.lower() in (SectionParser.true + SectionParser.false)
+
+        # List (simple heuristic)
+        if d.startswith('[') and d.endswith(']'):
+            if s == '':
+                return False
+            try:
+                parsed = ast.literal_eval(s)
+                return isinstance(parsed, list)
+            except Exception:
+                return False
+
+        # Integer
+        try:
+            int(d)
+            try:
+                int(s)
+                return True
+            except Exception:
+                return False
+        except Exception:
+            pass
+
+        # Float
+        try:
+            float(d)
+            try:
+                float(s)
+                return True
+            except Exception:
+                return False
+        except Exception:
+            pass
+
+        # String (non-empty required to be considered valid)
+        return s != ''
+
+    def _sanitize_and_patch_config(self):
+        """Ensure all values exist and are valid; fill with defaults and mark for patching if needed."""
+        defaults_cp = self._load_defaults_parser()
+        patched = False
+
+        for sect in defaults_cp.sections():
+            if not self.config.has_section(sect):
+                self.config.add_section(sect)
+                patched = True
+
+            for key, def_val in defaults_cp.items(sect):
+                has_opt = self.config.has_option(sect, key)
+                cur_val = self.config.get(sect, key, fallback=None) if has_opt else None
+
+                needs_default = (not has_opt) or (cur_val is None) or (str(cur_val).strip() == '')
+                if not needs_default:
+                    # Validate type/format vs default
+                    if not self._is_value_valid_for_default(cur_val, def_val):
+                        needs_default = True
+
+                if needs_default:
+                    self.config.set(sect, key, str(def_val))
+                    patched = True
+
+        # Flag for persistence after object dict is constructed
+        self._patched_during_load = patched
+
     def get_config(self):
         # Pull info from ConfigParser object into AOConfig
+
+        # First, sanitize and patch missing/invalid values
+        self._sanitize_and_patch_config()
 
         config_dict = {sect: SectionParser(**dict(self.config.items(sect))) for sect in
                 self.config.sections()}
@@ -182,6 +276,15 @@ prefer_winfsp = True
         if not os.path.exists(self.ao_scenery_path):
             log.info(f"Creating dir {self.ao_scenery_path}")
             os.makedirs(self.ao_scenery_path)
+
+        # If we patched any values during load, persist them now so next run is stable
+        if getattr(self, "_patched_during_load", False):
+            try:
+                self.save()
+            except Exception as e:
+                log.error(f"Failed to persist patched config defaults: {e}")
+            finally:
+                self._patched_during_load = False
         return
 
 

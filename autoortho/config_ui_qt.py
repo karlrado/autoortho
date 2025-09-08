@@ -1413,6 +1413,14 @@ class ConfigUI(QMainWindow):
         """Handle Run button click"""
         self.save_config()
         self.cfg.load()
+        # Preflight check: prompt to unmount previous mounts if detected
+        try:
+            if not self.preflight_mount_check_and_prompt():
+                self.update_status_bar("Run cancelled by user")
+                return
+        except Exception:
+            # Non-fatal; continue
+            pass
         self.update_status_bar("Mounting sceneries...")
         self.run_button.setEnabled(False)
         self.run_button.setText("Running")
@@ -1759,6 +1767,63 @@ class ConfigUI(QMainWindow):
         self.cfg.save()
         self.ready.set()
         self.refresh_scenery()
+
+    def preflight_mount_check_and_prompt(self):
+        """Detect lingering mounts and prompt user to unmount/clean.
+
+        Returns True if it's OK to proceed with Run, False if user cancels.
+        """
+        try:
+            lingering = []
+            for scenery in self.cfg.scenery_mounts:
+                mount = scenery.get('mount')
+                if not mount:
+                    continue
+                try:
+                    if os.path.ismount(mount):
+                        lingering.append(mount)
+                except Exception:
+                    continue
+            if not lingering:
+                return True
+
+            msg = (
+                "Previous AutoOrtho mounts are still active:\n\n"
+                + "\n".join(lingering)
+                + "\n\nDo you want AutoOrtho to unmount them now?"
+            )
+            reply = QMessageBox.question(
+                self,
+                "Existing Mounts Detected",
+                msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return False
+
+            # Attempt unmount via AOMount implementation if available
+            try:
+                self.unmount_sceneries()
+            except Exception:
+                pass
+
+            # Brief wait loop for unmount completion
+            import time as _time
+            deadline = _time.time() + 10
+            while _time.time() < deadline:
+                if not any(os.path.ismount(x) for x in lingering):
+                    break
+                _time.sleep(0.3)
+            if any(os.path.ismount(x) for x in lingering):
+                QMessageBox.warning(
+                    self,
+                    "Unmount Incomplete",
+                    "Some mounts could not be unmounted automatically."
+                )
+            return True
+        except Exception:
+            return True
 
     def on_using_custom_tiles_check(self, state):
         """Handle using custom tiles check"""
