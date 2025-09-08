@@ -363,7 +363,18 @@ class AutoOrtho(Operations):
             log.debug(f"GETATTR FULLPATH {full_path}  Exists? {exists}")
             st = os.lstat(full_path)
             log.debug(f"GETATTR: Orig stat: {st}")
-            attrs = {k: getattr(st, k) for k in ('st_atime','st_ctime','st_gid','st_mode','st_mtime','st_nlink','st_size','st_uid')}
+            attrs = {k: getattr(st, k) for k in (
+                'st_atime',
+                'st_ctime',
+                'st_gid',
+                'st_mode',
+                'st_mtime',
+                'st_nlink',
+                'st_size',
+                'st_uid',
+                'st_ino',
+                'st_dev',
+                )}
 
         log.debug(f"GETATTR: ATTRS: {attrs}")
         return attrs
@@ -561,12 +572,11 @@ class AutoOrtho(Operations):
             col = int(col)
             zoom = int(zoom)
             self.tc._close_tile(row, col, maptype, zoom)
-            return_value = 0
-        else:
-            return_value = os.close(fh)
-
-        self.fh_locks.pop(fh, None)
-        return return_value
+            return 0
+        try:
+            return os.close(fh)
+        finally:
+            self.fh_locks.pop(fh, None)
 
     def fsync(self, path, fdatasync, fh):
         log.debug(f"FSYNC: {path}")
