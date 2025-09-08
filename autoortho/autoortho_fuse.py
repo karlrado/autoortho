@@ -561,11 +561,12 @@ class AutoOrtho(Operations):
             col = int(col)
             zoom = int(zoom)
             self.tc._close_tile(row, col, maptype, zoom)
-            return 0
-        try:
-            return os.close(fh)
-        finally:
-            self.fh_locks.pop(fh, None)
+            return_value = 0
+        else:
+            return_value = os.close(fh)
+
+        self.fh_locks.pop(fh, None)
+        return return_value
 
     def fsync(self, path, fdatasync, fh):
         log.debug(f"FSYNC: {path}")
