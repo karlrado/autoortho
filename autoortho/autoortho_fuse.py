@@ -356,6 +356,11 @@ class AutoOrtho(Operations):
 
         elif path.endswith("AOISWORKING"):
             attrs['st_size'] = 0
+        
+        elif path == "/textures":
+            attrs.update({
+                'st_mode': stat.S_IFDIR | 0o755, 'st_nlink': 2, 'st_size': 0,
+            })
 
         else:
             full_path = self._full_path(path)
