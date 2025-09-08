@@ -134,8 +134,6 @@ class AutoOrtho(Operations):
 
     startup = True
 
-    VIRTUAL_DIRS = {"/textures", "/terrain", "/Earth nav data"}
-
     def __init__(self, root, cache_dir='.cache'):
         log.info(f"ROOT: {root}")
         self.dds_re = re.compile(r".*/(\d+)[-_](\d+)[-_]((?!ZL)\S*)(\d{2}).dds")
@@ -356,11 +354,6 @@ class AutoOrtho(Operations):
 
         elif path.endswith("AOISWORKING"):
             attrs['st_size'] = 0
-        
-        elif path == "/textures":
-            attrs.update({
-                'st_mode': stat.S_IFDIR | 0o755, 'st_nlink': 2, 'st_size': 0,
-            })
 
         else:
             full_path = self._full_path(path)
@@ -386,15 +379,8 @@ class AutoOrtho(Operations):
 
     @lru_cache(maxsize=1024)
     def readdir(self, path, fh):
-        if path == "/":
-            try:
-                base = set(os.listdir(self.root))
-            except Exception:
-                base = set()
-            base |= {"Earth nav data", "terrain", "textures"}
-            return ['.', '..', *sorted(base)]
 
-        if path == "/textures":
+        if path in ["/textures", "/terrain"]:
             return ['.', '..', 'AOISWORKING']
 
         full_path = self._full_path(path)
