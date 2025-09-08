@@ -134,8 +134,6 @@ class AutoOrtho(Operations):
 
     startup = True
 
-    VIRTUAL_DIRS = {"/textures", "/terrain", "/Earth nav data"}
-
     def __init__(self, root, cache_dir='.cache'):
         log.info(f"ROOT: {root}")
         self.dds_re = re.compile(r".*/(\d+)[-_](\d+)[-_]((?!ZL)\S*)(\d{2}).dds")
@@ -363,22 +361,26 @@ class AutoOrtho(Operations):
             log.debug(f"GETATTR FULLPATH {full_path}  Exists? {exists}")
             st = os.lstat(full_path)
             log.debug(f"GETATTR: Orig stat: {st}")
-            attrs = {k: getattr(st, k) for k in ('st_atime','st_ctime','st_gid','st_mode','st_mtime','st_nlink','st_size','st_uid')}
+            attrs = {k: getattr(st, k) for k in (
+                'st_atime',
+                'st_ctime',
+                'st_gid',
+                'st_mode',
+                'st_mtime',
+                'st_nlink',
+                'st_size',
+                'st_uid',
+                'st_ino',
+                'st_dev',
+                )}
 
         log.debug(f"GETATTR: ATTRS: {attrs}")
         return attrs
 
     @lru_cache(maxsize=1024)
     def readdir(self, path, fh):
-        if path == "/":
-            try:
-                base = set(os.listdir(self.root))
-            except Exception:
-                base = set()
-            base |= {"Earth nav data", "terrain", "textures"}
-            return ['.', '..', *sorted(base)]
 
-        if path == "/textures":
+        if path in ["/textures", "/terrain"]:
             return ['.', '..', 'AOISWORKING']
 
         full_path = self._full_path(path)
