@@ -107,7 +107,6 @@ def setuplogs():
 # If SSL_CERT_DIR is not set, default to /etc/ssl/certs when available for Linux users.
 try:
     if system_type == 'linux' and "SSL_CERT_DIR" not in os.environ:
-        if os.environ.get("APPIMAGE") and os.path.isdir("/etc/ssl/certs"):
             os.environ["SSL_CERT_DIR"] = "/etc/ssl/certs"
     if system_type == "darwin" and ".app" in sys.argv[0]:
         macos_dir = Path(sys.argv[0]).resolve().parents[0]  # .../Contents/MacOS
