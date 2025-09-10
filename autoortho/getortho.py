@@ -333,7 +333,7 @@ class Chunk(object):
         if not self.starttime:
             self.startime = time.time()
 
-        server_num = idx%(len(self.serverlist))
+        server_num = idx % (len(self.serverlist))
         server = self.serverlist[server_num]
         quadkey = _gtile_to_quadkey(self.col, self.row, self.zoom)
 
@@ -353,6 +353,8 @@ class Chunk(object):
             "YNDX": f"https://sat{server_num+1:02d}.maps.yandex.net/tiles?l=sat&v=3.1814.0&x={self.col}&y={self.row}&z={self.zoom}",
             "APPLE": f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v=10181&accessKey={apple_token_service.apple_token}"
         }
+
+        MAPTYPES_WITH_SERVER = ["YNDX", "EOX", "GO2"]
 
         self.url = MAPTYPES[self.maptype.upper()]
         #log.debug(f"{self} getting {url}")
@@ -380,7 +382,7 @@ class Chunk(object):
                 status_code = resp.status_code
 
                 if self.maptype.upper() == "APPLE" and status_code == 403:
-                    log.warning(f"Failed with status {status_code} to get chunk {self} on server {server}.  Retrying with new Apple Maps token.")
+                    log.warning(f"Failed with status {status_code} to get chunk {self}.  Retrying with new Apple Maps token.")
                     apple_token_service.reset_apple_maps_token()
                     MAPTYPES["APPLE"] = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v=10181&accessKey={apple_token_service.apple_token}"
                     self.url = MAPTYPES[self.maptype.upper()]
@@ -393,14 +395,14 @@ class Chunk(object):
                 status_code = resp.status
 
                 if self.maptype.upper() == "APPLE" and status_code == 403:
-                    log.warning(f"Failed with status {status_code} to get chunk {self} on server {server}.  Retrying with new Apple Maps token.")
+                    log.warning(f"Failed with status {status_code} to get chunk {self}.  Retrying with new Apple Maps token.")
                     apple_token_service.reset_apple_maps_token()
                     self.url = MAPTYPES[self.maptype.upper()]
                     resp = session.get(self.url)
                     status_code = resp.status_code
 
             if status_code != 200:
-                log.warning(f"Failed with status {status_code} to get chunk {self} on server {server}.")
+                log.warning(f"Failed with status {status_code} to get chunk {self}" + (" on server " + server if self.maptype.upper() in MAPTYPES_WITH_SERVER else "") + ".")
                 inc_stat(f"http_{status_code}")
                 inc_stat("req_err")
 
