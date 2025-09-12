@@ -19,8 +19,9 @@ import aostats
 import winsetup
 import macsetup
 import flighttrack
-
+from utils.mount_utils import cleanup_mountpoint
 from utils.constants import MAPTYPES, system_type
+
 from version import __version__
 
 import logging
@@ -140,17 +141,13 @@ def setupmount(mountpoint, systemtype):
 
     try:
         yield mountpoint
+
     finally:
         # Do not remove if still mounted; just try to present placeholder content.
         try:
-            if os.path.ismount(mountpoint):
-                log.debug(f"Skipping cleanup: still mounted: {mountpoint}")
-            else:
-                for d in ('Earth nav data', 'terrain', 'textures'):
-                    os.makedirs(os.path.join(mountpoint, d), exist_ok=True)
-                Path(placeholder_path).touch()
+            cleanup_mountpoint(mountpoint)
         except Exception as e:
-            log.warning(f"Placeholder restore failed for {mountpoint}: {e}")
+            log.warning(f"Failed to cleanup mountpoint {mountpoint}: {e}")
 
 
 def diagnose(CFG):
@@ -275,11 +272,11 @@ class AOMount:
             self.unmount_sceneries()
 
 
-    def unmount_sceneries(self):
+    def unmount_sceneries(self, force=False):
         log.info("Unmounting ...")
         self.mounts_running = False
         for scenery in self.cfg.scenery_mounts:
-            self.unmount(scenery.get('mount'))
+            self.unmount(scenery.get('mount'), force)
 
         log.info("Wait on threads...")
         for t in self.mount_threads:
@@ -346,7 +343,7 @@ class AOMount:
             time.sleep(5)
             os._exit(2)
 
-    def unmount(self, mountpoint):
+    def unmount(self, mountpoint, force=False):
         log.info(f"Shutting down {mountpoint}")
         poison_path = os.path.join(mountpoint, ".poison")
 
@@ -357,11 +354,12 @@ class AOMount:
         except Exception as exc:
             log.debug(f"Poison trigger stat failed: {exc}")
 
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            if not os.path.ismount(mountpoint):
-                break
-            time.sleep(0.5)
+        if not force:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                if not os.path.ismount(mountpoint):
+                    break
+                time.sleep(0.5)
 
         if os.path.ismount(mountpoint):
             try:
