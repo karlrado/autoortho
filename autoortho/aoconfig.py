@@ -92,6 +92,8 @@ fetch_threads = 32
 simheaven_compat = False
 # Using custom generated Ortho4XP tiles along with AutoOrtho.
 using_custom_tiles = False
+# Color used for missing textures.
+missing_color = [66, 77, 55]
 
 [pydds]
 # ISPC or STB for dds file compression
