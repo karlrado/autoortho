@@ -95,7 +95,21 @@ def setupmount(mountpoint, systemtype):
 
         # If it's not empty and doesn't look like our placeholder, refuse
         if os.listdir(mountpoint):
-            if os.path.exists(placeholder_path):
+            # Treat certain metadata or stale control files as ignorable
+            try:
+                entries = [e for e in os.listdir(mountpoint) if e not in ('.DS_Store', '.metadata_never_index', '.poison')]
+            except Exception:
+                entries = os.listdir(mountpoint)
+
+            # If only ignorable files remain, clean them up and proceed
+            if not entries:
+                try:
+                    poison_fp = os.path.join(mountpoint, '.poison')
+                    if os.path.exists(poison_fp):
+                        os.remove(poison_fp)
+                except Exception:
+                    pass
+            elif os.path.exists(placeholder_path):
                 had_placeholder = True
                 # Remove our placeholder content to ensure an empty dir for FUSE
                 try:
@@ -119,7 +133,7 @@ def setupmount(mountpoint, systemtype):
                 except Exception as e:
                     log.warning(f"Failed to cleanup placeholder content at {mountpoint}: {e}")
                 # After cleanup, verify directory is now empty
-                if os.listdir(mountpoint):
+                if any(e for e in os.listdir(mountpoint) if e not in ('.DS_Store', '.metadata_never_index')):
                     raise MountError(f"Mount point {mountpoint} is not empty after cleanup")
             else:
                 raise MountError(f"Mount point {mountpoint} exists and is not empty")
@@ -158,9 +172,17 @@ def diagnose(CFG):
     for scenery in CFG.scenery_mounts:
         mount = scenery.get('mount')
         ret = False
-        for i in range(5):
-            time.sleep(i)
-            ret = os.path.isdir(os.path.join(mount, 'textures'))
+        # Use shorter sleeps with more attempts to avoid long pauses
+        for i in range(40):
+            time.sleep(0.25)
+            try:
+                if system_type == 'darwin':
+                    # Prefer OS-level FUSE readiness on macOS
+                    ret = macsetup.is_macfuse_mount(mount) or os.path.isdir(os.path.join(mount, 'textures'))
+                else:
+                    ret = os.path.isdir(os.path.join(mount, 'textures'))
+            except Exception:
+                ret = False
             if ret:
                 break
             log.info('.')
@@ -177,7 +199,13 @@ def diagnose(CFG):
         root = scenery.get('root')
         mount = scenery.get('mount')
         log.info(f"    {root}")
-        ret = os.path.isdir(os.path.join(mount, 'textures'))
+        try:
+            if system_type == 'darwin':
+                ret = macsetup.is_macfuse_mount(mount) or os.path.isdir(os.path.join(mount, 'textures'))
+            else:
+                ret = os.path.isdir(os.path.join(mount, 'textures'))
+        except Exception:
+            ret = False
         log.info(f"        Mounted? {ret}")
         if not ret:
             failed = True
@@ -295,6 +323,15 @@ class AOMount:
             nothreads = True
 
         root = os.path.expanduser(root)
+
+        # Cleanup: remove any stale poison file in the root to prevent
+        # accidental FUSE self-termination if touched after mount
+        try:
+            poison_root = os.path.join(root, ".poison")
+            if os.path.exists(poison_root):
+                os.remove(poison_root)
+        except Exception as exc:
+            log.debug(f"Ignoring failure to remove root poison file: {exc}")
 
         try:
             if system_type == 'windows':

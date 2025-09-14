@@ -67,12 +67,8 @@ def fuse_config_by_os() -> dict:
             set_gid=1,
         ))
     elif system_type == 'darwin':
-        overrides["config"].update(dict(
-            negative_timeout=0,
-            attr_timeout=30,
-            entry_timeout=30,
-            kernel_cache=True,
-        ))
+        # Leave defaults
+        pass
     elif system_type == 'windows':
         overrides["config"].update(dict(
             uid=-1,
@@ -100,9 +96,6 @@ def fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
             nothreads=nothreads,
             foreground=True,
             allow_other=True,
-            volname=mount_name,
-            local=True,
-            rdonly=True,
         ))
 
     elif system_type == 'windows':
@@ -592,7 +585,7 @@ def run(ao, mountpoint, name="", nothreads=False):
     options = fuse_option_profiles_by_os(nothreads, name)
 
     log.info(f"Starting FUSE mount")
-    log.debug(f"Loading FUSE with options: "
+    log.info(f"Loading FUSE with options: "
             f"{', '.join(sorted(map(str, options.keys())))}")
 
     try:

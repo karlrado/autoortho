@@ -107,7 +107,7 @@ noclean = False
 
 [fuse]
 # Enable or disable multi-threading when using FUSE
-threading = True
+threading = {False if system_type == "darwin" else True}
 
 [flightdata]
 # Local port for map and stats
