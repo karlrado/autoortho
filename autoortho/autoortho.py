@@ -311,19 +311,56 @@ class AOMount:
                             nothreads
                     )
             elif system_type == 'darwin':
-                # systemtype, libpath = macsetup.find_mac_libs()
+                # Isolated subprocess mount for macOS for stability
                 systemtype = "macOS"
                 with setupmount(mountpoint, systemtype) as mount:
                     log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
-                    import autoortho_fuse
-                    import mfusepy
-                    # mfusepy._libfuse = ctypes.CDLL(libpath)
-                    autoortho_fuse.run(
-                            autoortho_fuse.AutoOrtho(root),
+                    # Clean up leftovers that could immediately exit the worker
+                    try:
+                        macsetup.remove_stale_poison(root, mount)
+                    except Exception as exc:
+                        log.debug(f"macOS: poison cleanup failed: {exc}")
+
+                    # Spawn isolated worker process
+                    try:
+                        proc, log_fh = macsetup.spawn_mac_fuse_worker(
+                            root,
                             mount,
-                            mount.split('/')[-1],
-                            nothreads
-                    )
+                            nothreads=nothreads,
+                        )
+                    except Exception as exc:
+                        log.exception(f"Failed to spawn macFUSE worker: {exc}")
+                        raise
+
+                    # Wait for readiness
+                    if not macsetup.wait_for_mount_ready(mount, timeout=30.0, poll_interval=0.3):
+                        try:
+                            rc = proc.poll()
+                        except Exception:
+                            rc = None
+                        log.error(f"macFUSE mount did not become ready: {mount} (proc rc={rc})")
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                        raise MountError(f"macFUSE mount readiness timed out for {mount}")
+
+                    log.info(f"macFUSE mount ready at {mount}; entering monitor loop")
+
+                    # Monitor worker until it dies or mounts_running flips false
+                    try:
+                        while self.mounts_running:
+                            rc = proc.poll()
+                            if rc is not None:
+                                log.error(f"macFUSE worker for {mount} exited rc={rc}")
+                                self.mounts_running = False
+                                break
+                            time.sleep(0.5)
+                    finally:
+                        try:
+                            log_fh.close()
+                        except Exception:
+                            pass
             else:
                 # Linux
                 with setupmount(mountpoint, "Linux-FUSE") as mount:

@@ -67,12 +67,8 @@ def fuse_config_by_os() -> dict:
             set_gid=1,
         ))
     elif system_type == 'darwin':
-        overrides["config"].update(dict(
-            negative_timeout=0,
-            attr_timeout=30,
-            entry_timeout=30,
-            kernel_cache=True,
-        ))
+        # Leave defaults
+        pass 
     elif system_type == 'windows':
         overrides["config"].update(dict(
             uid=-1,
@@ -100,9 +96,6 @@ def fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
             nothreads=nothreads,
             foreground=True,
             allow_other=True,
-            volname=mount_name,
-            local=True,
-            rdonly=True,
         ))
 
     elif system_type == 'windows':
@@ -602,3 +595,24 @@ def run(ao, mountpoint, name="", nothreads=False):
     except Exception as e:
         log.error(f"FUSE mount failed with non-negotiable error: {e}")
         raise
+
+
+def main_worker():
+    """Isolated mount worker entrypoint.
+
+    Usage: python -m autoortho.mount_worker <root> <mountpoint> [--nothreads]
+    """
+    import argparse
+    parser = argparse.ArgumentParser("autoortho mount worker")
+    parser.add_argument("root")
+    parser.add_argument("mountpoint")
+    parser.add_argument("--nothreads", action="store_true")
+    args = parser.parse_args()
+
+    ao = AutoOrtho(args.root)
+    try:
+        run(ao, args.mountpoint, os.path.basename(args.mountpoint), args.nothreads)
+    except Exception:
+        # Ensure a non-zero exit so parent can detect failures quickly
+        import sys
+        sys.exit(2)
