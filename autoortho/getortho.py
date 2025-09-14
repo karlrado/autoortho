@@ -903,7 +903,15 @@ class Tile(object):
         
         log.debug(f"GET_IMG: Create new image: Zoom: {zoom} | {(img_width, img_height)}")
         
-        new_im = AoImage.new('RGBA', (img_width, img_height), (66,77,55))
+        new_im = AoImage.new(
+            "RGBA",
+            (img_width, img_height),
+            (
+                CFG.autoortho.missing_color[0],
+                CFG.autoortho.missing_color[1],
+                CFG.autoortho.missing_color[2],
+            ),
+        )
 
         log.debug(f"GET_IMG: Will use image {new_im}")
 
