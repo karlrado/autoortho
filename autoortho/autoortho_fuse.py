@@ -585,7 +585,7 @@ def run(ao, mountpoint, name="", nothreads=False):
     options = fuse_option_profiles_by_os(nothreads, name)
 
     log.info(f"Starting FUSE mount")
-    log.debug(f"Loading FUSE with options: "
+    log.info(f"Loading FUSE with options: "
             f"{', '.join(sorted(map(str, options.keys())))}")
 
     try:
