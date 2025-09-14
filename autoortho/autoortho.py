@@ -95,7 +95,21 @@ def setupmount(mountpoint, systemtype):
 
         # If it's not empty and doesn't look like our placeholder, refuse
         if os.listdir(mountpoint):
-            if os.path.exists(placeholder_path):
+            # Treat certain metadata or stale control files as ignorable
+            try:
+                entries = [e for e in os.listdir(mountpoint) if e not in ('.DS_Store', '.metadata_never_index', '.poison')]
+            except Exception:
+                entries = os.listdir(mountpoint)
+
+            # If only ignorable files remain, clean them up and proceed
+            if not entries:
+                try:
+                    poison_fp = os.path.join(mountpoint, '.poison')
+                    if os.path.exists(poison_fp):
+                        os.remove(poison_fp)
+                except Exception:
+                    pass
+            elif os.path.exists(placeholder_path):
                 had_placeholder = True
                 # Remove our placeholder content to ensure an empty dir for FUSE
                 try:
@@ -119,7 +133,7 @@ def setupmount(mountpoint, systemtype):
                 except Exception as e:
                     log.warning(f"Failed to cleanup placeholder content at {mountpoint}: {e}")
                 # After cleanup, verify directory is now empty
-                if os.listdir(mountpoint):
+                if any(e for e in os.listdir(mountpoint) if e not in ('.DS_Store', '.metadata_never_index')):
                     raise MountError(f"Mount point {mountpoint} is not empty after cleanup")
             else:
                 raise MountError(f"Mount point {mountpoint} exists and is not empty")
@@ -158,9 +172,17 @@ def diagnose(CFG):
     for scenery in CFG.scenery_mounts:
         mount = scenery.get('mount')
         ret = False
-        for i in range(5):
-            time.sleep(i)
-            ret = os.path.isdir(os.path.join(mount, 'textures'))
+        # Use shorter sleeps with more attempts to avoid long pauses
+        for i in range(40):
+            time.sleep(0.25)
+            try:
+                if system_type == 'darwin':
+                    # Prefer OS-level FUSE readiness on macOS
+                    ret = macsetup.is_macfuse_mount(mount) or os.path.isdir(os.path.join(mount, 'textures'))
+                else:
+                    ret = os.path.isdir(os.path.join(mount, 'textures'))
+            except Exception:
+                ret = False
             if ret:
                 break
             log.info('.')
@@ -177,7 +199,13 @@ def diagnose(CFG):
         root = scenery.get('root')
         mount = scenery.get('mount')
         log.info(f"    {root}")
-        ret = os.path.isdir(os.path.join(mount, 'textures'))
+        try:
+            if system_type == 'darwin':
+                ret = macsetup.is_macfuse_mount(mount) or os.path.isdir(os.path.join(mount, 'textures'))
+            else:
+                ret = os.path.isdir(os.path.join(mount, 'textures'))
+        except Exception:
+            ret = False
         log.info(f"        Mounted? {ret}")
         if not ret:
             failed = True
@@ -296,6 +324,15 @@ class AOMount:
 
         root = os.path.expanduser(root)
 
+        # Cleanup: remove any stale poison file in the root to prevent
+        # accidental FUSE self-termination if touched after mount
+        try:
+            poison_root = os.path.join(root, ".poison")
+            if os.path.exists(poison_root):
+                os.remove(poison_root)
+        except Exception as exc:
+            log.debug(f"Ignoring failure to remove root poison file: {exc}")
+
         try:
             if system_type == 'windows':
                 systemtype, libpath = winsetup.find_win_libs()
@@ -311,56 +348,19 @@ class AOMount:
                             nothreads
                     )
             elif system_type == 'darwin':
-                # Isolated subprocess mount for macOS for stability
+                # systemtype, libpath = macsetup.find_mac_libs()
                 systemtype = "macOS"
                 with setupmount(mountpoint, systemtype) as mount:
                     log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
-                    # Clean up leftovers that could immediately exit the worker
-                    try:
-                        macsetup.remove_stale_poison(root, mount)
-                    except Exception as exc:
-                        log.debug(f"macOS: poison cleanup failed: {exc}")
-
-                    # Spawn isolated worker process
-                    try:
-                        proc, log_fh = macsetup.spawn_mac_fuse_worker(
-                            root,
+                    import autoortho_fuse
+                    import mfusepy
+                    # mfusepy._libfuse = ctypes.CDLL(libpath)
+                    autoortho_fuse.run(
+                            autoortho_fuse.AutoOrtho(root),
                             mount,
-                            nothreads=nothreads,
-                        )
-                    except Exception as exc:
-                        log.exception(f"Failed to spawn macFUSE worker: {exc}")
-                        raise
-
-                    # Wait for readiness
-                    if not macsetup.wait_for_mount_ready(mount, timeout=30.0, poll_interval=0.3):
-                        try:
-                            rc = proc.poll()
-                        except Exception:
-                            rc = None
-                        log.error(f"macFUSE mount did not become ready: {mount} (proc rc={rc})")
-                        try:
-                            proc.terminate()
-                        except Exception:
-                            pass
-                        raise MountError(f"macFUSE mount readiness timed out for {mount}")
-
-                    log.info(f"macFUSE mount ready at {mount}; entering monitor loop")
-
-                    # Monitor worker until it dies or mounts_running flips false
-                    try:
-                        while self.mounts_running:
-                            rc = proc.poll()
-                            if rc is not None:
-                                log.error(f"macFUSE worker for {mount} exited rc={rc}")
-                                self.mounts_running = False
-                                break
-                            time.sleep(0.5)
-                    finally:
-                        try:
-                            log_fh.close()
-                        except Exception:
-                            pass
+                            mount.split('/')[-1],
+                            nothreads
+                    )
             else:
                 # Linux
                 with setupmount(mountpoint, "Linux-FUSE") as mount:
