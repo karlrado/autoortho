@@ -381,7 +381,7 @@ class Chunk(object):
                 resp = session.get(self.url)
                 status_code = resp.status_code
 
-                if self.maptype.upper() == "APPLE" and status_code == 403:
+                if self.maptype.upper() == "APPLE" and status_code == 403 or status_code == 410:
                     log.warning(f"Failed with status {status_code} to get chunk {self}.  Retrying with new Apple Maps token.")
                     apple_token_service.reset_apple_maps_token()
                     MAPTYPES["APPLE"] = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v={apple_token_service.version}&accessKey={apple_token_service.apple_token}"
@@ -394,7 +394,7 @@ class Chunk(object):
                 resp = urlopen(req, timeout=5)
                 status_code = resp.status
 
-                if self.maptype.upper() == "APPLE" and status_code == 403:
+                if self.maptype.upper() == "APPLE" and status_code == 403 or status_code == 410:
                     log.warning(f"Failed with status {status_code} to get chunk {self}.  Retrying with new Apple Maps token.")
                     apple_token_service.reset_apple_maps_token()
                     self.url = MAPTYPES[self.maptype.upper()]
