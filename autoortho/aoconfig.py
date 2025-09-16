@@ -92,6 +92,8 @@ fetch_threads = 32
 simheaven_compat = False
 # Using custom generated Ortho4XP tiles along with AutoOrtho.
 using_custom_tiles = False
+# Color used for missing textures.
+missing_color = [66, 77, 55]
 
 [pydds]
 # ISPC or STB for dds file compression
@@ -105,7 +107,7 @@ noclean = False
 
 [fuse]
 # Enable or disable multi-threading when using FUSE
-threading = True
+threading = {False if system_type == "darwin" else True}
 
 [flightdata]
 # Local port for map and stats

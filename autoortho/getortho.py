@@ -351,7 +351,7 @@ class Chunk(object):
             "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
             "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
             "YNDX": f"https://sat{server_num+1:02d}.maps.yandex.net/tiles?l=sat&v=3.1814.0&x={self.col}&y={self.row}&z={self.zoom}",
-            "APPLE": f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v=10181&accessKey={apple_token_service.apple_token}"
+            "APPLE": f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v={apple_token_service.version}&accessKey={apple_token_service.apple_token}"
         }
 
         MAPTYPES_WITH_SERVER = ["YNDX", "EOX", "GO2"]
@@ -381,10 +381,10 @@ class Chunk(object):
                 resp = session.get(self.url)
                 status_code = resp.status_code
 
-                if self.maptype.upper() == "APPLE" and status_code == 403:
+                if self.maptype.upper() == "APPLE" and status_code == 403 or status_code == 410:
                     log.warning(f"Failed with status {status_code} to get chunk {self}.  Retrying with new Apple Maps token.")
                     apple_token_service.reset_apple_maps_token()
-                    MAPTYPES["APPLE"] = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v=10181&accessKey={apple_token_service.apple_token}"
+                    MAPTYPES["APPLE"] = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v={apple_token_service.version}&accessKey={apple_token_service.apple_token}"
                     self.url = MAPTYPES[self.maptype.upper()]
                     resp = session.get(self.url)
                     status_code = resp.status_code
@@ -394,7 +394,7 @@ class Chunk(object):
                 resp = urlopen(req, timeout=5)
                 status_code = resp.status
 
-                if self.maptype.upper() == "APPLE" and status_code == 403:
+                if self.maptype.upper() == "APPLE" and status_code == 403 or status_code == 410:
                     log.warning(f"Failed with status {status_code} to get chunk {self}.  Retrying with new Apple Maps token.")
                     apple_token_service.reset_apple_maps_token()
                     self.url = MAPTYPES[self.maptype.upper()]
@@ -903,7 +903,15 @@ class Tile(object):
         
         log.debug(f"GET_IMG: Create new image: Zoom: {zoom} | {(img_width, img_height)}")
         
-        new_im = AoImage.new('RGBA', (img_width, img_height), (66,77,55))
+        new_im = AoImage.new(
+            "RGBA",
+            (img_width, img_height),
+            (
+                CFG.autoortho.missing_color[0],
+                CFG.autoortho.missing_color[1],
+                CFG.autoortho.missing_color[2],
+            ),
+        )
 
         log.debug(f"GET_IMG: Will use image {new_im}")
 

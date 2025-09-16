@@ -22,13 +22,14 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QPushButton, QLabel, QLineEdit, QCheckBox, QComboBox,
     QSlider, QTextEdit, QFileDialog, QMessageBox, QScrollArea,
-    QSplashScreen, QGroupBox, QProgressBar, QStatusBar, QFrame, QSpinBox
+    QSplashScreen, QGroupBox, QProgressBar, QStatusBar, QFrame, QSpinBox,
+    QColorDialog
 )
 from PySide6.QtCore import (
     Qt, QThread, Signal, QTimer, QSize
 )
 from PySide6.QtGui import (
-    QPixmap, QIcon
+    QPixmap, QIcon, QColor
 )
 
 import downloader
@@ -995,6 +996,35 @@ class ConfigUI(QMainWindow):
         threads_layout.addStretch()
         autoortho_layout.addLayout(threads_layout)
 
+        missing_color_layout = QHBoxLayout()
+        missing_color_layout.setSpacing(10)
+        missing_color_label = QLabel("Missing Tile Color:")
+        missing_color_label.setToolTip(
+            "This is the solid color used to fill a texture when\n"
+            "scenery data cannot be fetched.  It can be useful to\n"
+            "set this to a more visible color when tuning the maxwait\n"
+            "setting to make it easier to see missing textures."
+        )
+        self.missing_color_button = StyledButton("Select")
+        self.missing_color = QColor(
+            self.cfg.autoortho.missing_color[0],
+            self.cfg.autoortho.missing_color[1],
+            self.cfg.autoortho.missing_color[2],
+        )
+        self.update_missing_color_button()
+        self.missing_color_button.clicked.connect(self.show_missing_color_dialog)
+
+        self.reset_color_button = StyledButton("Reset")
+        self.reset_color_button.setToolTip(
+            "Reset the missing texture color to the default gray."
+        )
+        self.reset_color_button.clicked.connect(self.reset_missing_color)
+        missing_color_layout.addWidget(missing_color_label)
+        missing_color_layout.addWidget(self.missing_color_button)
+        missing_color_layout.addWidget(self.reset_color_button)
+        missing_color_layout.addStretch()
+        autoortho_layout.addLayout(missing_color_layout)
+
         if self.cfg.autoortho.using_custom_tiles:
             self.info_label = QLabel(
                 "Note: You are using custom tiles. Max zoom near airports setting is incompatible with custom tiles, all tiles will be capped to the general max zoom level you set.\n\n"
@@ -1202,6 +1232,45 @@ class ConfigUI(QMainWindow):
         self.settings_layout.addWidget(flightdata_group)
 
         self.settings_layout.addStretch()
+
+    def show_missing_color_dialog(self):
+        color = QColorDialog.getColor(
+            self.missing_color, self, "Select missing tile color"
+        )
+        if color.isValid():
+            self.missing_color = color
+            self.update_missing_color_button()
+
+    def _get_missing_color_style(self):
+        return f"""
+                QPushButton {{
+                    background-color: {self.missing_color.name()};
+                    color: white;
+                    border: 1px solid #555;
+                    padding: 6px 12px;
+                    border-radius: 4px;
+                    font-size: 13px;
+                }}
+                QPushButton:hover {{
+                    background-color: #4A4A4A;
+                    border-color: #1d71d1;
+                }}
+                QPushButton:pressed {{
+                    background-color: #2A2A2A;
+                }}
+                QPushButton:disabled {{
+                    background-color: #2A2A2A;
+                    color: #666;
+                    border-color: #333;
+                }}
+            """
+
+    def update_missing_color_button(self):
+        self.missing_color_button.setStyleSheet(self._get_missing_color_style())
+
+    def reset_missing_color(self):
+        self.missing_color = QColor(66, 77, 55)
+        self.update_missing_color_button()
 
     def refresh_scenery_list(self):
         """Refresh the scenery list display"""
@@ -1740,6 +1809,9 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.fetch_threads = str(
                 self.fetch_threads_spinbox.value()
             )
+            self.cfg.autoortho.missing_color = [self.missing_color.red(),
+                                                self.missing_color.green(),
+                                                self.missing_color.blue()]
 
             # DDS settings
             if not self.system == "darwin":
