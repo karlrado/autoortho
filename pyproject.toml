@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "autoortho4xplane"
-version = "1.2.7"
+version = "1.2.8"
 description = "AutoOrtho project for X-plane, the project is a fork ."
 authors = []
 license = "Apache 2.0"
