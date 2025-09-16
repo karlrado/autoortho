@@ -96,6 +96,7 @@ def fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
             nothreads=nothreads,
             foreground=True,
             allow_other=True,
+            volname=mount_name,
         ))
 
     elif system_type == 'windows':

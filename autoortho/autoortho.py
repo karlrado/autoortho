@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import os
+import subprocess
 import sys
 import time
 import ctypes
@@ -246,6 +247,7 @@ class AOMount:
     def __init__(self, cfg):
         self.cfg = cfg
         self.mount_threads = []
+        self.mac_os_procs = []
 
 
 
@@ -256,17 +258,24 @@ class AOMount:
 
         self.mounts_running = True
         for scenery in self.cfg.scenery_mounts:
-            t = threading.Thread(
-                target=self.domount,
-                daemon=False,
-                args=(
+            if system_type == "darwin":
+                self.domount(
                     scenery.get('root'),
                     scenery.get('mount'),
                     self.cfg.fuse.threading
                 )
-            )
-            t.start()
-            self.mount_threads.append(t)
+            else:
+                t = threading.Thread(
+                    target=self.domount,
+                    daemon=False,
+                    args=(
+                        scenery.get('root'),
+                        scenery.get('mount'),
+                        self.cfg.fuse.threading
+                    )
+                )
+                t.start()
+                self.mount_threads.append(t)
 
         if not blocking:
             log.info("Running mounts in non-blocking mode.")
@@ -285,11 +294,21 @@ class AOMount:
             diagnose(self.cfg)
 
             while self.mounts_running:
-                for t in list(self.mount_threads):
-                    if not t.is_alive():
-                        log.error(f"Mount thread {t.name or t.ident} died; failing all mounts.")
-                        self.mounts_running = False
-                        break
+
+                if system_type == "darwin": 
+                    for p in self.mac_os_procs:
+                        if not p.poll() is not None:
+                            log.error(f"Mount thread {t.name or t.ident} died; failing all mounts.")
+                            self.mounts_running = False
+                            break
+
+                else:
+                    for t in list(self.mount_threads):
+                        if not t.is_alive():
+                            log.error(f"Mount thread {t.name or t.ident} died; failing all mounts.")
+                            self.mounts_running = False
+                            break
+  
                 time.sleep(0.5)
 
         except (KeyboardInterrupt, SystemExit) as err:
@@ -310,6 +329,16 @@ class AOMount:
         for t in self.mount_threads:
             t.join(5)
             log.info(f"Thread {t.ident} exited.")
+
+        for p in self.mac_os_procs:
+            if p.poll() is None:
+                p.send_signal(signal.SIGINT)
+        try:
+            for p in self.mac_os_procs:
+                p.wait(timeout=10)
+        except Exception:
+            p.terminate()
+
         log.info("Unmount complete")
 
 
@@ -352,15 +381,16 @@ class AOMount:
                 systemtype = "macOS"
                 with setupmount(mountpoint, systemtype) as mount:
                     log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
-                    import autoortho_fuse
-                    import mfusepy
-                    # mfusepy._libfuse = ctypes.CDLL(libpath)
-                    autoortho_fuse.run(
-                            autoortho_fuse.AutoOrtho(root),
-                            mount,
-                            mount.split('/')[-1],
-                            nothreads
-                    )
+                    cmd = [sys.executable, f"{os.path.abspath("autoortho/macfuse_worker.py")}",
+                            "--root", root,
+                            "--mountpoint", mount,
+                            "--volname",mount.split('/')[-1]]
+                    
+                    if nothreads:
+                        cmd.append("--nothreads")
+                    p = subprocess.Popen(cmd)
+                    self.mac_os_procs.append(p)
+                    log.info(f"FUSE process for mount {mount.split('/')[-1]} started with pid: {p.pid}")
             else:
                 # Linux
                 with setupmount(mountpoint, "Linux-FUSE") as mount:
