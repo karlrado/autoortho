@@ -75,10 +75,12 @@ def main():
         raise
     finally:
         try:
-            from getortho import stats_batcher
+            from getortho import stats_batcher, shutdown
             if stats_batcher:
                 stats_batcher.stop()
-        except Exception:
+            shutdown()
+        except Exception as e:
+            log.error(f"Error stopping stats batcher: {e}")
             pass
 
 

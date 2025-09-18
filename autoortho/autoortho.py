@@ -460,6 +460,14 @@ class AOMount:
         for scenery in self.cfg.scenery_mounts:
             self.unmount(scenery.get('mount'), force)
 
+        log.info("Stop logs reporter...")
+        if hasattr(self, "_reporter_thread"):
+            try:
+                self.stop_reporter()
+            except Exception as e:
+                log.error(f"Error stopping reporter: {e}")
+                pass
+
         log.info("Wait on threads...")
         for t in self.mount_threads:
             t.join(5)
@@ -468,31 +476,40 @@ class AOMount:
         log.info("Send SIGINT to macOS processes...")
         for p in self.mac_os_procs:
             if p.poll() is None:
-                p.send_signal(signal.SIGINT)
+                p.terminate()
 
         log.info("Wait on macOS processes...")
         try:
             for p in self.mac_os_procs:
                 p.wait(timeout=10)
-        except Exception:
-            p.terminate()
+        except Exception as e:
+            log.error(f"Error waiting on macOS processes: {e}")
+            pass
+
+        for p in self.mac_os_procs:
+            if p.poll() is None:
+                log.warning("Process %s still alive; sending SIGKILL", p.pid)
+                try:
+                    p.kill()
+                except Exception as e:
+                    log.error(f"Error killing macOS process: {e}")
+                    pass
 
         log.info("Shutdown stats manager...")
         if hasattr(self, "_stats_server"):
             try:
                 self._stats_server.shutdown()
-            except Exception:
+            except Exception as e:
+                log.error(f"Error shutting down stats manager: {e}")
                 pass
 
         log.info("Shutdown log server...")
         if hasattr(self, "log_server"):
             try:
                 self.log_server.shutdown()
-            except Exception:
+            except Exception as e:
+                log.error(f"Error shutting down log server: {e}")
                 pass
-
-        log.info("Stop reporter...")
-        self.stop_reporter()
 
         log.info("Unmount complete")
 
