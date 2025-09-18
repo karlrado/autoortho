@@ -970,16 +970,18 @@ class ConfigUI(QMainWindow):
 
         # Fetch threads
         threads_layout = QHBoxLayout()
-        threads_label = QLabel("Fetch threads:")
+        threads_label = QLabel("Fetch threads per mount:" if self.system == "darwin" else "Global fetch threads:")
         threads_label.setToolTip(
             "Number of simultaneous download threads.\n"
             "More threads = faster downloads but higher CPU/network usage.\n"
-            "Too many threads may cause timeouts or instability."
+            "Too many threads may cause timeouts or instability.\n"
+            "On macOS, this is the number of threads per mount.\n"
+            "On other systems, fetch threads are shared globally."
         )
         threads_layout.addWidget(threads_label)
         self.fetch_threads_spinbox = ModernSpinBox()
 
-        max_threads = 100
+        max_threads = 1000
         self.fetch_threads_spinbox.setRange(1, max_threads)
 
         # Ensure initial value doesn't exceed available threads
@@ -989,7 +991,7 @@ class ConfigUI(QMainWindow):
         self.fetch_threads_spinbox.setValue(initial_threads)
         self.fetch_threads_spinbox.setObjectName('fetch_threads')
         self.fetch_threads_spinbox.setToolTip(
-            f"Number of download threads (1-{max_threads})"
+            f"Number of download threads per mount (1-{max_threads})" if self.system == "darwin" else f"Number of global download threads (1-{max_threads})"
         )
 
         threads_layout.addWidget(self.fetch_threads_spinbox)
