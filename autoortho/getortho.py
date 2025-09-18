@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 
+import atexit
 import os
-import sys
 import time
-import math
-import tempfile
 import threading
 import concurrent.futures
-
-import subprocess
-import collections
 import uuid
 
 from io import BytesIO
@@ -25,7 +20,7 @@ import psutil
 from aoimage import AoImage
 
 from aoconfig import CFG
-from aostats import STATS, StatTracker, set_stat, inc_stat, get_stat
+from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat
 from utils.constants import system_type
 from utils.apple_token_service import apple_token_service
 
@@ -43,6 +38,25 @@ import tracemalloc
 tile_stats = StatTracker(20, 12)
 mm_stats = StatTracker(0, 5)
 partial_stats = StatTracker()
+
+stats_batcher = None
+if os.getenv("AO_STATS_ADDR"):  # means we're in a worker
+    stats_batcher = StatsBatcher(flush_interval=0.05, max_items=200)
+    atexit.register(stats_batcher.stop)
+
+
+def bump(key, n=1):
+    if stats_batcher:
+        stats_batcher.add(key, n)
+    else:
+        inc_stat(key, n)
+
+
+def bump_many(d: dict):
+    if stats_batcher:
+        stats_batcher.add_many(d)
+    else:
+        inc_many(d)
 
 
 def _is_jpeg(dataheader):
@@ -80,7 +94,7 @@ def locked(fn):
 class Getter(object):
     queue = None 
     workers = None
-    WORKING = False
+    WORKING = None
     session = None
 
     def __init__(self, num_workers):
@@ -88,7 +102,8 @@ class Getter(object):
         self.count = 0
         self.queue = PriorityQueue()
         self.workers = []
-        self.WORKING = True
+        self.WORKING = threading.Event()
+        self.WORKING.set()
         self.localdata = threading.local()
         self.session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
@@ -109,7 +124,7 @@ class Getter(object):
 
 
     def stop(self):
-        self.WORKING = False
+        self.WORKING.clear()
         for t in self.workers:
             t.join()
         # If a stats thread was started, join it as well
@@ -120,7 +135,7 @@ class Getter(object):
     def worker(self, idx):
         global STATS
         self.localdata.idx = idx
-        while self.WORKING:
+        while self.WORKING.is_set():
             try:
                 obj, args, kwargs = self.queue.get(timeout=5)
                 #log.debug(f"Got: {obj} {args} {kwargs}")
@@ -130,8 +145,7 @@ class Getter(object):
                 continue
 
             #STATS.setdefault('count', 0) + 1
-            STATS['count'] = STATS.get('count', 0) + 1
-
+            bump('count', 1)
 
             try:
                 if not self.get(obj, *args, **kwargs):
@@ -148,7 +162,7 @@ class Getter(object):
         self.queue.put((obj, args, kwargs))
 
     def show_stats(self):
-        while self.WORKING:
+        while self.WORKING.is_set():
             log.info(f"{self.__class__.__name__} got: {self.count}")
             time.sleep(10)
         log.info(f"Exiting {self.__class__.__name__} stat thread.  Got: {self.count} total")
@@ -233,7 +247,7 @@ class Chunk(object):
 
     def get_cache(self):
         if os.path.isfile(self.cache_path):
-            inc_stat('chunk_hit')
+            bump('chunk_hit')
             cache_file = Path(self.cache_path)
             # Get data
             data = cache_file.read_bytes()
@@ -254,7 +268,7 @@ class Chunk(object):
                 self.data = b''
                 return False  # FIXED: Explicitly return False for corrupted cache
         else:
-            inc_stat('chunk_miss')
+            bump('chunk_miss')
             return False
 
     def save_cache(self):
@@ -331,7 +345,7 @@ class Chunk(object):
             return True
 
         if not self.starttime:
-            self.startime = time.time()
+            self.starttime = time.time()
 
         server_num = idx % (len(self.serverlist))
         server = self.serverlist[server_num]
@@ -362,49 +376,33 @@ class Chunk(object):
                 "user-agent": "curl/7.68.0"
         }
         if self.maptype.upper() == "EOX":
-            log.info("EOX DETECTED")
+            log.debug("EOX DETECTED")
             header.update({'referer': 'https://s2maps.eu/'})
        
         time.sleep((self.attempt/10))
         self.attempt += 1
 
         log.debug(f"Requesting {self.url} ..")
-
-        use_requests = True
         
-        resp = 0
+        resp = None
         try:
-            if use_requests:
-                # FIXME: Not the best way to set headers
-                session.headers = header
-                #resp = session.get(self.url, stream=True)
-                resp = session.get(self.url)
+
+            resp = session.get(self.url, headers=header, timeout=(5, 20))
+            status_code = resp.status_code
+
+            if self.maptype.upper() == "APPLE" and status_code in (403, 410):
+                log.warning("APPLE tile got %s; rotating token and retrying", status_code)
+                apple_token_service.reset_apple_maps_token()
+                MAPTYPES["APPLE"] = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v={apple_token_service.version}&accessKey={apple_token_service.apple_token}"
+                self.url = MAPTYPES[self.maptype.upper()]
+                if resp is not None:
+                    resp.close()
+                resp = session.get(self.url, headers=header, timeout=(5, 20))
                 status_code = resp.status_code
-
-                if self.maptype.upper() == "APPLE" and status_code == 403 or status_code == 410:
-                    log.warning(f"Failed with status {status_code} to get chunk {self}.  Retrying with new Apple Maps token.")
-                    apple_token_service.reset_apple_maps_token()
-                    MAPTYPES["APPLE"] = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v={apple_token_service.version}&accessKey={apple_token_service.apple_token}"
-                    self.url = MAPTYPES[self.maptype.upper()]
-                    resp = session.get(self.url)
-                    status_code = resp.status_code
-
-            else:
-                req = Request(self.url, headers=header)
-                resp = urlopen(req, timeout=5)
-                status_code = resp.status
-
-                if self.maptype.upper() == "APPLE" and status_code == 403 or status_code == 410:
-                    log.warning(f"Failed with status {status_code} to get chunk {self}.  Retrying with new Apple Maps token.")
-                    apple_token_service.reset_apple_maps_token()
-                    self.url = MAPTYPES[self.maptype.upper()]
-                    resp = session.get(self.url)
-                    status_code = resp.status_code
 
             if status_code != 200:
                 log.warning(f"Failed with status {status_code} to get chunk {self}" + (" on server " + server if self.maptype.upper() in MAPTYPES_WITH_SERVER else "") + ".")
-                inc_stat(f"http_{status_code}")
-                inc_stat("req_err")
+                bump_many({f"http_{status_code}": 1, "req_err": 1})
 
                 err = get_stat("req_err")
                 if err > 50:
@@ -415,13 +413,9 @@ class Chunk(object):
                         log.error(f"Check your network connection, DNS, maptype choice, and firewall settings.")
                 return False
 
-            inc_stat("req_ok")
+            bump("req_ok")
 
-            if use_requests:
-                data = resp.content
-                #data = resp.raw.read()
-            else:
-                data = resp.read()
+            data = resp.content
 
             if _is_jpeg(data[:3]):
                 log.debug(f"Data for {self} is JPEG")
@@ -432,7 +426,7 @@ class Chunk(object):
             #    return False
                 self.data = b''
 
-            inc_stat('bytes_dl', len(self.data))
+            bump('bytes_dl', len(self.data))
                 
         except Exception as err:
             log.warning(f"Failed to get chunk {self} on server {server}. Err: {err} URL: {self.url}")
@@ -441,7 +435,7 @@ class Chunk(object):
             if resp:
                 resp.close()
 
-        self.fetchtime = time.time() - self.starttime
+        self.fetchtime = time.monotonic() - self.starttime
 
         self.save_cache()
         self.ready.set()
@@ -940,12 +934,12 @@ class Tile(object):
                 log.debug(f"GET_IMG: Tile {self} not ready.  Try to find backup chunk.")
                 chunk_img = self.get_best_chunk(chunk.col, chunk.row, mipmap, zoom)
                 if chunk_img:
-                    inc_stat('backup_chunk_count')
+                    bump('backup_chunk_count')
 
             if not chunk_ready and not chunk_img:
                 # Ran out of time, lower mipmap.  Retry...
                 log.debug(f"GET_IMG: Final retry for {chunk}")
-                inc_stat('retry_chunk_count')
+                bump('retry_chunk_count')
                 chunk_ready = chunk.ready.wait(maxwait)
                 if chunk_ready and chunk.data:
                     log.debug(f"GET_IMG: Final retry for {chunk}, SUCCESS!")
@@ -953,7 +947,7 @@ class Tile(object):
 
             if not chunk_img and not chunk.data:
                 log.debug(f"GET_IMG: Empty chunk data.  Skip.")
-                STATS['chunk_missing_count'] = STATS.get('chunk_missing_count', 0) + 1
+                bump('chunk_missing_count')
             elif not chunk_img and chunk.data:
                 log.warning(f"GET_IMG: FAILED! {chunk}:  LEN: {len(chunk.data)}  HEADER: {chunk.data[:8]}")
                 
@@ -1276,7 +1270,7 @@ class TileCacher(object):
             tile = self.tiles.get(idx)
             if not tile:
                 self.misses += 1
-                inc_stat('tile_mem_miss')
+                bump('tile_mem_miss')
                 # Use target zoom level directly - much cleaner than offset calculations
                 tile = Tile(
                     col, row, map_type, zoom, 
@@ -1291,7 +1285,7 @@ class TileCacher(object):
             elif tile.refs <= 0:
                 # Only in this case would this cache have made a difference
                 self.hits += 1
-                inc_stat('tile_mem_hits')
+                bump('tile_mem_hits')
 
             tile.refs += 1
         return tile
@@ -1354,5 +1348,11 @@ def shutdown():
         except Exception:
             # Ignore any edge-case failures during shutdown
             pass
+
+    try:
+        if stats_batcher:
+            stats_batcher.stop()
+    except Exception:
+        pass
 
     log.info("autoortho.getortho shutdown complete")
