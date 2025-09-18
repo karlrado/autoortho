@@ -3,6 +3,8 @@ import time
 import threading
 import collections
 from collections.abc import MutableMapping
+from multiprocessing.managers import BaseManager
+
 
 from aoconfig import CFG
 import logging
@@ -23,8 +25,9 @@ def _connect_manager_from_env():
     if not addr or not auth:
         return None, None
     host, port = addr.split(":")
-    from multiprocessing.managers import BaseManager
-    class _StatsManager(BaseManager): pass
+
+    class _StatsManager(BaseManager):
+        pass
     _StatsManager.register('get_store')
     m = _StatsManager(address=(host, int(port)), authkey=auth.encode('utf-8'))
     m.connect()

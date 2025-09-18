@@ -17,7 +17,6 @@ import pickle
 import struct
 
 
-from pathlib import Path
 from contextlib import contextmanager
 from multiprocessing.managers import BaseManager
 
@@ -134,7 +133,6 @@ def setupmount(mountpoint, systemtype):
     if systemtype != "winfsp-FUSE":
         if not os.path.exists(mountpoint):
             os.makedirs(mountpoint, exist_ok=True)
-            created_mount_dir = True
         elif not os.path.isdir(mountpoint):
             raise MountError(f"{mountpoint} exists but is not a directory")
 
@@ -155,7 +153,6 @@ def setupmount(mountpoint, systemtype):
                 except Exception:
                     pass
             elif os.path.exists(placeholder_path):
-                had_placeholder = True
                 # Remove our placeholder content to ensure an empty dir for FUSE
                 try:
                     for name in ('Earth nav data', 'terrain', 'textures'):
@@ -291,22 +288,16 @@ class AOMount:
         self.cfg = cfg
         self.mount_threads = []
         self.mac_os_procs = []
+
+        StatsManager.register('get_store')
+        self.start_stats_manager()
+
+        self._reporter_stop = threading.Event()
+        self._reporter_thread = None
+        self.start_reporter()
+
         if system_type == "darwin":
-            self._shared_store = aostats.StatsStore()
-            StatsManager.register('get_store', callable=lambda: self._shared_store)
-
-            aostats.bind_local_store(self._shared_store)
-
-            self._stats_server, self.stats_host, self.stats_port = self.start_stats_manager()
-            self.stats_auth = b'AO4XPSTATS'
-            self.stats_addr = f"{self.stats_host}:{self.stats_port}"
-
-            self.log_server, self.log_host, self.log_port = self.start_log_server()
-            self.log_addr = f"{self.log_host}:{self.log_port}"
-
-            self._reporter_stop = threading.Event()
-            self._reporter_thread = None
-            self.start_reporter()
+            self.start_log_server()
 
     def start_log_server(self):
         """Start once in the parent. Returns (host, port) bound on 127.0.0.1."""
@@ -314,16 +305,54 @@ class AOMount:
         host, port = server.server_address
         t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
-        return server, host, port
+        self.log_server = server
+        self.log_host = host
+        self.log_port = port
+        self.log_addr = f"{self.log_host}:{self.log_port}"
+        return
 
-    def start_stats_manager(self):
-        mgr = StatsManager(address=('127.0.0.1', 0), authkey=b'AO4XPSTATS')
-        server = mgr.get_server()
-        host, port = server.address
-        t = threading.Thread(target=server.serve_forever, daemon=True)
-        t.start()
+    def stop_log_server(self, join_timeout: float = 2.0):
+        server = getattr(self, "log_server", None)
+        if server:
+            server.shutdown()
+        if server and server.is_alive():
+            server.join(timeout=join_timeout)
+        self.log_server = None
+        self.log_host = None
+        self.log_port = None
+        self.log_addr = None
+        return
+
+    def start_stats_manager(self, authkey: bytes = b'AO4XPSTATS'):
+        self._shared_store = aostats.StatsStore()
+
+        mgr = StatsManager(address=('127.0.0.1', 0), authkey=authkey)
+        mgr.start()
+        StatsManager.register('get_store', callable=lambda: self._shared_store)
+        aostats.bind_local_store(self._shared_store)
+        host, port = mgr.address
         log.info(f"StatsManager listening on {host}:{port}")
-        return server, host, port
+        self.stats_manager = mgr
+        self.stats_host = host
+        self.stats_port = port
+        self.stats_auth = authkey
+        self.stats_addr = f"{self.stats_host}:{self.stats_port}"
+        return
+
+    def stop_stats_manager(self, join_timeout: float = 2.0):
+        mgr = getattr(self, "stats_manager", None)
+        if mgr:
+            try:
+                mgr.shutdown()
+            except Exception as e:
+                log.error(f"Error stopping stats manager: {e}")
+        self.stats_manager = None
+        self._shared_store = None
+        self.stats_host = None
+        self.stats_port = None
+        self.stats_auth = None
+        self.stats_addr = None
+        return
 
     def launch_macfuse_worker(
             self, root: str,
@@ -353,6 +382,31 @@ class AOMount:
         log.info(f"FUSE process for mount {volname} started with pid: {p.pid}")
         return p
 
+    def stop_macfuse_workers(self, timeout: float = 10.0):
+        log.info("Send SIGTERM to macOS processes...")
+        for p in self.mac_os_procs:
+            if p.poll() is None:
+                p.terminate()
+
+        log.info("Wait on macOS processes...")
+        try:
+            for p in self.mac_os_procs:
+                p.wait(timeout=timeout)
+        except Exception as e:
+            log.error(f"Error waiting on macOS processes: {e}")
+            pass
+
+        for p in self.mac_os_procs:
+            if p.poll() is None:
+                log.warning("Process %s still alive; sending SIGKILL", p.pid)
+                try:
+                    p.kill()
+                except Exception as e:
+                    log.error(f"Error killing macOS process: {e}")
+                    pass
+        self.mac_os_procs = []
+        return
+
     def reporter(self):
         while True:
             time.sleep(10)
@@ -379,12 +433,14 @@ class AOMount:
 
     def stop_reporter(self, join_timeout: float = 3.0):
         """Stop the periodic global-stats logger and join the thread."""
+        log.info("Stopping reporter...")
+        if not self._reporter_thread:
+            log.info("Reporter thread not running.")
+            return
         self._reporter_stop.set()
-        t = self._reporter_thread
-        if t and t.is_alive():
-            t.join(timeout=join_timeout)
+        if self._reporter_thread.is_alive():
+            self._reporter_thread.join(timeout=join_timeout)
         self._reporter_thread = None
-
 
     def mount_sceneries(self, blocking=True):
         if not self.cfg.scenery_mounts:
@@ -453,63 +509,24 @@ class AOMount:
             log.info("Shutting down ...")
             self.unmount_sceneries()
 
-
     def unmount_sceneries(self, force=False):
         log.info("Unmounting ...")
         self.mounts_running = False
         for scenery in self.cfg.scenery_mounts:
             self.unmount(scenery.get('mount'), force)
 
-        log.info("Stop logs reporter...")
-        if hasattr(self, "_reporter_thread"):
-            try:
-                self.stop_reporter()
-            except Exception as e:
-                log.error(f"Error stopping reporter: {e}")
-                pass
+        self.stop_reporter()
 
-        log.info("Wait on threads...")
+        log.info("Wait on mount threads...")
         for t in self.mount_threads:
             t.join(5)
             log.info(f"Thread {t.ident} exited.")
 
-        log.info("Send SIGINT to macOS processes...")
-        for p in self.mac_os_procs:
-            if p.poll() is None:
-                p.terminate()
+        self.stop_macfuse_workers()
 
-        log.info("Wait on macOS processes...")
-        try:
-            for p in self.mac_os_procs:
-                p.wait(timeout=10)
-        except Exception as e:
-            log.error(f"Error waiting on macOS processes: {e}")
-            pass
+        self.stop_stats_manager()
 
-        for p in self.mac_os_procs:
-            if p.poll() is None:
-                log.warning("Process %s still alive; sending SIGKILL", p.pid)
-                try:
-                    p.kill()
-                except Exception as e:
-                    log.error(f"Error killing macOS process: {e}")
-                    pass
-
-        log.info("Shutdown stats manager...")
-        if hasattr(self, "_stats_server"):
-            try:
-                self._stats_server.shutdown()
-            except Exception as e:
-                log.error(f"Error shutting down stats manager: {e}")
-                pass
-
-        log.info("Shutdown log server...")
-        if hasattr(self, "log_server"):
-            try:
-                self.log_server.shutdown()
-            except Exception as e:
-                log.error(f"Error shutting down log server: {e}")
-                pass
+        self.stop_log_server()
 
         log.info("Unmount complete")
 

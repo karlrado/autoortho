@@ -8,8 +8,6 @@ import math
 import errno
 import ctypes
 import threading
-import shutil
-import stat
 
 import flighttrack
 
