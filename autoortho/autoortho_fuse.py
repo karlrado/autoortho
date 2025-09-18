@@ -128,7 +128,7 @@ class AutoOrtho(Operations):
 
     startup = True
 
-    def __init__(self, root, cache_dir='.cache'):
+    def __init__(self, root, cache_dir='.cache', *args, **kwargs):
         log.info(f"ROOT: {root}")
         self.dds_re = re.compile(r".*/(\d+)[-_](\d+)[-_]((?!ZL)\S*)(\d{2}).dds")
         self.ktx2_re = re.compile(r".*/(\d+)[-_](\d+)[-_]((?!ZL)\D*)(\d+).ktx2")
@@ -152,6 +152,8 @@ class AutoOrtho(Operations):
         self._size_cache = {}
         self._ft_started = False
         self._ft_start_lock = threading.Lock()
+
+        self.use_ns = kwargs.get("use_ns", False)
 
     # Helpers
     # =======

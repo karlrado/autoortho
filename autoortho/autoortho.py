@@ -11,15 +11,21 @@ import tempfile
 import platform
 import argparse
 import threading
+import socketserver
+import logging.handlers
+import pickle
+import struct
+
 
 from pathlib import Path
 from contextlib import contextmanager
+from multiprocessing.managers import BaseManager
+
 
 import aoconfig
 import aostats
 import winsetup
 import macsetup
-import flighttrack
 from utils.mount_utils import cleanup_mountpoint
 from utils.constants import MAPTYPES, system_type
 
@@ -35,11 +41,49 @@ import geocoder
 from PySide6.QtWidgets import QApplication
 import config_ui_qt as config_ui
 USE_QT = True
+
+
 class MountError(Exception):
     pass
 
+
 class AutoOrthoError(Exception):
     pass
+
+
+class StatsManager(BaseManager): 
+    pass
+
+
+class LogRecordStreamHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        while True:
+            # Read 4-byte length prefix
+            chunk = self._recvall(4)
+            if not chunk:
+                break
+            slen = struct.unpack('>L', chunk)[0]
+            # Read the pickled LogRecord
+            chunk = self._recvall(slen)
+            if not chunk:
+                break
+            record_dict = pickle.loads(chunk)
+            record = logging.makeLogRecord(record_dict)
+            # Forward to parent's logging
+            logging.getLogger(record.name).handle(record)
+
+    def _recvall(self, n):
+        data = b''
+        while len(data) < n:
+            packet = self.connection.recv(n - len(data))
+            if not packet:
+                return None
+            data += packet
+        return data
+
+
+class LogServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
 
 
 @contextmanager
@@ -240,7 +284,6 @@ def diagnose(CFG):
     log.info("------------------------------------\n\n")
 
 
-
 class AOMount:
     mounts_running = False
 
@@ -248,7 +291,99 @@ class AOMount:
         self.cfg = cfg
         self.mount_threads = []
         self.mac_os_procs = []
+        if system_type == "darwin":
+            self._shared_store = aostats.StatsStore()
+            StatsManager.register('get_store', callable=lambda: self._shared_store)
 
+            aostats.bind_local_store(self._shared_store)
+
+            self._stats_server, self.stats_host, self.stats_port = self.start_stats_manager()
+            self.stats_auth = b'AO4XPSTATS'
+            self.stats_addr = f"{self.stats_host}:{self.stats_port}"
+
+            self.log_server, self.log_host, self.log_port = self.start_log_server()
+            self.log_addr = f"{self.log_host}:{self.log_port}"
+
+            self._reporter_stop = threading.Event()
+            self._reporter_thread = None
+            self.start_reporter()
+
+    def start_log_server(self):
+        """Start once in the parent. Returns (host, port) bound on 127.0.0.1."""
+        server = LogServer(('127.0.0.1', 0), LogRecordStreamHandler)
+        host, port = server.server_address
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        return server, host, port
+
+    def start_stats_manager(self):
+        mgr = StatsManager(address=('127.0.0.1', 0), authkey=b'AO4XPSTATS')
+        server = mgr.get_server()
+        host, port = server.address
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        log.info(f"StatsManager listening on {host}:{port}")
+        return server, host, port
+
+    def launch_macfuse_worker(
+            self, root: str,
+            mountpoint: str,
+            volname: str,
+            nothreads: bool,
+            stats_addr=None,
+            stats_auth=None,
+            log_addr=None,
+    ) -> subprocess.Popen:
+        log.info(f"AutoOrtho:  root: {root}  mountpoint: {mountpoint}")
+
+        env = os.environ.copy()
+        if stats_addr:
+            env['AO_STATS_ADDR'] = stats_addr
+            env['AO_STATS_AUTH'] = stats_auth.decode('utf-8')
+
+        if log_addr:
+            env['AO_LOG_ADDR'] = log_addr
+
+        cmd = [sys.executable, os.path.abspath("autoortho/macfuse_worker.py"),
+            "--root", root, "--mountpoint", mountpoint, "--volname", volname]
+
+        if nothreads:
+            cmd.append("--nothreads")
+        p = subprocess.Popen(cmd, env=env)
+        log.info(f"FUSE process for mount {volname} started with pid: {p.pid}")
+        return p
+
+    def reporter(self):
+        while True:
+            time.sleep(10)
+            snap = self._shared_store.snapshot()
+            log.info(f"STATS: {snap}")
+
+    def start_reporter(self, interval_sec: float = 10.0):
+        """Start the periodic global-stats logger (macOS parent)."""
+        if self._reporter_thread and self._reporter_thread.is_alive():
+            return
+        self._reporter_stop.clear()
+
+        def _reporter_loop():
+            while not self._reporter_stop.wait(interval_sec):
+                try:
+                    snap = self._shared_store.snapshot()
+                    log.info("STATS: %s", snap)
+                except Exception as e:
+                    log.debug("reporter(): %s", e)
+
+        t = threading.Thread(target=_reporter_loop, name="AO-Reporter", daemon=True)
+        t.start()
+        self._reporter_thread = t
+
+    def stop_reporter(self, join_timeout: float = 3.0):
+        """Stop the periodic global-stats logger and join the thread."""
+        self._reporter_stop.set()
+        t = self._reporter_thread
+        if t and t.is_alive():
+            t.join(timeout=join_timeout)
+        self._reporter_thread = None
 
 
     def mount_sceneries(self, blocking=True):
@@ -297,8 +432,8 @@ class AOMount:
 
                 if system_type == "darwin": 
                     for p in self.mac_os_procs:
-                        if not p.poll() is not None:
-                            log.error(f"Mount thread {t.name or t.ident} died; failing all mounts.")
+                        if p.poll() is not None:   # process has exited
+                            log.error(f"FUSE process {p.pid} exited; failing all mounts.")
                             self.mounts_running = False
                             break
 
@@ -330,17 +465,36 @@ class AOMount:
             t.join(5)
             log.info(f"Thread {t.ident} exited.")
 
+        log.info("Send SIGINT to macOS processes...")
         for p in self.mac_os_procs:
             if p.poll() is None:
                 p.send_signal(signal.SIGINT)
+
+        log.info("Wait on macOS processes...")
         try:
             for p in self.mac_os_procs:
                 p.wait(timeout=10)
         except Exception:
             p.terminate()
 
-        log.info("Unmount complete")
+        log.info("Shutdown stats manager...")
+        if hasattr(self, "_stats_server"):
+            try:
+                self._stats_server.shutdown()
+            except Exception:
+                pass
 
+        log.info("Shutdown log server...")
+        if hasattr(self, "log_server"):
+            try:
+                self.log_server.shutdown()
+            except Exception:
+                pass
+
+        log.info("Stop reporter...")
+        self.stop_reporter()
+
+        log.info("Unmount complete")
 
     def domount(self, root, mountpoint, threading=True):
 
@@ -380,17 +534,11 @@ class AOMount:
                 # systemtype, libpath = macsetup.find_mac_libs()
                 systemtype = "macOS"
                 with setupmount(mountpoint, systemtype) as mount:
-                    log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
-                    cmd = [sys.executable, f"{os.path.abspath("autoortho/macfuse_worker.py")}",
-                            "--root", root,
-                            "--mountpoint", mount,
-                            "--volname",mount.split('/')[-1]]
-                    
-                    if nothreads:
-                        cmd.append("--nothreads")
-                    p = subprocess.Popen(cmd)
-                    self.mac_os_procs.append(p)
-                    log.info(f"FUSE process for mount {mount.split('/')[-1]} started with pid: {p.pid}")
+                    process = self.launch_macfuse_worker(
+                        root, mountpoint, mount.split('/')[-1], nothreads,
+                        self.stats_addr, self.stats_auth, self.log_addr
+                    )
+                    self.mac_os_procs.append(process)
             else:
                 # Linux
                 with setupmount(mountpoint, "Linux-FUSE") as mount:
@@ -508,8 +656,6 @@ def main():
         # Don't show cfgui
         run_headless = True
 
-    stats = aostats.AOStats()
-
 
     import flighttrack
     ftrack = threading.Thread(
@@ -519,15 +665,14 @@ def main():
 
     # Start helper threads
     ftrack.start()
-    stats.start()
 
     # Run things
     if args.root and args.mountpoint:
         # Just mount specific requested dirs
         root = args.root
         mountpoint = args.mountpoint
-        log.info("root:", root)
-        log.info("mountpoint:", mountpoint)
+        log.info("root: %s", root)
+        log.info("mountpoint: %s", mountpoint)
         aom = AOMount(CFG)
         aom.domount(
             root,
@@ -549,7 +694,6 @@ def main():
             cfgui = AOMountUI(CFG)
             cfgui.setup()
 
-    stats.stop()
     flighttrack.ft.stop()
 
     log.info("AutoOrtho exit.")
