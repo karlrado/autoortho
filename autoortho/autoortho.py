@@ -85,6 +85,16 @@ class LogServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
 
 
+_SERVER_STATS_STORE = None
+
+def _get_or_create_stats_store():
+    """Factory used by the StatsManager server process to expose a singleton store."""
+    global _SERVER_STATS_STORE
+    if _SERVER_STATS_STORE is None:
+        _SERVER_STATS_STORE = aostats.StatsStore()
+    return _SERVER_STATS_STORE
+
+
 @contextmanager
 def setupmount(mountpoint, systemtype):
     mountpoint = os.path.expanduser(mountpoint)
@@ -289,7 +299,7 @@ class AOMount:
         self.mount_threads = []
         self.mac_os_procs = []
 
-        StatsManager.register('get_store')
+        # Start shared stats manager and reporter/log servers
         self.start_stats_manager()
 
         self._reporter_stop = threading.Event()
@@ -306,6 +316,7 @@ class AOMount:
         t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
         self.log_server = server
+        self.log_thread = t
         self.log_host = host
         self.log_port = port
         self.log_addr = f"{self.log_host}:{self.log_port}"
@@ -313,23 +324,41 @@ class AOMount:
 
     def stop_log_server(self, join_timeout: float = 2.0):
         server = getattr(self, "log_server", None)
-        if server:
-            server.shutdown()
-        if server and server.is_alive():
-            server.join(timeout=join_timeout)
+        t = getattr(self, "log_thread", None)
+        try:
+            if server:
+                server.shutdown()
+        except Exception:
+            pass
+        if t and t.is_alive():
+            try:
+                t.join(timeout=join_timeout)
+            except Exception:
+                pass
         self.log_server = None
+        self.log_thread = None
         self.log_host = None
         self.log_port = None
         self.log_addr = None
         return
 
     def start_stats_manager(self, authkey: bytes = b'AO4XPSTATS'):
-        self._shared_store = aostats.StatsStore()
+        # Register the store exposure BEFORE starting the manager so the server
+        # process exports a singleton StatsStore with the required API.
+        StatsManager.register(
+            'get_store',
+            callable=_get_or_create_stats_store,
+            exposed=['inc', 'inc_many', 'set', 'get', 'delete', 'keys', 'snapshot']
+        )
 
         mgr = StatsManager(address=('127.0.0.1', 0), authkey=authkey)
         mgr.start()
-        StatsManager.register('get_store', callable=lambda: self._shared_store)
-        aostats.bind_local_store(self._shared_store)
+
+        # Obtain a proxy to the server-owned store and bind helpers to it so
+        # that all stats updates/readouts go through the shared store.
+        store_proxy = mgr.get_store()
+        aostats.bind_local_store(store_proxy)
+        self._shared_store = store_proxy
         host, port = mgr.address
         log.info(f"StatsManager listening on {host}:{port}")
         self.stats_manager = mgr
@@ -422,8 +451,137 @@ class AOMount:
         def _reporter_loop():
             while not self._reporter_stop.wait(interval_sec):
                 try:
+                    # Update this process's own memory heartbeat so it's counted
+                    try:
+                        aostats.update_process_memory_stat()
+                    except Exception:
+                        pass
+
+                    # Aggregate RSS across all live processes reporting into the shared store
+                    total_rss = 0
+                    proc_count = 0
+                    now_ts = int(time.time())
+                    try:
+                        keys = self._shared_store.keys()
+                        for k in keys:
+                            if isinstance(k, str) and k.startswith('proc_mem_rss_bytes:'):
+                                pid = k.split(':', 1)[1]
+                                # Liveness check: heartbeat within last 45 seconds
+                                alive_ts = self._shared_store.get(f'proc_alive_ts:{pid}', 0)
+                                if isinstance(alive_ts, (int, float)):
+                                    alive_ok = (now_ts - int(alive_ts)) <= 45
+                                else:
+                                    alive_ok = False
+                                if not alive_ok:
+                                    # Clean stale entries
+                                    try:
+                                        self._shared_store.delete(k)
+                                        self._shared_store.delete(f'proc_alive_ts:{pid}')
+                                    except Exception:
+                                        pass
+                                    continue
+                                try:
+                                    val = int(self._shared_store.get(k, 0) or 0)
+                                except Exception:
+                                    val = 0
+                                if val > 0:
+                                    total_rss += val
+                                    proc_count += 1
+                        try:
+                            # 'proc_count' is not required externally; only publish cur_mem_mb
+                            self._shared_store.set('cur_mem_mb', total_rss // 1048576)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                    # Aggregate mm and partial-mm counters into averages and counts
+                    try:
+                        keys = self._shared_store.keys()
+                        mm_counts = {}
+                        mm_averages = {}
+                        p_counts = {}
+                        p_averages = {}
+                        for k in keys:
+                            if not isinstance(k, str):
+                                continue
+                            if k.startswith('mm_count:'):
+                                try:
+                                    mm = int(k.split(':', 1)[1])
+                                except Exception:
+                                    continue
+                                cnt = int(self._shared_store.get(k, 0) or 0)
+                                tot = int(self._shared_store.get(f'mm_time_total_ms:{mm}', 0) or 0)
+                                if cnt > 0:
+                                    mm_counts[mm] = cnt
+                                    mm_averages[mm] = round(tot / cnt / 1000.0, 3)
+                            elif k.startswith('partial_mm_count:'):
+                                try:
+                                    mm = int(k.split(':', 1)[1])
+                                except Exception:
+                                    continue
+                                cnt = int(self._shared_store.get(k, 0) or 0)
+                                tot = int(self._shared_store.get(f'partial_mm_time_total_ms:{mm}', 0) or 0)
+                                if cnt > 0:
+                                    p_counts[mm] = cnt
+                                    p_averages[mm] = round(tot / cnt / 1000.0, 3)
+                        # Publish aggregated views only when non-empty; otherwise remove
+                        try:
+                            if mm_counts:
+                                self._shared_store.set('mm_counts', mm_counts)
+                                self._shared_store.set('mm_averages', mm_averages)
+                            else:
+                                try:
+                                    self._shared_store.delete('mm_counts')
+                                    self._shared_store.delete('mm_averages')
+                                except Exception:
+                                    pass
+
+                            if p_counts:
+                                self._shared_store.set('partial_mm_counts', p_counts)
+                                self._shared_store.set('partial_mm_averages', p_averages)
+                            else:
+                                try:
+                                    self._shared_store.delete('partial_mm_counts')
+                                    self._shared_store.delete('partial_mm_averages')
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
                     snap = self._shared_store.snapshot()
-                    log.info("STATS: %s", snap)
+                    # Hide internal per-process and batching keys from logs
+                    try:
+                        def _is_internal(k):
+                            return (
+                                (isinstance(k, str) and (
+                                    k.startswith('proc_mem_rss_bytes') or
+                                    k.startswith('proc_alive_ts') or
+                                    k.startswith('mm_count:') or
+                                    k.startswith('mm_time_total_ms:') or
+                                    k.startswith('partial_mm_count:') or
+                                    k.startswith('partial_mm_time_total_ms:')
+                                )) or k in ('proc_count',)
+                            )
+                        filtered = {k: v for k, v in snap.items() if not _is_internal(k)}
+                    except Exception:
+                        filtered = snap
+
+                    # Ensure nested dicts are logged with numerically sorted keys
+                    try:
+                        for _name in ('mm_counts', 'mm_averages', 'partial_mm_counts', 'partial_mm_averages'):
+                            _val = filtered.get(_name)
+                            if isinstance(_val, dict) and _val:
+                                try:
+                                    sorted_items = sorted(_val.items(), key=lambda kv: int(kv[0]))
+                                except Exception:
+                                    sorted_items = sorted(_val.items(), key=lambda kv: kv[0])
+                                filtered[_name] = {k: v for k, v in sorted_items}
+                    except Exception:
+                        pass
+                    log.info("STATS: %s", filtered)
                 except Exception as e:
                     log.debug("reporter(): %s", e)
 
@@ -522,7 +680,8 @@ class AOMount:
             t.join(5)
             log.info(f"Thread {t.ident} exited.")
 
-        self.stop_macfuse_workers()
+        if system_type == "darwin":
+            self.stop_macfuse_workers()
 
         self.stop_stats_manager()
 

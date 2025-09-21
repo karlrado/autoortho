@@ -16,6 +16,7 @@ from packaging import version
 import utils.resources_rc
 from utils.constants import MAPTYPES, system_type
 from utils.mappers import map_kubilus_region_to_simheaven_region
+from utils.dsf_utils import DsfUtils, dsf_utils
 from utils.mount_utils import cleanup_mountpoint
 
 from PySide6.QtWidgets import (
@@ -23,7 +24,7 @@ from PySide6.QtWidgets import (
     QTabWidget, QPushButton, QLabel, QLineEdit, QCheckBox, QComboBox,
     QSlider, QTextEdit, QFileDialog, QMessageBox, QScrollArea,
     QSplashScreen, QGroupBox, QProgressBar, QStatusBar, QFrame, QSpinBox,
-    QColorDialog
+    QColorDialog, QRadioButton
 )
 from PySide6.QtCore import (
     Qt, QThread, Signal, QTimer, QSize
@@ -112,6 +113,58 @@ class UpdateCheckWorker(QThread):
             self.result.emit((tag, html_url))
         except Exception as err:
             self.error.emit(str(err))
+
+class AddSeasonsWorker(QThread):
+    """Worker thread for adding seasons"""
+    finished = Signal(str, bool)  # region_id, success
+    error = Signal(str, str)  # region_id, error_message
+    progress = Signal(str, dict)  # region_id, progress_data
+
+    def __init__(self, scenery_name: str, scenery_path: str):
+        super().__init__()
+        self.scenery_name = scenery_name
+        self.scenery_path = os.path.join(scenery_path, "z_autoortho", "scenery", self.scenery_name)
+
+    def run(self):
+        """Run the worker thread"""
+        try:
+            log.info(f"Adding seasons to {self.scenery_name}")
+            def progress_callback(progress_data):
+                self.progress.emit(self.scenery_name, progress_data)
+
+            success = dsf_utils.add_seasons_to_package(self.scenery_name, progress_callback=progress_callback)
+
+            log.info(f"Finished adding seasons to {self.scenery_name}")
+            self.progress.emit(self.scenery_name, {"stage": "finished"})
+            self.finished.emit(self.scenery_name, success)
+        except Exception as err:
+            tb = traceback.format_exc()
+            log.error(tb)
+            self.error.emit(self.scenery_name, str(err))
+
+
+class RestoreDefaultDsfsWorker(QThread):
+    """Worker thread for restoring default DSFs"""
+    finished = Signal(str, bool)  # region_id, success
+    error = Signal(str, str)  # region_id, error_message
+    progress = Signal(str, dict)  # region_id, progress_data
+    
+    def __init__(self, dl_manager, region_id):
+        super().__init__()
+        self.dl_manager = dl_manager
+        self.region_id = region_id
+    
+    def run(self):
+        try:
+            def progress_callback(progress_data):
+                self.progress.emit(self.region_id, progress_data)
+
+            success = dsf_utils.restore_default_dsfs(self.region_id, progress_callback=progress_callback)
+            self.finished.emit(self.region_id, success)
+        except Exception as err:
+            tb = traceback.format_exc()
+            self.error.emit(self.region_id, str(err))
+            log.error(tb)
 
 class StyledButton(QPushButton):
     """Custom styled button with hover effects"""
@@ -271,6 +324,10 @@ class ConfigUI(QMainWindow):
         self.download_workers = {}
         self.download_progress = {}
         self.uninstall_workers = {}
+        self.add_seasons_workers = {}
+        self.add_seasons_queue = []  # queue of region_id/package_name waiting to run add seasons
+        self.add_seasons_current = None  # currently processing region_id/package_name
+        self.restore_default_dsfs_workers = {}
         self.simheaven_config_changed_session = False
         self.installed_packages = []
         self.cache_thread = None
@@ -1039,6 +1096,133 @@ class ConfigUI(QMainWindow):
 
         self.settings_layout.addWidget(autoortho_group)
 
+        # Seasons Settings group
+        seasons_group = QGroupBox("Seasons")
+        seasons_layout = QVBoxLayout()
+        seasons_group.setLayout(seasons_layout)
+
+        # Enable/Disable controls
+        seasons_toggle_layout = QHBoxLayout()
+        self.seasons_enabled_radio = QRadioButton("Enabled")
+        self.seasons_disabled_radio = QRadioButton("Disabled")
+        seasons_enabled = bool(self.cfg.seasons.enabled)
+        self.seasons_enabled_radio.setChecked(seasons_enabled)
+        self.seasons_disabled_radio.setChecked(not seasons_enabled)
+        self.seasons_enabled_radio.toggled.connect(self.on_seasons_enabled_toggled)
+        self.seasons_disabled_radio.toggled.connect(self.on_seasons_enabled_toggled)
+        seasons_toggle_layout.addWidget(self.seasons_enabled_radio)
+        seasons_toggle_layout.addWidget(self.seasons_disabled_radio)
+        seasons_toggle_layout.addStretch()
+        seasons_layout.addLayout(seasons_toggle_layout)
+
+        # Spring saturation
+        spr_row = QHBoxLayout()
+        spr_label = QLabel("Spring Saturation")
+        self.spr_sat_slider = ModernSlider()
+        self.spr_sat_slider.setRange(0, 100)
+        self.spr_sat_slider.setSingleStep(5)
+        spr_val = int(float(self.cfg.seasons.spr_saturation))
+        self.spr_sat_slider.setValue(spr_val)
+        self.spr_sat_slider.setObjectName('spr_saturation')
+        self.spr_sat_value_label = QLabel(f"{spr_val}%")
+        self.spr_sat_slider.valueChanged.connect(
+            lambda v: self.spr_sat_value_label.setText(f"{v}%")
+        )
+        spr_row.addWidget(spr_label)
+        spr_row.addWidget(self.spr_sat_slider)
+        spr_row.addWidget(self.spr_sat_value_label)
+        seasons_layout.addLayout(spr_row)
+
+        # Summer saturation
+        sum_row = QHBoxLayout()
+        sum_label = QLabel("Summer Saturation")
+        self.sum_sat_slider = ModernSlider()
+        self.sum_sat_slider.setRange(0, 100)
+        self.sum_sat_slider.setSingleStep(5)
+        sum_val = int(float(self.cfg.seasons.sum_saturation))
+        self.sum_sat_slider.setValue(sum_val)
+        self.sum_sat_slider.setObjectName('sum_saturation')
+        self.sum_sat_value_label = QLabel(f"{sum_val}%")
+        self.sum_sat_slider.valueChanged.connect(
+            lambda v: self.sum_sat_value_label.setText(f"{v}%")
+        )
+        sum_row.addWidget(sum_label)
+        sum_row.addWidget(self.sum_sat_slider)
+        sum_row.addWidget(self.sum_sat_value_label)
+        seasons_layout.addLayout(sum_row)
+
+        # Fall saturation
+        fal_row = QHBoxLayout()
+        fal_label = QLabel("Fall Saturation")
+        self.fal_sat_slider = ModernSlider()
+        self.fal_sat_slider.setRange(0, 100)
+        self.fal_sat_slider.setSingleStep(5)
+        fal_val = int(float(self.cfg.seasons.fal_saturation))
+        self.fal_sat_slider.setValue(fal_val)
+        self.fal_sat_slider.setObjectName('fal_saturation')
+        self.fal_sat_value_label = QLabel(f"{fal_val}%")
+        self.fal_sat_slider.valueChanged.connect(
+            lambda v: self.fal_sat_value_label.setText(f"{v}%")
+        )
+        fal_row.addWidget(fal_label)
+        fal_row.addWidget(self.fal_sat_slider)
+        fal_row.addWidget(self.fal_sat_value_label)
+        seasons_layout.addLayout(fal_row)
+
+        # Winter saturation
+        win_row = QHBoxLayout()
+        win_label = QLabel("Winter Saturation")
+        self.win_sat_slider = ModernSlider()
+        self.win_sat_slider.setRange(0, 100)
+        self.win_sat_slider.setSingleStep(5)
+        win_val = int(float(self.cfg.seasons.win_saturation))
+        self.win_sat_slider.setValue(win_val)
+        self.win_sat_slider.setObjectName('win_saturation')
+        self.win_sat_value_label = QLabel(f"{win_val}%")
+        self.win_sat_slider.valueChanged.connect(
+            lambda v: self.win_sat_value_label.setText(f"{v}%")
+        )
+        win_row.addWidget(win_label)
+        win_row.addWidget(self.win_sat_slider)
+        win_row.addWidget(self.win_sat_value_label)
+        seasons_layout.addLayout(win_row)
+
+        # Seasons convert workers
+        seasons_convert_workers_row = QHBoxLayout()
+        seasons_convert_workers_label = QLabel("DSF Seasons convert workers:")
+        self.seasons_convert_workers_slider = ModernSlider()
+        self.seasons_convert_workers_slider.setRange(1, os.cpu_count())
+        self.seasons_convert_workers_slider.setValue(int(self.cfg.seasons.seasons_convert_workers))
+        self.seasons_convert_workers_slider.setObjectName('seasons_convert_workers')
+        self.seasons_convert_workers_slider.setToolTip(
+            "Number of workers to use for converting DSF to XP12 native seasons format.\n"
+            "More workers = faster conversion but higher CPU and RAM usage.\n"
+            "Recommended: 4 and work your way up from there depending on your system."
+        )
+        self.seasons_convert_workers_value_label = QLabel(f"{self.cfg.seasons.seasons_convert_workers} workers")
+        self.seasons_convert_workers_slider.valueChanged.connect(
+            lambda v: self.seasons_convert_workers_value_label.setText(f"{v} workers")
+        )
+        seasons_convert_workers_row.addWidget(seasons_convert_workers_label)
+        seasons_convert_workers_row.addWidget(self.seasons_convert_workers_slider)
+        seasons_convert_workers_row.addWidget(self.seasons_convert_workers_value_label)
+        seasons_layout.addLayout(seasons_convert_workers_row)
+
+        # Compress DSF
+
+        compress_dsf_row = QHBoxLayout()
+        self.compress_dsf_check = QCheckBox("Compress DSF after conversion")
+        self.compress_dsf_check.setChecked(self.cfg.seasons.compress_dsf)
+        self.compress_dsf_check.setObjectName('compress_dsf')
+        self.compress_dsf_check.setToolTip("Compress DSF to 7z format after conversion to XP12 format")
+        compress_dsf_row.addWidget(self.compress_dsf_check)
+        seasons_layout.addLayout(compress_dsf_row)
+
+        # Initialize enabled state of sliders
+        self._set_seasons_controls_enabled(seasons_enabled)
+
+        self.settings_layout.addWidget(seasons_group)
+
         # DDS Compression Settings group
         dds_group = QGroupBox("DDS Compression Settings")
         dds_layout = QVBoxLayout()
@@ -1274,6 +1458,28 @@ class ConfigUI(QMainWindow):
         self.missing_color = QColor(66, 77, 55)
         self.update_missing_color_button()
 
+    def on_seasons_enabled_toggled(self):
+        try:
+            enabled = self.seasons_enabled_radio.isChecked()
+            self._set_seasons_controls_enabled(enabled)
+        except Exception:
+            pass
+
+    def _set_seasons_controls_enabled(self, enabled):
+        try:
+            for slider in (
+                getattr(self, 'spr_sat_slider', None),
+                getattr(self, 'sum_sat_slider', None),
+                getattr(self, 'fal_sat_slider', None),
+                getattr(self, 'win_sat_slider', None),
+            ):
+                if slider is not None:
+                    slider.setEnabled(enabled)
+            if self.compress_dsf_check is not None:
+                self.compress_dsf_check.setEnabled(enabled)
+        except Exception:
+            pass
+
     def refresh_scenery_list(self):
         """Refresh the scenery list display"""
         # Clear existing widgets
@@ -1363,6 +1569,7 @@ class ConfigUI(QMainWindow):
                     )
                 )
                 item_layout.addWidget(install_btn)
+
             else:
                 status_label = QLabel("✓ Up to date")
                 status_label.setStyleSheet("color: #4CAF50;")
@@ -1389,11 +1596,118 @@ class ConfigUI(QMainWindow):
                         self.on_delete_scenery(rid)
                     )
                 )
-                item_layout.addWidget(delete_btn)
+                seasons_apply_status = latest.seasons_apply_status
+                if seasons_apply_status == downloader.SeasonsApplyStatus.NOT_APPLIED:
+                    add_seasons_btn_text = "Add Native Seasons"
+                    add_seasons_btn_color = "#2d78ba"
+                elif seasons_apply_status == downloader.SeasonsApplyStatus.PARTIALLY_APPLIED:
+                    add_seasons_btn_text = "Partially Added Seasons"
+                    add_seasons_btn_color = "#db7100"
+                elif seasons_apply_status == downloader.SeasonsApplyStatus.APPLIED:
+                    add_seasons_btn_text = "Seasons Added"
+                    add_seasons_btn_color = "#4CAF50"
+                else:
+                    add_seasons_btn_text = "Add Native Seasons"
+                    add_seasons_btn_color = "#2d78ba"
+                add_seasons_btn = StyledButton(add_seasons_btn_text, primary=False)
+                add_seasons_btn.setFixedSize(200,35)
+                add_seasons_btn.setStyleSheet(
+                    f"""
+                    background-color: {add_seasons_btn_color};
+                    font-size: 16px;
+                    font-weight: bold;
+                    text-align: center;
+                    line-height: 30px;
+                    """
+                )
+                package_name = os.path.basename(latest.subfolder_dir)
+                add_seasons_btn.setObjectName(f"add-seasons-{package_name}")
+                add_seasons_btn.clicked.connect(
+                    lambda checked, rid=package_name: (
+                        self.on_add_seasons(rid, seasons_apply_status)
+                    )
+                )
+                restore_btn = None
+                if seasons_apply_status != downloader.SeasonsApplyStatus.NOT_APPLIED:
+                    restore_btn = StyledButton("Restore Default DSFs", primary=False)
+                    restore_btn.setFixedSize(200,35)
+                    restore_btn.setStyleSheet(
+                        f"""
+                        background-color: #2d78ba;
+                        font-size: 16px;
+                        font-weight: bold;
+                        text-align: center;
+                        line-height: 30px;
+                        """
+                    )
+                    restore_btn.setObjectName(f"restore-dsfs-{package_name}")
+                    restore_btn.clicked.connect(
+                        lambda checked, rid=package_name: (
+                            self.on_restore_default_dsfs(rid)
+                        )
+                    )                # add a horizontal layout
+                h_layout = QHBoxLayout()
+                h_layout.addWidget(add_seasons_btn)
+                if restore_btn:
+                    h_layout.addWidget(restore_btn)
+                h_layout.addWidget(delete_btn)
+
+                dsf_progress_bar = QProgressBar()
+                dsf_progress_bar.setVisible(False)
+                dsf_progress_bar.setObjectName(f"dsf-progress-bar-{package_name}")
+                dsf_progress_bar.setToolTip("Progress of adding seasons to DSFs")
+                dsf_progress_bar.setRange(0, 100)
+
+                item_layout.addLayout(h_layout)
+                item_layout.addWidget(dsf_progress_bar)
+
 
             self.scenery_layout.addWidget(item_frame)
 
         self.scenery_layout.addStretch()
+
+    def on_restore_default_dsfs(self, region_id):
+        """Handle restoring default DSFs"""
+        button = self.findChild(QPushButton, f"restore-dsfs-{region_id}")
+        if button:
+            button.setEnabled(False)
+            button.setText("Restoring default DSFs...")
+
+        dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
+        if dsf_progress_bar:
+            dsf_progress_bar.setVisible(True)
+
+        # Create worker thread
+        worker = RestoreDefaultDsfsWorker(self.dl, region_id)
+        worker.finished.connect(self.on_restore_default_dsfs_finished)
+        worker.error.connect(self.on_restore_default_dsfs_error)
+        worker.progress.connect(self.on_restore_default_dsfs_progress)
+        # Keep a strong reference so the thread isn't GC'd while running
+        worker.setParent(self)
+        self.restore_default_dsfs_workers[region_id] = worker
+        worker.start()
+
+    def on_restore_default_dsfs_error(self, region_id, error_msg):
+        """Handle restore default DSFs error"""
+        self.show_error.emit(f"Failed to restore default DSFs to {region_id}:\n{error_msg}")
+        self.on_restore_default_dsfs_finished(region_id, False)
+
+    def on_restore_default_dsfs_finished(self, region_id, success):
+        """Handle restore default DSFs completion"""
+        button = self.findChild(QPushButton, f"restore-dsfs-{region_id}")
+        if button:
+            button.setEnabled(True)
+            button.setText("Restore Default DSFs")
+        dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
+        if dsf_progress_bar:
+            dsf_progress_bar.setVisible(False)
+        self.refresh_scenery_list()
+
+    def on_restore_default_dsfs_progress(self, region_id, progress_data):
+        """Update restore default DSFs progress"""
+        dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
+        if dsf_progress_bar:
+            dsf_progress_bar.setValue(progress_data["pcnt_done"])
 
     def on_delete_scenery(self, region_id):
         """Handle scenery deletion"""
@@ -1483,6 +1797,27 @@ class ConfigUI(QMainWindow):
 
     def on_run(self):
         """Handle Run button click"""
+        # Block run while seasons are being added
+        try:
+            if getattr(self, 'add_seasons_workers', None) and len(self.add_seasons_workers) > 0:
+                QMessageBox.warning(
+                    self,
+                    "Seasons In Progress",
+                    "Cannot Run while Native Seasons are being added. Please wait for the seasons operation to finish."
+                )
+                self.update_status_bar("Run blocked: adding seasons in progress")
+                return
+        except Exception:
+            pass
+        # Disable Add Seasons buttons while running
+        try:
+            for rid in self.installed_packages:
+                btn = self.findChild(QPushButton, f"add-seasons-{rid}")
+                if btn:
+                    btn.setEnabled(False)
+                    btn.setToolTip("Disabled while AutoOrtho is running")
+        except Exception:
+            pass
         self.save_config()
         self.cfg.load()
         # Preflight check: prompt to unmount previous mounts if detected
@@ -1637,6 +1972,212 @@ class ConfigUI(QMainWindow):
         self.download_workers[region_id] = worker
         worker.start()
 
+    def on_add_seasons(self, region_id, seasons_status: downloader.SeasonsApplyStatus):
+        """Handle adding seasons"""
+
+        # Block if AutoOrtho is running
+        if getattr(self, 'running', False):
+            QMessageBox.warning(
+                self,
+                "Operation Not Allowed While Running",
+                "Cannot add Native Seasons while AutoOrtho is running. Please stop AutoOrtho first."
+            )
+            return
+
+        if seasons_status == downloader.SeasonsApplyStatus.APPLIED:
+            QMessageBox.information(
+                self,
+                "Seasons Already Added",
+                "Native Seasons are already added to this scenery. Nothing to do."
+            )
+            return
+
+        elif seasons_status == downloader.SeasonsApplyStatus.PARTIALLY_APPLIED:
+            reply = QMessageBox.question(
+                self,
+                "Partially Added Seasons",
+                "Native Seasons are partially added to this scenery. This will try to add seasons to the remaining DSFs. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.No:
+                return
+        button = self.findChild(QPushButton, f"add-seasons-{region_id}")
+        if button is None:
+            return
+
+        # If something is already processing, enqueue this request
+        if self.add_seasons_current is not None:
+            # Avoid duplicates in queue
+            if region_id not in self.add_seasons_queue:
+                self.add_seasons_queue.append(region_id)
+                try:
+                    button.setEnabled(False)
+                    button.setText("Queued for seasons…")
+                except Exception:
+                    pass
+            return
+
+        # Nothing processing; start immediately
+        self._start_add_seasons_job(region_id)
+
+    def on_add_seasons_error(self, region_id, error_msg):
+        """Handle add seasons error"""
+        self.show_error.emit(f"Failed to add seasons to {region_id}:\n{error_msg}")
+        # Ensure current is cleared so queue can progress
+        try:
+            if self.add_seasons_current == region_id:
+                self.add_seasons_current = None
+        except Exception:
+            pass
+        self.on_add_seasons_finished(region_id, False)
+
+    def on_add_seasons_finished(self, region_id, success):
+        """Handle add seasons completion"""
+        button = self.findChild(QPushButton, f"add-seasons-{region_id}")
+        if button:
+            button.setEnabled(not self.running)
+            button.setText("Add Native Seasons")
+
+        if success:
+            self.update_status_bar(f"Successfully added seasons to {region_id}")
+            button.setText("Native Seasons Added")
+        else:
+            self.update_status_bar(f"Failed to add seasons to {region_id}")
+            button.setText("Add Native Seasons")
+
+        dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
+        if dsf_progress_bar:
+            dsf_progress_bar.setVisible(False)
+
+        # Clean up worker
+        if region_id in self.add_seasons_workers:
+            try:
+                self.add_seasons_workers[region_id].wait()
+            except Exception:
+                pass
+            del self.add_seasons_workers[region_id]
+        # Clear current and process next in queue
+        if self.add_seasons_current == region_id:
+            self.add_seasons_current = None
+        self._update_run_button_for_seasons_state()
+        # Start next queued seasons job if any
+        self._dequeue_and_start_next_seasons_job()
+        self.refresh_scenery_list()
+
+    def _has_active_seasons_jobs(self):
+        try:
+            return (self.add_seasons_current is not None) or (len(self.add_seasons_workers) > 0)
+        except Exception:
+            return False
+
+    def _update_run_button_for_seasons_state(self):
+        """Disable Run while seasons jobs are active; re-enable otherwise when not running"""
+        try:
+            if self._has_active_seasons_jobs():
+                if hasattr(self, 'run_button'):
+                    self.run_button.setEnabled(False)
+                    self.run_button.setToolTip("Disabled: Native Seasons are being added")
+            else:
+                if hasattr(self, 'run_button') and not self.running:
+                    self.run_button.setEnabled(True)
+                    self.run_button.setToolTip("")
+                    try:
+                        self.run_button.setText("Run")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _start_add_seasons_job(self, region_id):
+        """Internal helper to begin processing a single add-seasons job for region_id."""
+        try:
+            button = self.findChild(QPushButton, f"add-seasons-{region_id}")
+            if button:
+                button.setEnabled(False)
+                button.setText("Adding seasons...")
+
+            dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
+            if dsf_progress_bar:
+                dsf_progress_bar.setVisible(True)
+                dsf_progress_bar.setRange(0, 100)
+                dsf_progress_bar.setValue(0)
+
+            # Create worker thread
+            worker = AddSeasonsWorker(region_id, self.cfg.paths.scenery_path)
+            worker.progress.connect(self.on_add_seasons_progress)
+            worker.finished.connect(self.on_add_seasons_finished)
+            worker.error.connect(self.on_add_seasons_error)
+            # Keep a strong reference so the thread isn't GC'd while running
+            self.add_seasons_workers[region_id] = worker
+            worker.setParent(self)
+            self.add_seasons_current = region_id
+            worker.start()
+            # Disable Run while any seasons job is active
+            self._update_run_button_for_seasons_state()
+        except Exception:
+            pass
+
+    def _dequeue_and_start_next_seasons_job(self):
+        try:
+            if self.add_seasons_current is None and self.add_seasons_queue:
+                next_region_id = self.add_seasons_queue.pop(0)
+                # Start next job and update its button
+                self._start_add_seasons_job(next_region_id)
+            else:
+                # If nothing pending, re-enable all add seasons buttons
+                if not self._has_active_seasons_jobs():
+                    for rid in self.installed_packages:
+                        btn = self.findChild(QPushButton, f"add-seasons-{rid}")
+                        if btn:
+                            btn.setEnabled(True)
+                            # Don't override custom label from refresh_scenery_list; leave as-is
+        except Exception:
+            pass
+
+    def on_add_seasons_progress(self, region_id, progress_data):
+        """Handle add seasons progress"""
+
+        dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
+        if dsf_progress_bar:
+            dsf_progress_bar.setVisible(True)
+            # Always use 0-100 range to match percent value
+            try:
+                dsf_progress_bar.setRange(0, 100)
+                pcnt = int(progress_data.get('pcnt_done', 0))
+                dsf_progress_bar.setValue(pcnt)
+                files_done = progress_data.get('files_done')
+                files_total = progress_data.get('files_total')
+                if files_done is not None and files_total:
+                    dsf_progress_bar.setFormat(f"{files_done}/{files_total}")
+                else:
+                    dsf_progress_bar.setFormat("%p%")
+            except Exception:
+                # Be resilient to unexpected payloads
+                dsf_progress_bar.setRange(0, 100)
+                dsf_progress_bar.setValue(0)
+                dsf_progress_bar.setFormat("%p%")
+
+        # While one is processing, show other packages as queued if they are in queue
+        try:
+            if self.add_seasons_queue:
+                for rid in self.installed_packages:
+                    if rid == self.add_seasons_current:
+                        continue
+                    btn = self.findChild(QPushButton, f"add-seasons-{rid}")
+                    if not btn:
+                        continue
+                    if rid in self.add_seasons_queue:
+                        btn.setEnabled(False)
+                        btn.setText("Queued for seasons…")
+                    else:
+                        # If not queued and not current, ensure enabled state only if nothing running
+                        if not self._has_active_seasons_jobs():
+                            btn.setEnabled(True)
+        except Exception:
+            pass
+
+
     def on_uninstall_error(self, region_id, error_msg):
         """Handle uninstall error"""
         self.show_error.emit(f"Failed to uninstall {region_id}:\n{error_msg}")
@@ -1666,7 +2207,21 @@ class ConfigUI(QMainWindow):
             del self.uninstall_workers[region_id]
         if region_id in self.download_workers:
             del self.download_workers[region_id]
+        if region_id in self.add_seasons_workers:
+            try:
+                self.add_seasons_workers[region_id].wait()
+                self.add_seasons_workers[region_id].deleteLater()
+            except Exception:
+                pass
+            del self.add_seasons_workers[region_id]
 
+        if region_id in self.restore_default_dsfs_workers:
+            try:
+                self.restore_default_dsfs_workers[region_id].wait()
+                self.restore_default_dsfs_workers[region_id].deleteLater()
+            except Exception:
+                pass
+            del self.restore_default_dsfs_workers[region_id]
 
     def on_download_progress(self, region_id, progress_data):
         """Update download progress"""
@@ -1838,6 +2393,15 @@ class ConfigUI(QMainWindow):
             self.cfg.flightdata.xplane_udp_port = str(
                 self.xplane_udp_port_edit.text()
             )
+
+            # Seasons settings
+            self.cfg.seasons.enabled = self.seasons_enabled_radio.isChecked()
+            self.cfg.seasons.compress_dsf = self.compress_dsf_check.isChecked()
+            self.cfg.seasons.seasons_convert_workers = str(self.seasons_convert_workers_slider.value())
+            self.cfg.seasons.spr_saturation = str(self.spr_sat_slider.value())
+            self.cfg.seasons.sum_saturation = str(self.sum_sat_slider.value())
+            self.cfg.seasons.fal_saturation = str(self.fal_sat_slider.value())
+            self.cfg.seasons.win_saturation = str(self.win_sat_slider.value())
 
         self.cfg.save()
         self.ready.set()
