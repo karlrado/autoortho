@@ -55,7 +55,7 @@ def configure_worker_logging(mount_name):
 
     # Fallback: local console logging
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format='[WORKER %(process)d][%(mount)s]: %(message)s',
         stream=sys.stdout
     )
