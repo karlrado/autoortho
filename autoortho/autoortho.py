@@ -401,16 +401,22 @@ class AOMount:
 
         if log_addr:
             env['AO_LOG_ADDR'] = log_addr
-        # When packaged as a macOS app (Nuitka), there is no standalone
-        # macfuse_worker.py on disk. Invoke the app's __main__ with a special
-        # dispatch flag. In source/dev mode, use -m autoortho to hit __main__.
-        is_packaged = bool(getattr(sys, 'frozen', False) or os.environ.get('NUITKA_ONEFILE_PARENT'))
-        if is_packaged:
-            cmd = [sys.executable, "--macfuse-worker",
+
+        # Decide how to launch the worker depending on packaged vs dev mode
+        # In dev mode, invoke the worker module with the current Python
+        # In packaged app mode, re-exec the current app binary with a special flag
+        worker_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "macfuse_worker.py"))
+        packaged_exec = sys.argv[0]
+        is_dev_mode = os.path.exists(worker_py)
+
+        if is_dev_mode:
+            cmd = [sys.executable, worker_py,
                    "--root", root, "--mountpoint", mountpoint, "--volname", volname]
         else:
-            cmd = [sys.executable, "-m", "autoortho", "--macfuse-worker",
+            # Packaged: call the same app binary with worker dispatch flag
+            cmd = [packaged_exec, "--macfuse-worker",
                    "--root", root, "--mountpoint", mountpoint, "--volname", volname]
+        log.info(f"Launching macFUSE worker: {' '.join(cmd)}")
 
         if nothreads:
             cmd.append("--nothreads")

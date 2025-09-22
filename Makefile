@@ -52,6 +52,7 @@ __main__.app: autoortho/.version
 		--macos-app-name=AutoOrtho \
 		--macos-app-icon=autoortho/imgs/ao-icon.icns \
 		--enable-plugin=pyside6 \
+		--include-module=autoortho.macfuse_worker \
 		--include-data-file=autoortho/.version=autoortho/.version \
 		--include-data-file=./autoortho/templates/*.html=templates/ \
 		--user-package-configuration-file=nuitka-package.config.yml \
