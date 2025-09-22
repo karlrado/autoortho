@@ -14,6 +14,10 @@
         relative_path: 'lib/macos/7zip'
         prefixes: ['7zz']
         when: 'macos'
+    - from_filenames:
+        relative_path: 'lib/macos'
+        prefixes: ['DSFTool']
+        when: 'macos'
 
     - from_filenames:
         relative_path: 'lib/linux'
@@ -28,6 +32,10 @@
     - from_filenames:
         relative_path: 'lib/linux/7zip'
         prefixes: ['7zz']
+        when: 'linux'
+    - from_filenames:
+        relative_path: 'lib/linux'
+        prefixes: ['DSFTool']
         when: 'linux'
 
     - from_filenames:
@@ -44,4 +52,9 @@
         relative_path: 'lib/windows/7zip'
         prefixes: ['7za', '7zxa']
         suffixes: ['exe', 'dll']
+        when: 'win32'
+    - from_filenames:
+        relative_path: 'lib/windows'
+        prefixes: ['DSFTool']
+        suffixes: ['exe']
         when: 'win32'
