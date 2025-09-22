@@ -390,7 +390,7 @@ class DsfUtils:
         if os.path.exists(scenery_info_json):
             with open(scenery_info_json, "r") as file:
                 scenery_info = json.load(file)
-                dsf_folder_files = scenery_info.get("dsf_folder_files", {})
+                processed_dsf_seasons = scenery_info.get("processed_dsf_seasons", {})
         else:
             log.error(f"Scenery info json does not exist for {scenery_name}")
             return False
@@ -400,7 +400,7 @@ class DsfUtils:
         if progress_callback:
             progress_callback({"pcnt_done": 0, "status": "Restoring default DSFs...", "files_done": files_done, "files_total": total_dsfs})
 
-        for dsf_folder, dsf_files in dsf_folder_files.items():
+        for dsf_folder, dsf_files in processed_dsf_seasons.items():
             for dsf_file in dsf_files:
                 folder_backup_path = os.path.join(self.get_scenery_dsf_backup_dir(scenery_name), dsf_folder)
 
@@ -430,12 +430,6 @@ class DsfUtils:
         os.replace(tmp_path, scenery_info_json)
                     
         return True
-        
+     
 
 dsf_utils = DsfUtils()
-
-        
-
-        
-    
-        
