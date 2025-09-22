@@ -120,6 +120,21 @@ import autoortho
 
 if __name__ == "__main__":
     try:
+        # Special dispatch path for packaged macOS worker subprocesses.
+        # When launched with "--macfuse-worker", run the worker main instead
+        # of the regular GUI/headless entrypoint. This lets the packaged app
+        # spawn workers via sys.executable without needing a separate script
+        # file on disk.
+        if len(sys.argv) > 1 and sys.argv[1] == "--macfuse-worker":
+            try:
+                import autoortho.macfuse_worker as _worker
+            except Exception:
+                from . import macfuse_worker as _worker  # type: ignore
+            # Remove the dispatch flag so the worker's argparse doesn't see it
+            sys.argv.pop(1)
+            _worker.main()
+            sys.exit(0)
+
         setuplogs()
         autoortho.main()
     except Exception as _fatal_err:

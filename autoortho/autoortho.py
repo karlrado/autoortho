@@ -401,9 +401,16 @@ class AOMount:
 
         if log_addr:
             env['AO_LOG_ADDR'] = log_addr
-
-        cmd = [sys.executable, os.path.abspath("autoortho/macfuse_worker.py"),
-            "--root", root, "--mountpoint", mountpoint, "--volname", volname]
+        # When packaged as a macOS app (Nuitka), there is no standalone
+        # macfuse_worker.py on disk. Invoke the app's __main__ with a special
+        # dispatch flag. In source/dev mode, use -m autoortho to hit __main__.
+        is_packaged = bool(getattr(sys, 'frozen', False) or os.environ.get('NUITKA_ONEFILE_PARENT'))
+        if is_packaged:
+            cmd = [sys.executable, "--macfuse-worker",
+                   "--root", root, "--mountpoint", mountpoint, "--volname", volname]
+        else:
+            cmd = [sys.executable, "-m", "autoortho", "--macfuse-worker",
+                   "--root", root, "--mountpoint", mountpoint, "--volname", volname]
 
         if nothreads:
             cmd.append("--nothreads")
