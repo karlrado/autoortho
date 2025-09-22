@@ -229,8 +229,8 @@ def diagnose(CFG):
             time.sleep(0.25)
             try:
                 if system_type == 'darwin':
-                    # Prefer OS-level FUSE readiness on macOS
-                    ret = macsetup.is_macfuse_mount(mount) or os.path.isdir(os.path.join(mount, 'textures'))
+                    # macOS: only trust OS-level FUSE readiness
+                    ret = macsetup.is_macfuse_mount(mount)
                 else:
                     ret = os.path.isdir(os.path.join(mount, 'textures'))
             except Exception:
@@ -253,7 +253,7 @@ def diagnose(CFG):
         log.info(f"    {root}")
         try:
             if system_type == 'darwin':
-                ret = macsetup.is_macfuse_mount(mount) or os.path.isdir(os.path.join(mount, 'textures'))
+                ret = macsetup.is_macfuse_mount(mount)
             else:
                 ret = os.path.isdir(os.path.join(mount, 'textures'))
         except Exception:
@@ -737,14 +737,16 @@ class AOMount:
                             nothreads
                     )
             elif system_type == 'darwin':
-                # systemtype, libpath = macsetup.find_mac_libs()
+                # macOS: prepare mountpoint (must be empty), then launch worker
                 systemtype = "macOS"
-                with setupmount(mountpoint, systemtype) as mount:
-                    process = self.launch_macfuse_worker(
-                        root, mountpoint, mount.split('/')[-1], nothreads,
-                        self.stats_addr, self.stats_auth, self.log_addr
-                    )
-                    self.mac_os_procs.append(process)
+                if not macsetup.setup_macfuse_mount(mountpoint):
+                    raise MountError(f"Failed to setup mount point {mountpoint}!")
+                volname = mountpoint.split('/')[-1]
+                process = self.launch_macfuse_worker(
+                    root, mountpoint, volname, nothreads,
+                    self.stats_addr, self.stats_auth, self.log_addr
+                )
+                self.mac_os_procs.append(process)
             else:
                 # Linux
                 with setupmount(mountpoint, "Linux-FUSE") as mount:

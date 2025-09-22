@@ -42,12 +42,35 @@ def configure_worker_logging(mount_name):
             # fall back to local console if socket setup fails
             log.error(f"Worker logging routed to parent via SocketHandler failed: {e}")
 
-    # Fallback: local console logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='[WORKER %(process)d][%(mount)s]: %(message)s',
-        stream=sys.stdout
-    )
+    # Fallback: local console logging + file
+    log_dir = os.path.join(os.path.expanduser("~"), ".autoortho-data", "logs")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except Exception:
+        pass
+    handlers = [
+        logging.StreamHandler(sys.stdout)
+    ]
+    try:
+        handlers.append(
+            logging.handlers.RotatingFileHandler(
+                filename=os.path.join(log_dir, f"worker_{mount_name}.log"),
+                maxBytes=10485760,
+                backupCount=2
+            )
+        )
+    except Exception:
+        pass
+    root.handlers[:] = []
+    root.setLevel(logging.INFO)
+    for h in handlers:
+        root.addHandler(h)
+    fmt = logging.Formatter('[WORKER %(process)d][%(mount)s]: %(message)s')
+    for h in root.handlers:
+        try:
+            h.setFormatter(fmt)
+        except Exception:
+            pass
     root.addFilter(AddMount())
 
 
