@@ -732,14 +732,14 @@ class AOMount:
                             nothreads
                     )
             elif system_type == 'darwin':
-                # systemtype, libpath = macsetup.find_mac_libs()
-                systemtype = "macOS"
-                with setupmount(mountpoint, systemtype) as mount:
-                    process = self.launch_macfuse_worker(
-                        root, mountpoint, mount.split('/')[-1], nothreads,
-                        self.stats_addr, self.stats_auth, self.log_addr
-                    )
-                    self.mac_os_procs.append(process)
+                if not macsetup.setup_macfuse_mount(mountpoint):
+                    raise MountError(f"Failed to setup mount point {mountpoint}!")
+                volname = mountpoint.split('/')[-1]
+                process = self.launch_macfuse_worker(
+                    root, mountpoint, volname, nothreads,
+                    self.stats_addr, self.stats_auth, self.log_addr
+                )
+                self.mac_os_procs.append(process)
             else:
                 # Linux
                 with setupmount(mountpoint, "Linux-FUSE") as mount:

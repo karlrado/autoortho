@@ -1,5 +1,13 @@
 import os
 import sys
+
+if os.environ.get("AO_RUN_MODE") == "macfuse_worker" or "--ao-worker=macfuse" in sys.argv:
+    # Absolute import is robust under Nuitka for the entry module
+    from autoortho.macfuse_worker import main as _ao_worker_main
+    _ao_worker_main()
+    os._exit(0)
+
+
 import logging
 import logging.handlers
 import atexit, signal, threading
@@ -115,16 +123,6 @@ try:
             os.environ.setdefault("SSL_CERT_FILE", str(pem))
 except Exception:
     pass
-
-
-# If this process was spawned as a macFUSE worker, run that entrypoint
-# immediately and exit. We must do this before importing/starting the main app.
-if os.environ.get("AO_RUN_MODE") == "macfuse_worker":
-    from .macfuse_worker import main as _ao_worker_main
-    _ao_worker_main()
-    # macFUSE threads can linger; do not fall back into app startup.
-    os._exit(0)
-
 
 import autoortho
 
