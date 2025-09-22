@@ -52,7 +52,7 @@ OutFile "${INSTALLER_NAME}"
 ShowInstDetails show
 
 ; Add version info and manifest to reduce AV false positives
-VIProductVersion "0.0.8.1"
+VIProductVersion "0.1.3.0"
 VIAddVersionKey "ProductName" "${PRODUCT_NAME}"
 VIAddVersionKey "CompanyName" "AutoOrtho Project"
 VIAddVersionKey "LegalCopyright" "© AutoOrtho Project"
