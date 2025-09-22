@@ -41,36 +41,24 @@ def configure_worker_logging(mount_name):
         except Exception as e:
             # fall back to local console if socket setup fails
             log.error(f"Worker logging routed to parent via SocketHandler failed: {e}")
+    else:
+        # in addition to console
+        from pathlib import Path
+        log_dir = Path.home() / ".autoortho-data" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        fh = logging.handlers.RotatingFileHandler(log_dir / f"worker-{mount_name}.log",
+                                                maxBytes=10_485_760, backupCount=3)
+        root.addHandler(fh)
+        root.setLevel(logging.DEBUG)
+        root.addFilter(AddMount())
+        root.info("Worker logging routed to local file")
 
-    # Fallback: local console logging + file
-    log_dir = os.path.join(os.path.expanduser("~"), ".autoortho-data", "logs")
-    try:
-        os.makedirs(log_dir, exist_ok=True)
-    except Exception:
-        pass
-    handlers = [
-        logging.StreamHandler(sys.stdout)
-    ]
-    try:
-        handlers.append(
-            logging.handlers.RotatingFileHandler(
-                filename=os.path.join(log_dir, f"worker_{mount_name}.log"),
-                maxBytes=10485760,
-                backupCount=2
-            )
-        )
-    except Exception:
-        pass
-    root.handlers[:] = []
-    root.setLevel(logging.INFO)
-    for h in handlers:
-        root.addHandler(h)
-    fmt = logging.Formatter('[WORKER %(process)d][%(mount)s]: %(message)s')
-    for h in root.handlers:
-        try:
-            h.setFormatter(fmt)
-        except Exception:
-            pass
+    # Fallback: local console logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[WORKER %(process)d][%(mount)s]: %(message)s',
+        stream=sys.stdout
+    )
     root.addFilter(AddMount())
 
 

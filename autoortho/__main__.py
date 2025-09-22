@@ -116,21 +116,20 @@ try:
 except Exception:
     pass
 
+
+# If this process was spawned as a macFUSE worker, run that entrypoint
+# immediately and exit. We must do this before importing/starting the main app.
+if os.environ.get("AO_RUN_MODE") == "macfuse_worker":
+    from .macfuse_worker import main as _ao_worker_main
+    _ao_worker_main()
+    # macFUSE threads can linger; do not fall back into app startup.
+    os._exit(0)
+
+
 import autoortho
 
 if __name__ == "__main__":
     try:
-        # If invoked as a packaged worker, dispatch directly to the worker entrypoint
-        if "--macfuse-worker" in sys.argv:
-            try:
-                sys.argv.remove("--macfuse-worker")
-            except ValueError:
-                pass
-            # Defer import to avoid pulling worker code into normal UI path
-            from autoortho import macfuse_worker as _ao_mac_worker
-            _ao_mac_worker.main()
-            sys.exit(0)
-
         setuplogs()
         autoortho.main()
     except Exception as _fatal_err:

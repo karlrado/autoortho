@@ -25,7 +25,7 @@ import aoconfig
 import aostats
 import winsetup
 import macsetup
-from utils.mount_utils import cleanup_mountpoint
+from utils.mount_utils import cleanup_mountpoint, _is_nuitka_compiled
 from utils.constants import MAPTYPES, system_type
 
 from version import __version__
@@ -229,7 +229,7 @@ def diagnose(CFG):
             time.sleep(0.25)
             try:
                 if system_type == 'darwin':
-                    # macOS: only trust OS-level FUSE readiness
+                    # Require an actual FUSE mount on macOS; placeholders can mask failures
                     ret = macsetup.is_macfuse_mount(mount)
                 else:
                     ret = os.path.isdir(os.path.join(mount, 'textures'))
@@ -402,24 +402,19 @@ class AOMount:
         if log_addr:
             env['AO_LOG_ADDR'] = log_addr
 
-        # Decide how to launch the worker depending on packaged vs dev mode
-        # In dev mode, invoke the worker module with the current Python
-        # In packaged app mode, re-exec the current app binary with a special flag
-        worker_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "macfuse_worker.py"))
-        packaged_exec = sys.argv[0]
-        is_dev_mode = os.path.exists(worker_py)
-
-        if is_dev_mode:
-            cmd = [sys.executable, worker_py,
-                   "--root", root, "--mountpoint", mountpoint, "--volname", volname]
+        # Build the argv. In Nuitka, re-exec the app binary. In dev, run the module.
+        if _is_nuitka_compiled():
+            cmd = [sys.executable]  # the compiled app bundle's binary
         else:
-            # Packaged: call the same app binary with worker dispatch flag
-            cmd = [packaged_exec, "--macfuse-worker",
-                   "--root", root, "--mountpoint", mountpoint, "--volname", volname]
-        log.info(f"Launching macFUSE worker: {' '.join(cmd)}")
-
+            cmd = [sys.executable, "-m", "autoortho"]  # call package __main__.py
+        # Worker arguments (parsed by macfuse_worker.main via the early-dispatch)
+        cmd += ["--root", root, "--mountpoint", mountpoint]
+        if volname:
+            cmd += ["--volname", volname]
         if nothreads:
             cmd.append("--nothreads")
+
+        log.debug("Launching worker: compiled=%s exe=%s cmd=%s", _is_nuitka_compiled(), sys.executable, cmd)
         p = subprocess.Popen(cmd, env=env)
         log.info(f"FUSE process for mount {volname} started with pid: {p.pid}")
         return p
@@ -737,16 +732,14 @@ class AOMount:
                             nothreads
                     )
             elif system_type == 'darwin':
-                # macOS: prepare mountpoint (must be empty), then launch worker
+                # systemtype, libpath = macsetup.find_mac_libs()
                 systemtype = "macOS"
-                if not macsetup.setup_macfuse_mount(mountpoint):
-                    raise MountError(f"Failed to setup mount point {mountpoint}!")
-                volname = mountpoint.split('/')[-1]
-                process = self.launch_macfuse_worker(
-                    root, mountpoint, volname, nothreads,
-                    self.stats_addr, self.stats_auth, self.log_addr
-                )
-                self.mac_os_procs.append(process)
+                with setupmount(mountpoint, systemtype) as mount:
+                    process = self.launch_macfuse_worker(
+                        root, mountpoint, mount.split('/')[-1], nothreads,
+                        self.stats_addr, self.stats_auth, self.log_addr
+                    )
+                    self.mac_os_procs.append(process)
             else:
                 # Linux
                 with setupmount(mountpoint, "Linux-FUSE") as mount:
