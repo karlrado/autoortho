@@ -8,8 +8,6 @@ import math
 import errno
 import ctypes
 import threading
-import shutil
-import stat
 
 import flighttrack
 
@@ -96,6 +94,7 @@ def fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
             nothreads=nothreads,
             foreground=True,
             allow_other=True,
+            volname=mount_name,
         ))
 
     elif system_type == 'windows':
@@ -127,7 +126,7 @@ class AutoOrtho(Operations):
 
     startup = True
 
-    def __init__(self, root, cache_dir='.cache'):
+    def __init__(self, root, cache_dir='.cache', *args, **kwargs):
         log.info(f"ROOT: {root}")
         self.dds_re = re.compile(r".*/(\d+)[-_](\d+)[-_]((?!ZL)\S*)(\d{2}).dds")
         self.ktx2_re = re.compile(r".*/(\d+)[-_](\d+)[-_]((?!ZL)\D*)(\d+).ktx2")
@@ -151,6 +150,8 @@ class AutoOrtho(Operations):
         self._size_cache = {}
         self._ft_started = False
         self._ft_start_lock = threading.Lock()
+
+        self.use_ns = kwargs.get("use_ns", False)
 
     # Helpers
     # =======
