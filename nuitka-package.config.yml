@@ -39,7 +39,7 @@
         when: 'win32'
 
   data-files:
-      dirs:
+    - dirs:
         - 'lib/macos/7zip'
         - 'lib/macos'
       patterns:
@@ -47,8 +47,7 @@
         - 'DSFTool'
       when: 'macos'
 
-  data-files:
-      dirs:
+    - dirs:
         - 'lib/linux/7zip'
         - 'lib/linux'
       patterns:
@@ -56,8 +55,7 @@
         - 'DSFTool'
       when: 'linux'
 
-  data-files:
-      dirs:
+    - dirs:
         - 'lib/windows/7zip'
         - 'lib/windows'
       patterns:
