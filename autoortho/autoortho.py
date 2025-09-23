@@ -26,7 +26,12 @@ import aoconfig
 import aostats
 import winsetup
 import macsetup
-from utils.mount_utils import cleanup_mountpoint, _is_nuitka_compiled
+from utils.mount_utils import (
+    cleanup_mountpoint,
+    _is_nuitka_compiled,
+    is_only_ao_placeholder,
+    clear_ao_placeholder,
+)
 from utils.constants import MAPTYPES, system_type
 
 from version import __version__
@@ -421,16 +426,11 @@ class AOMount:
 
         log_dir = Path.home() / ".autoortho-data" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        std_file = open(log_dir / f"worker-{volname}.out", "ab", buffering=0)
+        std_file = open(log_dir / f"worker-{volname}.log", "ab", buffering=0)
 
         p = subprocess.Popen(cmd, env=env, stdout=std_file, stderr=std_file)
         log.info(f"FUSE process for mount {volname} started with pid: {p.pid}")
         p._ao_std_file = std_file
-        time.sleep(1)
-        rc = p.poll()
-        if rc is not None:
-            log.error("Worker for %s exited immediately with rc=%s. See worker-%s.out.",
-                volname, rc, volname)
         return p
 
     def stop_macfuse_workers(self, timeout: float = 10.0):
@@ -746,8 +746,27 @@ class AOMount:
                             nothreads
                     )
             elif system_type == 'darwin':
+                # If the directory only has our placeholder, clear it first so the preflight accepts it.
+                try:
+                    if os.path.isdir(mountpoint) and is_only_ao_placeholder(mountpoint):
+                        clear_ao_placeholder(mountpoint)
+                except Exception as _e:
+                    log.debug(f"Placeholder pre-clear failed (ignored): {_e}")
+
                 if not macsetup.setup_macfuse_mount(mountpoint):
-                    raise MountError(f"Failed to setup mount point {mountpoint}!")
+                    # Second chance: if it's only our placeholder but we didn't clear earlier, clear now and retry.
+                    try:
+                        if os.path.isdir(mountpoint) and is_only_ao_placeholder(mountpoint):
+                            clear_ao_placeholder(mountpoint)
+                            if not macsetup.setup_macfuse_mount(mountpoint):
+                                raise MountError(f"Failed to setup mount point {mountpoint}!")
+                        else:
+                            raise MountError(f"Failed to setup mount point {mountpoint}!")
+                    except MountError:
+                        raise
+                    except Exception as e:
+                        log.debug(f"Retry after placeholder clear failed: {e}")
+                        raise MountError(f"Failed to setup mount point {mountpoint}!")
                 volname = mountpoint.split('/')[-1]
                 process = self.launch_macfuse_worker(
                     root, mountpoint, volname, nothreads,
