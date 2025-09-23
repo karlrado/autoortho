@@ -70,7 +70,7 @@ def main():
     ap.add_argument("--nothreads", action="store_true")
     ap.add_argument("--volname")
     ap.add_argument("--loglevel", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], default="DEBUG")
-    args = ap.parse_args()
+    args, unknown = ap.parse_known_args()
 
     configure_worker_logging(args.volname, args.loglevel)
 

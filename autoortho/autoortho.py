@@ -406,9 +406,9 @@ class AOMount:
 
         # Build the argv. In Nuitka, re-exec the app binary. In dev, run the module.
         if _is_nuitka_compiled():
-            cmd = [sys.executable, "--ao-worker=macfuse"]
+            cmd = [sys.executable]
         else:
-            cmd = [sys.executable, "-m", "autoortho", "--ao-worker=macfuse"]
+            cmd = [sys.executable, "-m", "autoortho"]
         # Worker arguments (parsed by macfuse_worker.main via the early-dispatch)
         cmd += ["--root", root, "--mountpoint", mountpoint, "--loglevel", "DEBUG" if self.cfg.general.debug else "INFO"]
         if volname:
