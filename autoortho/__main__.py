@@ -3,7 +3,7 @@ import sys
 
 if os.environ.get("AO_RUN_MODE") == "macfuse_worker":
     # Absolute import is robust under Nuitka for the entry module
-    from autoortho.macfuse_worker import main as _ao_worker_main
+    from macfuse_worker import main as _ao_worker_main
     _ao_worker_main()
     os._exit(0)
 
