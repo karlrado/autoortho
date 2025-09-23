@@ -100,7 +100,7 @@ def is_macfuse_mount(path: str) -> bool:
                 # Example line:
                 #   dev on /Volumes/MyMount (osxfuse, local, nodev, nosuid)
                 if "(" in line and ")" in line:
-                    inside = line[line.find("(")  1: line.rfind(")")]
+                    inside = line[line.find("(") + 1: line.rfind(")")]
                     parts = [p.strip().lower() for p in inside.split(",")]
                     return any(
                         p.startswith("fuse") or "osxfuse" in p or "macfuse" in p or "fusefs" in p
