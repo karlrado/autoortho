@@ -15,6 +15,7 @@ import socketserver
 import logging.handlers
 import pickle
 import struct
+from pathlib import Path
 
 
 from contextlib import contextmanager
@@ -417,8 +418,19 @@ class AOMount:
             cmd.append("--nothreads")
 
         log.debug("Launching worker: compiled=%s exe=%s cmd=%s", _is_nuitka_compiled(), sys.executable, cmd)
-        p = subprocess.Popen(cmd, env=env)
+
+        log_dir = Path.home() / ".autoortho-data" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        std_file = open(log_dir / f"worker-{volname}.out", "ab", buffering=0)
+
+        p = subprocess.Popen(cmd, env=env, stdout=std_file, stderr=std_file)
         log.info(f"FUSE process for mount {volname} started with pid: {p.pid}")
+        p._ao_std_file = std_file
+        time.sleep(1)
+        rc = p.poll()
+        if rc is not None:
+            log.error("Worker for %s exited immediately with rc=%s. See worker-%s.out.",
+                volname, rc, volname)
         return p
 
     def stop_macfuse_workers(self, timeout: float = 10.0):
