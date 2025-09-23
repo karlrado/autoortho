@@ -51,6 +51,8 @@ __main__.app: autoortho/.version
 		--macos-target-arch=arm64 \
 		--macos-app-name=AutoOrtho \
 		--macos-app-icon=autoortho/imgs/ao-icon.icns \
+		--include-module=autoortho.macfuse_worker \
+		--include-module=mfusepy \
 		--enable-plugin=pyside6 \
 		--include-data-file=autoortho/.version=autoortho/.version \
 		--include-data-file=./autoortho/templates/*.html=templates/ \

@@ -15,6 +15,7 @@ import socketserver
 import logging.handlers
 import pickle
 import struct
+from pathlib import Path
 
 
 from contextlib import contextmanager
@@ -25,7 +26,12 @@ import aoconfig
 import aostats
 import winsetup
 import macsetup
-from utils.mount_utils import cleanup_mountpoint
+from utils.mount_utils import (
+    cleanup_mountpoint,
+    _is_nuitka_compiled,
+    is_only_ao_placeholder,
+    clear_ao_placeholder,
+)
 from utils.constants import MAPTYPES, system_type
 
 from version import __version__
@@ -229,8 +235,8 @@ def diagnose(CFG):
             time.sleep(0.25)
             try:
                 if system_type == 'darwin':
-                    # Prefer OS-level FUSE readiness on macOS
-                    ret = macsetup.is_macfuse_mount(mount) or os.path.isdir(os.path.join(mount, 'textures'))
+                    # Require an actual FUSE mount on macOS; placeholders can mask failures
+                    ret = macsetup.is_macfuse_mount(mount)
                 else:
                     ret = os.path.isdir(os.path.join(mount, 'textures'))
             except Exception:
@@ -253,7 +259,7 @@ def diagnose(CFG):
         log.info(f"    {root}")
         try:
             if system_type == 'darwin':
-                ret = macsetup.is_macfuse_mount(mount) or os.path.isdir(os.path.join(mount, 'textures'))
+                ret = macsetup.is_macfuse_mount(mount)
             else:
                 ret = os.path.isdir(os.path.join(mount, 'textures'))
         except Exception:
@@ -402,13 +408,29 @@ class AOMount:
         if log_addr:
             env['AO_LOG_ADDR'] = log_addr
 
-        cmd = [sys.executable, os.path.abspath("autoortho/macfuse_worker.py"),
-            "--root", root, "--mountpoint", mountpoint, "--volname", volname]
+        env['AO_RUN_MODE'] = 'macfuse_worker'
 
+        # Build the argv. In Nuitka, re-exec the app binary. In dev, run the module.
+        if _is_nuitka_compiled():
+            cmd = [sys.executable]
+        else:
+            cmd = [sys.executable, "-m", "autoortho"]
+        # Worker arguments (parsed by macfuse_worker.main via the early-dispatch)
+        cmd += ["--root", root, "--mountpoint", mountpoint, "--loglevel", "DEBUG" if self.cfg.general.debug else "INFO"]
+        if volname:
+            cmd += ["--volname", volname]
         if nothreads:
             cmd.append("--nothreads")
-        p = subprocess.Popen(cmd, env=env)
+
+        log.debug("Launching worker: compiled=%s exe=%s cmd=%s", _is_nuitka_compiled(), sys.executable, cmd)
+
+        log_dir = Path.home() / ".autoortho-data" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        std_file = open(log_dir / f"worker-{volname}.log", "ab", buffering=0)
+
+        p = subprocess.Popen(cmd, env=env, stdout=std_file, stderr=std_file)
         log.info(f"FUSE process for mount {volname} started with pid: {p.pid}")
+        p._ao_std_file = std_file
         return p
 
     def stop_macfuse_workers(self, timeout: float = 10.0):
@@ -724,14 +746,33 @@ class AOMount:
                             nothreads
                     )
             elif system_type == 'darwin':
-                # systemtype, libpath = macsetup.find_mac_libs()
-                systemtype = "macOS"
-                with setupmount(mountpoint, systemtype) as mount:
-                    process = self.launch_macfuse_worker(
-                        root, mountpoint, mount.split('/')[-1], nothreads,
-                        self.stats_addr, self.stats_auth, self.log_addr
-                    )
-                    self.mac_os_procs.append(process)
+                # If the directory only has our placeholder, clear it first so the preflight accepts it.
+                try:
+                    if os.path.isdir(mountpoint) and is_only_ao_placeholder(mountpoint):
+                        clear_ao_placeholder(mountpoint)
+                except Exception as _e:
+                    log.debug(f"Placeholder pre-clear failed (ignored): {_e}")
+
+                if not macsetup.setup_macfuse_mount(mountpoint):
+                    # Second chance: if it's only our placeholder but we didn't clear earlier, clear now and retry.
+                    try:
+                        if os.path.isdir(mountpoint) and is_only_ao_placeholder(mountpoint):
+                            clear_ao_placeholder(mountpoint)
+                            if not macsetup.setup_macfuse_mount(mountpoint):
+                                raise MountError(f"Failed to setup mount point {mountpoint}!")
+                        else:
+                            raise MountError(f"Failed to setup mount point {mountpoint}!")
+                    except MountError:
+                        raise
+                    except Exception as e:
+                        log.debug(f"Retry after placeholder clear failed: {e}")
+                        raise MountError(f"Failed to setup mount point {mountpoint}!")
+                volname = mountpoint.split('/')[-1]
+                process = self.launch_macfuse_worker(
+                    root, mountpoint, volname, nothreads,
+                    self.stats_addr, self.stats_auth, self.log_addr
+                )
+                self.mac_os_procs.append(process)
             else:
                 # Linux
                 with setupmount(mountpoint, "Linux-FUSE") as mount:
@@ -792,6 +833,12 @@ class AOMount:
                         log.warning(f"Windows force unmount failed: {exc}")
             except Exception as exc:
                 log.warning(f"Force unmount attempt failed: {exc}")
+
+        try:
+            from utils.mount_utils import cleanup_mountpoint
+            cleanup_mountpoint(mountpoint)
+        except Exception as e:
+            log.warning(f"Failed to cleanup mountpoint {mountpoint}: {e}")
 
 
 class AOMountUI(AOMount, config_ui.ConfigUI):

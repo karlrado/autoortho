@@ -30,7 +30,7 @@ from PySide6.QtCore import (
     Qt, QThread, Signal, QTimer, QSize
 )
 from PySide6.QtGui import (
-    QPixmap, QIcon, QColor
+    QPixmap, QIcon, QColor, QWheelEvent
 )
 
 import downloader
@@ -246,6 +246,8 @@ class ModernSlider(QSlider):
                 border-radius: 3px;
             }
         """)
+    def wheelEvent(self, event: QWheelEvent):
+        event.ignore()
 
 
 class ModernSpinBox(QSpinBox):
