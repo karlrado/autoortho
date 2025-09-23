@@ -402,13 +402,15 @@ class AOMount:
         if log_addr:
             env['AO_LOG_ADDR'] = log_addr
 
+        env['AO_RUN_MODE'] = 'macfuse_worker'
+
         # Build the argv. In Nuitka, re-exec the app binary. In dev, run the module.
         if _is_nuitka_compiled():
-            cmd = [sys.executable]  # the compiled app bundle's binary
+            cmd = [sys.executable, "--ao-worker=macfuse"]
         else:
-            cmd = [sys.executable, "-m", "autoortho"]  # call package __main__.py
+            cmd = [sys.executable, "-m", "autoortho", "--ao-worker=macfuse"]
         # Worker arguments (parsed by macfuse_worker.main via the early-dispatch)
-        cmd += ["--root", root, "--mountpoint", mountpoint]
+        cmd += ["--root", root, "--mountpoint", mountpoint, "--loglevel", "DEBUG" if self.cfg.general.debug else "INFO"]
         if volname:
             cmd += ["--volname", volname]
         if nothreads:
@@ -800,6 +802,12 @@ class AOMount:
                         log.warning(f"Windows force unmount failed: {exc}")
             except Exception as exc:
                 log.warning(f"Force unmount attempt failed: {exc}")
+
+        try:
+            from utils.mount_utils import cleanup_mountpoint
+            cleanup_mountpoint(mountpoint)
+        except Exception as e:
+            log.warning(f"Failed to cleanup mountpoint {mountpoint}: {e}")
 
 
 class AOMountUI(AOMount, config_ui.ConfigUI):

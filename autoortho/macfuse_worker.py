@@ -11,7 +11,7 @@ from aostats import update_process_memory_stat, clear_process_memory_stat
 log = logging.getLogger(__name__)
 
 
-def configure_worker_logging(mount_name):
+def configure_worker_logging(mount_name, loglevel: str):
     addr = os.getenv("AO_LOG_ADDR")
 
     # A filter that annotates every record with the mount id
@@ -49,13 +49,13 @@ def configure_worker_logging(mount_name):
         fh = logging.handlers.RotatingFileHandler(log_dir / f"worker-{mount_name}.log",
                                                 maxBytes=10_485_760, backupCount=3)
         root.addHandler(fh)
-        root.setLevel(logging.DEBUG)
+        root.setLevel(loglevel)
         root.addFilter(AddMount())
         root.info("Worker logging routed to local file")
 
     # Fallback: local console logging
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=loglevel,
         format='[WORKER %(process)d][%(mount)s]: %(message)s',
         stream=sys.stdout
     )
@@ -69,9 +69,10 @@ def main():
     ap.add_argument("--mountpoint", required=True)
     ap.add_argument("--nothreads", action="store_true")
     ap.add_argument("--volname")
+    ap.add_argument("--loglevel", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], default="DEBUG")
     args = ap.parse_args()
 
-    configure_worker_logging(args.volname)
+    configure_worker_logging(args.volname, args.loglevel)
 
     log.info(f"MOUNT: {args.mountpoint}")
     additional_args = fuse_option_profiles_by_os(args.nothreads, args.volname)
