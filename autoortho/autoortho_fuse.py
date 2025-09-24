@@ -546,6 +546,10 @@ class AutoOrtho(Operations):
     def releasedir(self, path, fh):
         log.debug(f"RELEASEDIR: {path}")
         return 0
+    
+    def opendir(self, path):
+        log.debug(f"OPENDIR: {path}")
+        return 0 
 
     #@locked
     def release(self, path, fh):

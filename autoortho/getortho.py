@@ -6,6 +6,8 @@ import time
 import threading
 import concurrent.futures
 import uuid
+import math
+from typing import Optional
 
 from io import BytesIO
 from urllib.request import urlopen, Request
@@ -74,6 +76,33 @@ seasons_enabled = CFG.seasons.enabled
 if seasons_enabled:
     from aoseasons import AoSeasonCache
     ao_seasons = AoSeasonCache(CFG.paths.cache_dir)
+
+    # Per-DSF tile locks to serialize .si generation across threads
+    _season_lock_map = {}
+    _season_lock_map_lock = threading.Lock()
+
+    def _season_tile_key_from_rc(row: int, col: int, zoom: int) -> str:
+        # Compute DSF base name used by AoDsfSeason (e.g., +37-122)
+        lon = col / pow(2, zoom) * 360 - 180
+        n = math.pi - 2 * math.pi * row / pow(2, zoom)
+        lat = 180 / math.pi * math.atan(0.5 * (math.exp(n) - math.exp(-n)))
+        lat_i = math.floor(lat)
+        lon_i = math.floor(lon)
+        return f"{lat_i:+03d}{lon_i:+04d}"
+
+    def _get_season_lock(key: str) -> threading.Lock:
+        with _season_lock_map_lock:
+            lock = _season_lock_map.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                _season_lock_map[key] = lock
+            return lock
+
+    def season_saturation_locked(row: int, col: int, zoom: int, day: Optional[int] = None) -> float:
+        key = _season_tile_key_from_rc(row, col, zoom)
+        lock = _get_season_lock(key)
+        with lock:
+            return ao_seasons.saturation(row, col, zoom, day)
 
 
 def _is_jpeg(dataheader):
@@ -998,7 +1027,7 @@ class Tile(object):
         log.debug(f"GET_IMG: DONE!  IMG created {new_im}")
 
         if seasons_enabled:
-            saturation = 0.01 * ao_seasons.saturation(self.row, self.col, self.tilename_zoom)
+            saturation = 0.01 * season_saturation_locked(self.row, self.col, self.tilename_zoom)
             if saturation < 1.0:    # desaturation is expensive
                 new_im = new_im.copy().desaturate(saturation)
         # Return image along with mipmap and zoom level this was created at
