@@ -37,6 +37,18 @@
         prefixes: ['7za', '7zxa']
         suffixes: ['dll']
         when: 'win32'
+    - from_filenames:
+        relative_path: 'lib/windows'
+        prefixes: ['DSFTool']
+        suffixes: ['exe']
+        executable: yes
+        when: 'win32'
+    - from_filenames:
+        relative_path: 'lib/windows/7zip'
+        prefixes: ['7za']
+        suffixes: ['exe']
+        executable: yes
+        when: 'win32'
 
   data-files:
     - dirs:
@@ -54,11 +66,3 @@
         - '7zz'
         - 'DSFTool'
       when: 'linux'
-
-    - dirs:
-        - 'lib/windows/7zip'
-        - 'lib/windows'
-      patterns:
-        - 'DSFTool.exe'
-        - '7za.exe'
-      when: 'win32'
