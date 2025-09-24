@@ -28,8 +28,8 @@ class DsfUtils:
         self.dsf_tool_location = self.get_dsf_tool_location()
         self.xplane_path = CFG.paths.xplane_path
         self.ao_path = CFG.paths.scenery_path
-        self.global_scenery_path = os.path.join(self.xplane_path, "Global Scenery", "X-Plane 12 Global Scenery", "Earth Nav Data")
-        self.demo_scenery_path = os.path.join(self.xplane_path, "Global Scenery", "X-Plane 12 Demo Areas", "Earth Nav Data")
+        self.global_scenery_path = os.path.join(self.xplane_path, "Global Scenery", "X-Plane 12 Global Scenery", "Earth nav data")
+        self.demo_scenery_path = os.path.join(self.xplane_path, "Global Scenery", "X-Plane 12 Demo Areas", "Earth nav data")
         self.dsf_dir = CFG.paths.dsf_dir
         self.seven_zip_dir = self.get_7zip_location()    # compressing dsf files
 
@@ -163,7 +163,7 @@ class DsfUtils:
 
         # get the name of the dsf to parse
         os.makedirs(cache_dir, exist_ok=True)
-        dsf_to_parse_location = os.path.join(self.ao_path, "z_autoortho", "scenery", package_name, "Earth Nav Data", dsf_folder, dsf_filename)
+        dsf_to_parse_location = os.path.join(self.ao_path, "z_autoortho", "scenery", package_name, "Earth nav data", dsf_folder, dsf_filename)
         global_dsf_file_path = self.get_dsf_folder_location(dsf_folder, dsf_filename)
 
         ao_mesh_dsf_txt_file_path = f"{os.path.join(cache_dir, f"ao_{dsf_filename}.txt")}"
@@ -261,7 +261,7 @@ class DsfUtils:
     def scan_for_dsfs(self, scenery_package_path):
         total_dsfs = 0
         dsf_folder_files = {}
-        dsf_folders = os.path.join(self.ao_path, "z_autoortho", "scenery", scenery_package_path, "Earth Nav Data")
+        dsf_folders = os.path.join(self.ao_path, "z_autoortho", "scenery", scenery_package_path, "Earth nav data")
         log.debug(f"Scanning for dsfs in {dsf_folders}")
         if not os.path.isdir(dsf_folders):
             return {}, 0
@@ -404,7 +404,7 @@ class DsfUtils:
             for dsf_file in dsf_files:
                 folder_backup_path = os.path.join(self.get_scenery_dsf_backup_dir(scenery_name), dsf_folder)
 
-                dsf_file_path = os.path.join(self.ao_path, "z_autoortho", "scenery", scenery_name, "Earth Nav Data", dsf_folder, dsf_file)
+                dsf_file_path = os.path.join(self.ao_path, "z_autoortho", "scenery", scenery_name, "Earth nav data", dsf_folder, dsf_file)
                 backup_path = os.path.join(self.get_scenery_dsf_backup_dir(scenery_name), dsf_folder, dsf_file + ".bak")
                 if os.path.exists(backup_path):
                     os.remove(dsf_file_path)
