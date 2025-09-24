@@ -59,5 +59,6 @@
         - 'lib/windows/7zip'
         - 'lib/windows'
       patterns:
-        - '*.exe'
+        - 'DSFTool.exe'
+        - '7za.exe'
       when: 'win32'
