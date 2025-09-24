@@ -602,7 +602,7 @@ class Release(object):
         self.downloaded = True
         return True
 
-    def install(self, progress_callback=None):
+    def install(self, progress_callback=None, noclean=False):
         if self.installed:
             log.info(f"Already installed {self.name}")
             return True
@@ -621,7 +621,8 @@ class Release(object):
             return False
         self.save()
         self.installed = True
-        self.cleanup()
+        if not noclean:
+            self.cleanup()
         return True
 
     def verify_and_install_all(self, progress_callback=None):
@@ -779,7 +780,7 @@ class Region(object):
         log.debug(f"SORTED: {releases}")
         return releases[0]
 
-    def install_release(self, ver=None, progress_callback=None):
+    def install_release(self, ver=None, progress_callback=None, noclean=False):
 
         if ver is None:
             rel = self.get_latest_release()
@@ -799,7 +800,7 @@ class Region(object):
             log.error(f"Failed to download release {rel}")
             return False
 
-        if not rel.install(progress_callback=progress_callback):
+        if not rel.install(progress_callback=progress_callback, noclean=noclean):
             log.error(f"Failed to install release {rel}")
             return False
 

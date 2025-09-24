@@ -62,7 +62,8 @@ class SceneryDownloadWorker(QThread):
                 self.progress.emit(self.region_id, progress_data)
 
             success = region.install_release(
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                noclean=self.dl_manager.noclean
             )
             self.finished.emit(self.region_id, success)
 
@@ -2384,6 +2385,7 @@ class ConfigUI(QMainWindow):
 
             # Scenery settings
             self.cfg.scenery.noclean = self.noclean_check.isChecked()
+            self.dl.noclean = self.cfg.scenery.noclean
 
             # FUSE settings
             self.cfg.fuse.threading = self.threading_check.isChecked()
