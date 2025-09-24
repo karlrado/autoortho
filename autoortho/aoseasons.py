@@ -28,14 +28,98 @@ class AoDsfSeason():
 
         if os.path.isfile(self.cached_si_fn):
             #print(f"Reading cached file: {self.cached_si_fn}")
-            self.f = open(self.cached_si_fn, "rb")
-            from_cache = True
+            try:
+                self.f = open(self.cached_si_fn, "rb")
+                from_cache = True
 
-            self.f.seek(0, os.SEEK_END)
-            file_len = self.f.tell()
-            #print(file_len)
-            self.f.seek(0, os.SEEK_SET)
-            self._decode_atom(file_len, 0)
+                self.f.seek(0, os.SEEK_END)
+                file_len = self.f.tell()
+                #print(file_len)
+                self.f.seek(0, os.SEEK_SET)
+                self._decode_atom(file_len, 0)
+            except Exception as e:
+                # Cached file is corrupted or truncated. Remove and regenerate from base DSF.
+                log.warning(f"Failed to read cached season file {self.cached_si_fn}: {e}. Regenerating from base DSF...")
+                try:
+                    if getattr(self, 'f', None):
+                        self.f.close()
+                except Exception:
+                    pass
+                self.f = None
+                try:
+                    os.remove(self.cached_si_fn)
+                except Exception:
+                    pass
+
+                # Attempt regeneration from DSF; if that fails, raise to signal base data issue
+                dsf_name = self.name_base + ".dsf"
+                en_dir = f"{lat_10:+03d}{lon_10:+04d}"
+                dsf_name_full = os.path.join(xp12_root, "Global Scenery/X-Plane 12 Global Scenery/Earth nav data",
+                                             en_dir, dsf_name)
+                if not os.path.isfile(dsf_name_full):
+                    dsf_name_full = os.path.join(xp12_root, "Global Scenery/X-Plane 12 Demo Areas/Earth nav data",
+                                                 en_dir, dsf_name)
+
+                try:
+                    if not os.path.isfile(dsf_name_full):
+                        raise FileNotFoundError(f"Base DSF archive not found for {dsf_name} in {en_dir}")
+
+                    with py7zr.SevenZipFile(dsf_name_full, mode='r') as archive:
+                        arc_names = archive.getnames()
+                        target_name = None
+                        for n in arc_names:
+                            if n == dsf_name or n.endswith("/" + dsf_name) or n.endswith("\\" + dsf_name) or n.endswith(dsf_name):
+                                target_name = n
+                                break
+
+                        if not target_name:
+                            raise RuntimeError(f"Could not find {dsf_name} inside {dsf_name_full}")
+
+                        try:
+                            info = archive.getinfo(target_name)
+                        except Exception:
+                            info = None
+
+                        uncompressed = None
+                        if info is not None:
+                            for attr in ("uncompressed", "uncompressed_size", "size"):
+                                val = getattr(info, attr, None)
+                                if isinstance(val, int) and val > 0:
+                                    uncompressed = val
+                                    break
+
+                        if not uncompressed:
+                            uncompressed = 128 * 1024 * 1024  # 128 MiB conservative default
+
+                        limit = int(uncompressed) + (1 * 1024 * 1024)  # +1 MiB headroom
+
+                        factory = py7zr.io.BytesIOFactory(limit=limit)
+                        archive.extract(targets=[target_name], factory=factory)
+
+                        fobj = factory.products.get(target_name)
+                        if fobj is None:
+                            raise RuntimeError(f"Extraction produced no file object for {target_name}")
+
+                        self.f = fobj
+
+                        try:
+                            file_len = self.f.size()
+                        except Exception:
+                            self.f.seek(0, os.SEEK_END)
+                            file_len = self.f.tell()
+                            self.f.seek(0, os.SEEK_SET)
+                        file_len -= 16  # footer
+
+                        buf = self.f.read(12)
+                        cockie, version = struct.unpack("<8sI", buf)
+
+                        self._decode_atom(file_len - 12, 0)
+
+                        # Mark as regenerated so we re-save cache below
+                        from_cache = False
+                except Exception as regen_err:
+                    # Second failure indicates a base data problem; re-raise
+                    raise RuntimeError(f"Failed to regenerate season info for {self.name_base}: {regen_err}")
         else:
             dsf_name = self.name_base + ".dsf"
             en_dir = f"{lat_10:+03d}{lon_10:+04d}"
