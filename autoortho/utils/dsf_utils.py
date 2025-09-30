@@ -5,12 +5,23 @@ import shutil
 import subprocess
 import uuid
 from logging import getLogger
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 from aoconfig import CFG
 from utils.constants import system_type
 
+from enum import Enum
+
 log = getLogger(__name__)
+
+class XP12DSFNotFound(Exception):
+    """Exception raised when a DSF file is not found in the XP12 Global Scenery or Demo Areas"""
+    pass
+
+class SeasonsAddResult(Enum):
+    ADDED = "added"
+    XP_TILE_MISSING = "tile_missing"
+    FAILED = "failed"
 
 
 class DsfUtils:
@@ -33,6 +44,30 @@ class DsfUtils:
         self.dsf_dir = CFG.paths.dsf_dir
         self.seven_zip_dir = self.get_7zip_location()    # compressing dsf files
 
+    def _run_silent_subprocess(self, command):
+        """Run external tools without popping a console window on Windows.
+
+        - Suppresses stdout entirely and captures stderr for logging
+        - Uses CREATE_NO_WINDOW on Windows to avoid opening new terminal windows
+        """
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if system_type == "windows" else 0
+        startupinfo = None
+        if system_type == "windows":
+            # Hide window even if the child is a console subsystem exe
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+            startupinfo.wShowWindow = 0  # SW_HIDE
+
+        return subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            creationflags=creationflags,
+            startupinfo=startupinfo,
+        )
+
     def compress_dsf_file(self, dsf_to_compress_path, compressed_dsf_path) -> bool:
         command = [
             self.seven_zip_dir,
@@ -43,12 +78,7 @@ class DsfUtils:
             dsf_to_compress_path,
         ]
         try:
-            result = subprocess.run(
-                command,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
+            result = self._run_silent_subprocess(command)
             return result.returncode == 0
         except subprocess.CalledProcessError as e:
             log.error(f"Failed to compress {dsf_to_compress_path} to {compressed_dsf_path}: {e}")
@@ -97,7 +127,7 @@ class DsfUtils:
             if os.path.exists(fallback_path):
                 return fallback_path
             else:
-                raise Exception(f"Global DSF file does not exist in {tentative_path} or {fallback_path}")
+                raise XP12DSFNotFound(f"Global DSF file does not exist in {tentative_path} or {fallback_path}")
     
     def convert_dsf_to_txt(self, dsf_file_path, txt_file_path):
         command = [
@@ -107,12 +137,7 @@ class DsfUtils:
             txt_file_path,
         ]
         try:
-            result = subprocess.run(
-                command,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
+            result = self._run_silent_subprocess(command)
             return result.returncode == 0
         except subprocess.CalledProcessError as e:
             log.error(
@@ -133,12 +158,7 @@ class DsfUtils:
             dsf_file_path,
         ]
         try:
-            result = subprocess.run(
-                command,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
+            result = self._run_silent_subprocess(command)
             return result.returncode == 0
         except subprocess.CalledProcessError as e:
             log.error(
@@ -151,7 +171,7 @@ class DsfUtils:
             log.error("Failed to execute DSFTool at %s: %s", self.dsf_tool_location, e)
             return False
 
-    def add_season_to_dsf_txt(self, package_name, dsf_folder, dsf_filename, cache_dir, processed_dsf_seasons):
+    def add_season_to_dsf_txt(self, package_name, dsf_folder, dsf_filename, cache_dir, processed_dsf_seasons) -> SeasonsAddResult:
 
         # BASED on script by hotbso https://github.com/hotbso/o4xp_2_xp12/blob/main/o4xp_2_xp12.py. Credit to him.
 
@@ -159,15 +179,21 @@ class DsfUtils:
         if dsf_folder in processed_dsf_seasons:
             if dsf_filename in processed_dsf_seasons[dsf_folder]:
                 log.info(f"DSF {dsf_folder}/{dsf_filename} already processed")
-                return True
+                return SeasonsAddResult.ADDED
+
+
+        try:
+            global_dsf_file_path = self.get_dsf_folder_location(dsf_folder, dsf_filename)
+        except XP12DSFNotFound:
+            log.warning(f"Global DSF file could not be found in XP12 Global Scenery or Demo Areas, this tile will be skipped")
+            return SeasonsAddResult.XP_TILE_MISSING # Mark as completed since it's not an error per se
+
+        ao_mesh_dsf_txt_file_path = f"{os.path.join(cache_dir, f"ao_{dsf_filename}.txt")}"
+        global_dsf_txt_file_path = f"{os.path.join(cache_dir, f"global_{dsf_filename}.txt")}"
 
         # get the name of the dsf to parse
         os.makedirs(cache_dir, exist_ok=True)
         dsf_to_parse_location = os.path.join(self.ao_path, "z_autoortho", "scenery", package_name, "Earth nav data", dsf_folder, dsf_filename)
-        global_dsf_file_path = self.get_dsf_folder_location(dsf_folder, dsf_filename)
-
-        ao_mesh_dsf_txt_file_path = f"{os.path.join(cache_dir, f"ao_{dsf_filename}.txt")}"
-        global_dsf_txt_file_path = f"{os.path.join(cache_dir, f"global_{dsf_filename}.txt")}"
 
         if self.convert_dsf_to_txt(dsf_to_parse_location, ao_mesh_dsf_txt_file_path):
             with open(ao_mesh_dsf_txt_file_path, "r") as file:
@@ -180,14 +206,14 @@ class DsfUtils:
             log.error(f"Failed to convert {dsf_to_parse_location} to txt")
             shutil.rmtree(cache_dir)
             log.debug(f"Removed cache directory {cache_dir}")
-            return False
+            return SeasonsAddResult.FAILED
 
 
         if skip_main_dsf:
             log.info(f"Skipping {dsf_to_parse_location} because it is already processed")
             shutil.rmtree(cache_dir)
             log.debug(f"Removed cache directory {cache_dir}")
-            return True
+            return SeasonsAddResult.ADDED
 
         raster_refs = []
         on_raster_refs = False
@@ -205,13 +231,13 @@ class DsfUtils:
             log.error(f"Failed to convert {global_dsf_file_path} to txt")
             shutil.rmtree(cache_dir)
             log.debug(f"Removed cache directory {cache_dir}")
-            return False
+            return SeasonsAddResult.FAILED
 
         if not raster_refs:
             log.error(f"Global DSF file {global_dsf_file_path} does not contain any raster refs")
             shutil.rmtree(cache_dir)
             log.debug(f"Removed cache directory {cache_dir}")
-            return False
+            return SeasonsAddResult.FAILED
 
 
         if not skip_main_dsf:
@@ -230,7 +256,7 @@ class DsfUtils:
                 log.error(f"Failed to build temp mesh DSF for {dsf_to_parse_location}")
                 shutil.rmtree(cache_dir)
                 log.debug(f"Removed cache directory {cache_dir}")
-                return False
+                return SeasonsAddResult.FAILED
 
             if CFG.seasons.compress_dsf:
                 if self.compress_dsf_file(temp_mesh_dsf_file_path, compressed_temp_mesh_dsf_file_path):
@@ -238,7 +264,7 @@ class DsfUtils:
                 else:
                     shutil.rmtree(cache_dir)
                     log.debug(f"Removed cache directory {cache_dir}")
-                    return False
+                    return SeasonsAddResult.FAILED
 
             main_backup_dir = os.path.join(self.get_scenery_dsf_backup_dir(package_name), dsf_folder)
             os.makedirs(main_backup_dir, exist_ok=True)
@@ -256,7 +282,7 @@ class DsfUtils:
         shutil.rmtree(cache_dir)
         log.debug(f"Removed cache directory {cache_dir}")
 
-        return True
+        return SeasonsAddResult.ADDED
 
     def scan_for_dsfs(self, scenery_package_path):
         total_dsfs = 0
@@ -285,12 +311,14 @@ class DsfUtils:
                 scenery_info = json.load(file)
                 dsf_folder_files = scenery_info.get("dsf_folder_files", {})
                 processed_dsf_seasons = scenery_info.get("processed_dsf_seasons", {})
+                missing_xp_tiles = scenery_info.get("missing_xp_tiles", {})
                 total_dsfs = scenery_info.get("total_dsfs", 0)
         else:
             scenery_info = {}
             dsf_folder_files = {}
             total_dsfs = 0
             processed_dsf_seasons = {}
+            missing_xp_tiles = {}
 
         if not dsf_folder_files and not processed_dsf_seasons:
             dsf_folder_files, total_dsfs = self.scan_for_dsfs(scenery_name)
@@ -337,11 +365,16 @@ class DsfUtils:
                     dsf_folder, dsf_file = in_flight.pop(future)
                     try:
                         success = future.result()
-                        if success:
+                        if success == SeasonsAddResult.ADDED:
                             if dsf_folder not in processed_dsf_seasons:
                                 processed_dsf_seasons[dsf_folder] = [dsf_file]
                             elif dsf_file not in processed_dsf_seasons[dsf_folder]:
                                 processed_dsf_seasons[dsf_folder].append(dsf_file)
+                        elif success == SeasonsAddResult.XP_TILE_MISSING:
+                            if dsf_folder not in missing_xp_tiles:
+                                missing_xp_tiles[dsf_folder] = [dsf_file]
+                            elif dsf_file not in missing_xp_tiles[dsf_folder]:
+                                missing_xp_tiles[dsf_folder].append(dsf_file)
                         else:
                             log.error(f"Failed to add season to {dsf_folder}/{dsf_file}")
                             failures += 1
@@ -374,14 +407,32 @@ class DsfUtils:
         scenery_info.update({
             "dsf_folder_files": dsf_folder_files,
             "processed_dsf_seasons": processed_dsf_seasons,
-            "total_dsfs": total_dsfs
+            "total_dsfs": total_dsfs,
+            "missing_xp_tiles": missing_xp_tiles
         })
         tmp_path = scenery_info_json + ".tmp"
         with open(tmp_path, "w") as file:
             json.dump(scenery_info, file, indent=4)
         os.replace(tmp_path, scenery_info_json)
 
-        return processed_dsf_seasons == dsf_folder_files
+        # If all dsfs have been processed or skipped due to missing XP tiles, return True
+        # Compare in a set-wise, order-insensitive manner and de-duplicate any overlaps
+        def _to_dict_of_sets(folder_to_files):
+            normalized = {}
+            for folder, files in folder_to_files.items():
+                normalized[folder] = set(files)
+            return normalized
+
+        merged_dsf_folder_files_sets = _to_dict_of_sets(processed_dsf_seasons)
+        for folder, files in missing_xp_tiles.items():
+            if folder not in merged_dsf_folder_files_sets:
+                merged_dsf_folder_files_sets[folder] = set(files)
+            else:
+                merged_dsf_folder_files_sets[folder].update(files)
+
+        dsf_folder_files_sets = _to_dict_of_sets(dsf_folder_files)
+
+        return dsf_folder_files_sets == merged_dsf_folder_files_sets
 
 
     def restore_default_dsfs(self, scenery_name:str, progress_callback=None):
@@ -423,6 +474,7 @@ class DsfUtils:
         # reset fields in scenery info json
         scenery_info.update({
             "processed_dsf_seasons": {},
+            "missing_xp_tiles": {},
         })
         tmp_path = scenery_info_json + ".tmp"
         with open(tmp_path, "w") as file:

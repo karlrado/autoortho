@@ -834,12 +834,6 @@ class AOMount:
             except Exception as exc:
                 log.warning(f"Force unmount attempt failed: {exc}")
 
-        try:
-            from utils.mount_utils import cleanup_mountpoint
-            cleanup_mountpoint(mountpoint)
-        except Exception as e:
-            log.warning(f"Failed to cleanup mountpoint {mountpoint}: {e}")
-
 
 class AOMountUI(AOMount, config_ui.ConfigUI):
     def __init__(self, *args, **kwargs):
