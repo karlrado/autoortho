@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import uuid
 from logging import getLogger
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 from aoconfig import CFG
 from utils.constants import system_type
@@ -44,6 +44,30 @@ class DsfUtils:
         self.dsf_dir = CFG.paths.dsf_dir
         self.seven_zip_dir = self.get_7zip_location()    # compressing dsf files
 
+    def _run_silent_subprocess(self, command):
+        """Run external tools without popping a console window on Windows.
+
+        - Suppresses stdout entirely and captures stderr for logging
+        - Uses CREATE_NO_WINDOW on Windows to avoid opening new terminal windows
+        """
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if system_type == "windows" else 0
+        startupinfo = None
+        if system_type == "windows":
+            # Hide window even if the child is a console subsystem exe
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+            startupinfo.wShowWindow = 0  # SW_HIDE
+
+        return subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            creationflags=creationflags,
+            startupinfo=startupinfo,
+        )
+
     def compress_dsf_file(self, dsf_to_compress_path, compressed_dsf_path) -> bool:
         command = [
             self.seven_zip_dir,
@@ -54,12 +78,7 @@ class DsfUtils:
             dsf_to_compress_path,
         ]
         try:
-            result = subprocess.run(
-                command,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
+            result = self._run_silent_subprocess(command)
             return result.returncode == 0
         except subprocess.CalledProcessError as e:
             log.error(f"Failed to compress {dsf_to_compress_path} to {compressed_dsf_path}: {e}")
@@ -118,12 +137,7 @@ class DsfUtils:
             txt_file_path,
         ]
         try:
-            result = subprocess.run(
-                command,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
+            result = self._run_silent_subprocess(command)
             return result.returncode == 0
         except subprocess.CalledProcessError as e:
             log.error(
@@ -144,12 +158,7 @@ class DsfUtils:
             dsf_file_path,
         ]
         try:
-            result = subprocess.run(
-                command,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
+            result = self._run_silent_subprocess(command)
             return result.returncode == 0
         except subprocess.CalledProcessError as e:
             log.error(
