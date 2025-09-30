@@ -100,7 +100,6 @@ __main__.dist: autoortho/.version
 
 win_exe: AutoOrtho_win_$(SAFE_VERSION).exe
 AutoOrtho_win_$(SAFE_VERSION).exe: __main__.dist
-	sudo apt update && sudo apt install -y nsis nsis-pluginapi
 	cp autoortho/imgs/ao-icon.ico .
 	makensis -DPRODUCT_VERSION=$(VERSION) installer.nsi
 	mv AutoOrtho.exe $@
