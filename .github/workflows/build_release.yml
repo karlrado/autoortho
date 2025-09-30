@@ -139,8 +139,6 @@ jobs:
           python -m pip install -U -r requirements-build.txt
     - name: Install NSIS
       run: choco install nsis -y --no-progress
-    - name: Verify NSIS
-      run: makensis -VERSION
 
     - name: Optionally set internal version separately
       if: ${{ inputs.internalver != '' }}
