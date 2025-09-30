@@ -1770,8 +1770,8 @@ class ConfigUI(QMainWindow):
 
         # Use standard icons for better feedback
         style = self.style()
-        icon_repair = style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
-        icon_reapply = style.standardIcon(QStyle.StandardPixmap.SP_CommandLink)
+        icon_repair = style.standardIcon(QStyle.StandardPixmap.SP_DialogResetButton)
+        icon_reapply = style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
         icon_restore = style.standardIcon(QStyle.StandardPixmap.SP_TrashIcon)
 
         repair_action = menu.addAction(icon_repair, "Repair: Try to apply seasons to missing tiles")
