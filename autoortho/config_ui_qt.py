@@ -1783,10 +1783,10 @@ class ConfigUI(QMainWindow):
         icon_reapply = style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
         icon_restore = style.standardIcon(QStyle.StandardPixmap.SP_TrashIcon)
 
-        repair_action = menu.addAction(icon_repair, "Repair: Try to apply seasons to missing tiles")
-        reapply_action = menu.addAction(icon_reapply, "Reapply:  Restore then apply seasons (clean install)")
+        repair_action = menu.addAction(icon_repair, "Repair: Try to apply seasons to missing/failed tiles")
+        reapply_action = menu.addAction(icon_reapply, "Reapply:  Restore then apply seasons again (clean install)")
         menu.addSeparator()
-        restore_action = menu.addAction(icon_restore, "Restore Default DSFs: Uninstall seasons")
+        restore_action = menu.addAction(icon_restore, "Restore Default DSFs: Uninstall seasons and revert to default DSFs")
 
         # Position menu anchored to the triggering button, falling back to cursor
         btn = self.findChild(QPushButton, f"seasons-options-{region_id}")
@@ -1814,7 +1814,7 @@ class ConfigUI(QMainWindow):
 
         if chosen == reapply_action:
             msg = (
-                "Reapply will first restore all DSFs to defaults (removing seasons), and then re-apply Native Seasons to all tiles.\n\n"
+                "Reapply will first restore all DSFs to defaults (removing seasons), and then re-apply Native Seasons to all tiles (if any are missing/failed).\n\n"
                 "This is a full clean and install process. Proceed?"
             )
             reply = QMessageBox.question(
