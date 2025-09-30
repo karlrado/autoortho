@@ -1619,7 +1619,7 @@ class ConfigUI(QMainWindow):
                 if package_name not in self.installed_package_names:
                     self.installed_package_names.append(package_name)
 
-                # Non-clickable status button
+                # Status button (clickable when seasons not yet applied)
                 seasons_status_btn = StyledButton(status_btn_text, primary=False)
                 seasons_status_btn.setFixedSize(200,35)
                 seasons_status_btn.setStyleSheet(
@@ -1631,8 +1631,17 @@ class ConfigUI(QMainWindow):
                     line-height: 30px;
                     """
                 )
-                seasons_status_btn.setEnabled(False)
-                seasons_status_btn.setObjectName(f"seasons-status-{package_name}")
+                if seasons_apply_status == downloader.SeasonsApplyStatus.NOT_APPLIED:
+                    seasons_status_btn.setEnabled(True)
+                    seasons_status_btn.setObjectName(f"seasons-options-{package_name}")
+                    seasons_status_btn.clicked.connect(
+                        lambda checked, rid=package_name, st=seasons_apply_status: (
+                            self.on_add_seasons(rid, st)
+                        )
+                    )
+                else:
+                    seasons_status_btn.setEnabled(False)
+                    seasons_status_btn.setObjectName(f"seasons-status-{package_name}")
 
                 # Seasons Options button (menu) - only when seasons are partially or fully added
                 seasons_options_btn = None

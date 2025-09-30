@@ -464,21 +464,34 @@ class Release(object):
         self.downloaded = True
         self.cleaned = True
 
-        merged_dsf_folder_files = self.processed_dsf_seasons.copy()
-        for folder, files in self.missing_xp_tiles.items():
-            if folder not in merged_dsf_folder_files:
-                merged_dsf_folder_files[folder] = files
-            else:
-                merged_dsf_folder_files[folder].extend(files)
+        # Determine seasons status by comparing (processed ∪ missing) to
+        # the expected DSF list, using order-insensitive set logic
+        def _to_dict_of_sets(folder_to_files):
+            normalized = {}
+            for folder, files in (folder_to_files or {}).items():
+                normalized[folder] = set(files)
+            return normalized
 
-        if not self.dsf_folders_files and not self.processed_dsf_seasons and not self.missing_xp_tiles:
+        expected = getattr(self, 'dsf_folder_files', None)
+        if expected is None:
+            expected = getattr(self, 'dsf_folders_files', {})
+
+        expected_sets = _to_dict_of_sets(expected)
+
+        merged_sets = _to_dict_of_sets(self.processed_dsf_seasons)
+        for folder, files in (self.missing_xp_tiles or {}).items():
+            if folder not in merged_sets:
+                merged_sets[folder] = set(files)
+            else:
+                merged_sets[folder].update(files)
+
+        if (not expected_sets and not self.processed_dsf_seasons
+                and not self.missing_xp_tiles):
             self.seasons_apply_status = SeasonsApplyStatus.NOT_APPLIED
-        elif merged_dsf_folder_files == self.processed_dsf_seasons:
+        elif merged_sets == expected_sets:
             self.seasons_apply_status = SeasonsApplyStatus.APPLIED
-        elif merged_dsf_folder_files != self.processed_dsf_seasons:
-            self.seasons_apply_status = SeasonsApplyStatus.PARTIALLY_APPLIED
         else:
-            self.seasons_apply_status = SeasonsApplyStatus.NOT_APPLIED
+            self.seasons_apply_status = SeasonsApplyStatus.PARTIALLY_APPLIED
 
         detected_info_ver = info.get('info_ver')
         if self.ortho_dirs and detected_info_ver is None:

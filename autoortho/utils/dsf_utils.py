@@ -416,13 +416,23 @@ class DsfUtils:
         os.replace(tmp_path, scenery_info_json)
 
         # If all dsfs have been processed or skipped due to missing XP tiles, return True
-        merged_dsf_folder_files = processed_dsf_seasons.copy()
+        # Compare in a set-wise, order-insensitive manner and de-duplicate any overlaps
+        def _to_dict_of_sets(folder_to_files):
+            normalized = {}
+            for folder, files in folder_to_files.items():
+                normalized[folder] = set(files)
+            return normalized
+
+        merged_dsf_folder_files_sets = _to_dict_of_sets(processed_dsf_seasons)
         for folder, files in missing_xp_tiles.items():
-            if folder not in merged_dsf_folder_files:
-                merged_dsf_folder_files[folder] = files
+            if folder not in merged_dsf_folder_files_sets:
+                merged_dsf_folder_files_sets[folder] = set(files)
             else:
-                merged_dsf_folder_files[folder].extend(files)
-        return dsf_folder_files == merged_dsf_folder_files
+                merged_dsf_folder_files_sets[folder].update(files)
+
+        dsf_folder_files_sets = _to_dict_of_sets(dsf_folder_files)
+
+        return dsf_folder_files_sets == merged_dsf_folder_files_sets
 
 
     def restore_default_dsfs(self, scenery_name:str, progress_callback=None):
@@ -464,6 +474,7 @@ class DsfUtils:
         # reset fields in scenery info json
         scenery_info.update({
             "processed_dsf_seasons": {},
+            "missing_xp_tiles": {},
         })
         tmp_path = scenery_info_json + ".tmp"
         with open(tmp_path, "w") as file:
