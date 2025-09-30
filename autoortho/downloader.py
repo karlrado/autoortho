@@ -440,6 +440,7 @@ class Release(object):
         self.dsf_folders_files = {}
         self.processed_dsf_seasons = {}
         self.total_dsfs = 0
+        self.missing_xp_tiles = {}
 
         #if os.path.exists(self.info_path):
         #    self.load(self.info_path)
@@ -463,11 +464,18 @@ class Release(object):
         self.downloaded = True
         self.cleaned = True
 
-        if not self.dsf_folders_files and not self.processed_dsf_seasons:
+        merged_dsf_folder_files = self.processed_dsf_seasons.copy()
+        for folder, files in self.missing_xp_tiles.items():
+            if folder not in merged_dsf_folder_files:
+                merged_dsf_folder_files[folder] = files
+            else:
+                merged_dsf_folder_files[folder].extend(files)
+
+        if not self.dsf_folders_files and not self.processed_dsf_seasons and not self.missing_xp_tiles:
             self.seasons_apply_status = SeasonsApplyStatus.NOT_APPLIED
-        elif self.dsf_folders_files == self.processed_dsf_seasons:
+        elif merged_dsf_folder_files == self.processed_dsf_seasons:
             self.seasons_apply_status = SeasonsApplyStatus.APPLIED
-        elif self.dsf_folders_files != self.processed_dsf_seasons:
+        elif merged_dsf_folder_files != self.processed_dsf_seasons:
             self.seasons_apply_status = SeasonsApplyStatus.PARTIALLY_APPLIED
         else:
             self.seasons_apply_status = SeasonsApplyStatus.NOT_APPLIED

@@ -24,13 +24,13 @@ from PySide6.QtWidgets import (
     QTabWidget, QPushButton, QLabel, QLineEdit, QCheckBox, QComboBox,
     QSlider, QTextEdit, QFileDialog, QMessageBox, QScrollArea,
     QSplashScreen, QGroupBox, QProgressBar, QStatusBar, QFrame, QSpinBox,
-    QColorDialog, QRadioButton
+    QColorDialog, QRadioButton, QMenu, QStyle
 )
 from PySide6.QtCore import (
-    Qt, QThread, Signal, QTimer, QSize
+    Qt, QThread, Signal, QTimer, QSize, QPoint
 )
 from PySide6.QtGui import (
-    QPixmap, QIcon, QColor, QWheelEvent
+    QPixmap, QIcon, QColor, QWheelEvent, QCursor
 )
 
 import downloader
@@ -331,6 +331,8 @@ class ConfigUI(QMainWindow):
         self.add_seasons_queue = []  # queue of region_id/package_name waiting to run add seasons
         self.add_seasons_current = None  # currently processing region_id/package_name
         self.restore_default_dsfs_workers = {}
+        self.reapply_after_restore = set()
+        self.installed_package_names = []
         self.simheaven_config_changed_session = False
         self.installed_packages = []
         self.cache_thread = None
@@ -1601,40 +1603,46 @@ class ConfigUI(QMainWindow):
                 )
                 seasons_apply_status = latest.seasons_apply_status
                 if seasons_apply_status == downloader.SeasonsApplyStatus.NOT_APPLIED:
-                    add_seasons_btn_text = "Add Native Seasons"
-                    add_seasons_btn_color = "#2d78ba"
+                    status_btn_text = "Add Native Seasons"
+                    status_btn_color = "#2d78ba"
                 elif seasons_apply_status == downloader.SeasonsApplyStatus.PARTIALLY_APPLIED:
-                    add_seasons_btn_text = "Partially Added Seasons"
-                    add_seasons_btn_color = "#db7100"
+                    status_btn_text = "Partially Added Seasons"
+                    status_btn_color = "#db7100"
                 elif seasons_apply_status == downloader.SeasonsApplyStatus.APPLIED:
-                    add_seasons_btn_text = "Seasons Added"
-                    add_seasons_btn_color = "#4CAF50"
+                    status_btn_text = "Seasons Added"
+                    status_btn_color = "#4CAF50"
                 else:
-                    add_seasons_btn_text = "Add Native Seasons"
-                    add_seasons_btn_color = "#2d78ba"
-                add_seasons_btn = StyledButton(add_seasons_btn_text, primary=False)
-                add_seasons_btn.setFixedSize(200,35)
-                add_seasons_btn.setStyleSheet(
+                    status_btn_text = "Add Native Seasons"
+                    status_btn_color = "#2d78ba"
+
+                package_name = os.path.basename(latest.subfolder_dir)
+                if package_name not in self.installed_package_names:
+                    self.installed_package_names.append(package_name)
+
+                # Non-clickable status button
+                seasons_status_btn = StyledButton(status_btn_text, primary=False)
+                seasons_status_btn.setFixedSize(200,35)
+                seasons_status_btn.setStyleSheet(
                     f"""
-                    background-color: {add_seasons_btn_color};
+                    background-color: {status_btn_color};
                     font-size: 16px;
                     font-weight: bold;
                     text-align: center;
                     line-height: 30px;
                     """
                 )
-                package_name = os.path.basename(latest.subfolder_dir)
-                add_seasons_btn.setObjectName(f"add-seasons-{package_name}")
-                add_seasons_btn.clicked.connect(
-                    lambda checked, rid=package_name: (
-                        self.on_add_seasons(rid, seasons_apply_status)
-                    )
-                )
-                restore_btn = None
-                if seasons_apply_status != downloader.SeasonsApplyStatus.NOT_APPLIED:
-                    restore_btn = StyledButton("Restore Default DSFs", primary=False)
-                    restore_btn.setFixedSize(200,35)
-                    restore_btn.setStyleSheet(
+                seasons_status_btn.setEnabled(False)
+                seasons_status_btn.setObjectName(f"seasons-status-{package_name}")
+
+                # Seasons Options button (menu) - only when seasons are partially or fully added
+                seasons_options_btn = None
+                if seasons_apply_status in (
+                    downloader.SeasonsApplyStatus.PARTIALLY_APPLIED,
+                    downloader.SeasonsApplyStatus.APPLIED,
+                ):
+                    seasons_options_btn = StyledButton("Seasons Options", primary=False)
+                    seasons_options_btn.setFixedSize(200,35)
+                    seasons_options_btn.setStyleSheet(
                         f"""
                         background-color: #2d78ba;
                         font-size: 16px;
@@ -1643,16 +1651,16 @@ class ConfigUI(QMainWindow):
                         line-height: 30px;
                         """
                     )
-                    restore_btn.setObjectName(f"restore-dsfs-{package_name}")
-                    restore_btn.clicked.connect(
+                    seasons_options_btn.setObjectName(f"seasons-options-{package_name}")
+                    seasons_options_btn.clicked.connect(
                         lambda checked, rid=package_name: (
-                            self.on_restore_default_dsfs(rid)
+                            self.on_seasons_options_clicked(rid)
                         )
-                    )                # add a horizontal layout
+                    )
                 h_layout = QHBoxLayout()
-                h_layout.addWidget(add_seasons_btn)
-                if restore_btn:
-                    h_layout.addWidget(restore_btn)
+                h_layout.addWidget(seasons_status_btn)
+                if seasons_options_btn:
+                    h_layout.addWidget(seasons_options_btn)
                 h_layout.addWidget(delete_btn)
 
                 dsf_progress_bar = QProgressBar()
@@ -1671,10 +1679,11 @@ class ConfigUI(QMainWindow):
 
     def on_restore_default_dsfs(self, region_id):
         """Handle restoring default DSFs"""
-        button = self.findChild(QPushButton, f"restore-dsfs-{region_id}")
+        # Button now is seasons-options, disable it while working
+        button = self.findChild(QPushButton, f"seasons-options-{region_id}")
         if button:
             button.setEnabled(False)
-            button.setText("Restoring default DSFs...")
+            button.setText("Working...")
 
         dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
         if dsf_progress_bar:
@@ -1697,13 +1706,21 @@ class ConfigUI(QMainWindow):
 
     def on_restore_default_dsfs_finished(self, region_id, success):
         """Handle restore default DSFs completion"""
-        button = self.findChild(QPushButton, f"restore-dsfs-{region_id}")
+        button = self.findChild(QPushButton, f"seasons-options-{region_id}")
         if button:
             button.setEnabled(True)
-            button.setText("Restore Default DSFs")
+            button.setText("Seasons Options")
         dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
         if dsf_progress_bar:
             dsf_progress_bar.setVisible(False)
+        # If this was part of a reapply flow, start add seasons next
+        try:
+            if success and region_id in self.reapply_after_restore:
+                self.reapply_after_restore.discard(region_id)
+                self._start_add_seasons_job(region_id)
+                return
+        except Exception:
+            pass
         self.refresh_scenery_list()
 
     def on_restore_default_dsfs_progress(self, region_id, progress_data):
@@ -1711,6 +1728,114 @@ class ConfigUI(QMainWindow):
         dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
         if dsf_progress_bar:
             dsf_progress_bar.setValue(progress_data["pcnt_done"])
+
+    def on_seasons_options_clicked(self, region_id):
+        """Show Seasons Options menu with Repair, Reapply, Restore"""
+        if getattr(self, 'running', False):
+            QMessageBox.warning(
+                self,
+                "Operation Not Allowed While Running",
+                "Cannot modify Native Seasons while AutoOrtho is running. Please stop AutoOrtho first."
+            )
+            return
+
+        # Build a styled, informative menu
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            """
+            QMenu {
+                background-color: #2A2A2A;
+                border: 1px solid #3A3A3A;
+                padding: 6px;
+            }
+            QMenu::item {
+                color: #E0E0E0;
+                padding: 8px 14px;
+                background-color: transparent;
+            }
+            QMenu::icon {
+                padding-left: 6px;
+            }
+            QMenu::item:selected {
+                background-color: #3A3A3A;
+                color: #ffffff;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #3A3A3A;
+                margin: 6px 8px;
+            }
+            """
+        )
+
+        # Use standard icons for better feedback
+        style = self.style()
+        icon_repair = style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
+        icon_reapply = style.standardIcon(QStyle.StandardPixmap.SP_CommandLink)
+        icon_restore = style.standardIcon(QStyle.StandardPixmap.SP_TrashIcon)
+
+        repair_action = menu.addAction(icon_repair, "Repair: Try to apply seasons to missing tiles")
+        reapply_action = menu.addAction(icon_reapply, "Reapply:  Restore then apply seasons (clean install)")
+        menu.addSeparator()
+        restore_action = menu.addAction(icon_restore, "Restore Default DSFs: Uninstall seasons")
+
+        # Position menu anchored to the triggering button, falling back to cursor
+        btn = self.findChild(QPushButton, f"seasons-options-{region_id}")
+        global_pos = QCursor.pos() if btn is None else btn.mapToGlobal(QPoint(0, btn.height()))
+        chosen = menu.exec(global_pos)
+        if not chosen:
+            return
+
+        if chosen == repair_action:
+            msg = (
+                "Repair will scan the scenery and apply Native Seasons to any DSF tiles that are missing seasons.\n\n"
+                "Proceed?"
+            )
+            reply = QMessageBox.question(
+                self,
+                "Confirm Repair",
+                msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                # Reuse existing flow to start add seasons
+                self._start_add_seasons_job(region_id)
+            return
+
+        if chosen == reapply_action:
+            msg = (
+                "Reapply will first restore all DSFs to defaults (removing seasons), and then re-apply Native Seasons to all tiles.\n\n"
+                "This is a full clean and install process. Proceed?"
+            )
+            reply = QMessageBox.question(
+                self,
+                "Confirm Reapply",
+                msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                # Flag to auto-run add seasons after restore completes
+                self.reapply_after_restore.add(region_id)
+                self.on_restore_default_dsfs(region_id)
+            return
+
+        if chosen == restore_action:
+            msg = (
+                "Restore will revert all DSFs to their original state and remove Native Seasons.\n\n"
+                "Proceed?"
+            )
+            reply = QMessageBox.question(
+                self,
+                "Confirm Restore",
+                msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.on_restore_default_dsfs(region_id)
+            return
 
     def on_delete_scenery(self, region_id):
         """Handle scenery deletion"""
@@ -1815,7 +1940,7 @@ class ConfigUI(QMainWindow):
         # Disable Add Seasons buttons while running
         try:
             for rid in self.installed_packages:
-                btn = self.findChild(QPushButton, f"add-seasons-{rid}")
+                btn = self.findChild(QPushButton, f"seasons-options-{rid}")
                 if btn:
                     btn.setEnabled(False)
                     btn.setToolTip("Disabled while AutoOrtho is running")
@@ -1977,7 +2102,6 @@ class ConfigUI(QMainWindow):
 
     def on_add_seasons(self, region_id, seasons_status: downloader.SeasonsApplyStatus):
         """Handle adding seasons"""
-
         # Block if AutoOrtho is running
         if getattr(self, 'running', False):
             QMessageBox.warning(
@@ -1987,25 +2111,8 @@ class ConfigUI(QMainWindow):
             )
             return
 
-        if seasons_status == downloader.SeasonsApplyStatus.APPLIED:
-            QMessageBox.information(
-                self,
-                "Seasons Already Added",
-                "Native Seasons are already added to this scenery. Nothing to do."
-            )
-            return
-
-        elif seasons_status == downloader.SeasonsApplyStatus.PARTIALLY_APPLIED:
-            reply = QMessageBox.question(
-                self,
-                "Partially Added Seasons",
-                "Native Seasons are partially added to this scenery. This will try to add seasons to the remaining DSFs. Continue?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes
-            )
-            if reply == QMessageBox.StandardButton.No:
-                return
-        button = self.findChild(QPushButton, f"add-seasons-{region_id}")
+        # Button no longer exists directly; use seasons-options for state changes
+        button = self.findChild(QPushButton, f"seasons-options-{region_id}")
         if button is None:
             return
 
@@ -2037,10 +2144,10 @@ class ConfigUI(QMainWindow):
 
     def on_add_seasons_finished(self, region_id, success):
         """Handle add seasons completion"""
-        button = self.findChild(QPushButton, f"add-seasons-{region_id}")
+        button = self.findChild(QPushButton, f"seasons-options-{region_id}")
         if button:
             button.setEnabled(not self.running)
-            button.setText("Add Native Seasons")
+            button.setText("Seasons Options")
 
         if success:
             self.update_status_bar(f"Successfully added seasons to {region_id}")
@@ -2081,6 +2188,14 @@ class ConfigUI(QMainWindow):
                 if hasattr(self, 'run_button'):
                     self.run_button.setEnabled(False)
                     self.run_button.setToolTip("Disabled: Native Seasons are being added")
+                # Also disable Seasons Options buttons
+                try:
+                    for rid in getattr(self, 'installed_package_names', []):
+                        btn = self.findChild(QPushButton, f"seasons-options-{rid}")
+                        if btn:
+                            btn.setEnabled(False)
+                except Exception:
+                    pass
             else:
                 if hasattr(self, 'run_button') and not self.running:
                     self.run_button.setEnabled(True)
@@ -2089,13 +2204,21 @@ class ConfigUI(QMainWindow):
                         self.run_button.setText("Run")
                     except Exception:
                         pass
+                # Re-enable Seasons Options buttons when idle
+                try:
+                    for rid in getattr(self, 'installed_package_names', []):
+                        btn = self.findChild(QPushButton, f"seasons-options-{rid}")
+                        if btn:
+                            btn.setEnabled(True)
+                except Exception:
+                    pass
         except Exception:
             pass
 
     def _start_add_seasons_job(self, region_id):
         """Internal helper to begin processing a single add-seasons job for region_id."""
         try:
-            button = self.findChild(QPushButton, f"add-seasons-{region_id}")
+            button = self.findChild(QPushButton, f"seasons-options-{region_id}")
             if button:
                 button.setEnabled(False)
                 button.setText("Adding seasons...")
@@ -2128,13 +2251,12 @@ class ConfigUI(QMainWindow):
                 # Start next job and update its button
                 self._start_add_seasons_job(next_region_id)
             else:
-                # If nothing pending, re-enable all add seasons buttons
+                # If nothing pending, re-enable all seasons options buttons
                 if not self._has_active_seasons_jobs():
                     for rid in self.installed_packages:
-                        btn = self.findChild(QPushButton, f"add-seasons-{rid}")
+                        btn = self.findChild(QPushButton, f"seasons-options-{rid}")
                         if btn:
                             btn.setEnabled(True)
-                            # Don't override custom label from refresh_scenery_list; leave as-is
         except Exception:
             pass
 
@@ -2167,7 +2289,7 @@ class ConfigUI(QMainWindow):
                 for rid in self.installed_packages:
                     if rid == self.add_seasons_current:
                         continue
-                    btn = self.findChild(QPushButton, f"add-seasons-{rid}")
+                    btn = self.findChild(QPushButton, f"seasons-options-{rid}")
                     if not btn:
                         continue
                     if rid in self.add_seasons_queue:
