@@ -118,7 +118,7 @@ jobs:
 
 
   build-windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
     permissions:
       contents: write
 
@@ -137,8 +137,6 @@ jobs:
           #choco --yes install winfsp
           python -m pip install -U -r requirements.txt
           python -m pip install -U -r requirements-build.txt
-    - name: Install NSIS
-      run: choco install nsis -y --no-progress
 
     - name: Optionally set internal version separately
       if: ${{ inputs.internalver != '' }}
