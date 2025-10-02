@@ -330,7 +330,7 @@ class Chunk(object):
             pass
 
         # Unique temp filename per writer to avoid collisions between threads/tiles
-        temp_filename = os.path.join(self.cache_dir, f"XX_{self.chunk_id}_{uuid.uuid4().hex}.tmp")
+        temp_filename = os.path.join(self.cache_dir, f"{self.chunk_id}_{uuid.uuid4().hex}.tmp")
 
         # Write data to the unique temp file first
         try:
