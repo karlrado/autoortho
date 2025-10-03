@@ -296,7 +296,30 @@ class Chunk(object):
             bump('chunk_hit')
             cache_file = Path(self.cache_path)
             # Get data
-            data = cache_file.read_bytes()
+            data = None
+            # On Windows, the cache file can be briefly locked by AV or a concurrent writer.
+            # Add a short retry/backoff loop to avoid spurious PermissionError / sharing violations.
+            max_attempts = 5
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    data = cache_file.read_bytes()
+                    break
+                except PermissionError as e:
+                    if attempt < max_attempts:
+                        time.sleep(0.02 * attempt)
+                        continue
+                    log.warning(f"Permission denied reading cache {self}: {e}")
+                    return False
+                except FileNotFoundError:
+                    # Raced with a concurrent replace/remove; treat as miss
+                    return False
+                except OSError as e:
+                    winerr = getattr(e, 'winerror', None)
+                    if winerr in (5, 32, 33) and attempt < max_attempts:
+                        time.sleep(0.02 * attempt)
+                        continue
+                    log.debug(f"OSError reading cache {self}: {e}")
+                    return False
 
             cache_file.touch()
             # Update modified data
