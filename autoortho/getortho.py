@@ -1002,29 +1002,27 @@ class Tile(object):
             chunk_img = None
             if chunk_ready and chunk.data:
                 # We returned and have data!
-                log.debug(f"GET_IMG: Ready and found chunk data.")
+                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Ready and found chunk data.")
                 chunk_img = AoImage.load_from_memory(chunk.data)
             elif mipmap < self.max_mipmap and not chunk_ready:
                 # Ran out of time, requesting mm below max.  Search for backup...
-                log.debug(f"GET_IMG: Tile {self} not ready.  Try to find backup chunk.")
+                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Tile {self} not ready.  Try to find backup chunk.")
                 chunk_img = self.get_best_chunk(chunk.col, chunk.row, mipmap, zoom)
                 if chunk_img:
                     bump('backup_chunk_count')
 
             if not chunk_ready and not chunk_img:
                 # Ran out of time, lower mipmap.  Retry...
-                log.debug(f"GET_IMG: Final retry for {chunk}")
+                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Final retry for {chunk}, WAITING!")
                 bump('retry_chunk_count')
                 chunk_ready = chunk.ready.wait(maxwait)
                 if chunk_ready and chunk.data:
-                    log.debug(f"GET_IMG: Final retry for {chunk}, SUCCESS!")
+                    log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Final retry for {chunk}, SUCCESS!")
                     chunk_img = AoImage.load_from_memory(chunk.data)
 
-            if not chunk_img and not chunk.data:
-                log.debug(f"GET_IMG: Empty chunk data.  Skip.")
+            if not chunk_img:
+                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Empty chunk data.  Skip.")
                 bump('chunk_missing_count')
-            elif not chunk_img and chunk.data:
-                log.warning(f"GET_IMG: FAILED! {chunk}:  LEN: {len(chunk.data)}  HEADER: {chunk.data[:8]}")
                 
             return (chunk, chunk_img, start_x, start_y)
         
