@@ -908,8 +908,14 @@ class ConfigUI(QMainWindow):
             "Automatically clean cache when AutoOrtho exits.\n"
             "Note that this can take a long time."
         )
-
         clean_cache_controls_layout.addWidget(self.auto_clean_cache_check)
+        self.delete_cache_btn = StyledButton("Delete Cache")
+        self.delete_cache_btn.clicked.connect(self.on_delete_cache)
+        self.delete_cache_btn.setToolTip(
+            "Delete all cache files.\n"
+            "This should be faster than cleaning with a non-zero limit."
+        )
+        clean_cache_controls_layout.addWidget(self.delete_cache_btn)
         clean_cache_controls_layout.addStretch()
         cache_layout.addLayout(clean_cache_controls_layout)
 
@@ -2023,12 +2029,16 @@ class ConfigUI(QMainWindow):
         else:
             self.update_status_bar("Configuration saved")
 
-    def on_clean_cache(self, for_exit=False):
+    def on_delete_cache(self):
+        self.on_clean_cache(delete_all=True)
+
+    def on_clean_cache(self, for_exit=False, delete_all=False):
         """Handle Clean Cache button click
 
         Args:
             for_exit (bool): When True, invoked from closeEvent - suppress dialogs
                              and allow closeEvent to wait on the thread.
+            delete_all (bool) : When True, all files in the cache should be deleted.
         """
 
         if self.running:
@@ -2050,7 +2060,7 @@ class ConfigUI(QMainWindow):
         self.cache_thread = QThread()
         self.cache_thread.run = lambda: self.clean_cache(
             self.cfg.paths.cache_dir,
-            int(self.file_cache_slider.value())
+            int(self.file_cache_slider.value() if not delete_all else 0)
         )
         self.cache_thread.finished.connect(lambda: self.on_cache_cleaned(for_exit))
         self.cache_thread.start()
