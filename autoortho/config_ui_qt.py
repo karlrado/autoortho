@@ -1662,7 +1662,7 @@ class ConfigUI(QMainWindow):
                     seasons_options_btn = StyledButton("Seasons Options", primary=False)
                     seasons_options_btn.setFixedSize(200,35)
                     seasons_options_btn.setStyleSheet(
-                        f"""
+                        """
                         background-color: #2d78ba;
                         font-size: 16px;
                         font-weight: bold;
@@ -2621,9 +2621,9 @@ class ConfigUI(QMainWindow):
 
     def on_using_custom_tiles_check(self, state):
         """Handle using custom tiles check"""
-        if state == False: 
-            if self.cfg.autoortho.using_custom_tiles == True and int(self.cfg.autoortho.max_zoom) > 17:
-                log.info(f"Max zoom being capped to 17 after custom tiles disabled")
+        if not state: 
+            if self.cfg.autoortho.using_custom_tiles and int(self.cfg.autoortho.max_zoom) > 17:
+                log.info("Max zoom being capped to 17 after custom tiles disabled")
                 self.cfg.autoortho.max_zoom = 17
             self.cfg.autoortho.using_custom_tiles = False
         else:
@@ -2719,7 +2719,7 @@ class ConfigUI(QMainWindow):
                     f.writelines(lines)
                 log.info(f"Successfully updated scenery_packs.ini at {scenery_packs_path}")
             else:
-                log.info(f"No AutoOrtho overlay found in scenery_packs.ini - skipping AutoOrtho overlay modifications")
+                log.info("No AutoOrtho overlay found in scenery_packs.ini - skipping AutoOrtho overlay modifications")
                 if not use_simheaven_overlay:
                     QMessageBox.information(
                         self,
