@@ -870,14 +870,10 @@ class ConfigUI(QMainWindow):
             "clean operation leaves in the file cache after cleaning.\n"
             "Note that this cache grows without bounds while AutoOrtho is running.\n"
             "Use the Clean Cache button to reduce the cache to this size.\n"
-            "Larger cache = fewer downloads but more disk usage.\n"
-            "Optimal: 50-200GB for regular use, 200-500GB for extensive "
-            "flying.\n"
-            "Minimum recommended: 20GB"
         )
         file_cache_layout.addWidget(file_cache_label)
         self.file_cache_slider = ModernSlider()
-        self.file_cache_slider.setRange(10, 500)
+        self.file_cache_slider.setRange(0, 500)
         self.file_cache_slider.setSingleStep(5)
         self.file_cache_slider.setValue(
             int(float(self.cfg.cache.file_cache_size))
@@ -912,8 +908,14 @@ class ConfigUI(QMainWindow):
             "Automatically clean cache when AutoOrtho exits.\n"
             "Note that this can take a long time."
         )
-
         clean_cache_controls_layout.addWidget(self.auto_clean_cache_check)
+        self.delete_cache_btn = StyledButton("Delete Cache")
+        self.delete_cache_btn.clicked.connect(self.on_delete_cache)
+        self.delete_cache_btn.setToolTip(
+            "Delete all cache files.\n"
+            "This should be faster than cleaning with a non-zero limit."
+        )
+        clean_cache_controls_layout.addWidget(self.delete_cache_btn)
         clean_cache_controls_layout.addStretch()
         cache_layout.addLayout(clean_cache_controls_layout)
 
@@ -1660,7 +1662,7 @@ class ConfigUI(QMainWindow):
                     seasons_options_btn = StyledButton("Seasons Options", primary=False)
                     seasons_options_btn.setFixedSize(200,35)
                     seasons_options_btn.setStyleSheet(
-                        f"""
+                        """
                         background-color: #2d78ba;
                         font-size: 16px;
                         font-weight: bold;
@@ -2027,12 +2029,16 @@ class ConfigUI(QMainWindow):
         else:
             self.update_status_bar("Configuration saved")
 
-    def on_clean_cache(self, for_exit=False):
+    def on_delete_cache(self):
+        self.on_clean_cache(delete_all=True)
+
+    def on_clean_cache(self, for_exit=False, delete_all=False):
         """Handle Clean Cache button click
 
         Args:
             for_exit (bool): When True, invoked from closeEvent - suppress dialogs
                              and allow closeEvent to wait on the thread.
+            delete_all (bool) : When True, all files in the cache should be deleted.
         """
 
         if self.running:
@@ -2054,7 +2060,7 @@ class ConfigUI(QMainWindow):
         self.cache_thread = QThread()
         self.cache_thread.run = lambda: self.clean_cache(
             self.cfg.paths.cache_dir,
-            int(self.file_cache_slider.value())
+            int(self.file_cache_slider.value() if not delete_all else 0)
         )
         self.cache_thread.finished.connect(lambda: self.on_cache_cleaned(for_exit))
         self.cache_thread.start()
@@ -2615,9 +2621,9 @@ class ConfigUI(QMainWindow):
 
     def on_using_custom_tiles_check(self, state):
         """Handle using custom tiles check"""
-        if state == False: 
-            if self.cfg.autoortho.using_custom_tiles == True and int(self.cfg.autoortho.max_zoom) > 17:
-                log.info(f"Max zoom being capped to 17 after custom tiles disabled")
+        if not state: 
+            if self.cfg.autoortho.using_custom_tiles and int(self.cfg.autoortho.max_zoom) > 17:
+                log.info("Max zoom being capped to 17 after custom tiles disabled")
                 self.cfg.autoortho.max_zoom = 17
             self.cfg.autoortho.using_custom_tiles = False
         else:
@@ -2713,7 +2719,7 @@ class ConfigUI(QMainWindow):
                     f.writelines(lines)
                 log.info(f"Successfully updated scenery_packs.ini at {scenery_packs_path}")
             else:
-                log.info(f"No AutoOrtho overlay found in scenery_packs.ini - skipping AutoOrtho overlay modifications")
+                log.info("No AutoOrtho overlay found in scenery_packs.ini - skipping AutoOrtho overlay modifications")
                 if not use_simheaven_overlay:
                     QMessageBox.information(
                         self,
@@ -2863,50 +2869,54 @@ class ConfigUI(QMainWindow):
             f"Cleaning up cache_dir {cache_dir}. Please wait..."
         )
 
-        target_gb = max(size_gb, 10)
-        target_bytes = pow(2, 30) * target_gb
+        target_bytes = pow(2, 30) * size_gb
 
         try:
-            cfiles = sorted(
-                pathlib.Path(cache_dir).glob('**/*'), key=os.path.getmtime
-            )
-            if not cfiles:
-                self.status_update.emit("Cache is empty.")
-                return
+            if size_gb == 0:
+                for entry in os.scandir(cache_dir):
+                    if entry.is_file():
+                        os.remove(entry.path)
+            else:
+                cfiles = sorted(
+                    pathlib.Path(cache_dir).glob('**/*'), key=os.path.getmtime
+                )
+                if not cfiles:
+                    self.status_update.emit("Cache is empty.")
+                    return
 
-            cache_bytes = sum(
-                file.stat().st_size for file in cfiles if file.is_file()
-            )
-            cachecount = len(cfiles)
-            avgcachesize = cache_bytes / cachecount if cachecount > 0 else 0
+                cache_bytes = sum(
+                    file.stat().st_size for file in cfiles if file.is_file()
+                )
+                cachecount = len(cfiles)
+                avgcachesize = cache_bytes / cachecount if cachecount > 0 else 0
 
-            self.status_update.emit(
-                f"Cache has {cachecount} files. "
-                f"Total size approx {cache_bytes//1048576} MB."
-            )
+                self.status_update.emit(
+                    f"Cache has {cachecount} files. "
+                    f"Total size approx {cache_bytes//1048576} MB."
+                )
 
-            empty_files = [
-                x for x in cfiles if x.is_file() and x.stat().st_size == 0
-            ]
-            self.status_update.emit(
-                f"Found {len(empty_files)} empty files to cleanup."
-            )
-            for file in empty_files:
-                if os.path.exists(file):
-                    os.remove(file)
+                empty_files = [
+                    x for x in cfiles if x.is_file() and x.stat().st_size == 0
+                ]
+                self.status_update.emit(
+                    f"Found {len(empty_files)} empty files to cleanup."
+                )
+                for file in empty_files:
+                    if os.path.exists(file):
+                        os.remove(file)
 
-            if target_bytes > cache_bytes:
-                self.status_update.emit("Cache within size limits.")
-                return
+                if target_bytes > cache_bytes:
+                    self.status_update.emit("Cache within size limits.")
+                    return
 
-            to_delete = int((cache_bytes - target_bytes) // avgcachesize)
+                to_delete = int((cache_bytes - target_bytes) // avgcachesize)
 
-            self.status_update.emit(
-                f"Over cache size limit, will remove {to_delete} files."
-            )
-            for file in cfiles[:to_delete]:
-                if file.is_file():
-                    os.remove(file)
+                self.status_update.emit(
+                    f"Over cache size limit, will remove {to_delete} files."
+                )
+                for file in cfiles[:to_delete]:
+                    if file.is_file():
+                        os.remove(file)
 
             self.status_update.emit("Cache cleanup done.")
         except Exception as e:
