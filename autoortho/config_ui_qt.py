@@ -1040,6 +1040,20 @@ class ConfigUI(QMainWindow):
         maxwait_layout.addWidget(self.maxwait_label)
         autoortho_layout.addLayout(maxwait_layout)
 
+        suspend_maxwait_layout = QHBoxLayout()
+        self.suspend_maxwait_check = QCheckBox("Suspend max wait during startup")
+        self.suspend_maxwait_check.setChecked(self.cfg.autoortho.suspend_maxwait)
+        self.suspend_maxwait_check.setObjectName('suspend_maxwait')
+        self.suspend_maxwait_check.setToolTip(
+            "Suspend the effect of max wait (by temporarily increasing it to a large\n"
+            "value) while loading scenery before the start of the flight.\n"
+            "This reduces backup (low res) textures and missing (grey) textures.\n"
+            "The specified max wait time is used after the flight starts.\n"
+            "This may increase the scenery load time before the start of the flight."
+        )
+        suspend_maxwait_layout.addWidget(self.suspend_maxwait_check)
+        autoortho_layout.addLayout(suspend_maxwait_layout)
+
         # Fetch threads
         threads_layout = QHBoxLayout()
         threads_label = QLabel("Fetch threads per mount:" if self.system == "darwin" else "Global fetch threads:")
@@ -2511,6 +2525,7 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.maxwait = str(
                 self.maxwait_slider.value() / 10.0
             )
+            self.cfg.autoortho.suspend_maxwait = self.suspend_maxwait_check.isChecked()
             self.cfg.autoortho.fetch_threads = str(
                 self.fetch_threads_spinbox.value()
             )
