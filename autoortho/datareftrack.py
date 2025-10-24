@@ -128,12 +128,15 @@ class DatarefTracker(object):
                 self.connected = True
 
             values = self.DecodePacket(data)
-            self.lat = values[0][0]
-            self.lon = values[1][0]
-            self.alt = values[2][0]
-            self.hdg = values[3][0]
-            self.spd = values[4][0]
-            self.data_valid = True
+            if len(values) == 5:
+                self.lat = values[0][0]
+                self.lon = values[1][0]
+                self.alt = values[2][0]
+                self.hdg = values[3][0]
+                self.spd = values[4][0]
+                self.data_valid = True
+            else:
+                self.data_valid = False
 
             # log.info(
             #     f"Lat: {self.lat:.6f}, Lon: {self.lon:.6f}, Alt: {self.alt:.0f}, "
