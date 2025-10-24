@@ -196,16 +196,27 @@ class Getter(object):
 
             try:
                 if not self.get(obj, *args, **kwargs):
+                    # Check if chunk is permanently failed before re-submitting
+                    if hasattr(obj, 'permanent_failure') and obj.permanent_failure:
+                        log.debug(f"Chunk {obj} permanently failed ({obj.failure_reason}), not re-submitting")
+                        continue
                     log.warning(f"Failed getting: {obj} {args} {kwargs}, re-submit.")
                     self.submit(obj, *args, **kwargs)
             except Exception as err:
                 log.error(f"ERROR {err} getting: {obj} {args} {kwargs}, re-submit.")
+                # Don't re-submit if permanently failed
+                if hasattr(obj, 'permanent_failure') and obj.permanent_failure:
+                    log.debug(f"Chunk {obj} permanently failed during exception, not re-submitting")
+                    continue
                 self.submit(obj, *args, **kwargs)
 
     def get(obj, *args, **kwargs):
         raise NotImplementedError
 
     def submit(self, obj, *args, **kwargs):
+        # Don't queue permanently failed chunks
+        if hasattr(obj, 'permanent_failure') and obj.permanent_failure:
+            return
         self.queue.put((obj, args, kwargs))
 
     def show_stats(self):
@@ -237,6 +248,22 @@ chunk_getter = ChunkGetter(int(CFG.autoortho.fetch_threads))
 
 log.info(f"chunk_getter: {chunk_getter}")
 #log.info(f"tile_getter: {tile_getter}")
+
+# HTTP status codes that indicate permanent failure (no retry)
+PERMANENT_FAILURE_CODES = {400, 401, 404, 405, 406, 410, 451}
+
+# HTTP status codes that need special handling
+TRANSIENT_FAILURE_CODES = {408, 429, 500, 502, 503, 504}
+
+# Max retries for transient failures before giving up
+MAX_TRANSIENT_RETRIES = {
+    408: 3,   # Request timeout - network issue
+    429: 10,  # Rate limit - needs backoff
+    500: 15,  # Internal error - might recover
+    502: 8,   # Bad gateway - infrastructure
+    503: 8,   # Service unavailable - infrastructure  
+    504: 5,   # Gateway timeout - infrastructure
+}
 
 
 class Chunk(object):
@@ -276,13 +303,21 @@ class Chunk(object):
         self.chunk_id = f"{col}_{row}_{zoom}_{maptype}"
         self.ready = threading.Event()
         self.ready.clear()
+        self.download_started = threading.Event()  # Signal when download thread begins
+        self.download_started.clear()
         if maptype == "Null":
             self.maptype = "EOX"
+
+        # Failure tracking for circuit breaker
+        self.permanent_failure = False
+        self.failure_reason = None
+        self.retry_count = 0
 
         self.cache_path = os.path.join(self.cache_dir, f"{self.chunk_id}.jpg")
         
         # FIXED: Check cache during initialization and set ready if found
         if self.get_cache():
+            self.download_started.set()  # Cache hit = "download" done immediately
             self.ready.set()
             log.debug(f"Chunk {self} initialized with cached data")
 
@@ -408,7 +443,10 @@ class Chunk(object):
                 return
 
     def get(self, idx=0, session=requests):
-        log.debug(f"Getting {self}") 
+        log.debug(f"Getting {self}")
+        
+        # Signal that download has started (not waiting in queue anymore)
+        self.download_started.set()
 
         if self.get_cache():
             self.ready.set()
@@ -473,6 +511,35 @@ class Chunk(object):
             if status_code != 200:
                 log.warning(f"Failed with status {status_code} to get chunk {self}" + (" on server " + server if self.maptype.upper() in MAPTYPES_WITH_SERVER else "") + ".")
                 bump_many({f"http_{status_code}": 1, "req_err": 1})
+                
+                # Check if this is a permanent failure
+                if status_code in PERMANENT_FAILURE_CODES:
+                    log.info(f"Chunk {self} permanently failed with {status_code}, marking as failed")
+                    self.permanent_failure = True
+                    self.failure_reason = status_code
+                    self.data = b''  # Empty data
+                    self.ready.set()  # Mark as ready (with no data) to unblock waiters
+                    bump(f'chunk_permanent_fail_{status_code}')
+                    return True  # Return True to stop worker retries
+                
+                # Check if transient failure has exceeded max retries
+                if status_code in TRANSIENT_FAILURE_CODES:
+                    self.retry_count += 1
+                    max_retries = MAX_TRANSIENT_RETRIES.get(status_code, 5)
+                    if self.retry_count >= max_retries:
+                        log.warning(f"Chunk {self} exceeded {max_retries} retries for {status_code}, giving up")
+                        self.permanent_failure = True
+                        self.failure_reason = f"{status_code}_max_retries"
+                        self.data = b''
+                        self.ready.set()
+                        bump(f'chunk_transient_fail_{status_code}_exhausted')
+                        return True
+                    # Increase backoff for rate limiting
+                    if status_code == 429:
+                        backoff_time = min(5, self.retry_count * 0.5)
+                        log.debug(f"Rate limited, backing off for {backoff_time}s (attempt {self.retry_count}/{max_retries})")
+                        time.sleep(backoff_time)
+                    bump(f'chunk_transient_fail_{status_code}_retry')
 
                 err = get_stat("req_err")
                 if err > 50:
@@ -481,6 +548,9 @@ class Chunk(object):
                     if error_rate >= 0.10:
                         log.error(f"Very high network error rate detected : {error_rate * 100 : .2f}%")
                         log.error(f"Check your network connection, DNS, maptype choice, and firewall settings.")
+                        # Enhanced circuit breaker: reduce wait times on severe error rates
+                        if error_rate >= 0.25:
+                            log.warning("Severe error rate (≥25%) detected, consider checking configuration")
                 return False
 
             bump("req_ok")
@@ -993,11 +1063,17 @@ class Tile(object):
             
         def process_chunk(chunk):
             """Process a single chunk and return (chunk, chunk_img, start_x, start_y)"""
-            chunk_ready = chunk.ready.wait(maxwait)
-            
             # Calculate position using native chunk size (no scaling)
             start_x = int(chunk.width * (chunk.col - col))
             start_y = int(chunk.height * (chunk.row - row))
+            
+            # Check if already marked as permanent failure
+            if chunk.permanent_failure:
+                log.debug(f"Chunk {chunk} is permanently failed ({chunk.failure_reason}), skipping")
+                bump(f'chunk_permanent_fail_{chunk.failure_reason}')
+                return (chunk, None, start_x, start_y)
+            
+            chunk_ready = chunk.ready.wait(maxwait)
 
             chunk_img = None
             if chunk_ready and chunk.data:
@@ -1026,21 +1102,71 @@ class Tile(object):
                 
             return (chunk, chunk_img, start_x, start_y)
         
-        # Process all chunks in parallel instead of sequentially
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(chunks))) as executor:
-            # Submit all chunk processing tasks
-            future_to_chunk = {executor.submit(process_chunk, chunk): chunk for chunk in chunks}
+        # Process chunks lazily - only after their download has started
+        processed_chunks = set()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(chunks)))
+        active_futures = {}
+        
+        start_time = time.time()
+        max_total_wait = self.maxchunk_wait * 3  # 3x safety margin
+        
+        try:
+            while len(processed_chunks) < len(chunks):
+                # Safety timeout check
+                if time.time() - start_time > max_total_wait:
+                    log.warning(f"Lazy submission timeout after {max_total_wait}s, "
+                               f"processed {len(processed_chunks)}/{len(chunks)} chunks")
+                    break
+                
+                # Find chunks whose downloads have started but haven't been submitted for processing yet
+                for chunk in chunks:
+                    chunk_id = id(chunk)
+                    if chunk_id in processed_chunks:
+                        continue
+                    
+                    # Skip permanently failed chunks immediately
+                    if chunk.permanent_failure:
+                        processed_chunks.add(chunk_id)
+                        continue
+                    
+                    # Submit when download has started
+                    if chunk.download_started.is_set():
+                        future = executor.submit(process_chunk, chunk)
+                        active_futures[future] = chunk
+                        processed_chunks.add(chunk_id)
+                
+                # Process any completed futures
+                if active_futures:
+                    done, pending = concurrent.futures.wait(
+                        active_futures.keys(), 
+                        timeout=0.1,  # Check every 100ms
+                        return_when=concurrent.futures.FIRST_COMPLETED
+                    )
+                    
+                    for future in done:
+                        try:
+                            chunk, chunk_img, start_x, start_y = future.result()
+                            if chunk_img:
+                                new_im.paste(chunk_img, (start_x, start_y))
+                        except Exception as exc:
+                            log.error(f"Chunk processing failed: {exc}")
+                        finally:
+                            del active_futures[future]
+                else:
+                    # No active futures yet, wait a bit before checking for started downloads
+                    time.sleep(0.05)
             
-            # Collect results and paste into image as they complete
-            for future in concurrent.futures.as_completed(future_to_chunk):
+            # Wait for any remaining futures to complete
+            for future in concurrent.futures.as_completed(active_futures.keys()):
                 try:
                     chunk, chunk_img, start_x, start_y = future.result()
                     if chunk_img:
-                        # For adaptive system, chunks are already downloaded at the optimal zoom level
-                        # or retrieved from backup at appropriate resolution. Paste directly.
                         new_im.paste(chunk_img, (start_x, start_y))
                 except Exception as exc:
                     log.error(f"Chunk processing failed: {exc}")
+                    
+        finally:
+            executor.shutdown(wait=True)
 
         if complete_img and mipmap <= self.max_mipmap:
             log.debug(f"GET_IMG: Save complete image for later...")
