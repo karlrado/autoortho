@@ -36,6 +36,13 @@ log = logging.getLogger(__name__)
 import tracemalloc
 #from memory_profiler import profile
 
+# Bound global JPEG decode concurrency to reduce memory spikes and failures
+try:
+    _MAX_DECODE = int(getattr(CFG.pydds, 'max_decode_concurrency', 16))
+except Exception:
+    _MAX_DECODE = 16
+_decode_sem = threading.Semaphore(_MAX_DECODE)
+
 
 # Track average fetch times
 tile_stats = StatTracker(20, 12)
@@ -1079,7 +1086,11 @@ class Tile(object):
             if chunk_ready and chunk.data:
                 # We returned and have data!
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Ready and found chunk data.")
-                chunk_img = AoImage.load_from_memory(chunk.data)
+                try:
+                    with _decode_sem:
+                        chunk_img = AoImage.load_from_memory(chunk.data)
+                except Exception as _e:
+                    log.debug(f"GET_IMG: load_from_memory failed for {chunk}: {_e}")
             elif mipmap < self.max_mipmap and not chunk_ready:
                 # Ran out of time, requesting mm below max.  Search for backup...
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Tile {self} not ready.  Try to find backup chunk.")
@@ -1094,7 +1105,11 @@ class Tile(object):
                 chunk_ready = chunk.ready.wait(maxwait)
                 if chunk_ready and chunk.data:
                     log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Final retry for {chunk}, SUCCESS!")
-                    chunk_img = AoImage.load_from_memory(chunk.data)
+                    try:
+                        with _decode_sem:
+                            chunk_img = AoImage.load_from_memory(chunk.data)
+                    except Exception as _e:
+                        log.debug(f"GET_IMG: load_from_memory failed on retry for {chunk}: {_e}")
 
             if not chunk_img:
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Empty chunk data.  Skip.")
@@ -1103,8 +1118,17 @@ class Tile(object):
             return (chunk, chunk_img, start_x, start_y)
         
         # Process chunks lazily - only after their download has started
+        # CPU-aware thread pool sizing bounded by decode concurrency
+        try:
+            cpu_workers = os.cpu_count() or 1
+        except Exception:
+            cpu_workers = 1
+        max_pool_workers = min(cpu_workers, len(chunks), _MAX_DECODE)
+        
         processed_chunks = set()
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(chunks)))
+        total_chunks = len(chunks)
+        completed = 0
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_pool_workers)
         active_futures = {}
         
         start_time = time.time()
@@ -1116,6 +1140,14 @@ class Tile(object):
                 if time.time() - start_time > max_total_wait:
                     log.warning(f"Lazy submission timeout after {max_total_wait}s, "
                                f"processed {len(processed_chunks)}/{len(chunks)} chunks")
+                    break
+                
+                # Smart early exit - if all started downloads are done, exit
+                chunks_started = sum(1 for c in chunks if c.download_started.is_set())
+                if chunks_started > 0 and len(processed_chunks) >= chunks_started:
+                    chunks_never_started = len(chunks) - chunks_started
+                    if chunks_never_started > 0:
+                        log.debug(f"Early exit: {chunks_never_started} chunks never started")
                     break
                 
                 # Find chunks whose downloads have started but haven't been submitted for processing yet
@@ -1139,22 +1171,31 @@ class Tile(object):
                 if active_futures:
                     done, pending = concurrent.futures.wait(
                         active_futures.keys(), 
-                        timeout=0.1,  # Check every 100ms
+                        timeout=0.025,  # Check 4x more frequently
                         return_when=concurrent.futures.FIRST_COMPLETED
                     )
                     
                     for future in done:
                         try:
                             chunk, chunk_img, start_x, start_y = future.result()
+                            completed += 1
                             if chunk_img:
                                 new_im.paste(chunk_img, (start_x, start_y))
+                                # Free native buffer immediately after paste
+                                try:
+                                    chunk_img.close()
+                                except Exception:
+                                    pass
                         except Exception as exc:
                             log.error(f"Chunk processing failed: {exc}")
                         finally:
                             del active_futures[future]
+                        # Progress logging
+                        if total_chunks and (completed % max(1, total_chunks // 4) == 0):
+                            log.debug(f"GET_IMG progress: {completed}/{total_chunks} chunks for mip {mipmap}")
                 else:
                     # No active futures yet, wait a bit before checking for started downloads
-                    time.sleep(0.05)
+                    time.sleep(0.01)  # Check 5x more frequently
             
             # Wait for any remaining futures to complete
             for future in concurrent.futures.as_completed(active_futures.keys()):
