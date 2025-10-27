@@ -1243,6 +1243,45 @@ class ConfigUI(QMainWindow):
         dds_layout = QVBoxLayout()
         dds_group.setLayout(dds_layout)
 
+        # Max decode concurrency
+        max_decode_layout = QHBoxLayout()
+        max_decode_label = QLabel("JPEG decode threads:")
+        max_decode_label.setToolTip(
+            "Maximum number of concurrent JPEG decode operations.\n"
+            "Higher values = faster tile processing but more CPU and RAM usage.\n"
+            "Lower values = reduced CPU/RAM usage but slower tile generation.\n\n"
+            "Performance Impact:\n"
+            "• Each decode thread uses ~50-100MB of RAM during peak\n"
+            "• Too many threads can cause memory spikes and cache thrashing\n"
+            "• Too few threads creates a bottleneck in the processing pipeline\n\n"
+            "Recommended: Leave at default (CPU count) for balanced performance.\n"
+            "Reduce if experiencing memory issues or system instability.\n"
+            f"Your system: {os.cpu_count() or 1} CPU threads available"
+        )
+        max_decode_layout.addWidget(max_decode_label)
+        self.max_decode_slider = ModernSlider()
+        cpu_count = os.cpu_count() or 1
+        self.max_decode_slider.setRange(1, cpu_count)
+        # Use CPU count as default if config value is higher or not set properly
+        try:
+            config_value = int(getattr(self.cfg.pydds, 'max_decode_concurrency', cpu_count))
+            initial_value = min(config_value, cpu_count) if config_value > 0 else cpu_count
+        except Exception:
+            initial_value = cpu_count
+        self.max_decode_slider.setValue(initial_value)
+        self.max_decode_slider.setObjectName('max_decode_concurrency')
+        self.max_decode_slider.setToolTip(
+            f"Drag to adjust concurrent JPEG decode threads (1-{cpu_count})\n"
+            f"Default: {cpu_count} threads (recommended)"
+        )
+        self.max_decode_label = QLabel(f"{initial_value}")
+        self.max_decode_slider.valueChanged.connect(
+            lambda v: self.max_decode_label.setText(f"{v}")
+        )
+        max_decode_layout.addWidget(self.max_decode_slider)
+        max_decode_layout.addWidget(self.max_decode_label)
+        dds_layout.addLayout(max_decode_layout)
+
         # Compressor
         supported_compressors = ['ISPC'] if self.system == "darwin" else ['ISPC', 'STB']
         if not self.system == "darwin":
@@ -2522,6 +2561,9 @@ class ConfigUI(QMainWindow):
             if not self.system == "darwin":
                 self.cfg.pydds.compressor = self.compressor_combo.currentText()
             self.cfg.pydds.format = self.format_combo.currentText()
+            self.cfg.pydds.max_decode_concurrency = str(
+                self.max_decode_slider.value()
+            )
 
             # General settings
             self.cfg.general.gui = self.gui_check.isChecked()

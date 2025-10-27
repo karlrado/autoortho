@@ -450,60 +450,56 @@ class DDS(Structure):
         #if not maxmipmaps:
         #    maxmipmaps = 8
 
-        with self.lock:
-            #print(f"gen_mipmaps: MIPMAP: {startmipmap} input SIZE: {img.size}")
+        # Print info outside lock; keep compression non-critical except for writes
+        width, height = img.size
+        mipmap = startmipmap
+        # I believe XP only references up to MM8, so might be able to trim
+        # this down more
+        # maxmipmaps == 0 indicates we want all mipmaps so set to len
+        # of our mipmap_list
+        if maxmipmaps > self.smallest_mm:
+            log.debug(f"Setting maxmipmaps to {self.smallest_mm}")
+            maxmipmaps = self.smallest_mm
 
-            # Size of all mipmaps: sum([pow(2,x)*pow(2,x) for x in range(12,1,-1) ])
+        log.debug(self.mipmap_list)
+        
+        # Initial reduction of image size before mipmap processing 
+        steps = 0
+        if mipmap > 0:
+            desired_width = self.width >> mipmap
+            while width > desired_width:
+                width >>= 1
+                compress_bytes >>= 2
+                steps += 1
 
-            #if not maxmipmaps:
-            #maxmipmaps = len(self.mipmap_list)
+        if steps > 0:        
+            #img = img.reduce(pow(2, steps))
+            img = img.reduce_2(steps)
 
-            width, height = img.size
-            mipmap = startmipmap
-            # I believe XP only references up to MM8, so might be able to trim
-            # this down more
-            # maxmipmaps == 0 indicates we want all mipmaps so set to len
-            # of our mipmap_list
-            if maxmipmaps > self.smallest_mm:
-                log.debug(f"Setting maxmipmaps to {self.smallest_mm}")
-                maxmipmaps = self.smallest_mm
+        while True:
+            if True:
+            #if not self.mipmap_list[mipmap].retrieved:
+                imgdata = img.data_ptr()
+                width, height = img.size
+                log.debug(f"MIPMAP: {mipmap} SIZE: {img.size}")
 
-            log.debug(self.mipmap_list)
-            
-            # Initial reduction of image size before mipmap processing 
-            steps = 0
-            if mipmap > 0:
-                desired_width = self.width >> mipmap
-                while width > desired_width:
-                    width >>= 1
+                if compress_bytes:
+                    # Get how many rows we need to process for requested number of bytes
+                    height = math.ceil((compress_bytes * 16) / (width * self.blocksize))
+                    # Make the rows a factor of 4
+                    height = max(4, ((height + 3) // 4) * 4) 
+                    log.debug(f"Doing partial compress of {compress_bytes} bytes.  Height: {height}")
                     compress_bytes >>= 2
-                    steps += 1
 
-            if steps > 0:        
-                #img = img.reduce(pow(2, steps))
-                img = img.reduce_2(steps)
+                try:
+                    dxtdata = self.compress(width, height, imgdata)
+                except Exception as e:
+                    log.warning(f"dds compress failed: {e}")
+                    dxtdata = None
 
-            while True:
-                if True:
-                #if not self.mipmap_list[mipmap].retrieved:
-                    imgdata = img.data_ptr()
-                    width, height = img.size
-                    log.debug(f"MIPMAP: {mipmap} SIZE: {img.size}")
-
-                    if compress_bytes:
-                        # Get how many rows we need to process for requested number of bytes
-                        height = math.ceil((compress_bytes * 16) / (width * self.blocksize))
-                        # Make the rows a factor of 4
-                        height = max(4, ((height + 3) // 4) * 4) 
-                        log.debug(f"Doing partial compress of {compress_bytes} bytes.  Height: {height}")
-                        compress_bytes >>= 2
-
-                    try:
-                        dxtdata = self.compress(width, height, imgdata)
-                    except:
-                        log.warning("dds compress failed")
-
-                    if dxtdata is not None:
+                # Lock ONLY for databuffer assignment
+                if dxtdata is not None:
+                    with self.lock:
                         self.mipmap_list[mipmap].databuffer = BytesIO(initial_bytes=dxtdata)
                         if not compress_bytes:
                             self.mipmap_list[mipmap].retrieved = True
@@ -517,17 +513,19 @@ class DDS(Structure):
                                 mm.retrieved = True
                                 mipmap += 1
 
-                    dxtdata = None
+                dxtdata = None
 
-            
-                if mipmap >= maxmipmaps: #(maxmipmaps + 1) or mipmap >= self.smallest_mm:
-                    # We've hit or max requested or possible mipmaps
-                    break
+        
+            if mipmap >= maxmipmaps: #(maxmipmaps + 1) or mipmap >= self.smallest_mm:
+                # We've hit or max requested or possible mipmaps
+                break
 
-                mipmap += 1
-                # Halve the image
-                img = img.reduce_2()
+            mipmap += 1
+            # Halve the image
+            img = img.reduce_2()
 
+        # Lock for header dump
+        with self.lock:
             self.dump_header()
 
 

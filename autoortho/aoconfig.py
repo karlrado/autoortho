@@ -102,8 +102,8 @@ missing_color = [66, 77, 55]
 compressor = ISPC
 # BC1 or BC3 for dxt1 or dxt5 respectively
 format = BC1
-# Maximum number of concurrent JPEG decode threads
-max_decode_concurrency = 16
+# Maximum number of concurrent JPEG decode threads (default: CPU count)
+max_decode_concurrency = {os.cpu_count() or 1}
 
 [scenery]
 # Don't cleanup downloads
