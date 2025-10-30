@@ -1356,12 +1356,15 @@ class Tile(object):
                     break
                 
                 # Smart early exit - if all started downloads are done, exit
-                chunks_started = sum(1 for c in chunks if c.download_started.is_set())
-                if chunks_started > 0 and len(processed_chunks) >= chunks_started:
-                    chunks_never_started = len(chunks) - chunks_started
-                    if chunks_never_started > 0:
-                        log.debug(f"Early exit: {chunks_never_started} chunks never started")
-                    break
+                # Only use early exit when spatial priorities are active (during flight)
+                # to avoid incomplete mipmaps during initial load or tests
+                if datareftracker.data_valid and datareftracker.connected:
+                    chunks_started = sum(1 for c in chunks if c.download_started.is_set())
+                    if chunks_started > 0 and len(processed_chunks) >= chunks_started:
+                        chunks_never_started = len(chunks) - chunks_started
+                        if chunks_never_started > 0:
+                            log.debug(f"Early exit: {chunks_never_started} chunks never started")
+                        break
                 
                 # Find chunks whose downloads have started but haven't been submitted for processing yet
                 for chunk in chunks:
