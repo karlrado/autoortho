@@ -900,6 +900,9 @@ def main():
     # Start helper threads
     ftrack.start()
 
+    from datareftrack import dt
+    dt.start()
+    
     # Run things
     if args.root and args.mountpoint:
         # Just mount specific requested dirs
@@ -928,6 +931,7 @@ def main():
             cfgui = AOMountUI(CFG)
             cfgui.setup()
 
+    dt.stop()
     flighttrack.ft.stop()
 
     log.info("AutoOrtho exit.")
