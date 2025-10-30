@@ -31,6 +31,13 @@ from datareftrack import dt as datareftracker
 
 MEMTRACE = False
 
+# Spatial priority system constants
+EARTH_RADIUS_M = 6371000  # Earth radius in meters
+PRIORITY_DISTANCE_WEIGHT = 1.0  # Weight for distance component
+PRIORITY_DIRECTION_WEIGHT = 0.5  # Weight for direction component
+PRIORITY_MIPMAP_WEIGHT = 2.0  # Weight for mipmap component
+LOOKAHEAD_TIME_SEC = 30  # Predict 30 seconds ahead
+
 import logging
 log = logging.getLogger(__name__)
 
@@ -136,6 +143,109 @@ def _gtile_to_quadkey(til_x, til_y, zoomlevel):
         temp_y=temp_y-b*size
         quadkey=quadkey+str(a+2*b)
     return quadkey
+
+
+def _chunk_to_latlon(row: int, col: int, zoom: int) -> tuple:
+    """
+    Convert tile row/col/zoom to center lat/lon coordinates.
+    Returns (lat, lon) in degrees.
+    
+    Uses official OSM/Web Mercator formula:
+    n = 2 ^ zoom
+    lon_deg = xtile / n * 360.0 - 180.0
+    lat_rad = arctan(sinh(π * (1 - 2 * ytile / n)))
+    lat_deg = lat_rad * 180.0 / π
+    
+    Note: Adds 0.5 to row/col to get tile CENTER instead of top-left corner.
+    """
+    n = 2.0 ** zoom
+    # Use tile center by adding 0.5 to both coordinates
+    lon = (col + 0.5) / n * 360.0 - 180.0
+    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * (row + 0.5) / n)))
+    lat = math.degrees(lat_rad)
+    return (lat, lon)
+
+
+def _haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Calculate great-circle distance between two points in meters using Haversine formula.
+    """
+    # Convert to radians
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    
+    # Haversine formula
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2) ** 2
+    c = 2 * math.asin(math.sqrt(a))
+    return EARTH_RADIUS_M * c
+
+
+def _calculate_spatial_priority(chunk_row: int, chunk_col: int, chunk_zoom: int, base_mipmap_priority: int) -> float:
+    """
+    Calculate priority based on:
+    1. Distance from player
+    2. Direction relative to movement vector (predictive)
+    3. Base mipmap priority (detail level)
+    
+    Lower priority number = more urgent (fetched first).
+    Returns priority as float.
+    """
+    # If no valid flight data, fall back to mipmap-only priority
+    if not datareftracker.data_valid or not datareftracker.connected:
+        return float(base_mipmap_priority)
+    
+    try:
+        # Get player position and velocity
+        player_lat = datareftracker.lat
+        player_lon = datareftracker.lon
+        player_hdg = datareftracker.hdg  # degrees, 0=N, 90=E, 180=S, 270=W
+        player_spd = datareftracker.spd  # m/s
+        
+
+        chunk_lat, chunk_lon = _chunk_to_latlon(chunk_row, chunk_col, chunk_zoom)
+        
+        distance_m = _haversine_distance(player_lat, player_lon, chunk_lat, chunk_lon)
+        
+        distance_priority = min(100, distance_m / 100)  # 100m per priority point, max 100
+        
+        if player_spd > 5:  # Only use predictive if moving
+            lat1_rad = math.radians(player_lat)
+            lat2_rad = math.radians(chunk_lat)
+            dlon_rad = math.radians(chunk_lon - player_lon)
+            
+            x = math.sin(dlon_rad) * math.cos(lat2_rad)
+            y = math.cos(lat1_rad) * math.sin(lat2_rad) - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(dlon_rad)
+            bearing = math.degrees(math.atan2(x, y))
+            bearing = (bearing + 360) % 360
+            
+            angle_diff = abs(player_hdg - bearing)
+            if angle_diff > 180:
+                angle_diff = 360 - angle_diff
+            
+
+            direction_priority = (angle_diff / 180) * 100 - 50
+            
+            predicted_distance = player_spd * LOOKAHEAD_TIME_SEC
+            if distance_m < predicted_distance and angle_diff < 45:
+                direction_priority -= 30
+        else:
+            direction_priority = 0
+        
+
+        total_priority = (
+            base_mipmap_priority * PRIORITY_MIPMAP_WEIGHT +
+            distance_priority * PRIORITY_DISTANCE_WEIGHT +
+            direction_priority * PRIORITY_DIRECTION_WEIGHT
+        )
+        
+        return max(0, total_priority)
+        
+    except Exception as e:
+        # On any error, fall back to mipmap-only priority
+        log.debug(f"Spatial priority calculation failed: {e}")
+        return float(base_mipmap_priority)
 
 def locked(fn):
     @wraps(fn)
@@ -1090,9 +1200,23 @@ class Tile(object):
         for chunk in chunks:
             if not chunk.ready.is_set():
                 log.debug(f"GET_IMG: Submitting chunk {chunk} for zoom {zoom}")
-                # Mipmap 0 (highest detail) = priority 0 (most urgent)
-                # Higher mipmaps = higher priority numbers (less urgent)
-                chunk.priority = mipmap
+                # INVERTED: Lower detail (higher mipmap) = lower priority number (more urgent)
+                # This ensures lower-detail tiles load first, minimizing missing tiles
+                base_priority = self.max_mipmap - mipmap
+                
+                # During initial load (before flight starts), further deprioritize high-detail
+                # to ensure lower mipmaps load completely first
+                if CFG.autoortho.suspend_maxwait and not datareftracker.connected:
+                    # Add penalty to high-detail mipmaps during initial load
+                    # Mipmap 0 gets +20, mipmap 4 gets +0
+                    initial_load_penalty = (self.max_mipmap - mipmap) * 5
+                    base_priority = base_priority + initial_load_penalty
+                
+                # Apply spatial + predictive priority system
+                # This considers distance from player and movement direction
+                chunk.priority = _calculate_spatial_priority(
+                    chunk.row, chunk.col, chunk.zoom, base_priority
+                )
                 
                 chunk_getter.submit(chunk)
                 data_updated = True
@@ -1314,17 +1438,16 @@ class Tile(object):
 
     def get_downscaled_from_higher_mipmap(self, target_mipmap, col, row, zoom):
         """
-        Try to downscale a higher-detail mipmap to fill missing lower-detail chunk.
+        Try to downscale a higher-detail mipmap OR upscale a lower-detail mipmap
+        to fill missing chunk.
         
         Args:
-            target_mipmap: The mipmap level we need (e.g., 3)
+            target_mipmap: The mipmap level we need (e.g., 0 or 3)
             col, row, zoom: Chunk coordinates at target zoom
         
         Returns:
-            Downscaled AoImage or None
+            Scaled AoImage or None
         """
-        # Check if we have already-built HIGHER detail mipmaps (lower numbers)
-        # e.g., if target_mipmap=3, check mipmaps 0, 1, 2
         for higher_mipmap in range(target_mipmap):
             if higher_mipmap not in self.imgs:
                 continue  # Haven't built this mipmap yet
@@ -1334,22 +1457,17 @@ class Tile(object):
                 continue
             
             # Calculate scale factor
-            # e.g., mipmap 0 to mipmap 3 = 2^3 = 8x larger
             scale_factor = 1 << (target_mipmap - higher_mipmap)
             
-            # Calculate which portion of higher_img corresponds to this chunk
-            # Higher mipmap has scale_factor times more chunks per dimension
             chunk_offset_x = (col % scale_factor) * 256
             chunk_offset_y = (row % scale_factor) * 256
             
-            # Extract and downscale
             try:
                 # Crop scale_factor*256 region, then downscale to 256
                 crop_size = 256 * scale_factor
                 cropped = AoImage.new('RGBA', (crop_size, crop_size), (0,0,0,0))
                 higher_img.crop(cropped, (chunk_offset_x, chunk_offset_y))
                 
-                # Downscale to 256x256
                 downscale_steps = int(math.log2(scale_factor))
                 downscaled = cropped.reduce_2(downscale_steps)
                 
@@ -1357,6 +1475,40 @@ class Tile(object):
                 return downscaled
             except Exception as e:
                 log.debug(f"Failed to downscale from mipmap {higher_mipmap}: {e}")
+                continue
+        
+        for lower_mipmap in range(target_mipmap + 1, min(self.max_mipmap + 1, len(self.imgs) + 1)):
+            if lower_mipmap not in self.imgs:
+                continue
+                
+            lower_img = self.imgs[lower_mipmap]
+            if lower_img is None:
+                continue
+            
+            scale_factor = 1 << (lower_mipmap - target_mipmap)
+            lower_col = col // scale_factor
+            lower_row = row // scale_factor
+            
+            offset_within_chunk_x = (col % scale_factor) * 256
+            offset_within_chunk_y = (row % scale_factor) * 256
+            
+            try:
+                subsection_size = 256 // scale_factor
+                
+                lower_img_x = lower_col * 256 + (offset_within_chunk_x // scale_factor)
+                lower_img_y = lower_row * 256 + (offset_within_chunk_y // scale_factor)
+                
+                cropped = AoImage.new('RGBA', (subsection_size, subsection_size), (0,0,0,0))
+                lower_img.crop(cropped, (lower_img_x, lower_img_y))
+                
+                upscale_steps = int(math.log2(scale_factor))
+                upscaled = cropped.scale(scale_factor)
+                
+                log.info(f"Upscaled mipmap {lower_mipmap} to fill missing mipmap {target_mipmap} chunk at {col}x{row}")
+                bump('upscaled_chunk_count')
+                return upscaled
+            except Exception as e:
+                log.debug(f"Failed to upscale from mipmap {lower_mipmap}: {e}")
                 continue
         
         return None
