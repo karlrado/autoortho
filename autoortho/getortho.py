@@ -27,6 +27,7 @@ from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_st
 from utils.constants import system_type
 from utils.apple_token_service import apple_token_service
 
+from datareftrack import dt as datareftracker
 
 MEMTRACE = False
 
@@ -861,7 +862,7 @@ class Tile(object):
         log.debug(f"Startrow: {startrow} Endrow: {endrow} bytes_per_chunk_row: {bytes_per_chunk_row} width_px: {base_width_px} height_px: {base_height_px}")
         
         new_im = self.get_img(mipmap, startrow, endrow,
-                maxwait=self.maxchunk_wait)
+                maxwait=self.get_maxwait())
         if not new_im:
             log.debug("No updates, so no image generated")
             return True
@@ -1240,6 +1241,11 @@ class Tile(object):
         log.debug(f"No best chunk found for {col}x{row}x{zoom}!")
         return False
 
+    def get_maxwait(self):
+        effective_maxwait = self.maxchunk_wait
+        if CFG.autoortho.suspend_maxwait and not datareftracker.connected:
+            effective_maxwait = 20
+        return effective_maxwait
 
     #@profile
     @locked
@@ -1257,7 +1263,7 @@ class Tile(object):
 
         # We can have multiple threads wait on get_img ...
         log.debug(f"GET_MIPMAP: Next call is get_img which may block!.............")
-        new_im = self.get_img(mipmap, maxwait=self.maxchunk_wait)
+        new_im = self.get_img(mipmap, maxwait=self.get_maxwait())
         if not new_im:
             log.debug("GET_MIPMAP: No updates, so no image generated")
             return True
