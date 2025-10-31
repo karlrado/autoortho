@@ -66,7 +66,14 @@ class DatarefTracker(object):
     def stop(self):
         log.info("Dataref Tracker shutdown requested.")
         # Unsubscribe
-        self.RequestDataRefs(self.sock, CFG.flightdata.xplane_udp_port, 0)
+        # It is possible that X-Plane is already shut down, so ignore any errors
+        # since we don't care at this point anyway.
+        # We can't really check if the socket is still open first, since XP could
+        # shutdown between the check and the unsub request.
+        try:
+            self.RequestDataRefs(self.sock, CFG.flightdata.xplane_udp_port, 0)
+        except (Exception, OSError):
+            pass
         self.running = False
         if self.t:
             self.t.join()
