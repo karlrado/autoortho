@@ -1164,8 +1164,16 @@ class Tile(object):
         
         # Do we already have this img?
         if mipmap in self.imgs:
-            log.debug(f"GET_IMG: Found saved image: {self.imgs[mipmap]}")
-            return self.imgs.get(mipmap)
+            img_data = self.imgs[mipmap]
+            # Unpack tuple format (new) or return directly (old format, backward compat)
+            if isinstance(img_data, tuple):
+                img = img_data[0]  # Extract just the image
+                log.debug(f"GET_IMG: Found saved image: {img}")
+                return img
+            else:
+                # Old format: just the image without metadata
+                log.debug(f"GET_IMG: Found saved image (old format): {img_data}")
+                return img_data
 
         log.debug(f"GET_IMG: MM List before { {x.idx:x.retrieved for x in self.dds.mipmap_list} }")
         if mipmap < len(self.dds.mipmap_list) and self.dds.mipmap_list[mipmap].retrieved:
@@ -1296,7 +1304,8 @@ class Tile(object):
                 if chunk_img:
                     bump('backup_chunk_count')
             
-            # NEW: Try downscaling from higher mipmaps if we still don't have an image
+            # Try scaling from already-built mipmaps if we still don't have an image
+            # This checks both downscaling (from higher-detail) and upscaling (from lower-detail)
             if not chunk_img:
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Attempting downscale from higher mipmaps.")
                 chunk_img = self.get_downscaled_from_higher_mipmap(mipmap, chunk.col, chunk.row, zoom)
@@ -1428,7 +1437,8 @@ class Tile(object):
 
         if complete_img and mipmap <= self.max_mipmap:
             log.debug(f"GET_IMG: Save complete image for later...")
-            self.imgs[mipmap] = new_im
+            # Store image with metadata (col, row, zoom) for coordinate mapping in upscaling
+            self.imgs[mipmap] = (new_im, col, row, zoom)
 
         log.debug(f"GET_IMG: DONE!  IMG created {new_im}")
 
@@ -1441,8 +1451,8 @@ class Tile(object):
 
     def get_downscaled_from_higher_mipmap(self, target_mipmap, col, row, zoom):
         """
-        Try to downscale a higher-detail mipmap OR upscale a lower-detail mipmap
-        to fill missing chunk.
+        Try to scale from already-built mipmaps to fill missing chunk.
+        Checks both downscaling (from higher-detail) and upscaling (from lower-detail).
         
         Args:
             target_mipmap: The mipmap level we need (e.g., 0 or 3)
@@ -1455,7 +1465,16 @@ class Tile(object):
             if higher_mipmap not in self.imgs:
                 continue  # Haven't built this mipmap yet
             
-            higher_img = self.imgs[higher_mipmap]
+            img_data = self.imgs[higher_mipmap]
+            if not img_data:
+                continue
+            
+            # Unpack metadata (or use old format for backward compat)
+            if isinstance(img_data, tuple):
+                higher_img = img_data[0]  # Extract image from tuple
+            else:
+                higher_img = img_data  # Old format: just the image
+            
             if higher_img is None:
                 continue
             
@@ -1480,34 +1499,61 @@ class Tile(object):
                 log.debug(f"Failed to downscale from mipmap {higher_mipmap}: {e}")
                 continue
         
-        for lower_mipmap in range(target_mipmap + 1, min(self.max_mipmap + 1, len(self.imgs) + 1)):
+        # Search for lower-detail mipmaps (higher mipmap numbers) to upscale
+        for lower_mipmap in range(target_mipmap + 1, self.max_mipmap + 1):
             if lower_mipmap not in self.imgs:
                 continue
-                
-            lower_img = self.imgs[lower_mipmap]
-            if lower_img is None:
+            
+            img_data = self.imgs[lower_mipmap]
+            if not img_data:
                 continue
             
-            scale_factor = 1 << (lower_mipmap - target_mipmap)
-            lower_col = col // scale_factor
-            lower_row = row // scale_factor
+            # Unpack metadata
+            if isinstance(img_data, tuple):
+                lower_img, base_col, base_row, base_zoom = img_data
+            else:
+                continue  # Old format without metadata, skip
             
-            offset_within_chunk_x = (col % scale_factor) * 256
-            offset_within_chunk_y = (row % scale_factor) * 256
+            # Calculate scale factor and relative position
+            scale_factor = 1 << (lower_mipmap - target_mipmap)
+            
+            # Map requested chunk to position in lower-detail image
+            # lower_img was built from chunks starting at (base_col, base_row) at base_zoom
+            # We need chunk (col, row) at zoom
+            
+            # Convert requested chunk coords to the zoom level of the lower image
+            zoom_diff = zoom - base_zoom
+            if zoom_diff >= 0:
+                # Requested chunk is at higher or same zoom as image base
+                rel_col = (col >> zoom_diff) - base_col
+                rel_row = (row >> zoom_diff) - base_row
+            else:
+                # Requested chunk is at lower zoom (shouldn't happen but handle it)
+                rel_col = (col << (-zoom_diff)) - base_col
+                rel_row = (row << (-zoom_diff)) - base_row
+            
+            # Each chunk in the image is 256px wide at its zoom level
+            # Position in pixels in the lower-detail image
+            pixel_x = rel_col * 256
+            pixel_y = rel_row * 256
+            
+            # Size to crop from lower image (will be upscaled by scale_factor)
+            crop_size = 256 // scale_factor
+            
+            # Bounds check
+            img_width, img_height = lower_img.size
+            if (pixel_x < 0 or pixel_y < 0 or 
+                pixel_x + crop_size > img_width or 
+                pixel_y + crop_size > img_height):
+                log.debug(f"Upscale bounds check failed: pos ({pixel_x},{pixel_y}) crop {crop_size} img ({img_width}x{img_height})")
+                continue
             
             try:
-                subsection_size = 256 // scale_factor
-                
-                lower_img_x = lower_col * 256 + (offset_within_chunk_x // scale_factor)
-                lower_img_y = lower_row * 256 + (offset_within_chunk_y // scale_factor)
-                
-                cropped = AoImage.new('RGBA', (subsection_size, subsection_size), (0,0,0,0))
-                lower_img.crop(cropped, (lower_img_x, lower_img_y))
-                
-                upscale_steps = int(math.log2(scale_factor))
-                upscaled = cropped.scale(scale_factor)
-                
-                log.info(f"Upscaled mipmap {lower_mipmap} to fill missing mipmap {target_mipmap} chunk at {col}x{row}")
+                # Use new C function for atomic crop+upscale
+                upscaled = lower_img.crop_and_upscale(
+                    pixel_x, pixel_y, crop_size, crop_size, scale_factor
+                )
+                log.info(f"Upscaled mipmap {lower_mipmap} (zoom {base_zoom}) to fill mipmap {target_mipmap} chunk at {col}x{row}")
                 bump('upscaled_chunk_count')
                 return upscaled
             except Exception as e:
@@ -1676,7 +1722,13 @@ class Tile(object):
 
         # 1) Free any cached AoImage instances (RGBA pixel buffers)
         try:
-            for im in list(self.imgs.values()):
+            for img_data in list(self.imgs.values()):
+                # Handle both tuple format (new) and plain image (old)
+                if isinstance(img_data, tuple):
+                    im = img_data[0]  # Extract image from tuple
+                else:
+                    im = img_data
+                
                 if im is not None and hasattr(im, "close"):
                     im.close()
         finally:

@@ -457,3 +457,85 @@ AOIAPI int32_t aoimage_desaturate(aoimage_t *img, float saturation) {
 
     return TRUE;
 }
+
+AOIAPI int32_t aoimage_crop_and_upscale(aoimage_t *src_img, aoimage_t *dst_img, 
+                                        uint32_t crop_x, uint32_t crop_y,
+                                        uint32_t crop_width, uint32_t crop_height,
+                                        uint32_t scale_factor) {
+    memset(dst_img, 0, sizeof(aoimage_t));
+    
+    // Validate inputs
+    assert(src_img->channels == 4);
+    
+    if (scale_factor == 0 || (scale_factor & (scale_factor - 1)) != 0) {
+        strcpy(dst_img->errmsg, "scale_factor must be power of 2");
+        return FALSE;
+    }
+    
+    // Bounds check
+    if (crop_x + crop_width > src_img->width) {
+        sprintf(dst_img->errmsg, "crop x bounds: %u + %u > %u", crop_x, crop_width, src_img->width);
+        return FALSE;
+    }
+    
+    if (crop_y + crop_height > src_img->height) {
+        sprintf(dst_img->errmsg, "crop y bounds: %u + %u > %u", crop_y, crop_height, src_img->height);
+        return FALSE;
+    }
+    
+    // Calculate destination dimensions
+    uint32_t dst_width = crop_width * scale_factor;
+    uint32_t dst_height = crop_height * scale_factor;
+    
+    // Check for overflow
+    unsigned long long num_pixels = (unsigned long long)dst_width * (unsigned long long)dst_height;
+    unsigned long long num_bytes = num_pixels * 4ULL;
+    if (num_pixels == 0ULL || (num_bytes / 4ULL) != num_pixels) {
+        strcpy(dst_img->errmsg, "destination size overflow");
+        return FALSE;
+    }
+    
+    // Allocate destination buffer
+    uint8_t *dest = malloc((size_t)num_bytes);
+    if (NULL == dest) {
+        sprintf(dst_img->errmsg, "can't malloc %llu bytes", num_bytes);
+        return FALSE;
+    }
+    
+    // Perform crop and upscale in one pass (nearest-neighbor)
+    // Read from source crop region, write each pixel scale_factor times in each direction
+    uint8_t *dst_ptr = dest;
+    
+    for (uint32_t src_y = 0; src_y < crop_height; ++src_y) {
+        uint32_t src_row_offset = ((crop_y + src_y) * src_img->width + crop_x) * 4;
+        
+        for (uint32_t rep_y = 0; rep_y < scale_factor; ++rep_y) {
+            for (uint32_t src_x = 0; src_x < crop_width; ++src_x) {
+                // Get source pixel
+                uint32_t src_offset = src_row_offset + src_x * 4;
+                uint8_t r = src_img->ptr[src_offset];
+                uint8_t g = src_img->ptr[src_offset + 1];
+                uint8_t b = src_img->ptr[src_offset + 2];
+                uint8_t a = src_img->ptr[src_offset + 3];
+                
+                // Replicate pixel scale_factor times horizontally
+                for (uint32_t rep_x = 0; rep_x < scale_factor; ++rep_x) {
+                    *dst_ptr++ = r;
+                    *dst_ptr++ = g;
+                    *dst_ptr++ = b;
+                    *dst_ptr++ = a;
+                }
+            }
+        }
+    }
+    
+    // Set destination image properties
+    dst_img->ptr = dest;
+    dst_img->width = dst_width;
+    dst_img->height = dst_height;
+    dst_img->stride = dst_width * 4;
+    dst_img->channels = 4;
+    
+    assert(dst_ptr == dest + num_bytes);
+    return TRUE;
+}

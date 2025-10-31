@@ -55,4 +55,10 @@ AOIAPI int32_t aoimage_crop(aoimage_t *img, const aoimage_t *c_img, uint32_t x, 
 
 // in place desaturation
 AOIAPI int32_t aoimage_desaturate(aoimage_t *img, float saturation);
+
+// atomic crop and upscale (single allocation, optimized for fallback)
+AOIAPI int32_t aoimage_crop_and_upscale(aoimage_t *src_img, aoimage_t *dst_img, 
+                                        uint32_t crop_x, uint32_t crop_y,
+                                        uint32_t crop_width, uint32_t crop_height,
+                                        uint32_t scale_factor);
 #endif
