@@ -1307,10 +1307,9 @@ class Tile(object):
             # Try scaling from already-built mipmaps if we still don't have an image
             # This checks both downscaling (from higher-detail) and upscaling (from lower-detail)
             if not chunk_img:
-                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Attempting downscale from higher mipmaps.")
+                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Attempting scaling from built mipmaps.")
                 chunk_img = self.get_downscaled_from_higher_mipmap(mipmap, chunk.col, chunk.row, zoom)
-                if chunk_img:
-                    bump('downscaled_chunk_count')
+                # Note: scaling function bumps its own counters (upscaled_chunk_count or downscaled_chunk_count)
 
             if not chunk_ready and not chunk_img:
                 # Ran out of time, lower mipmap.  Retry...
@@ -1494,6 +1493,7 @@ class Tile(object):
                 downscaled = cropped.reduce_2(downscale_steps)
                 
                 log.info(f"Downscaled mipmap {higher_mipmap} to fill missing mipmap {target_mipmap} chunk at {col}x{row}")
+                bump('downscaled_chunk_count')
                 return downscaled
             except Exception as e:
                 log.debug(f"Failed to downscale from mipmap {higher_mipmap}: {e}")
