@@ -1310,6 +1310,12 @@ class Tile(object):
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Attempting scaling from built mipmaps.")
                 chunk_img = self.get_downscaled_from_higher_mipmap(mipmap, chunk.col, chunk.row, zoom)
                 # Note: scaling function bumps its own counters (upscaled_chunk_count or downscaled_chunk_count)
+            
+            # Cascading fallback: on-demand download of lower-detail chunks
+            # Only triggered when built mipmaps don't exist yet (e.g., mipmap 0 requested first)
+            if not chunk_img and not chunk_ready:
+                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Attempting cascading fallback.")
+                chunk_img = self.get_or_build_lower_mipmap_chunk(mipmap, chunk.col, chunk.row, zoom)
 
             if not chunk_ready and not chunk_img:
                 # Ran out of time, lower mipmap.  Retry...
@@ -1447,6 +1453,84 @@ class Tile(object):
                 new_im = new_im.copy().desaturate(saturation)
         # Return image along with mipmap and zoom level this was created at
         return new_im
+
+    def get_or_build_lower_mipmap_chunk(self, target_mipmap, col, row, zoom):
+        """
+        Cascading fallback: Try to get/build progressively lower-detail mipmaps.
+        Only downloads chunks on-demand when needed (lazy evaluation).
+        
+        Args:
+            target_mipmap: The mipmap level we need (e.g., 0)
+            col, row, zoom: Chunk coordinates at target zoom
+        
+        Returns:
+            Upscaled AoImage or None
+        """
+        # Try each progressively lower-detail mipmap
+        for fallback_mipmap in range(target_mipmap + 1, self.max_mipmap + 1):
+            log.debug(f"Cascading fallback: trying mipmap {fallback_mipmap} for failed mipmap {target_mipmap}")
+            
+            # Calculate coordinates at fallback mipmap level
+            mipmap_diff = fallback_mipmap - target_mipmap
+            fallback_col = col >> mipmap_diff
+            fallback_row = row >> mipmap_diff
+            fallback_zoom = zoom - mipmap_diff
+            
+            # Try to get the chunk at this fallback level
+            fallback_chunk = Chunk(fallback_col, fallback_row, self.maptype, fallback_zoom, cache_dir=self.cache_dir)
+            
+            # Check cache first
+            if not fallback_chunk.ready.is_set():
+                if fallback_chunk.get_cache():
+                    fallback_chunk.ready.set()
+                    log.debug(f"Cascading fallback: found cached chunk at mipmap {fallback_mipmap}")
+                else:
+                    # Not in cache, try to download it (with shorter timeout)
+                    chunk_getter.submit(fallback_chunk)
+                    # Wait with reduced timeout (don't want to cascade delays)
+                    got_it = fallback_chunk.ready.wait(timeout=min(3.0, self.get_maxwait() / 2))
+                    if not got_it:
+                        log.debug(f"Cascading fallback: mipmap {fallback_mipmap} also timed out, trying next level")
+                        fallback_chunk.close()
+                        continue
+            
+            # We have the chunk data, decode and upscale it
+            if fallback_chunk.data:
+                try:
+                    with _decode_sem:
+                        fallback_img = AoImage.load_from_memory(fallback_chunk.data)
+                    
+                    # Calculate which portion to extract and upscale
+                    scale_factor = 1 << mipmap_diff
+                    offset_col = col % scale_factor
+                    offset_row = row % scale_factor
+                    
+                    # Pixel position in fallback image
+                    pixel_x = offset_col * (256 // scale_factor)
+                    pixel_y = offset_row * (256 // scale_factor)
+                    crop_size = 256 // scale_factor
+                    
+                    # Upscale to 256×256
+                    upscaled = fallback_img.crop_and_upscale(
+                        pixel_x, pixel_y, crop_size, crop_size, scale_factor
+                    )
+                    
+                    log.info(f"Cascading fallback SUCCESS: upscaled mipmap {fallback_mipmap} → {target_mipmap} at {col}x{row} (scale {scale_factor}×)")
+                    bump('upscaled_chunk_count')
+                    bump(f'cascade_fallback_mm{fallback_mipmap}')
+                    
+                    fallback_chunk.close()
+                    return upscaled
+                    
+                except Exception as e:
+                    log.debug(f"Cascading fallback: failed to upscale from mipmap {fallback_mipmap}: {e}")
+                    fallback_chunk.close()
+                    continue
+            
+            fallback_chunk.close()
+        
+        log.debug(f"Cascading fallback: all mipmaps failed for {col}x{row} at mipmap {target_mipmap}")
+        return None
 
     def get_downscaled_from_higher_mipmap(self, target_mipmap, col, row, zoom):
         """
