@@ -347,4 +347,347 @@ def test_get_best_chunks_all(mm, tmpdir):
             ret.write_jpg(os.path.join(tmpdir, f"best_{mm}_{x}_{y}.jpg"))
 
     #assert True == False
+
+
+# ============================================================================
+# Upscaling System Tests
+# ============================================================================
+
+class TestCoordinateMapping:
+    """Test the mathematical coordinate transformations used in upscaling."""
+    
+    def test_chunk_coordinate_downscaling(self):
+        """Verify that chunk coordinates scale correctly across mipmap levels."""
+        col = 12345
+        row = 6789
+        diff = 2
+        
+        col_p = col >> diff
+        row_p = row >> diff
+        
+        assert col_p == 3086, f"Expected col_p=3086, got {col_p}"
+        assert row_p == 1697, f"Expected row_p=1697, got {row_p}"
+    
+    def test_offset_calculation(self):
+        """Verify that offsets within a lower-detail chunk are calculated correctly."""
+        col = 12345
+        row = 6789
+        scalefactor = 4
+        
+        col_offset = col % scalefactor
+        row_offset = row % scalefactor
+        
+        assert col_offset == 1, f"Expected col_offset=1, got {col_offset}"
+        assert row_offset == 1, f"Expected row_offset=1, got {row_offset}"
+    
+    def test_coordinate_roundtrip(self):
+        """Verify that coordinates can be mapped down and back up consistently."""
+        col_hd = 12345
+        row_hd = 6789
+        diff = 2
+        scalefactor = 1 << diff
+        
+        # Map to low-detail
+        col_ld = col_hd >> diff
+        row_ld = row_hd >> diff
+        
+        # Get offset within low-detail chunk
+        col_offset = col_hd % scalefactor
+        row_offset = row_hd % scalefactor
+        
+        # Reconstruct high-detail coordinates
+        col_reconstructed_base = col_ld << diff
+        row_reconstructed_base = row_ld << diff
+        col_reconstructed = col_reconstructed_base + col_offset
+        row_reconstructed = row_reconstructed_base + row_offset
+        
+        assert col_reconstructed == col_hd, f"Col roundtrip failed: {col_reconstructed} != {col_hd}"
+        assert row_reconstructed == row_hd, f"Row roundtrip failed: {row_reconstructed} != {row_hd}"
+
+
+class TestUpscalingVisualComparison:
+    """Test upscaling quality by comparing upscaled vs native images."""
+    
+    def test_upscale_2x_vs_native(self, tmpdir):
+        """Compare 2× upscaled image (from mipmap 1) to native mipmap 0."""
+        # Use separate cache for this test
+        cache_dir = os.path.join(tmpdir, "cache_2x")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # First, download and save the NATIVE mipmap 0 chunk
+        chunk_native = getortho.Chunk(2176, 3232, 'EOX', 13, cache_dir=cache_dir)
+        getortho.chunk_getter.submit(chunk_native)
+        chunk_native.ready.wait(20)
+        
+        if chunk_native.data:
+            from aoimage import AoImage
+            native_img = AoImage.load_from_memory(chunk_native.data)
+            native_path = os.path.join(tmpdir, "native_mm0_2176_3232.jpg")
+            native_img.write_jpg(native_path, quality=95)
+            print(f"Saved native image: {native_path}")
+        
+        # Now build ONLY mipmap 1 (lower detail)
+        tile = getortho.Tile(2176, 3232, 'EOX', 13, cache_dir=cache_dir, max_zoom=13)
+        tile.get_img(1, maxwait=20)
+        
+        # Get upscaled version from mipmap 1 (will ONLY find mm1, not mm0)
+        upscaled_img = tile.get_best_chunk(2176, 3232, 0, 13)
+        
+        if upscaled_img and upscaled_img is not False:
+            upscaled_path = os.path.join(tmpdir, "upscaled_2x_from_mm1_2176_3232.jpg")
+            upscaled_img.write_jpg(upscaled_path, quality=95)
+            print(f"Saved 2× upscaled image: {upscaled_path}")
+            
+            # Verify dimensions match
+            assert upscaled_img.size == (256, 256), "Upscaled image should be 256×256"
+            
+            print(f"\nCompare images:")
+            print(f"  Native:    {native_path}")
+            print(f"  Upscaled:  {upscaled_path}")
+    
+    def test_upscale_4x_vs_native(self, tmpdir):
+        """Compare 4× upscaled image (from mipmap 2) to native mipmap 0."""
+        # Use separate cache for this test
+        cache_dir = os.path.join(tmpdir, "cache_4x")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Download native mipmap 0
+        chunk_native = getortho.Chunk(2176, 3232, 'EOX', 13, cache_dir=cache_dir)
+        getortho.chunk_getter.submit(chunk_native)
+        chunk_native.ready.wait(20)
+        
+        if chunk_native.data:
+            from aoimage import AoImage
+            native_img = AoImage.load_from_memory(chunk_native.data)
+            native_path = os.path.join(tmpdir, "native_mm0_4x.jpg")
+            native_img.write_jpg(native_path, quality=95)
+        
+        # Build ONLY mipmap 2
+        tile = getortho.Tile(2176, 3232, 'EOX', 13, cache_dir=cache_dir, max_zoom=13)
+        tile.get_img(2, maxwait=20)
+        
+        # Get upscaled version (4×)
+        upscaled_img = tile.get_best_chunk(2176, 3232, 0, 13)
+        
+        if upscaled_img and upscaled_img is not False:
+            upscaled_path = os.path.join(tmpdir, "upscaled_4x_from_mm2.jpg")
+            upscaled_img.write_jpg(upscaled_path, quality=95)
+            print(f"\nCompare 4× upscaling:")
+            print(f"  Native:    {native_path}")
+            print(f"  Upscaled:  {upscaled_path}")
+    
+    def test_upscale_8x_vs_native(self, tmpdir):
+        """Compare 8× upscaled image (from mipmap 3) to native mipmap 0."""
+        # Use separate cache for this test
+        cache_dir = os.path.join(tmpdir, "cache_8x")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Download native
+        chunk_native = getortho.Chunk(2176, 3232, 'EOX', 13, cache_dir=cache_dir)
+        getortho.chunk_getter.submit(chunk_native)
+        chunk_native.ready.wait(20)
+        
+        if chunk_native.data:
+            from aoimage import AoImage
+            native_img = AoImage.load_from_memory(chunk_native.data)
+            native_path = os.path.join(tmpdir, "native_mm0_8x.jpg")
+            native_img.write_jpg(native_path, quality=95)
+        
+        # Build ONLY mipmap 3
+        tile = getortho.Tile(2176, 3232, 'EOX', 13, cache_dir=cache_dir, max_zoom=13)
+        tile.get_img(3, maxwait=20)
+        
+        # Get upscaled version (8×)
+        upscaled_img = tile.get_best_chunk(2176, 3232, 0, 13)
+        
+        if upscaled_img and upscaled_img is not False:
+            upscaled_path = os.path.join(tmpdir, "upscaled_8x_from_mm3.jpg")
+            upscaled_img.write_jpg(upscaled_path, quality=95)
+            print(f"\nCompare 8× upscaling:")
+            print(f"  Native:    {native_path}")
+            print(f"  Upscaled:  {upscaled_path}")
+    
+    def test_upscale_16x_vs_native(self, tmpdir):
+        """Compare 16× upscaled image (from mipmap 4) to native mipmap 0."""
+        # Use separate cache for this test
+        cache_dir = os.path.join(tmpdir, "cache_16x")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Download native
+        chunk_native = getortho.Chunk(2176, 3232, 'EOX', 13, cache_dir=cache_dir)
+        getortho.chunk_getter.submit(chunk_native)
+        chunk_native.ready.wait(20)
+        
+        if chunk_native.data:
+            from aoimage import AoImage
+            native_img = AoImage.load_from_memory(chunk_native.data)
+            native_path = os.path.join(tmpdir, "native_mm0_16x.jpg")
+            native_img.write_jpg(native_path, quality=95)
+        
+        # Build ONLY mipmap 4 (lowest detail)
+        tile = getortho.Tile(2176, 3232, 'EOX', 13, cache_dir=cache_dir, max_zoom=13)
+        tile.get_img(4, maxwait=20)
+        
+        # Get upscaled version (16×)
+        upscaled_img = tile.get_best_chunk(2176, 3232, 0, 13)
+        
+        if upscaled_img and upscaled_img is not False:
+            upscaled_path = os.path.join(tmpdir, "upscaled_16x_from_mm4.jpg")
+            upscaled_img.write_jpg(upscaled_path, quality=95)
+            print(f"\nCompare 16× upscaling:")
+            print(f"  Native:    {native_path}")
+            print(f"  Upscaled:  {upscaled_path}")
+            print(f"\nNote: 16× upscale will be very blocky but better than missing tile!")
+
+
+class TestFallbackChainIntegration:
+    """Test the complete fallback chain with visual output."""
+    
+    def test_fallback_chain_with_images(self, tmpdir):
+        """Test complete fallback chain and save images at each stage."""
+        # Create output directory for comparison
+        output_dir = os.path.join(tmpdir, "fallback_comparison")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Download native mipmap 0 for reference
+        print("\n=== Downloading native mipmap 0 for reference ===")
+        chunk_native = getortho.Chunk(2176, 3232, 'EOX', 13, cache_dir=tmpdir)
+        getortho.chunk_getter.submit(chunk_native)
+        chunk_native.ready.wait(20)
+        
+        if chunk_native.data:
+            from aoimage import AoImage
+            native_img = AoImage.load_from_memory(chunk_native.data)
+            native_path = os.path.join(output_dir, "0_native_mipmap0.jpg")
+            native_img.write_jpg(native_path, quality=95)
+            print(f"✓ Saved: {native_path}")
+        
+        # Test each mipmap upscaling SEPARATELY with fresh cache dirs
+        # This ensures get_best_chunk() finds ONLY the specific mipmap we're testing
+        for mm in [1, 2, 3, 4]:
+            print(f"\n=== Testing fallback from mipmap {mm} (scale factor: {2**mm}×) ===")
+            
+            # Create a separate cache directory for this mipmap test
+            mm_cache_dir = os.path.join(tmpdir, f"cache_mm{mm}")
+            os.makedirs(mm_cache_dir, exist_ok=True)
+            
+            # Create new tile with isolated cache
+            tile_mm = getortho.Tile(2176, 3232, 'EOX', 13, cache_dir=mm_cache_dir, max_zoom=13)
+            
+            # Build ONLY this specific mipmap
+            tile_mm.get_img(mm, maxwait=20)
+            
+            # Get upscaled version (will find ONLY the mipmap we just built)
+            upscaled_img = tile_mm.get_best_chunk(2176, 3232, 0, 13)
+            
+            if upscaled_img and upscaled_img is not False:
+                upscaled_path = os.path.join(output_dir, f"{mm}_upscaled_{2**mm}x_from_mm{mm}.jpg")
+                upscaled_img.write_jpg(upscaled_path, quality=95)
+                print(f"✓ Saved: {upscaled_path}")
+                print(f"  Cache dir: {mm_cache_dir}")
+            else:
+                print(f"✗ Failed to get upscaled image from mipmap {mm}")
+            
+            # Clean up tile
+            tile_mm.close()
+        
+        print(f"\n=== All comparison images saved to: {output_dir} ===")
+        print("View these images side-by-side to see upscaling quality at different scales")
+        print("\nExpected quality:")
+        print("  2× (mm1): Nearly identical to native")
+        print("  4× (mm2): Slight blur")
+        print("  8× (mm3): Noticeable blockiness")
+        print("  16× (mm4): Very blocky but recognizable")
+    
+    def test_cascading_fallback_with_images(self, tmpdir):
+        """Test cascading fallback and save the result."""
+        output_dir = os.path.join(tmpdir, "cascade_test")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        tile = getortho.Tile(2176, 3232, 'EOX', 13, cache_dir=tmpdir, max_zoom=13)
+        
+        # Test cascading fallback (simulates mipmap 0 failure)
+        print("\n=== Testing cascading fallback (on-demand download) ===")
+        cascaded_img = tile.get_or_build_lower_mipmap_chunk(0, 2176, 3232, 13)
+        
+        if cascaded_img:
+            cascade_path = os.path.join(output_dir, "cascaded_fallback.jpg")
+            cascaded_img.write_jpg(cascade_path, quality=95)
+            print(f"✓ Cascading fallback succeeded: {cascade_path}")
+            
+            # Also save the native for comparison
+            chunk_native = getortho.Chunk(2176, 3232, 'EOX', 13, cache_dir=tmpdir)
+            getortho.chunk_getter.submit(chunk_native)
+            if chunk_native.ready.wait(20) and chunk_native.data:
+                from aoimage import AoImage
+                native_img = AoImage.load_from_memory(chunk_native.data)
+                native_path = os.path.join(output_dir, "native_for_comparison.jpg")
+                native_img.write_jpg(native_path, quality=95)
+                print(f"✓ Native saved: {native_path}")
+        else:
+            print("✗ Cascading fallback failed")
+
+
+class TestBuiltMipmapUpscaling:
+    """Test upscaling from built mipmaps stored in self.imgs."""
+    
+    def test_upscale_from_built_mipmap_with_images(self, tmpdir):
+        """Test upscaling from built mipmap and save visual comparison."""
+        output_dir = os.path.join(tmpdir, "built_mipmap_test")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        tile = getortho.Tile(2176, 3232, 'EOX', 13, cache_dir=tmpdir, max_zoom=13)
+        
+        print("\n=== Testing upscaling from built mipmaps (self.imgs) ===")
+        
+        # Build mipmap 2
+        img_mm2 = tile.get_img(2, maxwait=20)
+        assert img_mm2 is not None, "Failed to build mipmap 2"
+        
+        # Save the full mipmap 2 for reference
+        mm2_path = os.path.join(output_dir, "full_mipmap2.jpg")
+        img_mm2.write_jpg(mm2_path, quality=95)
+        print(f"✓ Full mipmap 2 saved: {mm2_path}")
+        
+        # Now upscale a chunk from built mipmap
+        chunk_img = tile.get_downscaled_from_higher_mipmap(0, 2176, 3232, 13)
+        
+        if chunk_img:
+            upscaled_path = os.path.join(output_dir, "upscaled_from_built_mm2.jpg")
+            chunk_img.write_jpg(upscaled_path, quality=95)
+            print(f"✓ Upscaled from built mipmap: {upscaled_path}")
+            
+            # Compare to native
+            chunk_native = getortho.Chunk(2176, 3232, 'EOX', 13, cache_dir=tmpdir)
+            getortho.chunk_getter.submit(chunk_native)
+            if chunk_native.ready.wait(20) and chunk_native.data:
+                from aoimage import AoImage
+                native_img = AoImage.load_from_memory(chunk_native.data)
+                native_path = os.path.join(output_dir, "native_mm0.jpg")
+                native_img.write_jpg(native_path, quality=95)
+                print(f"✓ Native saved: {native_path}")
+    
+    def test_metadata_storage_verification(self, tmpdir):
+        """Verify that images are stored with correct metadata."""
+        tile = getortho.Tile(2176, 3232, 'EOX', 13, cache_dir=tmpdir, max_zoom=13)
+        
+        # Build a mipmap
+        img = tile.get_img(2, maxwait=20)
+        assert img is not None, "Failed to build mipmap"
+        
+        # Verify metadata storage
+        assert 2 in tile.imgs, "Image should be stored in tile.imgs"
+        img_data = tile.imgs[2]
+        
+        # New format: (image, col, row, zoom)
+        assert isinstance(img_data, tuple), "Should be stored as tuple"
+        assert len(img_data) == 4, f"Should have 4 elements, got {len(img_data)}"
+        
+        stored_img, stored_col, stored_row, stored_zoom = img_data
+        
+        print(f"\nMetadata verification:")
+        print(f"  Stored col:  {stored_col}")
+        print(f"  Stored row:  {stored_row}")
+        print(f"  Stored zoom: {stored_zoom}")
+        print(f"  Image size:  {stored_img.size}")
     

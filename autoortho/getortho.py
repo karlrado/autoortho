@@ -1007,7 +1007,7 @@ class Tile(object):
         blocksize = 8 if CFG.pydds.format == "BC1" else 16
         blocks_per_row = max(1, base_width_px // 4)
         bytes_per_row = blocks_per_row * blocksize
-        # Each chunk-row is 256 px tall → 64 blocks vertically
+        # Each chunk-row is 256 px tall -> 64 blocks vertically
         bytes_per_chunk_row = bytes_per_row * 64
 
         # Compute start/end chunk-rows touched by the requested byte range
@@ -1297,24 +1297,27 @@ class Tile(object):
                         chunk_img = AoImage.load_from_memory(chunk.data)
                 except Exception as _e:
                     log.debug(f"GET_IMG: load_from_memory failed for {chunk}: {_e}")
-            elif mipmap < self.max_mipmap and not chunk_ready:
-                # Ran out of time, requesting mm below max.  Search for backup...
-                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Tile {self} not ready.  Try to find backup chunk.")
-                chunk_img = self.get_best_chunk(chunk.col, chunk.row, mipmap, zoom)
-                if chunk_img:
-                    bump('backup_chunk_count')
+            # FALLBACK CHAIN (in order of preference):
+            # Each fallback only runs if previous ones failed
             
-            # Try scaling from already-built mipmaps if we still don't have an image
-            # This checks both downscaling (from higher-detail) and upscaling (from lower-detail)
+            # Fallback 1: Search disk cache for lower-zoom JPEGs
+            # This is the BEST fallback - uses existing cached data efficiently
+            if not chunk_img and not chunk_ready:
+                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Searching disk cache for backup chunk.")
+                chunk_img = self.get_best_chunk(chunk.col, chunk.row, mipmap, zoom)
+                # get_best_chunk bumps 'upscaled_from_jpeg_count' if successful
+            
+            # Fallback 2: Scale from already-built mipmaps (if they exist)
+            # Only useful if full mipmaps have already been built and cached in self.imgs
             if not chunk_img:
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Attempting scaling from built mipmaps.")
                 chunk_img = self.get_downscaled_from_higher_mipmap(mipmap, chunk.col, chunk.row, zoom)
                 # Note: scaling function bumps its own counters (upscaled_chunk_count or downscaled_chunk_count)
             
-            # Cascading fallback: on-demand download of lower-detail chunks
-            # Only triggered when built mipmaps don't exist yet (e.g., mipmap 0 requested first)
+            # Fallback 3: On-demand download of lower-detail chunks
+            # Last resort before final retry - downloads new data if needed
             if not chunk_img and not chunk_ready:
-                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Attempting cascading fallback.")
+                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Attempting cascading fallback (download).")
                 chunk_img = self.get_or_build_lower_mipmap_chunk(mipmap, chunk.col, chunk.row, zoom)
 
             if not chunk_ready and not chunk_img:
@@ -1505,17 +1508,19 @@ class Tile(object):
                     offset_col = col % scale_factor
                     offset_row = row % scale_factor
                     
+                    log.info(f"CASCADE DEBUG: target=({col},{row}), fallback_chunk=({fallback_col},{fallback_row}), offset=({offset_col},{offset_row}), scale={scale_factor}")
+                    
                     # Pixel position in fallback image
                     pixel_x = offset_col * (256 // scale_factor)
                     pixel_y = offset_row * (256 // scale_factor)
                     crop_size = 256 // scale_factor
                     
-                    # Upscale to 256×256
+                    # Upscale to 256x256
                     upscaled = fallback_img.crop_and_upscale(
                         pixel_x, pixel_y, crop_size, crop_size, scale_factor
                     )
                     
-                    log.info(f"Cascading fallback SUCCESS: upscaled mipmap {fallback_mipmap} → {target_mipmap} at {col}x{row} (scale {scale_factor}×)")
+                    log.info(f"Cascading fallback SUCCESS: upscaled mipmap {fallback_mipmap} -> {target_mipmap} at {col}x{row} (scale {scale_factor}x)")
                     bump('upscaled_chunk_count')
                     bump(f'cascade_fallback_mm{fallback_mipmap}')
                     
@@ -1609,20 +1614,37 @@ class Tile(object):
             zoom_diff = zoom - base_zoom
             if zoom_diff >= 0:
                 # Requested chunk is at higher or same zoom as image base
-                rel_col = (col >> zoom_diff) - base_col
-                rel_row = (row >> zoom_diff) - base_row
+                # Calculate which parent chunk at base_zoom level
+                parent_col = col >> zoom_diff
+                parent_row = row >> zoom_diff
+                
+                # Relative to base position (which parent chunk in the image)
+                rel_col = parent_col - base_col
+                rel_row = parent_row - base_row
+                
+                # Calculate sub-chunk offset within that parent (0 to 2^zoom_diff-1)
+                sub_col = col & ((1 << zoom_diff) - 1)  # Equivalent to col % (1 << zoom_diff)
+                sub_row = row & ((1 << zoom_diff) - 1)
             else:
                 # Requested chunk is at lower zoom (shouldn't happen but handle it)
-                rel_col = (col << (-zoom_diff)) - base_col
-                rel_row = (row << (-zoom_diff)) - base_row
-            
-            # Each chunk in the image is 256px wide at its zoom level
-            # Position in pixels in the lower-detail image
-            pixel_x = rel_col * 256
-            pixel_y = rel_row * 256
+                parent_col = col << (-zoom_diff)
+                parent_row = row << (-zoom_diff)
+                rel_col = parent_col - base_col
+                rel_row = parent_row - base_row
+                sub_col = 0
+                sub_row = 0
             
             # Size to crop from lower image (will be upscaled by scale_factor)
             crop_size = 256 // scale_factor
+            
+            # Each parent chunk in the image is 256px wide
+            # We need to find the sub-chunk within that 256x256 parent
+            # Each sub-chunk occupies (256 // scale_factor) pixels in the parent
+            sub_chunk_size_in_parent = crop_size  # Same as 256 // scale_factor
+            pixel_x = rel_col * 256 + sub_col * sub_chunk_size_in_parent
+            pixel_y = rel_row * 256 + sub_row * sub_chunk_size_in_parent
+            
+            log.info(f"MIPMAP UPSCALE DEBUG: target=({col},{row},z{zoom}) base=({base_col},{base_row},z{base_zoom}) parent=({parent_col},{parent_row}) sub=({sub_col},{sub_row}) pixel=({pixel_x},{pixel_y}) crop={crop_size}")
             
             # Bounds check
             img_width, img_height = lower_img.size
@@ -1673,12 +1695,12 @@ class Tile(object):
                 c.close()
                 continue
         
-            log.debug(f"Found best chunk for {col}x{row}x{zoom} at {col_p}x{row_p}x{zoom_p}")
+            log.info(f"Found cached JPEG for {col}x{row}x{zoom} (mm{mm}) at {col_p}x{row_p}x{zoom_p} (mm{i}), upscaling {scalefactor}x")
             # Offset into chunk
             col_offset = col % scalefactor
             row_offset = row % scalefactor
 
-            log.debug(f"Col_Offset: {col_offset}, Row_Offset: {row_offset}, Scale_Factor: {scalefactor}")
+            log.info(f"UPSCALE DEBUG: col={col}, row={row}, col_p={col_p}, row_p={row_p}, col_offset={col_offset}, row_offset={row_offset}, scalefactor={scalefactor}")
 
             # Pixel width
             w_p = max(1, 256 >> diff)
@@ -1700,6 +1722,9 @@ class Tile(object):
 
             # Close the cache chunk to free memory before returning
             c.close()
+            
+            # Track upscaling from cached JPEGs separately
+            bump('upscaled_from_jpeg_count')
             return chunk_img
 
         log.debug(f"No best chunk found for {col}x{row}x{zoom}!")
