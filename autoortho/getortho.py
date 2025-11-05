@@ -1154,6 +1154,19 @@ class Tile(object):
         # Get an image for a particular mipmap
         #
 
+        # CRITICAL: If building mipmap 0, ensure lower mipmaps (1-4) are fully built first
+        # This ensures they're available in self.imgs for fallback upscaling
+        if mipmap == 0 and (startrow == 0 and endrow is None):
+            log.debug(f"GET_IMG: Building mipmap 0, ensuring lower mipmaps are available for fallback")
+            for lower_mm in range(1, min(self.max_mipmap + 1, 5)):
+                if lower_mm not in self.imgs:
+                    log.debug(f"GET_IMG: Pre-building mipmap {lower_mm} for fallback support")
+                    try:
+                        # Build the complete lower mipmap
+                        self.get_img(lower_mm, startrow=0, endrow=None, maxwait=maxwait, min_zoom=min_zoom)
+                    except Exception as e:
+                        log.debug(f"GET_IMG: Failed to pre-build mipmap {lower_mm}: {e}")
+
         # Get effective zoom  
         zoom = min((self.max_zoom - mipmap), self.max_zoom)
         log.debug(f"GET_IMG: Default tile zoom: {self.tilename_zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
@@ -1439,6 +1452,28 @@ class Tile(object):
                         new_im.paste(chunk_img, (start_x, start_y))
                 except Exception as exc:
                     log.error(f"Chunk processing failed: {exc}")
+            
+            # CRITICAL: Process any chunks that never started downloading
+            # These would otherwise be left as missing color patches
+            unprocessed_chunks = [c for c in chunks if id(c) not in processed_chunks and not c.permanent_failure]
+            if unprocessed_chunks:
+                log.debug(f"Processing {len(unprocessed_chunks)} chunks that never started downloading (fallback only)")
+                for chunk in unprocessed_chunks:
+                    try:
+                        # Don't wait for download, go straight to fallback
+                        future = executor.submit(process_chunk, chunk)
+                        result = future.result(timeout=5)  # Short timeout for fallback
+                        if result:
+                            chunk, chunk_img, start_x, start_y = result
+                            if chunk_img:
+                                new_im.paste(chunk_img, (start_x, start_y))
+                            else:
+                                bump('chunk_missing_count')
+                        processed_chunks.add(id(chunk))
+                    except Exception as exc:
+                        log.debug(f"Fallback failed for unprocessed chunk {chunk}: {exc}")
+                        bump('chunk_missing_count')
+                        processed_chunks.add(id(chunk))
                     
         finally:
             executor.shutdown(wait=True)
