@@ -725,9 +725,9 @@ class Release(object):
         # self.cleanup()
         try:
 
-            if os.path.exists(self.install_dir):
-                log.info(f"Removing {self.install_dir}")
-                shutil.rmtree(self.install_dir)
+            if os.path.exists(self.subfolder_dir):
+                log.info(f"Removing {self.subfolder_dir}")
+                shutil.rmtree(self.subfolder_dir)
 
             if os.path.exists(self.info_path):
                 log.info(f"Removing {self.info_path}")
