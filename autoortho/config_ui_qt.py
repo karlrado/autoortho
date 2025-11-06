@@ -900,6 +900,9 @@ class ConfigUI(QMainWindow):
             # Add to root logger
             logging.getLogger().addHandler(self.ui_log_handler)
             
+            # Update root logger level to ensure all messages can flow through
+            self._update_root_logger_level()
+            
             # Add welcome message directly to the log text
             self.log_text.append("=== AutoOrtho Logs ===")
             self.log_text.append(f"UI Log Level: {console_level_str}")
@@ -909,6 +912,7 @@ class ConfigUI(QMainWindow):
             
             # Now log through the handler to test it
             log.info(f"UI logging initialized at level: {console_level_str}")
+            log.debug("DEBUG logging test message (only visible if UI Log Level is DEBUG)")
         except Exception as e:
             # Try to display error in the text widget
             try:
@@ -924,6 +928,16 @@ class ConfigUI(QMainWindow):
                 console_level_str = getattr(self.cfg.general, 'console_log_level', 'INFO').upper()
                 console_level = getattr(logging, console_level_str, logging.INFO)
                 self.ui_log_handler.setLevel(console_level)
+                
+                # Also update any StreamHandler (terminal console) to match
+                root_logger = logging.getLogger()
+                for handler in root_logger.handlers:
+                    if isinstance(handler, logging.StreamHandler) and not isinstance(handler, QTextEditLogger):
+                        handler.setLevel(console_level)
+                
+                # Update root logger level to minimum of all handlers
+                self._update_root_logger_level()
+                
                 log.info(f"UI log level updated to: {console_level_str}")
         except Exception as e:
             log.error(f"Failed to update UI log level: {e}")
@@ -960,8 +974,39 @@ class ConfigUI(QMainWindow):
                     handler.setLevel(file_level)
                     log.info(f"File log level updated to: {file_level_str}")
                     break
+            
+            # Update root logger level to minimum of all handlers
+            self._update_root_logger_level()
         except Exception as e:
             log.error(f"Failed to update file log level: {e}")
+    
+    def _update_root_logger_level(self):
+        """Update root logger level to minimum of all active handlers
+        
+        This ensures that messages at any handler's level can flow through
+        the root logger. Individual handlers then filter based on their own levels.
+        """
+        try:
+            root_logger = logging.getLogger()
+            
+            # Find the minimum level across all handlers
+            min_level = logging.CRITICAL  # Start with highest level
+            handler_levels = []
+            for handler in root_logger.handlers:
+                if handler.level < min_level:
+                    min_level = handler.level
+                handler_name = handler.__class__.__name__
+                handler_level_name = logging.getLevelName(handler.level)
+                handler_levels.append(f"{handler_name}={handler_level_name}")
+            
+            # Set root logger to the minimum level so all messages can flow through
+            if min_level != root_logger.level:
+                old_level = logging.getLevelName(root_logger.level)
+                root_logger.setLevel(min_level)
+                level_name = logging.getLevelName(min_level)
+                log.info(f"Root logger adjusted: {old_level} → {level_name} (handlers: {', '.join(handler_levels)})")
+        except Exception as e:
+            log.error(f"Failed to update root logger level: {e}")
 
     def refresh_settings_tab(self):
         """Refresh the settings tab"""
