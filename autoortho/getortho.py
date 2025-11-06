@@ -1286,11 +1286,11 @@ class Tile(object):
             start_x = int(chunk.width * (chunk.col - col))
             start_y = int(chunk.height * (chunk.row - row))
             
-            # Check if already marked as permanent failure
-            if chunk.permanent_failure:
-                log.debug(f"Chunk {chunk} is permanently failed ({chunk.failure_reason}), skipping")
+            # Track if this chunk permanently failed
+            is_permanent_failure = chunk.permanent_failure
+            if is_permanent_failure:
+                log.debug(f"Chunk {chunk} is permanently failed ({chunk.failure_reason}), will attempt fallbacks")
                 bump(f'chunk_permanent_fail_{chunk.failure_reason}')
-                return (chunk, None, start_x, start_y)
             
             # Smart timeout: only wait for download, not decode
             if chunk.ready.is_set():
@@ -1312,12 +1312,13 @@ class Tile(object):
                         chunk_img = AoImage.load_from_memory(chunk.data)
                 except Exception as _e:
                     log.debug(f"GET_IMG: load_from_memory failed for {chunk}: {_e}")
-
-            # Fallback system (each fallback only runs if previous ones failed)
-            # Avoid creating missing color images at all costs.
+            
+            # FALLBACK CHAIN (in order of preference):
+            # Each fallback only runs if previous ones failed
+            # For permanent failures (404, etc), we ALWAYS try fallbacks to get lower-zoom alternatives
             
             # Fallback 1: Search disk cache for lower-zoom JPEGs
-            if not chunk_img and not chunk_ready:
+            if not chunk_img and (not chunk_ready or is_permanent_failure):
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Searching disk cache for backup chunk.")
                 chunk_img = self.get_best_chunk(chunk.col, chunk.row, mipmap, zoom)
                 # get_best_chunk bumps 'upscaled_from_jpeg_count' if successful
@@ -1328,13 +1329,14 @@ class Tile(object):
                 chunk_img = self.get_downscaled_from_higher_mipmap(mipmap, chunk.col, chunk.row, zoom)
                 # Note: scaling function bumps its own counters (upscaled_chunk_count or downscaled_chunk_count)
             
-            # Fallback 3: On-demand download of lower-detail chunks (last resort)
-            if not chunk_img and not chunk_ready:
+            # Fallback 3: On-demand download of lower-detail chunks
+            if not chunk_img and (not chunk_ready or is_permanent_failure):
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Attempting cascading fallback (download).")
                 chunk_img = self.get_or_build_lower_mipmap_chunk(mipmap, chunk.col, chunk.row, zoom)
 
-            if not chunk_ready and not chunk_img:
+            if not chunk_ready and not chunk_img and not is_permanent_failure:
                 # Ran out of time, lower mipmap.  Retry...
+                # Don't retry permanent failures (404, etc) - they won't succeed
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Final retry for {chunk}, WAITING!")
                 bump('retry_chunk_count')
                 # Smart timeout for retry: check if already downloaded
@@ -1354,6 +1356,8 @@ class Tile(object):
             if not chunk_img:
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Empty chunk data.  Skip.")
                 bump('chunk_missing_count')
+                if is_permanent_failure:
+                    log.info(f"Chunk {chunk} permanently failed and all fallbacks exhausted")
                 
             return (chunk, chunk_img, start_x, start_y)
         
