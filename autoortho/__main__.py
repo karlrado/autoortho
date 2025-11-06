@@ -94,22 +94,57 @@ def setuplogs():
     if not os.path.isdir(log_dir):
         os.makedirs(log_dir)
 
-    log_level=logging.DEBUG if os.environ.get('AO_DEBUG') or CFG.general.debug else logging.INFO
-    logging.basicConfig(
-            #filename=os.path.join(log_dir, "autoortho.log"),
-            level=log_level,
-            handlers=[
-                #logging.FileHandler(filename=os.path.join(log_dir, "autoortho.log")),
-                logging.handlers.RotatingFileHandler(
-                    filename=os.path.join(log_dir, "autoortho.log"),
-                    maxBytes=10485760,
-                    backupCount=5
-                ),
-                logging.StreamHandler() if sys.stdout is not None else logging.NullHandler()
-            ]
+    # Get log levels from config
+    file_log_level_str = getattr(CFG.general, 'file_log_level', 'DEBUG').upper()
+    console_log_level_str = getattr(CFG.general, 'console_log_level', 'INFO').upper()
+    
+    # Override with AO_DEBUG environment variable if set (for development)
+    if os.environ.get('AO_DEBUG'):
+        file_log_level_str = 'DEBUG'
+        console_log_level_str = 'DEBUG'
+    
+    # Convert to logging levels
+    file_log_level = getattr(logging, file_log_level_str, logging.DEBUG)
+    console_log_level = getattr(logging, console_log_level_str, logging.INFO)
+    
+    # Set root logger to the minimum level so all messages can flow through
+    root_level = min(file_log_level, console_log_level)
+    
+    # Create formatters
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
+    console_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    
+    # Create file handler with its own level
+    file_handler = logging.handlers.RotatingFileHandler(
+        filename=os.path.join(log_dir, "autoortho.log"),
+        maxBytes=10485760,
+        backupCount=5
+    )
+    file_handler.setLevel(file_log_level)
+    file_handler.setFormatter(file_formatter)
+    
+    # Create console handler with its own level (only if stdout exists)
+    handlers = [file_handler]
+    if sys.stdout is not None:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(console_log_level)
+        console_handler.setFormatter(console_formatter)
+        handlers.append(console_handler)
+    
+    # Configure logging
+    logging.basicConfig(
+        level=root_level,
+        handlers=handlers
+    )
+    
     log = logging.getLogger(__name__)
-    log.info(f"Setup logs: {log_dir}, log level: {log_level}")
+    log.info(f"Setup logs: {log_dir}")
+    log.info(f"File log level: {file_log_level_str}, Console log level: {console_log_level_str}")
 
 
 # If SSL_CERT_DIR is not set, default to /etc/ssl/certs when available for Linux users.

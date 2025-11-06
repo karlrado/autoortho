@@ -58,8 +58,10 @@ gui = True
 showconfig = True
 # Hide when running
 hide = True
-# Debug mode
-debug = False
+# Console/UI log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+console_log_level = INFO
+# File log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+file_log_level = DEBUG
 
 [paths]
 # X-Plane install path
@@ -106,6 +108,8 @@ missing_color = [66, 77, 55]
 compressor = ISPC
 # BC1 or BC3 for dxt1 or dxt5 respectively
 format = BC1
+# Maximum number of concurrent JPEG decode threads (default: CPU count)
+max_decode_concurrency = {os.cpu_count() or 1}
 
 [scenery]
 # Don't cleanup downloads
