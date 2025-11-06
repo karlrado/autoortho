@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e  # Exit on any error
 
 export DEBIAN_FRONTEND=noninteractive
 export TZ=America/New_York
@@ -15,8 +16,13 @@ apt-get install -y make curl patchelf python3-pip python3-venv python3-tk zlib1g
     libgl1 libegl1
 
 # Create and prepare an isolated virtual environment to avoid PEP 668 restrictions
+echo "Creating virtual environment..."
 python3 -m venv .venv
 . .venv/bin/activate
+echo "Upgrading pip and setuptools..."
 pip install -U pip setuptools
-pip install -r requirements-build.txt --no-use-pep517
+echo "Installing build requirements (including nuitka)..."
+pip install -r requirements-build.txt
+echo "Installing runtime requirements..."
 pip install -r requirements.txt
+echo "Build environment setup complete!"
