@@ -41,6 +41,55 @@ log = logging.getLogger(__name__)
 CUR_PATH = os.path.dirname(os.path.realpath(__file__))
 
 
+class QTextEditLogger(logging.Handler):
+    """Custom logging handler that writes to a QTextEdit widget"""
+    def __init__(self, text_edit):
+        super().__init__()
+        self.text_edit = text_edit
+        self.max_lines = 1000  # Keep last 1000 lines in UI
+        
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Use a lambda to ensure thread-safe UI updates
+            # QTextEdit.append must be called from the main GUI thread
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, lambda: self._append_text(msg))
+        except Exception as e:
+            # Fail silently in production, but useful for debugging
+            import sys
+            print(f"QTextEditLogger emit error: {e}", file=sys.stderr)
+    
+    def _append_text(self, msg):
+        """Append text to the widget (called from main thread)"""
+        try:
+            self.text_edit.append(msg)
+            self._trim_text()
+            # Auto-scroll to bottom
+            scrollbar = self.text_edit.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+        except Exception as e:
+            import sys
+            print(f"QTextEditLogger append error: {e}", file=sys.stderr)
+    
+    def _trim_text(self):
+        """Keep only the last max_lines in the text edit"""
+        try:
+            doc = self.text_edit.document()
+            if doc.blockCount() > self.max_lines:
+                cursor = self.text_edit.textCursor()
+                cursor.movePosition(cursor.MoveOperation.Start)
+                cursor.movePosition(
+                    cursor.MoveOperation.Down,
+                    cursor.MoveMode.KeepAnchor,
+                    doc.blockCount() - self.max_lines
+                )
+                cursor.removeSelectedText()
+        except Exception as e:
+            import sys
+            print(f"QTextEditLogger trim error: {e}", file=sys.stderr)
+
+
 class SceneryDownloadWorker(QThread):
     """Worker thread for downloading scenery"""
     progress = Signal(str, dict)  # region_id, progress_data
@@ -340,6 +389,9 @@ class ConfigUI(QMainWindow):
         self._shutdown_in_progress = False
         self._ready_to_close = False
 
+        # Set up logging handler for UI (must be None before init_ui is called)
+        self.ui_log_handler = None
+
         # Setup UI
         self.init_ui()
 
@@ -347,11 +399,6 @@ class ConfigUI(QMainWindow):
         self.status_update.connect(self.update_status_bar)
         self.log_update.connect(self.append_log)
         self.show_error.connect(self.display_error)
-
-        # Start log update timer
-        self.log_timer = QTimer()
-        self.log_timer.timeout.connect(self.update_logs)
-        self.log_timer.start(1000)
 
         self.ready.set()
 
@@ -824,6 +871,97 @@ class ConfigUI(QMainWindow):
         layout.addWidget(self.log_text)
 
         self.tabs.addTab(logs_widget, "Logs")
+        
+        # Set up the UI logging handler now that log_text exists
+        self.setup_ui_logging()
+
+    def setup_ui_logging(self):
+        """Set up the UI logging handler with the configured log level"""
+        try:
+            # Remove existing handler if present
+            if hasattr(self, 'ui_log_handler') and self.ui_log_handler:
+                logging.getLogger().removeHandler(self.ui_log_handler)
+            
+            # Create new handler
+            self.ui_log_handler = QTextEditLogger(self.log_text)
+            
+            # Set the console log level from config
+            console_level_str = getattr(self.cfg.general, 'console_log_level', 'INFO').upper()
+            console_level = getattr(logging, console_level_str, logging.INFO)
+            self.ui_log_handler.setLevel(console_level)
+            
+            # Set formatter
+            formatter = logging.Formatter(
+                '%(asctime)s - %(levelname)s - %(message)s',
+                datefmt='%H:%M:%S'
+            )
+            self.ui_log_handler.setFormatter(formatter)
+            
+            # Add to root logger
+            logging.getLogger().addHandler(self.ui_log_handler)
+            
+            # Add welcome message directly to the log text
+            self.log_text.append("=== AutoOrtho Logs ===")
+            self.log_text.append(f"UI Log Level: {console_level_str}")
+            self.log_text.append(f"File Log Level: {getattr(self.cfg.general, 'file_log_level', 'DEBUG').upper()}")
+            self.log_text.append(f"Log file location: {self.cfg.paths.log_file}")
+            self.log_text.append("")
+            
+            # Now log through the handler to test it
+            log.info(f"UI logging initialized at level: {console_level_str}")
+        except Exception as e:
+            # Try to display error in the text widget
+            try:
+                self.log_text.append(f"ERROR: Failed to setup UI logging: {e}")
+            except Exception:
+                pass
+            log.error(f"Failed to setup UI logging: {e}")
+    
+    def update_ui_log_level(self):
+        """Update the UI log handler level when config changes"""
+        try:
+            if hasattr(self, 'ui_log_handler') and self.ui_log_handler:
+                console_level_str = getattr(self.cfg.general, 'console_log_level', 'INFO').upper()
+                console_level = getattr(logging, console_level_str, logging.INFO)
+                self.ui_log_handler.setLevel(console_level)
+                log.info(f"UI log level updated to: {console_level_str}")
+        except Exception as e:
+            log.error(f"Failed to update UI log level: {e}")
+    
+    def on_console_log_level_changed(self, new_level):
+        """Handle console log level change in UI"""
+        try:
+            self.cfg.general.console_log_level = new_level
+            self.update_ui_log_level()
+            log.info(f"Console/UI log level changed to: {new_level}")
+        except Exception as e:
+            log.error(f"Failed to change console log level: {e}")
+    
+    def on_file_log_level_changed(self, new_level):
+        """Handle file log level change in UI"""
+        try:
+            self.cfg.general.file_log_level = new_level
+            self.update_file_log_level()
+            log.info(f"File log level changed to: {new_level}")
+        except Exception as e:
+            log.error(f"Failed to change file log level: {e}")
+    
+    def update_file_log_level(self):
+        """Update the file log handler level when config changes"""
+        try:
+            file_level_str = getattr(self.cfg.general, 'file_log_level', 'DEBUG').upper()
+            file_level = getattr(logging, file_level_str, logging.DEBUG)
+            
+            # Find and update the file handler
+            root_logger = logging.getLogger()
+            for handler in root_logger.handlers:
+                # Check if this is a file handler (RotatingFileHandler or FileHandler)
+                if isinstance(handler, (logging.handlers.RotatingFileHandler, logging.FileHandler)):
+                    handler.setLevel(file_level)
+                    log.info(f"File log level updated to: {file_level_str}")
+                    break
+        except Exception as e:
+            log.error(f"Failed to update file log level: {e}")
 
     def refresh_settings_tab(self):
         """Refresh the settings tab"""
@@ -1357,6 +1495,7 @@ class ConfigUI(QMainWindow):
         general_layout = QVBoxLayout()
         general_group.setLayout(general_layout)
 
+
         self.gui_check = QCheckBox("Use GUI at startup")
         self.gui_check.setChecked(self.cfg.general.gui)
         self.gui_check.setObjectName('gui')
@@ -1366,6 +1505,8 @@ class ConfigUI(QMainWindow):
             "Recommended: Enabled for easier monitoring and control."
         )
         general_layout.addWidget(self.gui_check)
+
+        general_layout.addSpacing(10)
 
         self.hide_check = QCheckBox("Hide window when running")
         self.hide_check.setChecked(self.cfg.general.hide)
@@ -1377,15 +1518,62 @@ class ConfigUI(QMainWindow):
         )
         general_layout.addWidget(self.hide_check)
 
-        self.debug_check = QCheckBox("Debug mode")
-        self.debug_check.setChecked(self.cfg.general.debug)
-        self.debug_check.setObjectName('debug')
-        self.debug_check.setToolTip(
-            "Enable detailed logging for troubleshooting.\n"
-            "Creates larger log files with more information.\n"
-            "Only enable if experiencing issues or when asked by support."
+        # Console/UI log level
+        console_log_level_layout = QHBoxLayout()
+        console_log_level_label = QLabel("UI Log Level:")
+        console_log_level_label.setToolTip(
+            "Set the minimum log level displayed in the UI Logs tab.\n"
+            "DEBUG: Show all messages (very verbose)\n"
+            "INFO: Show informational messages and above (recommended)\n"
+            "WARNING: Show only warnings and errors\n"
+            "ERROR: Show only errors and critical messages\n"
+            "CRITICAL: Show only critical errors\n\n"
+            "Changes take effect immediately.\n"
+            "This does not affect the log file."
         )
-        general_layout.addWidget(self.debug_check)
+        console_log_level_layout.addWidget(console_log_level_label)
+        self.console_log_level_combo = QComboBox()
+        self.console_log_level_combo.addItems(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
+        console_level = getattr(self.cfg.general, 'console_log_level', 'INFO').upper()
+        self.console_log_level_combo.setCurrentText(console_level)
+        self.console_log_level_combo.setObjectName('console_log_level')
+        self.console_log_level_combo.setToolTip(
+            "Select the minimum log level for the UI (INFO recommended)\n"
+            "Changes take effect immediately - no restart needed!"
+        )
+        self.console_log_level_combo.currentTextChanged.connect(self.on_console_log_level_changed)
+        console_log_level_layout.addWidget(self.console_log_level_combo)
+        console_log_level_layout.addStretch()
+        general_layout.addLayout(console_log_level_layout)
+
+        # File log level
+        file_log_level_layout = QHBoxLayout()
+        file_log_level_label = QLabel("File Log Level:")
+        file_log_level_label.setToolTip(
+            "Set the minimum log level saved to the log file.\n"
+            "DEBUG: Save all messages (recommended for bug reports)\n"
+            "INFO: Save informational messages and above\n"
+            "WARNING: Save only warnings and errors\n"
+            "ERROR: Save only errors and critical messages\n"
+            "CRITICAL: Save only critical errors\n\n"
+            "Changes take effect immediately.\n"
+            "This does not affect what's shown in the UI.\n"
+            "DEBUG is recommended so bug reports include full details."
+        )
+        file_log_level_layout.addWidget(file_log_level_label)
+        self.file_log_level_combo = QComboBox()
+        self.file_log_level_combo.addItems(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
+        file_level = getattr(self.cfg.general, 'file_log_level', 'DEBUG').upper()
+        self.file_log_level_combo.setCurrentText(file_level)
+        self.file_log_level_combo.setObjectName('file_log_level')
+        self.file_log_level_combo.setToolTip(
+            "Select the minimum log level for the file (DEBUG recommended)\n"
+            "Changes take effect immediately - no restart needed."
+        )
+        self.file_log_level_combo.currentTextChanged.connect(self.on_file_log_level_changed)
+        file_log_level_layout.addWidget(self.file_log_level_combo)
+        file_log_level_layout.addStretch()
+        general_layout.addLayout(file_log_level_layout)
 
         self.settings_layout.addWidget(general_group)
 
@@ -2583,7 +2771,8 @@ class ConfigUI(QMainWindow):
             # General settings
             self.cfg.general.gui = self.gui_check.isChecked()
             self.cfg.general.hide = self.hide_check.isChecked()
-            self.cfg.general.debug = self.debug_check.isChecked()
+            self.cfg.general.console_log_level = self.console_log_level_combo.currentText()
+            self.cfg.general.file_log_level = self.file_log_level_combo.currentText()
 
             # Scenery settings
             self.cfg.scenery.noclean = self.noclean_check.isChecked()
@@ -2858,18 +3047,6 @@ class ConfigUI(QMainWindow):
         except Exception:
             pass
 
-    def update_logs(self):
-        """Update log display"""
-        try:
-            if os.path.exists(self.cfg.paths.log_file):
-                with open(self.cfg.paths.log_file) as h:
-                    lines = h.readlines()[-50:]  # Last 50 lines
-                    self.log_text.setPlainText(''.join(lines))
-                    # Auto scroll to bottom
-                    scrollbar = self.log_text.verticalScrollBar()
-                    scrollbar.setValue(scrollbar.maximum())
-        except Exception:
-            pass
 
     def update_status_bar(self, message):
         """Update status bar message"""
@@ -3015,12 +3192,13 @@ class ConfigUI(QMainWindow):
             event.accept()
             return
 
-        # Stop periodic UI updates early
-        if hasattr(self, 'log_timer'):
-            try:
-                self.log_timer.stop()
-            except Exception:
-                pass
+        # Clean up UI logging handler
+        try:
+            if hasattr(self, 'ui_log_handler') and self.ui_log_handler:
+                logging.getLogger().removeHandler(self.ui_log_handler)
+                self.ui_log_handler = None
+        except Exception:
+            pass
 
         # Stop all background workers immediately
         try:

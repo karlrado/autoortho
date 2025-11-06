@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-
+import logging
 import atexit
 import os
 import time
@@ -7,6 +7,7 @@ import threading
 import concurrent.futures
 import uuid
 import math
+import tracemalloc
 from typing import Optional
 
 from io import BytesIO
@@ -24,31 +25,29 @@ from aoimage import AoImage
 
 from aoconfig import CFG
 from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat
-from utils.constants import system_type
+from utils.constants import (
+    system_type, 
+    CURRENT_CPU_COUNT,
+    EARTH_RADIUS_M,
+    PRIORITY_DISTANCE_WEIGHT,
+    PRIORITY_DIRECTION_WEIGHT,
+    PRIORITY_MIPMAP_WEIGHT,
+    LOOKAHEAD_TIME_SEC,
+)
 from utils.apple_token_service import apple_token_service
 
 from datareftrack import dt as datareftracker
 
 MEMTRACE = False
 
-# Spatial priority system constants
-EARTH_RADIUS_M = 6371000  # Earth radius in meters
-PRIORITY_DISTANCE_WEIGHT = 1.0  # Weight for distance component
-PRIORITY_DIRECTION_WEIGHT = 0.5  # Weight for direction component
-PRIORITY_MIPMAP_WEIGHT = 2.0  # Weight for mipmap component
-LOOKAHEAD_TIME_SEC = 30  # Predict 30 seconds ahead
-
-import logging
 log = logging.getLogger(__name__)
 
-import tracemalloc
-#from memory_profiler import profile
 
 # Bound global JPEG decode concurrency to reduce memory spikes and failures
 try:
-    _MAX_DECODE = int(getattr(CFG.pydds, 'max_decode_concurrency', os.cpu_count() or 1))
+    _MAX_DECODE = int(getattr(CFG.pydds, 'max_decode_concurrency', CURRENT_CPU_COUNT))
 except Exception:
-    _MAX_DECODE = os.cpu_count() or 1
+    _MAX_DECODE = CURRENT_CPU_COUNT
 _decode_sem = threading.Semaphore(_MAX_DECODE)
 
 
@@ -58,6 +57,7 @@ mm_stats = StatTracker(0, 5)
 partial_stats = StatTracker()
 
 stats_batcher = None
+
 
 def _ensure_stats_batcher():
     global stats_batcher
@@ -127,6 +127,7 @@ def _is_jpeg(dataheader):
         return True
     else:
         return False
+
 
 def _gtile_to_quadkey(til_x, til_y, zoomlevel):
     """
@@ -202,7 +203,6 @@ def _calculate_spatial_priority(chunk_row: int, chunk_col: int, chunk_zoom: int,
         player_lon = datareftracker.lon
         player_hdg = datareftracker.hdg  # degrees, 0=N, 90=E, 180=S, 270=W
         player_spd = datareftracker.spd  # m/s
-        
 
         chunk_lat, chunk_lon = _chunk_to_latlon(chunk_row, chunk_col, chunk_zoom)
         
@@ -247,6 +247,7 @@ def _calculate_spatial_priority(chunk_row: int, chunk_col: int, chunk_zoom: int,
         log.debug(f"Spatial priority calculation failed: {e}")
         return float(base_mipmap_priority)
 
+
 def locked(fn):
     @wraps(fn)
     def wrapped(self, *args, **kwargs):
@@ -256,8 +257,9 @@ def locked(fn):
         return result
     return wrapped
 
+
 class Getter(object):
-    queue = None 
+    queue = None
     workers = None
     WORKING = None
     session = None
@@ -457,8 +459,8 @@ class Chunk(object):
         # Hack override maptype
         #self.maptype = "BI"
 
-        if not priority:
-            self.priority = zoom
+        # Set priority: use provided value or default to zoom level
+        self.priority = priority if priority else zoom
         self.chunk_id = f"{col}_{row}_{zoom}_{maptype}"
         self.ready = threading.Event()
         self.ready.clear()
@@ -1310,25 +1312,23 @@ class Tile(object):
                         chunk_img = AoImage.load_from_memory(chunk.data)
                 except Exception as _e:
                     log.debug(f"GET_IMG: load_from_memory failed for {chunk}: {_e}")
-            # FALLBACK CHAIN (in order of preference):
-            # Each fallback only runs if previous ones failed
+
+            # Fallback system (each fallback only runs if previous ones failed)
+            # Avoid creating missing color images at all costs.
             
             # Fallback 1: Search disk cache for lower-zoom JPEGs
-            # This is the BEST fallback - uses existing cached data efficiently
             if not chunk_img and not chunk_ready:
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Searching disk cache for backup chunk.")
                 chunk_img = self.get_best_chunk(chunk.col, chunk.row, mipmap, zoom)
                 # get_best_chunk bumps 'upscaled_from_jpeg_count' if successful
             
             # Fallback 2: Scale from already-built mipmaps (if they exist)
-            # Only useful if full mipmaps have already been built and cached in self.imgs
             if not chunk_img:
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Attempting scaling from built mipmaps.")
                 chunk_img = self.get_downscaled_from_higher_mipmap(mipmap, chunk.col, chunk.row, zoom)
                 # Note: scaling function bumps its own counters (upscaled_chunk_count or downscaled_chunk_count)
             
-            # Fallback 3: On-demand download of lower-detail chunks
-            # Last resort before final retry - downloads new data if needed
+            # Fallback 3: On-demand download of lower-detail chunks (last resort)
             if not chunk_img and not chunk_ready:
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Attempting cascading fallback (download).")
                 chunk_img = self.get_or_build_lower_mipmap_chunk(mipmap, chunk.col, chunk.row, zoom)
@@ -1358,12 +1358,7 @@ class Tile(object):
             return (chunk, chunk_img, start_x, start_y)
         
         # Process chunks lazily - only after their download has started
-        # CPU-aware thread pool sizing bounded by decode concurrency
-        try:
-            cpu_workers = os.cpu_count() or 1
-        except Exception:
-            cpu_workers = 1
-        max_pool_workers = min(cpu_workers, len(chunks), _MAX_DECODE)
+        max_pool_workers = min(CURRENT_CPU_COUNT, len(chunks), _MAX_DECODE)
         
         processed_chunks = set()
         total_chunks = len(chunks)
@@ -1526,8 +1521,8 @@ class Tile(object):
                     # Not in cache, try to download it (with shorter timeout)
                     chunk_getter.submit(fallback_chunk)
                     # Wait with reduced timeout (don't want to cascade delays)
-                    got_it = fallback_chunk.ready.wait(timeout=min(3.0, self.get_maxwait() / 2))
-                    if not got_it:
+                    fallback_chunk_ready = fallback_chunk.ready.wait(timeout=min(3.0, self.get_maxwait() / 2))
+                    if not fallback_chunk_ready:
                         log.debug(f"Cascading fallback: mipmap {fallback_mipmap} also timed out, trying next level")
                         fallback_chunk.close()
                         continue
@@ -1543,7 +1538,7 @@ class Tile(object):
                     offset_col = col % scale_factor
                     offset_row = row % scale_factor
                     
-                    log.info(f"CASCADE DEBUG: target=({col},{row}), fallback_chunk=({fallback_col},{fallback_row}), offset=({offset_col},{offset_row}), scale={scale_factor}")
+                    log.debug(f"CASCADE DEBUG: target=({col},{row}), fallback_chunk=({fallback_col},{fallback_row}), offset=({offset_col},{offset_row}), scale={scale_factor}")
                     
                     # Pixel position in fallback image
                     pixel_x = offset_col * (256 // scale_factor)
@@ -1555,15 +1550,15 @@ class Tile(object):
                         pixel_x, pixel_y, crop_size, crop_size, scale_factor
                     )
                     
-                    log.info(f"Cascading fallback SUCCESS: upscaled mipmap {fallback_mipmap} -> {target_mipmap} at {col}x{row} (scale {scale_factor}x)")
+                    log.debug(f"Cascading fallback SUCCESS: upscaled mipmap {fallback_mipmap} -> {target_mipmap} at {col}x{row} (scale {scale_factor}x)")
                     bump('upscaled_chunk_count')
-                    bump(f'cascade_fallback_mm{fallback_mipmap}')
+                    bump('chunk_from_cascade_fallback')
                     
                     fallback_chunk.close()
                     return upscaled
                     
                 except Exception as e:
-                    log.debug(f"Cascading fallback: failed to upscale from mipmap {fallback_mipmap}: {e}")
+                    log.warning(f"Cascading fallback: failed to upscale from mipmap {fallback_mipmap}: {e}")
                     fallback_chunk.close()
                     continue
             
@@ -1616,7 +1611,7 @@ class Tile(object):
                 downscale_steps = int(math.log2(scale_factor))
                 downscaled = cropped.reduce_2(downscale_steps)
                 
-                log.info(f"Downscaled mipmap {higher_mipmap} to fill missing mipmap {target_mipmap} chunk at {col}x{row}")
+                log.debug(f"Downscaled mipmap {higher_mipmap} to fill missing mipmap {target_mipmap} chunk at {col}x{row}")
                 bump('downscaled_chunk_count')
                 return downscaled
             except Exception as e:
@@ -1679,7 +1674,7 @@ class Tile(object):
             pixel_x = rel_col * 256 + sub_col * sub_chunk_size_in_parent
             pixel_y = rel_row * 256 + sub_row * sub_chunk_size_in_parent
             
-            log.info(f"MIPMAP UPSCALE DEBUG: target=({col},{row},z{zoom}) base=({base_col},{base_row},z{base_zoom}) parent=({parent_col},{parent_row}) sub=({sub_col},{sub_row}) pixel=({pixel_x},{pixel_y}) crop={crop_size}")
+            log.debug(f"MIPMAP UPSCALE DEBUG: target=({col},{row},z{zoom}) base=({base_col},{base_row},z{base_zoom}) parent=({parent_col},{parent_row}) sub=({sub_col},{sub_row}) pixel=({pixel_x},{pixel_y}) crop={crop_size}")
             
             # Bounds check
             img_width, img_height = lower_img.size
@@ -1690,11 +1685,10 @@ class Tile(object):
                 continue
             
             try:
-                # Use new C function for atomic crop+upscale
                 upscaled = lower_img.crop_and_upscale(
                     pixel_x, pixel_y, crop_size, crop_size, scale_factor
                 )
-                log.info(f"Upscaled mipmap {lower_mipmap} (zoom {base_zoom}) to fill mipmap {target_mipmap} chunk at {col}x{row}")
+                log.debug(f"Upscaled mipmap {lower_mipmap} (zoom {base_zoom}) to fill mipmap {target_mipmap} chunk at {col}x{row}")
                 bump('upscaled_chunk_count')
                 return upscaled
             except Exception as e:

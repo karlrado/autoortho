@@ -58,8 +58,10 @@ gui = True
 showconfig = True
 # Hide when running
 hide = True
-# Debug mode
-debug = False
+# Console/UI log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+console_log_level = INFO
+# File log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+file_log_level = DEBUG
 
 [paths]
 # X-Plane install path
