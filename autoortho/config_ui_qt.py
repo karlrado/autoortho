@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QColorDialog, QRadioButton, QMenu, QStyle
 )
 from PySide6.QtCore import (
-    Qt, QThread, Signal, QTimer, QSize, QPoint
+    Qt, QThread, Signal, QTimer, QSize, QPoint, QObject
 )
 from PySide6.QtGui import (
     QPixmap, QIcon, QColor, QWheelEvent, QCursor
@@ -43,25 +43,33 @@ CUR_PATH = os.path.dirname(os.path.realpath(__file__))
 
 class QTextEditLogger(logging.Handler):
     """Custom logging handler that writes to a QTextEdit widget"""
+    
+    # Create a signal class for thread-safe communication
+    class _SignalEmitter(QObject):
+        log_signal = Signal(str)
+    
     def __init__(self, text_edit):
         super().__init__()
         self.text_edit = text_edit
         self.max_lines = 1000  # Keep last 1000 lines in UI
         
+        # Create signal emitter
+        self._emitter = self._SignalEmitter()
+        self._emitter.log_signal.connect(self._append_text)
+        
     def emit(self, record):
         try:
             msg = self.format(record)
-            # Use a lambda to ensure thread-safe UI updates
-            # QTextEdit.append must be called from the main GUI thread
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(0, lambda: self._append_text(msg))
+            # Emit signal to ensure thread-safe UI updates
+            # The signal-slot mechanism handles cross-thread communication properly
+            self._emitter.log_signal.emit(msg)
         except Exception as e:
             # Fail silently in production, but useful for debugging
             import sys
             print(f"QTextEditLogger emit error: {e}", file=sys.stderr)
     
     def _append_text(self, msg):
-        """Append text to the widget (called from main thread)"""
+        """Append text to the widget (called from main thread via signal)"""
         try:
             self.text_edit.append(msg)
             self._trim_text()
@@ -910,9 +918,8 @@ class ConfigUI(QMainWindow):
             self.log_text.append(f"Log file location: {self.cfg.paths.log_file}")
             self.log_text.append("")
             
-            # Now log through the handler to test it
+            # Log initialization
             log.info(f"UI logging initialized at level: {console_level_str}")
-            log.debug("DEBUG logging test message (only visible if UI Log Level is DEBUG)")
         except Exception as e:
             # Try to display error in the text widget
             try:
@@ -2268,7 +2275,9 @@ class ConfigUI(QMainWindow):
         self.verify()
         self.running = True  # Set running state
         self.update_status_bar("Running")
-        self.showMinimized()
+        # Minimize window if hide setting is enabled
+        if self.cfg.general.hide:
+            self.showMinimized()
 
     def on_save(self):
         """Handle Save button click"""
