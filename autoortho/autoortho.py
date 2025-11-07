@@ -605,11 +605,12 @@ class AOMount:
                         pass
                     log.info("STATS: %s", filtered)
                 except Exception as e:
-                    log.debug("reporter(): %s", e)
+                    log.error("reporter() exception: %s", e, exc_info=True)
 
         t = threading.Thread(target=_reporter_loop, name="AO-Reporter", daemon=True)
         t.start()
         self._reporter_thread = t
+        log.info("Stats reporter thread started (will log every %.1f seconds)", interval_sec)
 
     def stop_reporter(self, join_timeout: float = 3.0):
         """Stop the periodic global-stats logger and join the thread."""
@@ -900,6 +901,9 @@ def main():
     # Start helper threads
     ftrack.start()
 
+    from datareftrack import dt
+    dt.start()
+    
     # Run things
     if args.root and args.mountpoint:
         # Just mount specific requested dirs
@@ -928,6 +932,7 @@ def main():
             cfgui = AOMountUI(CFG)
             cfgui.setup()
 
+    dt.stop()
     flighttrack.ft.stop()
 
     log.info("AutoOrtho exit.")

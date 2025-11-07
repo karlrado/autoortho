@@ -58,8 +58,10 @@ gui = True
 showconfig = True
 # Hide when running
 hide = True
-# Debug mode
-debug = False
+# Console/UI log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+console_log_level = INFO
+# File log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+file_log_level = DEBUG
 
 [paths]
 # X-Plane install path
@@ -89,6 +91,10 @@ max_zoom_near_airports = 18
 # stutters.  Lower numbers will be more responsive at the expense of
 # ocassional low quality tiles.
 maxwait = 0.5
+# Temporarily increase maxwait to an effectively infinite value while X-Plane is
+# loading scenery data prior to starting the flight.  This allows more downloads to
+# succeed and reduce the use of backup chunks and missing chunks at the start of flight.
+suspend_maxwait = True
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False
@@ -102,6 +108,8 @@ missing_color = [66, 77, 55]
 compressor = ISPC
 # BC1 or BC3 for dxt1 or dxt5 respectively
 format = BC1
+# Maximum number of concurrent JPEG decode threads (default: CPU count)
+max_decode_concurrency = {os.cpu_count() or 1}
 
 [scenery]
 # Don't cleanup downloads

@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QColorDialog, QRadioButton, QMenu, QStyle
 )
 from PySide6.QtCore import (
-    Qt, QThread, Signal, QTimer, QSize, QPoint
+    Qt, QThread, Signal, QTimer, QSize, QPoint, QObject
 )
 from PySide6.QtGui import (
     QPixmap, QIcon, QColor, QWheelEvent, QCursor
@@ -39,6 +39,63 @@ from version import __version__
 log = logging.getLogger(__name__)
 
 CUR_PATH = os.path.dirname(os.path.realpath(__file__))
+
+
+class QTextEditLogger(logging.Handler):
+    """Custom logging handler that writes to a QTextEdit widget"""
+    
+    # Create a signal class for thread-safe communication
+    class _SignalEmitter(QObject):
+        log_signal = Signal(str)
+    
+    def __init__(self, text_edit):
+        super().__init__()
+        self.text_edit = text_edit
+        self.max_lines = 1000  # Keep last 1000 lines in UI
+        
+        # Create signal emitter
+        self._emitter = self._SignalEmitter()
+        self._emitter.log_signal.connect(self._append_text)
+        
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Emit signal to ensure thread-safe UI updates
+            # The signal-slot mechanism handles cross-thread communication properly
+            self._emitter.log_signal.emit(msg)
+        except Exception as e:
+            # Fail silently in production, but useful for debugging
+            import sys
+            print(f"QTextEditLogger emit error: {e}", file=sys.stderr)
+    
+    def _append_text(self, msg):
+        """Append text to the widget (called from main thread via signal)"""
+        try:
+            self.text_edit.append(msg)
+            self._trim_text()
+            # Auto-scroll to bottom
+            scrollbar = self.text_edit.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+        except Exception as e:
+            import sys
+            print(f"QTextEditLogger append error: {e}", file=sys.stderr)
+    
+    def _trim_text(self):
+        """Keep only the last max_lines in the text edit"""
+        try:
+            doc = self.text_edit.document()
+            if doc.blockCount() > self.max_lines:
+                cursor = self.text_edit.textCursor()
+                cursor.movePosition(cursor.MoveOperation.Start)
+                cursor.movePosition(
+                    cursor.MoveOperation.Down,
+                    cursor.MoveMode.KeepAnchor,
+                    doc.blockCount() - self.max_lines
+                )
+                cursor.removeSelectedText()
+        except Exception as e:
+            import sys
+            print(f"QTextEditLogger trim error: {e}", file=sys.stderr)
 
 
 class SceneryDownloadWorker(QThread):
@@ -340,6 +397,9 @@ class ConfigUI(QMainWindow):
         self._shutdown_in_progress = False
         self._ready_to_close = False
 
+        # Set up logging handler for UI (must be None before init_ui is called)
+        self.ui_log_handler = None
+
         # Setup UI
         self.init_ui()
 
@@ -347,11 +407,6 @@ class ConfigUI(QMainWindow):
         self.status_update.connect(self.update_status_bar)
         self.log_update.connect(self.append_log)
         self.show_error.connect(self.display_error)
-
-        # Start log update timer
-        self.log_timer = QTimer()
-        self.log_timer.timeout.connect(self.update_logs)
-        self.log_timer.start(1000)
 
         self.ready.set()
 
@@ -824,6 +879,141 @@ class ConfigUI(QMainWindow):
         layout.addWidget(self.log_text)
 
         self.tabs.addTab(logs_widget, "Logs")
+        
+        # Set up the UI logging handler now that log_text exists
+        self.setup_ui_logging()
+
+    def setup_ui_logging(self):
+        """Set up the UI logging handler with the configured log level"""
+        try:
+            # Remove existing handler if present
+            if hasattr(self, 'ui_log_handler') and self.ui_log_handler:
+                logging.getLogger().removeHandler(self.ui_log_handler)
+            
+            # Create new handler
+            self.ui_log_handler = QTextEditLogger(self.log_text)
+            
+            # Set the console log level from config
+            console_level_str = getattr(self.cfg.general, 'console_log_level', 'INFO').upper()
+            console_level = getattr(logging, console_level_str, logging.INFO)
+            self.ui_log_handler.setLevel(console_level)
+            
+            # Set formatter
+            formatter = logging.Formatter(
+                '%(asctime)s - %(levelname)s - %(message)s',
+                datefmt='%H:%M:%S'
+            )
+            self.ui_log_handler.setFormatter(formatter)
+            
+            # Add to root logger
+            logging.getLogger().addHandler(self.ui_log_handler)
+            
+            # Update root logger level to ensure all messages can flow through
+            self._update_root_logger_level()
+            
+            # Add welcome message directly to the log text
+            self.log_text.append("=== AutoOrtho Logs ===")
+            self.log_text.append(f"UI Log Level: {console_level_str}")
+            self.log_text.append(f"File Log Level: {getattr(self.cfg.general, 'file_log_level', 'DEBUG').upper()}")
+            self.log_text.append(f"Log file location: {self.cfg.paths.log_file}")
+            self.log_text.append("")
+            
+            # Log initialization
+            log.info(f"UI logging initialized at level: {console_level_str}")
+        except Exception as e:
+            # Try to display error in the text widget
+            try:
+                self.log_text.append(f"ERROR: Failed to setup UI logging: {e}")
+            except Exception:
+                pass
+            log.error(f"Failed to setup UI logging: {e}")
+    
+    def update_ui_log_level(self):
+        """Update the UI log handler level when config changes"""
+        try:
+            if hasattr(self, 'ui_log_handler') and self.ui_log_handler:
+                console_level_str = getattr(self.cfg.general, 'console_log_level', 'INFO').upper()
+                console_level = getattr(logging, console_level_str, logging.INFO)
+                self.ui_log_handler.setLevel(console_level)
+                
+                # Also update any StreamHandler (terminal console) to match
+                root_logger = logging.getLogger()
+                for handler in root_logger.handlers:
+                    if isinstance(handler, logging.StreamHandler) and not isinstance(handler, QTextEditLogger):
+                        handler.setLevel(console_level)
+                
+                # Update root logger level to minimum of all handlers
+                self._update_root_logger_level()
+                
+                log.info(f"UI log level updated to: {console_level_str}")
+        except Exception as e:
+            log.error(f"Failed to update UI log level: {e}")
+    
+    def on_console_log_level_changed(self, new_level):
+        """Handle console log level change in UI"""
+        try:
+            self.cfg.general.console_log_level = new_level
+            self.update_ui_log_level()
+            log.info(f"Console/UI log level changed to: {new_level}")
+        except Exception as e:
+            log.error(f"Failed to change console log level: {e}")
+    
+    def on_file_log_level_changed(self, new_level):
+        """Handle file log level change in UI"""
+        try:
+            self.cfg.general.file_log_level = new_level
+            self.update_file_log_level()
+            log.info(f"File log level changed to: {new_level}")
+        except Exception as e:
+            log.error(f"Failed to change file log level: {e}")
+    
+    def update_file_log_level(self):
+        """Update the file log handler level when config changes"""
+        try:
+            file_level_str = getattr(self.cfg.general, 'file_log_level', 'DEBUG').upper()
+            file_level = getattr(logging, file_level_str, logging.DEBUG)
+            
+            # Find and update the file handler
+            root_logger = logging.getLogger()
+            for handler in root_logger.handlers:
+                # Check if this is a file handler (RotatingFileHandler or FileHandler)
+                if isinstance(handler, (logging.handlers.RotatingFileHandler, logging.FileHandler)):
+                    handler.setLevel(file_level)
+                    log.info(f"File log level updated to: {file_level_str}")
+                    break
+            
+            # Update root logger level to minimum of all handlers
+            self._update_root_logger_level()
+        except Exception as e:
+            log.error(f"Failed to update file log level: {e}")
+    
+    def _update_root_logger_level(self):
+        """Update root logger level to minimum of all active handlers
+        
+        This ensures that messages at any handler's level can flow through
+        the root logger. Individual handlers then filter based on their own levels.
+        """
+        try:
+            root_logger = logging.getLogger()
+            
+            # Find the minimum level across all handlers
+            min_level = logging.CRITICAL  # Start with highest level
+            handler_levels = []
+            for handler in root_logger.handlers:
+                if handler.level < min_level:
+                    min_level = handler.level
+                handler_name = handler.__class__.__name__
+                handler_level_name = logging.getLevelName(handler.level)
+                handler_levels.append(f"{handler_name}={handler_level_name}")
+            
+            # Set root logger to the minimum level so all messages can flow through
+            if min_level != root_logger.level:
+                old_level = logging.getLevelName(root_logger.level)
+                root_logger.setLevel(min_level)
+                level_name = logging.getLevelName(min_level)
+                log.info(f"Root logger adjusted: {old_level} → {level_name} (handlers: {', '.join(handler_levels)})")
+        except Exception as e:
+            log.error(f"Failed to update root logger level: {e}")
 
     def refresh_settings_tab(self):
         """Refresh the settings tab"""
@@ -870,14 +1060,10 @@ class ConfigUI(QMainWindow):
             "clean operation leaves in the file cache after cleaning.\n"
             "Note that this cache grows without bounds while AutoOrtho is running.\n"
             "Use the Clean Cache button to reduce the cache to this size.\n"
-            "Larger cache = fewer downloads but more disk usage.\n"
-            "Optimal: 50-200GB for regular use, 200-500GB for extensive "
-            "flying.\n"
-            "Minimum recommended: 20GB"
         )
         file_cache_layout.addWidget(file_cache_label)
         self.file_cache_slider = ModernSlider()
-        self.file_cache_slider.setRange(10, 500)
+        self.file_cache_slider.setRange(0, 500)
         self.file_cache_slider.setSingleStep(5)
         self.file_cache_slider.setValue(
             int(float(self.cfg.cache.file_cache_size))
@@ -912,8 +1098,14 @@ class ConfigUI(QMainWindow):
             "Automatically clean cache when AutoOrtho exits.\n"
             "Note that this can take a long time."
         )
-
         clean_cache_controls_layout.addWidget(self.auto_clean_cache_check)
+        self.delete_cache_btn = StyledButton("Delete Cache")
+        self.delete_cache_btn.clicked.connect(self.on_delete_cache)
+        self.delete_cache_btn.setToolTip(
+            "Delete all cache files.\n"
+            "This should be faster than cleaning with a non-zero limit."
+        )
+        clean_cache_controls_layout.addWidget(self.delete_cache_btn)
         clean_cache_controls_layout.addStretch()
         cache_layout.addLayout(clean_cache_controls_layout)
 
@@ -1037,6 +1229,20 @@ class ConfigUI(QMainWindow):
         maxwait_layout.addWidget(self.maxwait_slider)
         maxwait_layout.addWidget(self.maxwait_label)
         autoortho_layout.addLayout(maxwait_layout)
+
+        suspend_maxwait_layout = QHBoxLayout()
+        self.suspend_maxwait_check = QCheckBox("Suspend max wait during startup")
+        self.suspend_maxwait_check.setChecked(self.cfg.autoortho.suspend_maxwait)
+        self.suspend_maxwait_check.setObjectName('suspend_maxwait')
+        self.suspend_maxwait_check.setToolTip(
+            "Suspend the effect of max wait (by temporarily increasing it to a large\n"
+            "value) while loading scenery before the start of the flight.\n"
+            "This reduces backup (low res) textures and missing (grey) textures.\n"
+            "The specified max wait time is used after the flight starts.\n"
+            "This may increase the scenery load time before the start of the flight."
+        )
+        suspend_maxwait_layout.addWidget(self.suspend_maxwait_check)
+        autoortho_layout.addLayout(suspend_maxwait_layout)
 
         # Fetch threads
         threads_layout = QHBoxLayout()
@@ -1241,6 +1447,45 @@ class ConfigUI(QMainWindow):
         dds_layout = QVBoxLayout()
         dds_group.setLayout(dds_layout)
 
+        # Max decode concurrency
+        max_decode_layout = QHBoxLayout()
+        max_decode_label = QLabel("JPEG decode threads:")
+        max_decode_label.setToolTip(
+            "Maximum number of concurrent JPEG decode operations.\n"
+            "Higher values = faster tile processing but more CPU and RAM usage.\n"
+            "Lower values = reduced CPU/RAM usage but slower tile generation.\n\n"
+            "Performance Impact:\n"
+            "• Each decode thread uses ~50-100MB of RAM during peak\n"
+            "• Too many threads can cause memory spikes and cache thrashing\n"
+            "• Too few threads creates a bottleneck in the processing pipeline\n\n"
+            "Recommended: Leave at default (CPU count) for balanced performance.\n"
+            "Reduce if experiencing memory issues or system instability.\n"
+            f"Your system: {os.cpu_count() or 1} CPU threads available"
+        )
+        max_decode_layout.addWidget(max_decode_label)
+        self.max_decode_slider = ModernSlider()
+        cpu_count = os.cpu_count() or 1
+        self.max_decode_slider.setRange(1, cpu_count)
+        # Use CPU count as default if config value is higher or not set properly
+        try:
+            config_value = int(getattr(self.cfg.pydds, 'max_decode_concurrency', cpu_count))
+            initial_value = min(config_value, cpu_count) if config_value > 0 else cpu_count
+        except Exception:
+            initial_value = cpu_count
+        self.max_decode_slider.setValue(initial_value)
+        self.max_decode_slider.setObjectName('max_decode_concurrency')
+        self.max_decode_slider.setToolTip(
+            f"Drag to adjust concurrent JPEG decode threads (1-{cpu_count})\n"
+            f"Default: {cpu_count} threads (recommended)"
+        )
+        self.max_decode_label = QLabel(f"{initial_value}")
+        self.max_decode_slider.valueChanged.connect(
+            lambda v: self.max_decode_label.setText(f"{v}")
+        )
+        max_decode_layout.addWidget(self.max_decode_slider)
+        max_decode_layout.addWidget(self.max_decode_label)
+        dds_layout.addLayout(max_decode_layout)
+
         # Compressor
         supported_compressors = ['ISPC'] if self.system == "darwin" else ['ISPC', 'STB']
         if not self.system == "darwin":
@@ -1302,6 +1547,7 @@ class ConfigUI(QMainWindow):
         general_layout = QVBoxLayout()
         general_group.setLayout(general_layout)
 
+
         self.gui_check = QCheckBox("Use GUI at startup")
         self.gui_check.setChecked(self.cfg.general.gui)
         self.gui_check.setObjectName('gui')
@@ -1311,6 +1557,8 @@ class ConfigUI(QMainWindow):
             "Recommended: Enabled for easier monitoring and control."
         )
         general_layout.addWidget(self.gui_check)
+
+        general_layout.addSpacing(10)
 
         self.hide_check = QCheckBox("Hide window when running")
         self.hide_check.setChecked(self.cfg.general.hide)
@@ -1322,15 +1570,62 @@ class ConfigUI(QMainWindow):
         )
         general_layout.addWidget(self.hide_check)
 
-        self.debug_check = QCheckBox("Debug mode")
-        self.debug_check.setChecked(self.cfg.general.debug)
-        self.debug_check.setObjectName('debug')
-        self.debug_check.setToolTip(
-            "Enable detailed logging for troubleshooting.\n"
-            "Creates larger log files with more information.\n"
-            "Only enable if experiencing issues or when asked by support."
+        # Console/UI log level
+        console_log_level_layout = QHBoxLayout()
+        console_log_level_label = QLabel("UI Log Level:")
+        console_log_level_label.setToolTip(
+            "Set the minimum log level displayed in the UI Logs tab.\n"
+            "DEBUG: Show all messages (very verbose)\n"
+            "INFO: Show informational messages and above (recommended)\n"
+            "WARNING: Show only warnings and errors\n"
+            "ERROR: Show only errors and critical messages\n"
+            "CRITICAL: Show only critical errors\n\n"
+            "Changes take effect immediately.\n"
+            "This does not affect the log file."
         )
-        general_layout.addWidget(self.debug_check)
+        console_log_level_layout.addWidget(console_log_level_label)
+        self.console_log_level_combo = QComboBox()
+        self.console_log_level_combo.addItems(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
+        console_level = getattr(self.cfg.general, 'console_log_level', 'INFO').upper()
+        self.console_log_level_combo.setCurrentText(console_level)
+        self.console_log_level_combo.setObjectName('console_log_level')
+        self.console_log_level_combo.setToolTip(
+            "Select the minimum log level for the UI (INFO recommended)\n"
+            "Changes take effect immediately - no restart needed!"
+        )
+        self.console_log_level_combo.currentTextChanged.connect(self.on_console_log_level_changed)
+        console_log_level_layout.addWidget(self.console_log_level_combo)
+        console_log_level_layout.addStretch()
+        general_layout.addLayout(console_log_level_layout)
+
+        # File log level
+        file_log_level_layout = QHBoxLayout()
+        file_log_level_label = QLabel("File Log Level:")
+        file_log_level_label.setToolTip(
+            "Set the minimum log level saved to the log file.\n"
+            "DEBUG: Save all messages (recommended for bug reports)\n"
+            "INFO: Save informational messages and above\n"
+            "WARNING: Save only warnings and errors\n"
+            "ERROR: Save only errors and critical messages\n"
+            "CRITICAL: Save only critical errors\n\n"
+            "Changes take effect immediately.\n"
+            "This does not affect what's shown in the UI.\n"
+            "DEBUG is recommended so bug reports include full details."
+        )
+        file_log_level_layout.addWidget(file_log_level_label)
+        self.file_log_level_combo = QComboBox()
+        self.file_log_level_combo.addItems(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
+        file_level = getattr(self.cfg.general, 'file_log_level', 'DEBUG').upper()
+        self.file_log_level_combo.setCurrentText(file_level)
+        self.file_log_level_combo.setObjectName('file_log_level')
+        self.file_log_level_combo.setToolTip(
+            "Select the minimum log level for the file (DEBUG recommended)\n"
+            "Changes take effect immediately - no restart needed."
+        )
+        self.file_log_level_combo.currentTextChanged.connect(self.on_file_log_level_changed)
+        file_log_level_layout.addWidget(self.file_log_level_combo)
+        file_log_level_layout.addStretch()
+        general_layout.addLayout(file_log_level_layout)
 
         self.settings_layout.addWidget(general_group)
 
@@ -1660,7 +1955,7 @@ class ConfigUI(QMainWindow):
                     seasons_options_btn = StyledButton("Seasons Options", primary=False)
                     seasons_options_btn.setFixedSize(200,35)
                     seasons_options_btn.setStyleSheet(
-                        f"""
+                        """
                         background-color: #2d78ba;
                         font-size: 16px;
                         font-weight: bold;
@@ -1980,7 +2275,9 @@ class ConfigUI(QMainWindow):
         self.verify()
         self.running = True  # Set running state
         self.update_status_bar("Running")
-        self.showMinimized()
+        # Minimize window if hide setting is enabled
+        if self.cfg.general.hide:
+            self.showMinimized()
 
     def on_save(self):
         """Handle Save button click"""
@@ -2027,12 +2324,16 @@ class ConfigUI(QMainWindow):
         else:
             self.update_status_bar("Configuration saved")
 
-    def on_clean_cache(self, for_exit=False):
+    def on_delete_cache(self):
+        self.on_clean_cache(delete_all=True)
+
+    def on_clean_cache(self, for_exit=False, delete_all=False):
         """Handle Clean Cache button click
 
         Args:
             for_exit (bool): When True, invoked from closeEvent - suppress dialogs
                              and allow closeEvent to wait on the thread.
+            delete_all (bool) : When True, all files in the cache should be deleted.
         """
 
         if self.running:
@@ -2054,7 +2355,7 @@ class ConfigUI(QMainWindow):
         self.cache_thread = QThread()
         self.cache_thread.run = lambda: self.clean_cache(
             self.cfg.paths.cache_dir,
-            int(self.file_cache_slider.value())
+            int(self.file_cache_slider.value() if not delete_all else 0)
         )
         self.cache_thread.finished.connect(lambda: self.on_cache_cleaned(for_exit))
         self.cache_thread.start()
@@ -2505,6 +2806,7 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.maxwait = str(
                 self.maxwait_slider.value() / 10.0
             )
+            self.cfg.autoortho.suspend_maxwait = self.suspend_maxwait_check.isChecked()
             self.cfg.autoortho.fetch_threads = str(
                 self.fetch_threads_spinbox.value()
             )
@@ -2516,11 +2818,15 @@ class ConfigUI(QMainWindow):
             if not self.system == "darwin":
                 self.cfg.pydds.compressor = self.compressor_combo.currentText()
             self.cfg.pydds.format = self.format_combo.currentText()
+            self.cfg.pydds.max_decode_concurrency = str(
+                self.max_decode_slider.value()
+            )
 
             # General settings
             self.cfg.general.gui = self.gui_check.isChecked()
             self.cfg.general.hide = self.hide_check.isChecked()
-            self.cfg.general.debug = self.debug_check.isChecked()
+            self.cfg.general.console_log_level = self.console_log_level_combo.currentText()
+            self.cfg.general.file_log_level = self.file_log_level_combo.currentText()
 
             # Scenery settings
             self.cfg.scenery.noclean = self.noclean_check.isChecked()
@@ -2615,9 +2921,9 @@ class ConfigUI(QMainWindow):
 
     def on_using_custom_tiles_check(self, state):
         """Handle using custom tiles check"""
-        if state == False: 
-            if self.cfg.autoortho.using_custom_tiles == True and int(self.cfg.autoortho.max_zoom) > 17:
-                log.info(f"Max zoom being capped to 17 after custom tiles disabled")
+        if not state: 
+            if self.cfg.autoortho.using_custom_tiles and int(self.cfg.autoortho.max_zoom) > 17:
+                log.info("Max zoom being capped to 17 after custom tiles disabled")
                 self.cfg.autoortho.max_zoom = 17
             self.cfg.autoortho.using_custom_tiles = False
         else:
@@ -2713,7 +3019,7 @@ class ConfigUI(QMainWindow):
                     f.writelines(lines)
                 log.info(f"Successfully updated scenery_packs.ini at {scenery_packs_path}")
             else:
-                log.info(f"No AutoOrtho overlay found in scenery_packs.ini - skipping AutoOrtho overlay modifications")
+                log.info("No AutoOrtho overlay found in scenery_packs.ini - skipping AutoOrtho overlay modifications")
                 if not use_simheaven_overlay:
                     QMessageBox.information(
                         self,
@@ -2795,18 +3101,6 @@ class ConfigUI(QMainWindow):
         except Exception:
             pass
 
-    def update_logs(self):
-        """Update log display"""
-        try:
-            if os.path.exists(self.cfg.paths.log_file):
-                with open(self.cfg.paths.log_file) as h:
-                    lines = h.readlines()[-50:]  # Last 50 lines
-                    self.log_text.setPlainText(''.join(lines))
-                    # Auto scroll to bottom
-                    scrollbar = self.log_text.verticalScrollBar()
-                    scrollbar.setValue(scrollbar.maximum())
-        except Exception:
-            pass
 
     def update_status_bar(self, message):
         """Update status bar message"""
@@ -2863,50 +3157,54 @@ class ConfigUI(QMainWindow):
             f"Cleaning up cache_dir {cache_dir}. Please wait..."
         )
 
-        target_gb = max(size_gb, 10)
-        target_bytes = pow(2, 30) * target_gb
+        target_bytes = pow(2, 30) * size_gb
 
         try:
-            cfiles = sorted(
-                pathlib.Path(cache_dir).glob('**/*'), key=os.path.getmtime
-            )
-            if not cfiles:
-                self.status_update.emit("Cache is empty.")
-                return
+            if size_gb == 0:
+                for entry in os.scandir(cache_dir):
+                    if entry.is_file():
+                        os.remove(entry.path)
+            else:
+                cfiles = sorted(
+                    pathlib.Path(cache_dir).glob('**/*'), key=os.path.getmtime
+                )
+                if not cfiles:
+                    self.status_update.emit("Cache is empty.")
+                    return
 
-            cache_bytes = sum(
-                file.stat().st_size for file in cfiles if file.is_file()
-            )
-            cachecount = len(cfiles)
-            avgcachesize = cache_bytes / cachecount if cachecount > 0 else 0
+                cache_bytes = sum(
+                    file.stat().st_size for file in cfiles if file.is_file()
+                )
+                cachecount = len(cfiles)
+                avgcachesize = cache_bytes / cachecount if cachecount > 0 else 0
 
-            self.status_update.emit(
-                f"Cache has {cachecount} files. "
-                f"Total size approx {cache_bytes//1048576} MB."
-            )
+                self.status_update.emit(
+                    f"Cache has {cachecount} files. "
+                    f"Total size approx {cache_bytes//1048576} MB."
+                )
 
-            empty_files = [
-                x for x in cfiles if x.is_file() and x.stat().st_size == 0
-            ]
-            self.status_update.emit(
-                f"Found {len(empty_files)} empty files to cleanup."
-            )
-            for file in empty_files:
-                if os.path.exists(file):
-                    os.remove(file)
+                empty_files = [
+                    x for x in cfiles if x.is_file() and x.stat().st_size == 0
+                ]
+                self.status_update.emit(
+                    f"Found {len(empty_files)} empty files to cleanup."
+                )
+                for file in empty_files:
+                    if os.path.exists(file):
+                        os.remove(file)
 
-            if target_bytes > cache_bytes:
-                self.status_update.emit("Cache within size limits.")
-                return
+                if target_bytes > cache_bytes:
+                    self.status_update.emit("Cache within size limits.")
+                    return
 
-            to_delete = int((cache_bytes - target_bytes) // avgcachesize)
+                to_delete = int((cache_bytes - target_bytes) // avgcachesize)
 
-            self.status_update.emit(
-                f"Over cache size limit, will remove {to_delete} files."
-            )
-            for file in cfiles[:to_delete]:
-                if file.is_file():
-                    os.remove(file)
+                self.status_update.emit(
+                    f"Over cache size limit, will remove {to_delete} files."
+                )
+                for file in cfiles[:to_delete]:
+                    if file.is_file():
+                        os.remove(file)
 
             self.status_update.emit("Cache cleanup done.")
         except Exception as e:
@@ -2948,12 +3246,13 @@ class ConfigUI(QMainWindow):
             event.accept()
             return
 
-        # Stop periodic UI updates early
-        if hasattr(self, 'log_timer'):
-            try:
-                self.log_timer.stop()
-            except Exception:
-                pass
+        # Clean up UI logging handler
+        try:
+            if hasattr(self, 'ui_log_handler') and self.ui_log_handler:
+                logging.getLogger().removeHandler(self.ui_log_handler)
+                self.ui_log_handler = None
+        except Exception:
+            pass
 
         # Stop all background workers immediately
         try:

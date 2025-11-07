@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-
+import logging
 import atexit
 import os
 import time
@@ -7,6 +7,7 @@ import threading
 import concurrent.futures
 import uuid
 import math
+import tracemalloc
 from typing import Optional
 
 from io import BytesIO
@@ -24,17 +25,30 @@ from aoimage import AoImage
 
 from aoconfig import CFG
 from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat
-from utils.constants import system_type
+from utils.constants import (
+    system_type, 
+    CURRENT_CPU_COUNT,
+    EARTH_RADIUS_M,
+    PRIORITY_DISTANCE_WEIGHT,
+    PRIORITY_DIRECTION_WEIGHT,
+    PRIORITY_MIPMAP_WEIGHT,
+    LOOKAHEAD_TIME_SEC,
+)
 from utils.apple_token_service import apple_token_service
 
+from datareftrack import dt as datareftracker
 
 MEMTRACE = False
 
-import logging
 log = logging.getLogger(__name__)
 
-import tracemalloc
-#from memory_profiler import profile
+
+# Bound global JPEG decode concurrency to reduce memory spikes and failures
+try:
+    _MAX_DECODE = int(getattr(CFG.pydds, 'max_decode_concurrency', CURRENT_CPU_COUNT))
+except Exception:
+    _MAX_DECODE = CURRENT_CPU_COUNT
+_decode_sem = threading.Semaphore(_MAX_DECODE)
 
 
 # Track average fetch times
@@ -43,6 +57,7 @@ mm_stats = StatTracker(0, 5)
 partial_stats = StatTracker()
 
 stats_batcher = None
+
 
 def _ensure_stats_batcher():
     global stats_batcher
@@ -113,6 +128,7 @@ def _is_jpeg(dataheader):
     else:
         return False
 
+
 def _gtile_to_quadkey(til_x, til_y, zoomlevel):
     """
     Translates Google coding of tiles to Bing Quadkey coding. 
@@ -129,6 +145,109 @@ def _gtile_to_quadkey(til_x, til_y, zoomlevel):
         quadkey=quadkey+str(a+2*b)
     return quadkey
 
+
+def _chunk_to_latlon(row: int, col: int, zoom: int) -> tuple:
+    """
+    Convert tile row/col/zoom to center lat/lon coordinates.
+    Returns (lat, lon) in degrees.
+    
+    Uses official OSM/Web Mercator formula:
+    n = 2 ^ zoom
+    lon_deg = xtile / n * 360.0 - 180.0
+    lat_rad = arctan(sinh(π * (1 - 2 * ytile / n)))
+    lat_deg = lat_rad * 180.0 / π
+    
+    Note: Adds 0.5 to row/col to get tile CENTER instead of top-left corner.
+    """
+    n = 2.0 ** zoom
+    # Use tile center by adding 0.5 to both coordinates
+    lon = (col + 0.5) / n * 360.0 - 180.0
+    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * (row + 0.5) / n)))
+    lat = math.degrees(lat_rad)
+    return (lat, lon)
+
+
+def _haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Calculate great-circle distance between two points in meters using Haversine formula.
+    """
+    # Convert to radians
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    
+    # Haversine formula
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2) ** 2
+    c = 2 * math.asin(math.sqrt(a))
+    return EARTH_RADIUS_M * c
+
+
+def _calculate_spatial_priority(chunk_row: int, chunk_col: int, chunk_zoom: int, base_mipmap_priority: int) -> float:
+    """
+    Calculate priority based on:
+    1. Distance from player
+    2. Direction relative to movement vector (predictive)
+    3. Base mipmap priority (detail level)
+    
+    Lower priority number = more urgent (fetched first).
+    Returns priority as float.
+    """
+    # If no valid flight data, fall back to mipmap-only priority
+    if not datareftracker.data_valid or not datareftracker.connected:
+        return float(base_mipmap_priority)
+    
+    try:
+        # Get player position and velocity
+        player_lat = datareftracker.lat
+        player_lon = datareftracker.lon
+        player_hdg = datareftracker.hdg  # degrees, 0=N, 90=E, 180=S, 270=W
+        player_spd = datareftracker.spd  # m/s
+
+        chunk_lat, chunk_lon = _chunk_to_latlon(chunk_row, chunk_col, chunk_zoom)
+        
+        distance_m = _haversine_distance(player_lat, player_lon, chunk_lat, chunk_lon)
+        
+        distance_priority = min(100, distance_m / 100)  # 100m per priority point, max 100
+        
+        if player_spd > 5:  # Only use predictive if moving
+            lat1_rad = math.radians(player_lat)
+            lat2_rad = math.radians(chunk_lat)
+            dlon_rad = math.radians(chunk_lon - player_lon)
+            
+            x = math.sin(dlon_rad) * math.cos(lat2_rad)
+            y = math.cos(lat1_rad) * math.sin(lat2_rad) - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(dlon_rad)
+            bearing = math.degrees(math.atan2(x, y))
+            bearing = (bearing + 360) % 360
+            
+            angle_diff = abs(player_hdg - bearing)
+            if angle_diff > 180:
+                angle_diff = 360 - angle_diff
+            
+
+            direction_priority = (angle_diff / 180) * 100 - 50
+            
+            predicted_distance = player_spd * LOOKAHEAD_TIME_SEC
+            if distance_m < predicted_distance and angle_diff < 45:
+                direction_priority -= 30
+        else:
+            direction_priority = 0
+        
+
+        total_priority = (
+            base_mipmap_priority * PRIORITY_MIPMAP_WEIGHT +
+            distance_priority * PRIORITY_DISTANCE_WEIGHT +
+            direction_priority * PRIORITY_DIRECTION_WEIGHT
+        )
+        
+        return max(0, total_priority)
+        
+    except Exception as e:
+        # On any error, fall back to mipmap-only priority
+        log.debug(f"Spatial priority calculation failed: {e}")
+        return float(base_mipmap_priority)
+
+
 def locked(fn):
     @wraps(fn)
     def wrapped(self, *args, **kwargs):
@@ -138,8 +257,9 @@ def locked(fn):
         return result
     return wrapped
 
+
 class Getter(object):
-    queue = None 
+    queue = None
     workers = None
     WORKING = None
     session = None
@@ -152,14 +272,7 @@ class Getter(object):
         self.WORKING = threading.Event()
         self.WORKING.set()
         self.localdata = threading.local()
-        self.session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections = int(CFG.autoortho.fetch_threads),
-            pool_maxsize = int(CFG.autoortho.fetch_threads)
-        )
-        self.session.mount('https://', adapter)
-        self.session.mount('http://', adapter)
-        
+        # Thread-local sessions created in worker() to avoid shared-state contention
 
         for i in range(num_workers):
             t = threading.Thread(target=self.worker, args=(i,), daemon=True)
@@ -182,6 +295,26 @@ class Getter(object):
     def worker(self, idx):
         global STATS
         self.localdata.idx = idx
+        
+        # Create thread-local session with optimized pool and NO retries
+        # (Circuit breaker handles retries, not session)
+        try:
+            session = requests.Session()
+            # Larger pool to avoid connection stalls
+            pool_size = max(4, int(int(CFG.autoortho.fetch_threads) * 1.5))
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=pool_size,
+                pool_maxsize=pool_size,
+                max_retries=0,  # Circuit breaker handles retries
+                pool_block=True,
+            )
+            session.mount('https://', adapter)
+            session.mount('http://', adapter)
+            self.localdata.session = session
+        except Exception as _e:
+            log.warning(f"Failed to initialize thread-local session: {_e}")
+            self.localdata.session = requests.Session()
+        
         while self.WORKING.is_set():
             try:
                 obj, args, kwargs = self.queue.get(timeout=5)
@@ -195,17 +328,55 @@ class Getter(object):
             bump('count', 1)
 
             try:
+                # Mark object as in-flight
+                try:
+                    if hasattr(obj, 'in_queue'):
+                        obj.in_queue = False
+                    if hasattr(obj, 'in_flight'):
+                        obj.in_flight = True
+                except Exception:
+                    pass
+                
                 if not self.get(obj, *args, **kwargs):
+                    # Check if chunk is permanently failed before re-submitting
+                    if hasattr(obj, 'permanent_failure') and obj.permanent_failure:
+                        log.debug(f"Chunk {obj} permanently failed ({obj.failure_reason}), not re-submitting")
+                        continue
                     log.warning(f"Failed getting: {obj} {args} {kwargs}, re-submit.")
                     self.submit(obj, *args, **kwargs)
             except Exception as err:
                 log.error(f"ERROR {err} getting: {obj} {args} {kwargs}, re-submit.")
+                # Don't re-submit if permanently failed
+                if hasattr(obj, 'permanent_failure') and obj.permanent_failure:
+                    log.debug(f"Chunk {obj} permanently failed during exception, not re-submitting")
+                    continue
                 self.submit(obj, *args, **kwargs)
+            finally:
+                try:
+                    if hasattr(obj, 'in_flight'):
+                        obj.in_flight = False
+                except Exception:
+                    pass
 
     def get(obj, *args, **kwargs):
         raise NotImplementedError
 
     def submit(self, obj, *args, **kwargs):
+        # Don't queue permanently failed chunks
+        if hasattr(obj, 'permanent_failure') and obj.permanent_failure:
+            return
+        # Coalesce duplicate chunk submissions
+        try:
+            if hasattr(obj, 'ready') and obj.ready.is_set():
+                return  # Already done
+            if hasattr(obj, 'in_queue') and obj.in_queue:
+                return  # Already queued
+            if hasattr(obj, 'in_flight') and obj.in_flight:
+                return  # Currently downloading
+            if hasattr(obj, 'in_queue'):
+                obj.in_queue = True
+        except Exception:
+            pass
         self.queue.put((obj, args, kwargs))
 
     def show_stats(self):
@@ -222,7 +393,8 @@ class ChunkGetter(Getter):
             return True
 
         kwargs['idx'] = self.localdata.idx
-        kwargs['session'] = self.session
+        # Use thread-local session
+        kwargs['session'] = getattr(self.localdata, 'session', None) or requests
         #log.debug(f"{obj}, {args}, {kwargs}")
         return obj.get(*args, **kwargs)
 
@@ -237,6 +409,22 @@ chunk_getter = ChunkGetter(int(CFG.autoortho.fetch_threads))
 
 log.info(f"chunk_getter: {chunk_getter}")
 #log.info(f"tile_getter: {tile_getter}")
+
+# HTTP status codes that indicate permanent failure (no retry)
+PERMANENT_FAILURE_CODES = {400, 401, 404, 405, 406, 410, 451}
+
+# HTTP status codes that need special handling
+TRANSIENT_FAILURE_CODES = {408, 429, 500, 502, 503, 504}
+
+# Max retries for transient failures before giving up
+MAX_TRANSIENT_RETRIES = {
+    408: 3,   # Request timeout - network issue
+    429: 10,  # Rate limit - needs backoff
+    500: 15,  # Internal error - might recover
+    502: 8,   # Bad gateway - infrastructure
+    503: 8,   # Service unavailable - infrastructure  
+    504: 5,   # Gateway timeout - infrastructure
+}
 
 
 class Chunk(object):
@@ -271,18 +459,30 @@ class Chunk(object):
         # Hack override maptype
         #self.maptype = "BI"
 
-        if not priority:
-            self.priority = zoom
+        # Set priority: use provided value or default to zoom level
+        self.priority = priority if priority else zoom
         self.chunk_id = f"{col}_{row}_{zoom}_{maptype}"
         self.ready = threading.Event()
         self.ready.clear()
+        self.download_started = threading.Event()  # Signal when download thread begins
+        self.download_started.clear()
         if maptype == "Null":
             self.maptype = "EOX"
+
+        # Failure tracking for circuit breaker
+        self.permanent_failure = False
+        self.failure_reason = None
+        self.retry_count = 0
+
+        # Coalescing flags to prevent duplicate submissions
+        self.in_queue = False
+        self.in_flight = False
 
         self.cache_path = os.path.join(self.cache_dir, f"{self.chunk_id}.jpg")
         
         # FIXED: Check cache during initialization and set ready if found
         if self.get_cache():
+            self.download_started.set()  # Cache hit = "download" done immediately
             self.ready.set()
             log.debug(f"Chunk {self} initialized with cached data")
 
@@ -408,7 +608,10 @@ class Chunk(object):
                 return
 
     def get(self, idx=0, session=requests):
-        log.debug(f"Getting {self}") 
+        log.debug(f"Getting {self}")
+        
+        # Signal that download has started (not waiting in queue anymore)
+        self.download_started.set()
 
         if self.get_cache():
             self.ready.set()
@@ -473,6 +676,35 @@ class Chunk(object):
             if status_code != 200:
                 log.warning(f"Failed with status {status_code} to get chunk {self}" + (" on server " + server if self.maptype.upper() in MAPTYPES_WITH_SERVER else "") + ".")
                 bump_many({f"http_{status_code}": 1, "req_err": 1})
+                
+                # Check if this is a permanent failure
+                if status_code in PERMANENT_FAILURE_CODES:
+                    log.info(f"Chunk {self} permanently failed with {status_code}, marking as failed")
+                    self.permanent_failure = True
+                    self.failure_reason = status_code
+                    self.data = b''  # Empty data
+                    self.ready.set()  # Mark as ready (with no data) to unblock waiters
+                    bump(f'chunk_permanent_fail_{status_code}')
+                    return True  # Return True to stop worker retries
+                
+                # Check if transient failure has exceeded max retries
+                if status_code in TRANSIENT_FAILURE_CODES:
+                    self.retry_count += 1
+                    max_retries = MAX_TRANSIENT_RETRIES.get(status_code, 5)
+                    if self.retry_count >= max_retries:
+                        log.warning(f"Chunk {self} exceeded {max_retries} retries for {status_code}, giving up")
+                        self.permanent_failure = True
+                        self.failure_reason = f"{status_code}_max_retries"
+                        self.data = b''
+                        self.ready.set()
+                        bump(f'chunk_transient_fail_{status_code}_exhausted')
+                        return True
+                    # Increase backoff for rate limiting
+                    if status_code == 429:
+                        backoff_time = min(5, self.retry_count * 0.5)
+                        log.debug(f"Rate limited, backing off for {backoff_time}s (attempt {self.retry_count}/{max_retries})")
+                        time.sleep(backoff_time)
+                    bump(f'chunk_transient_fail_{status_code}_retry')
 
                 err = get_stat("req_err")
                 if err > 50:
@@ -481,6 +713,9 @@ class Chunk(object):
                     if error_rate >= 0.10:
                         log.error(f"Very high network error rate detected : {error_rate * 100 : .2f}%")
                         log.error(f"Check your network connection, DNS, maptype choice, and firewall settings.")
+                        # Enhanced circuit breaker: reduce wait times on severe error rates
+                        if error_rate >= 0.25:
+                            log.warning("Severe error rate (≥25%) detected, consider checking configuration")
                 return False
 
             bump("req_ok")
@@ -739,6 +974,11 @@ class Tile(object):
         return self.dds.mipmap_list[-1].idx
 
     def get_bytes(self, offset, length):
+        
+        # Guard against races where tile is being closed and DDS is cleared
+        if self.dds is None:
+            log.debug(f"GET_BYTES: DDS is None for {self}, likely closing; skipping")
+            return True
 
         mipmap = self.find_mipmap_pos(offset)
         log.debug(f"Get_bytes for mipmap {mipmap} ...")
@@ -769,7 +1009,7 @@ class Tile(object):
         blocksize = 8 if CFG.pydds.format == "BC1" else 16
         blocks_per_row = max(1, base_width_px // 4)
         bytes_per_row = blocks_per_row * blocksize
-        # Each chunk-row is 256 px tall → 64 blocks vertically
+        # Each chunk-row is 256 px tall -> 64 blocks vertically
         bytes_per_chunk_row = bytes_per_row * 64
 
         # Compute start/end chunk-rows touched by the requested byte range
@@ -788,14 +1028,21 @@ class Tile(object):
         if endrow < startrow:
             endrow = startrow
 
+        # Prefetch one extra chunk-row ahead to reduce subsequent stalls
+        if endrow < (chunk_rows_in_mm - 1):
+            endrow = min(endrow + 1, chunk_rows_in_mm - 1)
+
         log.debug(f"Startrow: {startrow} Endrow: {endrow} bytes_per_chunk_row: {bytes_per_chunk_row} width_px: {base_width_px} height_px: {base_height_px}")
         
         new_im = self.get_img(mipmap, startrow, endrow,
-                maxwait=self.maxchunk_wait)
+                maxwait=self.get_maxwait())
         if not new_im:
             log.debug("No updates, so no image generated")
             return True
 
+        # If tile is being closed concurrently, avoid touching DDS
+        if self.dds is None:
+            return True
         self.ready.clear()
         #log.info(new_im.size)
         
@@ -816,9 +1063,13 @@ class Tile(object):
             # usage.  Don't close here.
             #new_im.close()
 
-        # We haven't fully retrieved so unset flag
+        # We haven't fully retrieved so unset flag; guard against DDS being cleared
         log.debug(f"UNSETTING RETRIEVED! {self}")
-        self.dds.mipmap_list[mipmap].retrieved = False
+        try:
+            if self.dds is not None and self.dds.mipmap_list:
+                self.dds.mipmap_list[mipmap].retrieved = False
+        except Exception:
+            pass
         end_time = time.time()
         self.ready.set()
 
@@ -905,6 +1156,19 @@ class Tile(object):
         # Get an image for a particular mipmap
         #
 
+        # CRITICAL: If building mipmap 0, ensure lower mipmaps (1-4) are fully built first
+        # This ensures they're available in self.imgs for fallback upscaling
+        if mipmap == 0 and (startrow == 0 and endrow is None):
+            log.debug(f"GET_IMG: Building mipmap 0, ensuring lower mipmaps are available for fallback")
+            for lower_mm in range(1, min(self.max_mipmap + 1, 5)):
+                if lower_mm not in self.imgs:
+                    log.debug(f"GET_IMG: Pre-building mipmap {lower_mm} for fallback support")
+                    try:
+                        # Build the complete lower mipmap
+                        self.get_img(lower_mm, startrow=0, endrow=None, maxwait=maxwait, min_zoom=min_zoom)
+                    except Exception as e:
+                        log.debug(f"GET_IMG: Failed to pre-build mipmap {lower_mm}: {e}")
+
         # Get effective zoom  
         zoom = min((self.max_zoom - mipmap), self.max_zoom)
         log.debug(f"GET_IMG: Default tile zoom: {self.tilename_zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
@@ -915,8 +1179,16 @@ class Tile(object):
         
         # Do we already have this img?
         if mipmap in self.imgs:
-            log.debug(f"GET_IMG: Found saved image: {self.imgs[mipmap]}")
-            return self.imgs.get(mipmap)
+            img_data = self.imgs[mipmap]
+            # Unpack tuple format (new) or return directly (old format, backward compat)
+            if isinstance(img_data, tuple):
+                img = img_data[0]  # Extract just the image
+                log.debug(f"GET_IMG: Found saved image: {img}")
+                return img
+            else:
+                # Old format: just the image without metadata
+                log.debug(f"GET_IMG: Found saved image (old format): {img_data}")
+                return img_data
 
         log.debug(f"GET_IMG: MM List before { {x.idx:x.retrieved for x in self.dds.mipmap_list} }")
         if mipmap < len(self.dds.mipmap_list) and self.dds.mipmap_list[mipmap].retrieved:
@@ -951,7 +1223,24 @@ class Tile(object):
         for chunk in chunks:
             if not chunk.ready.is_set():
                 log.debug(f"GET_IMG: Submitting chunk {chunk} for zoom {zoom}")
-                chunk.priority = self.min_zoom - mipmap 
+                # INVERTED: Lower detail (higher mipmap) = lower priority number (more urgent)
+                # This ensures lower-detail tiles load first, minimizing missing tiles
+                base_priority = self.max_mipmap - mipmap
+                
+                # During initial load (before flight starts), further deprioritize high-detail
+                # to ensure lower mipmaps load completely first
+                if CFG.autoortho.suspend_maxwait and not datareftracker.connected:
+                    # Add penalty to high-detail mipmaps during initial load
+                    # Mipmap 0 gets +20, mipmap 4 gets +0
+                    initial_load_penalty = (self.max_mipmap - mipmap) * 5
+                    base_priority = base_priority + initial_load_penalty
+                
+                # Apply spatial + predictive priority system
+                # This considers distance from player and movement direction
+                chunk.priority = _calculate_spatial_priority(
+                    chunk.row, chunk.col, chunk.zoom, base_priority
+                )
+                
                 chunk_getter.submit(chunk)
                 data_updated = True
             else:
@@ -993,60 +1282,205 @@ class Tile(object):
             
         def process_chunk(chunk):
             """Process a single chunk and return (chunk, chunk_img, start_x, start_y)"""
-            chunk_ready = chunk.ready.wait(maxwait)
-            
             # Calculate position using native chunk size (no scaling)
             start_x = int(chunk.width * (chunk.col - col))
             start_y = int(chunk.height * (chunk.row - row))
+            
+            # Track if this chunk permanently failed
+            is_permanent_failure = chunk.permanent_failure
+            if is_permanent_failure:
+                log.debug(f"Chunk {chunk} is permanently failed ({chunk.failure_reason}), will attempt fallbacks")
+                bump(f'chunk_permanent_fail_{chunk.failure_reason}')
+            
+            # Smart timeout: only wait for download, not decode
+            if chunk.ready.is_set():
+                # Download already complete, just needs decode
+                chunk_ready = True
+                log.debug(f"Chunk {chunk} already downloaded, proceeding to decode")
+            else:
+                # Download in progress, apply maxwait
+                chunk_ready = chunk.ready.wait(maxwait)
+                if not chunk_ready:
+                    log.debug(f"Chunk {chunk} download timed out after {maxwait}s")
 
             chunk_img = None
             if chunk_ready and chunk.data:
                 # We returned and have data!
-                log.debug(f"GET_IMG: Ready and found chunk data.")
-                chunk_img = AoImage.load_from_memory(chunk.data)
-            elif mipmap < self.max_mipmap and not chunk_ready:
-                # Ran out of time, requesting mm below max.  Search for backup...
-                log.debug(f"GET_IMG: Tile {self} not ready.  Try to find backup chunk.")
+                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Ready and found chunk data.")
+                try:
+                    with _decode_sem:
+                        chunk_img = AoImage.load_from_memory(chunk.data)
+                except Exception as _e:
+                    log.debug(f"GET_IMG: load_from_memory failed for {chunk}: {_e}")
+            
+            # FALLBACK CHAIN (in order of preference):
+            # Each fallback only runs if previous ones failed
+            # For permanent failures (404, etc), we ALWAYS try fallbacks to get lower-zoom alternatives
+            
+            # Fallback 1: Search disk cache for lower-zoom JPEGs
+            if not chunk_img and (not chunk_ready or is_permanent_failure):
+                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Searching disk cache for backup chunk.")
                 chunk_img = self.get_best_chunk(chunk.col, chunk.row, mipmap, zoom)
-                if chunk_img:
-                    bump('backup_chunk_count')
+                # get_best_chunk bumps 'upscaled_from_jpeg_count' if successful
+            
+            # Fallback 2: Scale from already-built mipmaps (if they exist)
+            if not chunk_img:
+                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Attempting scaling from built mipmaps.")
+                chunk_img = self.get_downscaled_from_higher_mipmap(mipmap, chunk.col, chunk.row, zoom)
+                # Note: scaling function bumps its own counters (upscaled_chunk_count or downscaled_chunk_count)
+            
+            # Fallback 3: On-demand download of lower-detail chunks
+            if not chunk_img and (not chunk_ready or is_permanent_failure):
+                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Attempting cascading fallback (download).")
+                chunk_img = self.get_or_build_lower_mipmap_chunk(mipmap, chunk.col, chunk.row, zoom)
 
-            if not chunk_ready and not chunk_img:
+            if not chunk_ready and not chunk_img and not is_permanent_failure:
                 # Ran out of time, lower mipmap.  Retry...
-                log.debug(f"GET_IMG: Final retry for {chunk}")
+                # Don't retry permanent failures (404, etc) - they won't succeed
+                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Final retry for {chunk}, WAITING!")
                 bump('retry_chunk_count')
-                chunk_ready = chunk.ready.wait(maxwait)
+                # Smart timeout for retry: check if already downloaded
+                if chunk.ready.is_set():
+                    chunk_ready = True
+                    log.debug(f"Chunk {chunk} downloaded during retry, proceeding to decode")
+                else:
+                    chunk_ready = chunk.ready.wait(maxwait)
                 if chunk_ready and chunk.data:
-                    log.debug(f"GET_IMG: Final retry for {chunk}, SUCCESS!")
-                    chunk_img = AoImage.load_from_memory(chunk.data)
+                    log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Final retry for {chunk}, SUCCESS!")
+                    try:
+                        with _decode_sem:
+                            chunk_img = AoImage.load_from_memory(chunk.data)
+                    except Exception as _e:
+                        log.debug(f"GET_IMG: load_from_memory failed on retry for {chunk}: {_e}")
 
-            if not chunk_img and not chunk.data:
-                log.debug(f"GET_IMG: Empty chunk data.  Skip.")
+            if not chunk_img:
+                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Empty chunk data.  Skip.")
                 bump('chunk_missing_count')
-            elif not chunk_img and chunk.data:
-                log.warning(f"GET_IMG: FAILED! {chunk}:  LEN: {len(chunk.data)}  HEADER: {chunk.data[:8]}")
+                if is_permanent_failure:
+                    log.info(f"Chunk {chunk} permanently failed and all fallbacks exhausted")
                 
             return (chunk, chunk_img, start_x, start_y)
         
-        # Process all chunks in parallel instead of sequentially
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(chunks))) as executor:
-            # Submit all chunk processing tasks
-            future_to_chunk = {executor.submit(process_chunk, chunk): chunk for chunk in chunks}
+        # Process chunks lazily - only after their download has started
+        max_pool_workers = min(CURRENT_CPU_COUNT, len(chunks), _MAX_DECODE)
+        
+        processed_chunks = set()
+        total_chunks = len(chunks)
+        completed = 0
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_pool_workers)
+        active_futures = {}
+        
+        start_time = time.time()
+        max_total_wait = max(10.0, self.maxchunk_wait * 10)  # At least 10s, or 10x maxwait
+        
+        try:
+            while len(processed_chunks) < len(chunks):
+                # Safety timeout check
+                if time.time() - start_time > max_total_wait:
+                    chunks_abandoned = len(chunks) - len(processed_chunks)
+                    if chunks_abandoned > 0:
+                        bump('chunk_missing_count', chunks_abandoned)
+                    log.warning(f"Lazy submission timeout after {max_total_wait}s, "
+                               f"processed {len(processed_chunks)}/{len(chunks)} chunks, abandoned {chunks_abandoned}")
+                    break
+                
+                # Smart early exit - if all started downloads are done, exit
+                # Only use early exit when spatial priorities are active (during flight)
+                # to avoid incomplete mipmaps during initial load or tests
+                if datareftracker.data_valid and datareftracker.connected:
+                    chunks_started = sum(1 for c in chunks if c.download_started.is_set())
+                    if chunks_started > 0 and len(processed_chunks) >= chunks_started:
+                        chunks_never_started = len(chunks) - chunks_started
+                        if chunks_never_started > 0:
+                            log.debug(f"Early exit: {chunks_never_started} chunks never started")
+                        break
+                
+                # Find chunks whose downloads have started but haven't been submitted for processing yet
+                for chunk in chunks:
+                    chunk_id = id(chunk)
+                    if chunk_id in processed_chunks:
+                        continue
+                    
+                    # Skip permanently failed chunks immediately
+                    if chunk.permanent_failure:
+                        processed_chunks.add(chunk_id)
+                        bump('chunk_missing_count')
+                        continue
+                    
+                    # Submit when download has started
+                    if chunk.download_started.is_set():
+                        future = executor.submit(process_chunk, chunk)
+                        active_futures[future] = chunk
+                        processed_chunks.add(chunk_id)
+                
+                # Process any completed futures
+                if active_futures:
+                    done, pending = concurrent.futures.wait(
+                        active_futures.keys(), 
+                        timeout=0.025,  # Check 4x more frequently
+                        return_when=concurrent.futures.FIRST_COMPLETED
+                    )
+                    
+                    for future in done:
+                        try:
+                            chunk, chunk_img, start_x, start_y = future.result()
+                            completed += 1
+                            if chunk_img:
+                                new_im.paste(chunk_img, (start_x, start_y))
+                                # Free native buffer immediately after paste
+                                try:
+                                    chunk_img.close()
+                                except Exception:
+                                    pass
+                        except Exception as exc:
+                            log.error(f"Chunk processing failed: {exc}")
+                        finally:
+                            del active_futures[future]
+                        # Progress logging
+                        if total_chunks and (completed % max(1, total_chunks // 4) == 0):
+                            log.debug(f"GET_IMG progress: {completed}/{total_chunks} chunks for mip {mipmap}")
+                else:
+                    # No active futures yet, wait a bit before checking for started downloads
+                    time.sleep(0.01)  # Check 5x more frequently
             
-            # Collect results and paste into image as they complete
-            for future in concurrent.futures.as_completed(future_to_chunk):
+            # Wait for any remaining futures to complete
+            for future in concurrent.futures.as_completed(active_futures.keys()):
                 try:
                     chunk, chunk_img, start_x, start_y = future.result()
                     if chunk_img:
-                        # For adaptive system, chunks are already downloaded at the optimal zoom level
-                        # or retrieved from backup at appropriate resolution. Paste directly.
                         new_im.paste(chunk_img, (start_x, start_y))
                 except Exception as exc:
                     log.error(f"Chunk processing failed: {exc}")
+            
+            # CRITICAL: Process any chunks that never started downloading
+            # These would otherwise be left as missing color patches
+            unprocessed_chunks = [c for c in chunks if id(c) not in processed_chunks and not c.permanent_failure]
+            if unprocessed_chunks:
+                log.debug(f"Processing {len(unprocessed_chunks)} chunks that never started downloading (fallback only)")
+                for chunk in unprocessed_chunks:
+                    try:
+                        # Don't wait for download, go straight to fallback
+                        future = executor.submit(process_chunk, chunk)
+                        result = future.result(timeout=5)  # Short timeout for fallback
+                        if result:
+                            chunk, chunk_img, start_x, start_y = result
+                            if chunk_img:
+                                new_im.paste(chunk_img, (start_x, start_y))
+                            else:
+                                bump('chunk_missing_count')
+                        processed_chunks.add(id(chunk))
+                    except Exception as exc:
+                        log.debug(f"Fallback failed for unprocessed chunk {chunk}: {exc}")
+                        bump('chunk_missing_count')
+                        processed_chunks.add(id(chunk))
+                    
+        finally:
+            executor.shutdown(wait=True)
 
         if complete_img and mipmap <= self.max_mipmap:
             log.debug(f"GET_IMG: Save complete image for later...")
-            self.imgs[mipmap] = new_im
+            # Store image with metadata (col, row, zoom) for coordinate mapping in upscaling
+            self.imgs[mipmap] = (new_im, col, row, zoom)
 
         log.debug(f"GET_IMG: DONE!  IMG created {new_im}")
 
@@ -1056,6 +1490,216 @@ class Tile(object):
                 new_im = new_im.copy().desaturate(saturation)
         # Return image along with mipmap and zoom level this was created at
         return new_im
+
+    def get_or_build_lower_mipmap_chunk(self, target_mipmap, col, row, zoom):
+        """
+        Cascading fallback: Try to get/build progressively lower-detail mipmaps.
+        Only downloads chunks on-demand when needed (lazy evaluation).
+        
+        Args:
+            target_mipmap: The mipmap level we need (e.g., 0)
+            col, row, zoom: Chunk coordinates at target zoom
+        
+        Returns:
+            Upscaled AoImage or None
+        """
+        # Try each progressively lower-detail mipmap
+        for fallback_mipmap in range(target_mipmap + 1, self.max_mipmap + 1):
+            log.debug(f"Cascading fallback: trying mipmap {fallback_mipmap} for failed mipmap {target_mipmap}")
+            
+            # Calculate coordinates at fallback mipmap level
+            mipmap_diff = fallback_mipmap - target_mipmap
+            fallback_col = col >> mipmap_diff
+            fallback_row = row >> mipmap_diff
+            fallback_zoom = zoom - mipmap_diff
+            
+            # Try to get the chunk at this fallback level
+            fallback_chunk = Chunk(fallback_col, fallback_row, self.maptype, fallback_zoom, cache_dir=self.cache_dir)
+            
+            # Check cache first
+            if not fallback_chunk.ready.is_set():
+                if fallback_chunk.get_cache():
+                    fallback_chunk.ready.set()
+                    log.debug(f"Cascading fallback: found cached chunk at mipmap {fallback_mipmap}")
+                else:
+                    # Not in cache, try to download it (with shorter timeout)
+                    chunk_getter.submit(fallback_chunk)
+                    # Wait with reduced timeout (don't want to cascade delays)
+                    fallback_chunk_ready = fallback_chunk.ready.wait(timeout=min(3.0, self.get_maxwait() / 2))
+                    if not fallback_chunk_ready:
+                        log.debug(f"Cascading fallback: mipmap {fallback_mipmap} also timed out, trying next level")
+                        fallback_chunk.close()
+                        continue
+            
+            # We have the chunk data, decode and upscale it
+            if fallback_chunk.data:
+                try:
+                    with _decode_sem:
+                        fallback_img = AoImage.load_from_memory(fallback_chunk.data)
+                    
+                    # Calculate which portion to extract and upscale
+                    scale_factor = 1 << mipmap_diff
+                    offset_col = col % scale_factor
+                    offset_row = row % scale_factor
+                    
+                    log.debug(f"CASCADE DEBUG: target=({col},{row}), fallback_chunk=({fallback_col},{fallback_row}), offset=({offset_col},{offset_row}), scale={scale_factor}")
+                    
+                    # Pixel position in fallback image
+                    pixel_x = offset_col * (256 // scale_factor)
+                    pixel_y = offset_row * (256 // scale_factor)
+                    crop_size = 256 // scale_factor
+                    
+                    # Upscale to 256x256
+                    upscaled = fallback_img.crop_and_upscale(
+                        pixel_x, pixel_y, crop_size, crop_size, scale_factor
+                    )
+                    
+                    log.debug(f"Cascading fallback SUCCESS: upscaled mipmap {fallback_mipmap} -> {target_mipmap} at {col}x{row} (scale {scale_factor}x)")
+                    bump('upscaled_chunk_count')
+                    bump('chunk_from_cascade_fallback')
+                    
+                    fallback_chunk.close()
+                    return upscaled
+                    
+                except Exception as e:
+                    log.warning(f"Cascading fallback: failed to upscale from mipmap {fallback_mipmap}: {e}")
+                    fallback_chunk.close()
+                    continue
+            
+            fallback_chunk.close()
+        
+        log.debug(f"Cascading fallback: all mipmaps failed for {col}x{row} at mipmap {target_mipmap}")
+        return None
+
+    def get_downscaled_from_higher_mipmap(self, target_mipmap, col, row, zoom):
+        """
+        Try to scale from already-built mipmaps to fill missing chunk.
+        Checks both downscaling (from higher-detail) and upscaling (from lower-detail).
+        
+        Args:
+            target_mipmap: The mipmap level we need (e.g., 0 or 3)
+            col, row, zoom: Chunk coordinates at target zoom
+        
+        Returns:
+            Scaled AoImage or None
+        """
+        for higher_mipmap in range(target_mipmap):
+            if higher_mipmap not in self.imgs:
+                continue  # Haven't built this mipmap yet
+            
+            img_data = self.imgs[higher_mipmap]
+            if not img_data:
+                continue
+            
+            # Unpack metadata (or use old format for backward compat)
+            if isinstance(img_data, tuple):
+                higher_img = img_data[0]  # Extract image from tuple
+            else:
+                higher_img = img_data  # Old format: just the image
+            
+            if higher_img is None:
+                continue
+            
+            # Calculate scale factor
+            scale_factor = 1 << (target_mipmap - higher_mipmap)
+            
+            chunk_offset_x = (col % scale_factor) * 256
+            chunk_offset_y = (row % scale_factor) * 256
+            
+            try:
+                # Crop scale_factor*256 region, then downscale to 256
+                crop_size = 256 * scale_factor
+                cropped = AoImage.new('RGBA', (crop_size, crop_size), (0,0,0,0))
+                higher_img.crop(cropped, (chunk_offset_x, chunk_offset_y))
+                
+                downscale_steps = int(math.log2(scale_factor))
+                downscaled = cropped.reduce_2(downscale_steps)
+                
+                log.debug(f"Downscaled mipmap {higher_mipmap} to fill missing mipmap {target_mipmap} chunk at {col}x{row}")
+                bump('downscaled_chunk_count')
+                return downscaled
+            except Exception as e:
+                log.debug(f"Failed to downscale from mipmap {higher_mipmap}: {e}")
+                continue
+        
+        # Search for lower-detail mipmaps (higher mipmap numbers) to upscale
+        for lower_mipmap in range(target_mipmap + 1, self.max_mipmap + 1):
+            if lower_mipmap not in self.imgs:
+                continue
+            
+            img_data = self.imgs[lower_mipmap]
+            if not img_data:
+                continue
+            
+            # Unpack metadata
+            if isinstance(img_data, tuple):
+                lower_img, base_col, base_row, base_zoom = img_data
+            else:
+                continue  # Old format without metadata, skip
+            
+            # Calculate scale factor and relative position
+            scale_factor = 1 << (lower_mipmap - target_mipmap)
+            
+            # Map requested chunk to position in lower-detail image
+            # lower_img was built from chunks starting at (base_col, base_row) at base_zoom
+            # We need chunk (col, row) at zoom
+            
+            # Convert requested chunk coords to the zoom level of the lower image
+            zoom_diff = zoom - base_zoom
+            if zoom_diff >= 0:
+                # Requested chunk is at higher or same zoom as image base
+                # Calculate which parent chunk at base_zoom level
+                parent_col = col >> zoom_diff
+                parent_row = row >> zoom_diff
+                
+                # Relative to base position (which parent chunk in the image)
+                rel_col = parent_col - base_col
+                rel_row = parent_row - base_row
+                
+                # Calculate sub-chunk offset within that parent (0 to 2^zoom_diff-1)
+                sub_col = col & ((1 << zoom_diff) - 1)  # Equivalent to col % (1 << zoom_diff)
+                sub_row = row & ((1 << zoom_diff) - 1)
+            else:
+                # Requested chunk is at lower zoom (shouldn't happen but handle it)
+                parent_col = col << (-zoom_diff)
+                parent_row = row << (-zoom_diff)
+                rel_col = parent_col - base_col
+                rel_row = parent_row - base_row
+                sub_col = 0
+                sub_row = 0
+            
+            # Size to crop from lower image (will be upscaled by scale_factor)
+            crop_size = 256 // scale_factor
+            
+            # Each parent chunk in the image is 256px wide
+            # We need to find the sub-chunk within that 256x256 parent
+            # Each sub-chunk occupies (256 // scale_factor) pixels in the parent
+            sub_chunk_size_in_parent = crop_size  # Same as 256 // scale_factor
+            pixel_x = rel_col * 256 + sub_col * sub_chunk_size_in_parent
+            pixel_y = rel_row * 256 + sub_row * sub_chunk_size_in_parent
+            
+            log.debug(f"MIPMAP UPSCALE DEBUG: target=({col},{row},z{zoom}) base=({base_col},{base_row},z{base_zoom}) parent=({parent_col},{parent_row}) sub=({sub_col},{sub_row}) pixel=({pixel_x},{pixel_y}) crop={crop_size}")
+            
+            # Bounds check
+            img_width, img_height = lower_img.size
+            if (pixel_x < 0 or pixel_y < 0 or 
+                pixel_x + crop_size > img_width or 
+                pixel_y + crop_size > img_height):
+                log.debug(f"Upscale bounds check failed: pos ({pixel_x},{pixel_y}) crop {crop_size} img ({img_width}x{img_height})")
+                continue
+            
+            try:
+                upscaled = lower_img.crop_and_upscale(
+                    pixel_x, pixel_y, crop_size, crop_size, scale_factor
+                )
+                log.debug(f"Upscaled mipmap {lower_mipmap} (zoom {base_zoom}) to fill mipmap {target_mipmap} chunk at {col}x{row}")
+                bump('upscaled_chunk_count')
+                return upscaled
+            except Exception as e:
+                log.debug(f"Failed to upscale from mipmap {lower_mipmap}: {e}")
+                continue
+        
+        return None
 
     def get_best_chunk(self, col, row, mm, zoom):
         # For adaptive system, search up to actual_max_zoom level
@@ -1084,12 +1728,12 @@ class Tile(object):
                 c.close()
                 continue
         
-            log.debug(f"Found best chunk for {col}x{row}x{zoom} at {col_p}x{row_p}x{zoom_p}")
+            log.debug(f"Found cached JPEG for {col}x{row}x{zoom} (mm{mm}) at {col_p}x{row_p}x{zoom_p} (mm{i}), upscaling {scalefactor}x")
             # Offset into chunk
             col_offset = col % scalefactor
             row_offset = row % scalefactor
 
-            log.debug(f"Col_Offset: {col_offset}, Row_Offset: {row_offset}, Scale_Factor: {scalefactor}")
+            log.debug(f"UPSCALE DEBUG: col={col}, row={row}, col_p={col_p}, row_p={row_p}, col_offset={col_offset}, row_offset={row_offset}, scalefactor={scalefactor}")
 
             # Pixel width
             w_p = max(1, 256 >> diff)
@@ -1111,11 +1755,19 @@ class Tile(object):
 
             # Close the cache chunk to free memory before returning
             c.close()
+            
+            # Track upscaling from cached JPEGs separately
+            bump('upscaled_from_jpeg_count')
             return chunk_img
 
         log.debug(f"No best chunk found for {col}x{row}x{zoom}!")
         return False
 
+    def get_maxwait(self):
+        effective_maxwait = self.maxchunk_wait
+        if CFG.autoortho.suspend_maxwait and not datareftracker.connected:
+            effective_maxwait = 20
+        return effective_maxwait
 
     #@profile
     @locked
@@ -1133,7 +1785,7 @@ class Tile(object):
 
         # We can have multiple threads wait on get_img ...
         log.debug(f"GET_MIPMAP: Next call is get_img which may block!.............")
-        new_im = self.get_img(mipmap, maxwait=self.maxchunk_wait)
+        new_im = self.get_img(mipmap, maxwait=self.get_maxwait())
         if not new_im:
             log.debug("GET_MIPMAP: No updates, so no image generated")
             return True
@@ -1212,7 +1864,13 @@ class Tile(object):
 
         # 1) Free any cached AoImage instances (RGBA pixel buffers)
         try:
-            for im in list(self.imgs.values()):
+            for img_data in list(self.imgs.values()):
+                # Handle both tuple format (new) and plain image (old)
+                if isinstance(img_data, tuple):
+                    im = img_data[0]  # Extract image from tuple
+                else:
+                    im = img_data
+                
                 if im is not None and hasattr(im, "close"):
                     im.close()
         finally:

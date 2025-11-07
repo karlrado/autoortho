@@ -128,6 +128,23 @@ class AoImage(Structure):
             return None
         return self
 
+    def crop_and_upscale(self, x, y, width, height, scale_factor):
+        """
+        Crop a region and upscale it atomically in C (high performance).
+        This is optimized for fallback imagery - single allocation, no intermediate buffers.
+        
+        Args:
+            x, y: Crop region start position
+            width, height: Crop region dimensions
+            scale_factor: Upscale factor (must be power of 2: 2, 4, 8, 16)
+        
+        Returns:
+            New AoImage with dimensions (width * scale_factor, height * scale_factor)
+        """
+        result = AoImage()
+        if not _aoi.aoimage_crop_and_upscale(self, result, x, y, width, height, scale_factor):
+            raise AOImageException(f"crop_and_upscale failed: {result._errmsg.decode()}")
+        return result
 
     @property
     def size(self):
@@ -188,6 +205,7 @@ _aoi.aoimage_paste.argtypes = (POINTER(AoImage), POINTER(AoImage), c_uint32, c_u
 _aoi.aoimage_crop.argtypes = (POINTER(AoImage), POINTER(AoImage), c_uint32, c_uint32)
 _aoi.aoimage_copy.argtypes = (POINTER(AoImage), POINTER(AoImage), c_uint32)
 _aoi.aoimage_desaturate.argtypes = (POINTER(AoImage), c_float)
+_aoi.aoimage_crop_and_upscale.argtypes = (POINTER(AoImage), POINTER(AoImage), c_uint32, c_uint32, c_uint32, c_uint32, c_uint32)
 
 def main():
     logging.basicConfig(level = logging.DEBUG)

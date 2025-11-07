@@ -34,7 +34,7 @@ bin: autoortho/.version
 	chmod +x autoortho/lib/linux/DSFTool || true
 	chmod +x autoortho/lib/linux/*.so || true
 	chmod +x autoortho/aoimage/aoimage.so || true
-	python3 -m nuitka --verbose --verbose-output=nuitka.log \
+	.venv/bin/python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--linux-icon=autoortho/imgs/ao-icon.ico \
 		--enable-plugin=pyside6 \
 		--include-data-file=./autoortho/.version*=. \

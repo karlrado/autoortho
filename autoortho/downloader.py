@@ -721,12 +721,9 @@ class Release(object):
             v.cleanup()
         self.cleaned = True
 
-
     def uninstall(self) -> bool:
-        #self.cleanup()
-
+        # self.cleanup()
         try:
-            log.info(f"Removing {self.subfolder_dir}")
 
             if os.path.exists(self.subfolder_dir):
                 log.info(f"Removing {self.subfolder_dir}")
