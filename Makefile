@@ -37,7 +37,7 @@ bin: autoortho/.version
 	.venv/bin/python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--linux-icon=autoortho/imgs/ao-icon.ico \
 		--enable-plugin=pyside6 \
-		--include-data-file=./autoortho/.version*=. \
+		--include-data-file=./autoortho/.version=autoortho/.version \
 		--include-data-file=./autoortho/templates/*.html=templates/ \
 		--onefile \
 		--user-package-configuration-file=nuitka-package.config.yml \
@@ -59,7 +59,7 @@ __main__.app: autoortho/.version
 		--include-module=autoortho.macfuse_worker \
 		--include-module=mfusepy \
 		--enable-plugin=pyside6 \
-		--include-data-file=autoortho/.version=autoortho/.version \
+		--include-data-file=./autoortho/.version=autoortho/.version \
 		--include-data-file=./autoortho/templates/*.html=templates/ \
 		--user-package-configuration-file=nuitka-package.config.yml \
 		./autoortho/__main__.py
@@ -82,7 +82,7 @@ _autoortho_win.exe: autoortho/.version
 		--enable-plugin=pyside6 \
 		--windows-icon-from-ico=autoortho/imgs/ao-icon.ico \
 		--assume-yes-for-downloads \
-		--include-data-file=./autoortho/.version*=./ \
+		--include-data-file=./autoortho/.version=autoortho/.version \
 		--include-data-file=./autoortho/templates/*.html=templates/ \
 		--user-package-configuration-file=nuitka-package.config.yml \
 		--onefile \
@@ -96,7 +96,7 @@ __main__.dist: autoortho/.version
 		--enable-plugin=pyside6 \
 		--windows-icon-from-ico=autoortho/imgs/ao-icon.ico \
 		--assume-yes-for-downloads \
-		--include-data-file=./autoortho/.version*=./ \
+		--include-data-file=./autoortho/.version=autoortho/.version \
 		--include-data-file=./autoortho/templates/*.html=templates/ \
 		--user-package-configuration-file=nuitka-package.config.yml \
 		--standalone \
