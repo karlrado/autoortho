@@ -416,7 +416,8 @@ class AOMount:
         else:
             cmd = [sys.executable, "-m", "autoortho"]
         # Worker arguments (parsed by macfuse_worker.main via the early-dispatch)
-        cmd += ["--root", root, "--mountpoint", mountpoint, "--loglevel", "DEBUG" if self.cfg.general.debug else "INFO"]
+        loglevel = getattr(self.cfg.general, 'file_log_level', 'INFO').upper()
+        cmd += ["--root", root, "--mountpoint", mountpoint, "--loglevel", loglevel]
         if volname:
             cmd += ["--volname", volname]
         if nothreads:
