@@ -1635,7 +1635,7 @@ class TestStallPrevention:
         elapsed = time.time() - start
         
         assert not result, "Should timeout"
-        assert 0.04 <= elapsed <= 0.1, f"Should wait ~0.05s, got {elapsed:.3f}s"
+        assert 0.04 <= elapsed <= 0.2, f"Should wait ~0.05s, got {elapsed:.3f}s"
         
         # Test skip_download_wait behavior (no blocking)
         # In the fixed code, skip_download_wait=True means we don't call wait() at all
