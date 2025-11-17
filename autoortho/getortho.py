@@ -1770,7 +1770,7 @@ class Tile(object):
             return chunk_img
 
         log.debug(f"No best chunk found for {col}x{row}x{zoom}!")
-        return False
+        return None
 
     def get_maxwait(self):
         effective_maxwait = self.maxchunk_wait
