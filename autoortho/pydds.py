@@ -37,11 +37,29 @@ else:
     print("System is not supported")
     exit()
 
+# Load compression libraries with error handling
 _stb = None
 if _stb_path:
-    _stb = CDLL(_stb_path)
+    try:
+        if not os.path.exists(_stb_path):
+            raise FileNotFoundError(f"STB DXT library not found at: {_stb_path}")
+        _stb = CDLL(_stb_path)
+        log.info(f"Loaded STB DXT library from {_stb_path}")
+    except Exception as e:
+        log.error(f"Failed to load STB DXT library from {_stb_path}: {e}")
+        log.warning("DXT1 compression may not work correctly")
+        # Don't raise - ISPC can handle all formats
 
-_ispc = CDLL(_ispc_path)
+try:
+    if not os.path.exists(_ispc_path):
+        raise FileNotFoundError(f"ISPC texcomp library not found at: {_ispc_path}")
+    _ispc = CDLL(_ispc_path)
+    log.info(f"Loaded ISPC texcomp library from {_ispc_path}")
+except Exception as e:
+    log.error(f"FATAL: Failed to load ISPC texcomp library from {_ispc_path}")
+    log.error(f"Error: {e}")
+    log.error("AutoOrtho cannot continue without this library.")
+    raise
 
 DDSD_CAPS = 0x00000001          # dwCaps/dwCaps2 is enabled. 
 DDSD_HEIGHT = 0x00000002                # dwHeight is enabled. 

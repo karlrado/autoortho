@@ -1314,8 +1314,11 @@ class Tile(object):
                 try:
                     with _decode_sem:
                         chunk_img = AoImage.load_from_memory(chunk.data)
+                        if chunk_img is None:
+                            log.warning(f"GET_IMG: load_from_memory returned None for {chunk}")
                 except Exception as _e:
-                    log.debug(f"GET_IMG: load_from_memory failed for {chunk}: {_e}")
+                    log.error(f"GET_IMG: load_from_memory exception for {chunk}: {_e}")
+                    chunk_img = None
             
             # FALLBACK CHAIN (in order of preference):
             # Each fallback only runs if previous ones failed
@@ -1354,8 +1357,11 @@ class Tile(object):
                     try:
                         with _decode_sem:
                             chunk_img = AoImage.load_from_memory(chunk.data)
+                            if chunk_img is None:
+                                log.warning(f"GET_IMG: load_from_memory returned None on retry for {chunk}")
                     except Exception as _e:
-                        log.debug(f"GET_IMG: load_from_memory failed on retry for {chunk}: {_e}")
+                        log.error(f"GET_IMG: load_from_memory exception on retry for {chunk}: {_e}")
+                        chunk_img = None
 
             if not chunk_img:
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Empty chunk data.  Skip.")
@@ -1545,6 +1551,9 @@ class Tile(object):
                 try:
                     with _decode_sem:
                         fallback_img = AoImage.load_from_memory(fallback_chunk.data)
+                        if fallback_img is None:
+                            log.warning(f"GET_IMG: Fallback load_from_memory returned None for {fallback_chunk}")
+                            continue
                     
                     # Calculate which portion to extract and upscale
                     scale_factor = 1 << mipmap_diff
@@ -1751,9 +1760,15 @@ class Tile(object):
             log.debug(f"Pixel Size: {w_p}x{h_p}")
 
             # Load image to crop
-            img_p = AoImage.load_from_memory(c.data)
+            try:
+                img_p = AoImage.load_from_memory(c.data)
+            except Exception as e:
+                log.error(f"Exception loading chunk {c} into memory: {e}")
+                c.close()
+                continue
+            
             if not img_p:
-                log.warning(f"Failed to load chunk {c} into memory.")
+                log.warning(f"Failed to load chunk {c} into memory (returned None).")
                 c.close()
                 continue
 

@@ -30,15 +30,29 @@ class AoImage(Structure):
         self._stride = 0
         self._channels = 0
         self._errmsg = b'';
+        self._freed = False  # Prevent double-free crashes
 
     def __del__(self):
-        _aoi.aoimage_delete(self)
+        # Only delete if not already freed (prevents double-free crash)
+        if not self._freed:
+            try:
+                _aoi.aoimage_delete(self)
+                self._freed = True
+            except Exception as e:
+                # Log but don't raise in __del__ (causes issues)
+                log.debug(f"Error in AoImage.__del__: {e}")
 
     def __repr__(self):
         return f"ptr:  width: {self._width} height: {self._height} stride: {self._stride} channels: {self._channels}"
 
     def close(self):
-        _aoi.aoimage_delete(self)
+        # Only delete if not already freed (prevents double-free crash)
+        if not self._freed:
+            try:
+                _aoi.aoimage_delete(self)
+                self._freed = True
+            except Exception as e:
+                log.error(f"Error in AoImage.close: {e}")
         
     def convert(self, mode):
         """
@@ -163,11 +177,33 @@ def new(mode, wh, color):
 
 
 def load_from_memory(mem, datalen=None):
+    # Validate input before passing to C code
+    if not mem:
+        log.error("AoImage.load_from_memory: mem is None or empty")
+        return None
+    
     if not datalen:
         datalen = len(mem)
+    
+    if datalen < 4:
+        log.error(f"AoImage.load_from_memory: data too short ({datalen} bytes)")
+        return None
+    
     new = AoImage()
-    if not _aoi.aoimage_from_memory(new, mem, datalen):
-        log.error(f"AoImage.load_from_memory error: {new._errmsg.decode()}")
+    try:
+        # Breadcrumb: Log BEFORE entering C code (helps debug crashes)
+        log.debug(f"AoImage: Calling C aoimage_from_memory with {datalen} bytes")
+        
+        # Keep strong reference to mem to prevent GC during C call
+        mem_ref = mem
+        if not _aoi.aoimage_from_memory(new, mem_ref, datalen):
+            log.error(f"AoImage.load_from_memory error: {new._errmsg.decode()}")
+            return None
+        
+        # Breadcrumb: Made it through C code successfully
+        log.debug(f"AoImage: C call succeeded, created {new._width}x{new._height} image")
+    except Exception as e:
+        log.error(f"AoImage.load_from_memory exception: {e}")
         return None
 
     return new
@@ -191,7 +227,17 @@ else:
     log.error("System is not supported")
     exit()
 
-_aoi = CDLL(_aoi_path)
+# Load C library with error handling to prevent silent crashes
+try:
+    if not os.path.exists(_aoi_path):
+        raise FileNotFoundError(f"aoimage library not found at: {_aoi_path}")
+    _aoi = CDLL(_aoi_path)
+except Exception as e:
+    log.error(f"FATAL: Failed to load aoimage library from {_aoi_path}")
+    log.error(f"Error: {e}")
+    log.error("AutoOrtho cannot continue without this library.")
+    log.error("Please verify installation and that all DLL dependencies are present.")
+    raise
 _aoi.aoimage_read_jpg.argtypes = (c_char_p, POINTER(AoImage))
 _aoi.aoimage_write_jpg.argtypes = (c_char_p, POINTER(AoImage), c_int32)
 _aoi.aoimage_2_rgba.argtypes = (POINTER(AoImage), POINTER(AoImage))
