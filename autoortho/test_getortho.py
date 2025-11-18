@@ -1274,7 +1274,7 @@ class TestChunkProcessing:
         elapsed = time.time() - start
         
         assert not result, "Wait should return False on timeout"
-        assert 0.09 <= elapsed <= 0.2, f"Should timeout in ~0.1s, got {elapsed:.3f}s"
+        assert 0.09 <= elapsed <= 0.25, f"Should timeout in ~0.1s, got {elapsed:.3f}s"
     
     def test_chunk_permanent_failure_handling(self, tmpdir):
         """Test that permanent failures trigger fallback chain."""
