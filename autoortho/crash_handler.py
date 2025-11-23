@@ -58,7 +58,7 @@ This crash report has been saved to:
 {crash_log}
 
 Please report this crash with the log file to:
-https://github.com/kubilus1/autoortho/issues
+https://github.com/ProgrammingDinosaur/autoortho4xplane/issues
 {'=' * 70}
 """
     

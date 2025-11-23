@@ -1286,6 +1286,19 @@ class Tile(object):
             start_x = int(chunk.width * (chunk.col - col))
             start_y = int(chunk.height * (chunk.row - row))
             
+            # PHASE 2 FIX #6 & #8: Validate coordinates before use
+            # Negative coordinates indicate logic error or data corruption
+            if start_x < 0 or start_y < 0:
+                log.error(f"GET_IMG: Invalid negative coordinates: start_x={start_x}, start_y={start_y}, chunk.col={chunk.col}, chunk.row={chunk.row}, base col={col}, base row={row}")
+                # Return placeholder to prevent crash
+                return (chunk, None, 0, 0)
+            
+            # Check if coordinates would extend beyond image bounds
+            if start_x + chunk.width > img_width or start_y + chunk.height > img_height:
+                log.error(f"GET_IMG: Coordinates extend beyond image: pos=({start_x},{start_y}), size=({chunk.width}x{chunk.height}), image=({img_width}x{img_height})")
+                # Return placeholder to prevent crash
+                return (chunk, None, 0, 0)
+            
             # Track if this chunk permanently failed
             is_permanent_failure = chunk.permanent_failure
             if is_permanent_failure:
@@ -1436,7 +1449,12 @@ class Tile(object):
                             chunk, chunk_img, start_x, start_y = future.result()
                             completed += 1
                             if chunk_img:
-                                new_im.paste(chunk_img, (start_x, start_y))
+                                # PHASE 2 FIX #6: Validate coordinates before paste
+                                if start_x >= 0 and start_y >= 0:
+                                    if not new_im.paste(chunk_img, (start_x, start_y)):
+                                        log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
+                                else:
+                                    log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
                                 # Free native buffer immediately after paste
                                 try:
                                     chunk_img.close()
@@ -1458,7 +1476,12 @@ class Tile(object):
                 try:
                     chunk, chunk_img, start_x, start_y = future.result()
                     if chunk_img:
-                        new_im.paste(chunk_img, (start_x, start_y))
+                        # PHASE 2 FIX #6: Validate coordinates before paste
+                        if start_x >= 0 and start_y >= 0:
+                            if not new_im.paste(chunk_img, (start_x, start_y)):
+                                log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
+                        else:
+                            log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
                 except Exception as exc:
                     log.error(f"Chunk processing failed: {exc}")
             
@@ -1481,7 +1504,12 @@ class Tile(object):
                     try:
                         chunk, chunk_img, start_x, start_y = future.result()
                         if chunk_img:
-                            new_im.paste(chunk_img, (start_x, start_y))
+                            # PHASE 2 FIX #6: Validate coordinates before paste
+                            if start_x >= 0 and start_y >= 0:
+                                if not new_im.paste(chunk_img, (start_x, start_y)):
+                                    log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
+                            else:
+                                log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
                         else:
                             bump('chunk_missing_count')
                     except Exception as exc:
@@ -1628,7 +1656,21 @@ class Tile(object):
                 # Crop scale_factor*256 region, then downscale to 256
                 crop_size = 256 * scale_factor
                 cropped = AoImage.new('RGBA', (crop_size, crop_size), (0,0,0,0))
-                higher_img.crop(cropped, (chunk_offset_x, chunk_offset_y))
+                
+                # PHASE 2 FIX #6 & #8: Validate crop coordinates
+                if chunk_offset_x < 0 or chunk_offset_y < 0:
+                    log.warning(f"GET_IMG: Negative crop offset: ({chunk_offset_x},{chunk_offset_y}), skipping fallback")
+                    continue
+                
+                # Check bounds
+                higher_width, higher_height = higher_img.size
+                if chunk_offset_x + crop_size > higher_width or chunk_offset_y + crop_size > higher_height:
+                    log.warning(f"GET_IMG: Crop extends beyond image: pos=({chunk_offset_x},{chunk_offset_y}), size={crop_size}, image=({higher_width}x{higher_height})")
+                    continue
+                
+                if not higher_img.crop(cropped, (chunk_offset_x, chunk_offset_y)):
+                    log.warning(f"GET_IMG: crop() failed for fallback at ({chunk_offset_x},{chunk_offset_y})")
+                    continue
                 
                 downscale_steps = int(math.log2(scale_factor))
                 downscaled = cropped.reduce_2(downscale_steps)
