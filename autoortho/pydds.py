@@ -20,6 +20,15 @@ from utils.constants import system_type
 import logging
 log = logging.getLogger(__name__)
 
+# Define rgba_surface structure BEFORE it's referenced in library setup
+class rgba_surface(Structure):
+    _fields_ = [
+        ('data', c_char_p),
+        ('width', c_uint32),
+        ('height', c_uint32),
+        ('stride', c_uint32)
+    ]
+
 #_stb = CDLL("/usr/lib/x86_64-linux-gnu/libstb.so")
 if system_type == 'linux':
     print("Linux detected")
@@ -139,15 +148,6 @@ class MipMap(object):
 
     def __repr__(self):
         return f"MipMap({self.idx}, {self.startpos}, {self.endpos}, {self.length}, {self.retrieved}, {self.databuffer})"
-
-
-class rgba_surface(Structure):
-    _fields_ = [
-        ('data', c_char_p),
-        ('width', c_uint32),
-        ('height', c_uint32),
-        ('stride', c_uint32)
-    ]
 
 
 class DDS(Structure):
