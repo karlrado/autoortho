@@ -1,5 +1,10 @@
 [
   {
+    "version": "unstable",
+    "title": "unstable",
+    "aliases": []
+  },
+  {
     "version": "v0.8.2-karlrado",
     "title": "v0.8.2-karlrado",
     "aliases": [
