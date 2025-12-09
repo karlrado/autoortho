@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import sys
 import time
 import json
 import socket
@@ -19,7 +20,15 @@ from aostats import STATS
 
 RUNNING=True
 
-app = Flask(__name__)
+# Determine template folder for frozen vs dev mode
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    # PyInstaller: templates are in _MEIPASS/autoortho/templates
+    template_folder = os.path.join(sys._MEIPASS, 'autoortho', 'templates')
+else:
+    # Development: templates are relative to this file
+    template_folder = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'templates')
+
+app = Flask(__name__, template_folder=template_folder)
 app.config['SECRET_KEY'] = 'secret!'
 # Explicitly set async_mode='threading' for compatibility with PyInstaller frozen apps
 # Auto-detection fails in frozen environments

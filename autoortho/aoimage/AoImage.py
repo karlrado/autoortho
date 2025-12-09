@@ -283,14 +283,13 @@ def _get_aoimage_path():
         sys.exit(1)
     
     # Check if running as PyInstaller frozen executable
-    if getattr(sys, 'frozen', False):
-        # PyInstaller: library is in autoortho/aoimage/ relative to exe
-        base_path = os.path.dirname(sys.executable)
-        lib_path = os.path.join(base_path, 'autoortho', 'aoimage', lib_name)
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        # PyInstaller: library is in _MEIPASS/autoortho/aoimage/
+        lib_path = os.path.join(sys._MEIPASS, 'autoortho', 'aoimage', lib_name)
         if os.path.exists(lib_path):
             return lib_path
-        # Fallback: check same directory as exe
-        lib_path = os.path.join(base_path, lib_name)
+        # Fallback: check _MEIPASS root
+        lib_path = os.path.join(sys._MEIPASS, lib_name)
         if os.path.exists(lib_path):
             return lib_path
     

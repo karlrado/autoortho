@@ -116,6 +116,16 @@ if not os.path.exists(version_file):
 if os.path.exists(version_file):
     datas.append((version_file, 'autoortho'))
 
+# Flask templates (required for web UI)
+templates_path = os.path.join(autoortho_path, 'templates')
+if os.path.isdir(templates_path):
+    datas.append((templates_path, 'autoortho/templates'))
+
+# Images/icons for UI
+imgs_path = os.path.join(autoortho_path, 'imgs')
+if os.path.isdir(imgs_path):
+    datas.append((imgs_path, 'autoortho/imgs'))
+
 # 7-Zip license
 if sys.platform == 'win32':
     license_path = os.path.join(lib_path, '7zip', 'License.txt')
@@ -221,7 +231,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=icon_path,
-    contents_directory='.',  # Flat structure - no _internal folder
+    contents_directory='ao_files',  # Custom folder name instead of '_internal'
 )
 
 # =============================================================================

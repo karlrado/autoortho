@@ -103,8 +103,8 @@ class DsfUtils:
             raise ValueError(f"Unsupported system type: {system_type}")
         
         # Handle PyInstaller frozen mode
-        if getattr(sys, 'frozen', False):
-            base_dir = os.path.join(os.path.dirname(sys.executable), 'autoortho')
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            base_dir = os.path.join(sys._MEIPASS, 'autoortho')
         else:
             base_dir = os.path.dirname(os.path.dirname(__file__))
         
@@ -122,8 +122,8 @@ class DsfUtils:
             raise ValueError(f"Unsupported system type: {system_type}")
         
         # Handle PyInstaller frozen mode
-        if getattr(sys, 'frozen', False):
-            base_dir = os.path.join(os.path.dirname(sys.executable), 'autoortho')
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            base_dir = os.path.join(sys._MEIPASS, 'autoortho')
         else:
             base_dir = os.path.dirname(os.path.dirname(__file__))
         

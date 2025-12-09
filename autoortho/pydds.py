@@ -31,9 +31,9 @@ class rgba_surface(Structure):
 
 def _get_lib_base_path():
     """Get base path for libraries, handling both dev and frozen (PyInstaller) modes."""
-    if getattr(sys, 'frozen', False):
-        # PyInstaller: libs are in autoortho/lib/<platform>/ relative to exe
-        return os.path.join(os.path.dirname(sys.executable), 'autoortho')
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        # PyInstaller: libs are in _MEIPASS/autoortho/lib/<platform>/
+        return os.path.join(sys._MEIPASS, 'autoortho')
     else:
         # Development mode: libs are relative to this file
         return os.path.dirname(os.path.realpath(__file__))
