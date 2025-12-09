@@ -1,5 +1,42 @@
 # FAQ and Troubleshooting
 
+## Application File Structure
+
+### Important: Do NOT delete the `ao_files` folder!
+
+When you extract AutoOrtho (Windows zip or macOS app), you'll see a folder structure like this:
+
+**Windows (zip extraction):**
+```
+autoortho_release/
+├── autoortho.exe          ← Main executable
+├── ao_files/              ← REQUIRED - Contains Python runtime and dependencies
+│   ├── (many files...)
+│   └── ...
+└── ...
+```
+
+**macOS (app bundle):**
+```
+AutoOrtho.app/
+└── Contents/
+    ├── MacOS/
+    │   ├── autoortho      ← Main executable
+    │   └── ao_files/      ← REQUIRED - Contains Python runtime and dependencies
+    └── ...
+```
+
+The `ao_files` folder contains the bundled Python interpreter and all required libraries. **If you delete this folder, AutoOrtho will not work!**
+
+Common mistakes:
+- Moving only the `.exe` file to another location (without `ao_files`)
+- "Cleaning up" by deleting folders that look like temporary files
+- Anti-virus software quarantining files from this folder
+
+If AutoOrtho suddenly stops working after it previously worked, check that the `ao_files` folder is intact and in the same directory as the executable.
+
+---
+
 ## General Issues
 
 ### I see occasional blurry and/or green tiles
