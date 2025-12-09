@@ -17,15 +17,18 @@ autoortho/.version:
 # =============================================================================
 lin_bin: autoortho_linux_$(SAFE_VERSION)
 autoortho_linux_$(SAFE_VERSION): autoortho/*.py autoortho/.version
-	docker run --rm -v `pwd`:/code ubuntu:latest /bin/bash -c "cd /code; ./buildreqs.sh; . .venv/bin/activate; time make bin VERSION=$(VERSION)"
-	# Rename output folder to versioned name
-	rm -rf $@
-	mv dist/autoortho $@
+	# Build inside Docker and rename output folder (all as root to avoid permission issues)
+	docker run --rm -v `pwd`:/code ubuntu:latest /bin/bash -c "\
+		cd /code && \
+		./buildreqs.sh && \
+		. .venv/bin/activate && \
+		time make bin VERSION=$(VERSION) && \
+		rm -rf autoortho_linux_$(SAFE_VERSION) && \
+		mv dist/autoortho autoortho_linux_$(SAFE_VERSION) && \
+		chmod -R a+rw autoortho_linux_$(SAFE_VERSION)"
 
 lin_tar: autoortho_linux_$(SAFE_VERSION).tar.gz
 autoortho_linux_$(SAFE_VERSION).tar.gz: autoortho_linux_$(SAFE_VERSION)
-	# Ensure executable is marked executable
-	chmod a+x $</autoortho
 	# Package entire folder (includes ao_files/ with all bundled dependencies)
 	tar -czf $@ $<
 
