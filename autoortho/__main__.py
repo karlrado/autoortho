@@ -195,37 +195,6 @@ except Exception:
 
 import autoortho
 
-def _is_quarantine_error(err):
-    """Check if the error is a macOS quarantine-related error."""
-    err_str = str(err).lower()
-    # Error -47 is ECANCELED, which occurs when macOS blocks quarantined apps
-    # Also check for common quarantine-related error messages
-    return (
-        "-47" in err_str or
-        "ecanceled" in err_str or
-        "operation canceled" in err_str or
-        "quarantine" in err_str
-    )
-
-
-def _show_error_dialog(title, msg):
-    """Show a platform-appropriate error dialog."""
-    try:
-        if os.name == "nt":
-            import ctypes
-            ctypes.windll.user32.MessageBoxW(None, msg, title, 0x00000010)
-        elif system_type == "darwin":
-            import subprocess
-            # Escape special characters for AppleScript
-            escaped_msg = msg.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
-            apple_script = f'''
-                display dialog "{escaped_msg}" with title "{title}" buttons {{"OK"}} default button "OK" with icon stop
-            '''
-            subprocess.run(['osascript', '-e', apple_script], capture_output=True)
-    except Exception:
-        pass
-
-
 if __name__ == "__main__":
     try:
         setuplogs()
@@ -234,27 +203,26 @@ if __name__ == "__main__":
         import traceback
         logging.getLogger(__name__).exception("Fatal error during startup: %s", _fatal_err)
         log_path = os.path.join(os.path.expanduser("~"), ".autoortho-data", "logs", "autoortho.log")
-        
-        # Check for macOS quarantine error
-        if system_type == "darwin" and _is_quarantine_error(_fatal_err):
-            msg = (
-                "AutoOrtho cannot start because macOS has blocked it.\n\n"
-                "This happens when the app is downloaded from the internet "
-                "and hasn't been approved yet.\n\n"
-                "TO FIX THIS:\n"
-                "1. Open Terminal\n"
-                "2. Run this command:\n"
-                "   xattr -cr /path/to/AutoOrtho.app\n"
-                "   (drag the app onto Terminal to get the path)\n\n"
-                "Or: Right-click the app > Open > Open anyway\n\n"
-                f"Technical details: {_fatal_err}"
-            )
-            _show_error_dialog("AutoOrtho - macOS Security Block", msg)
-        else:
-            msg = (
-                "AutoOrtho failed to start.\n\n"
-                + str(_fatal_err)
-                + "\n\nSee log for details:\n"
-                + log_path
-            )
-            _show_error_dialog("AutoOrtho Error", msg)
+        msg = (
+            "AutoOrtho failed to start.\n\n"
+            + str(_fatal_err)
+            + "\n\nSee log for details:\n"
+            + log_path
+        )
+        try:
+            if os.name == "nt":
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(None, msg, "AutoOrtho Error", 0x00000010)
+            elif system_type == "darwin":
+                # Use osascript to show a native macOS dialog
+                import subprocess
+                apple_script = f'''
+                    display dialog "{msg.replace('"', '\\"').replace(chr(10), '\\n')}" ¬
+                    with title "AutoOrtho Error" ¬
+                    buttons {{"OK"}} ¬
+                    default button "OK" ¬
+                    with icon stop
+                '''
+                subprocess.run(['osascript', '-e', apple_script], capture_output=True)
+        except Exception:
+            pass

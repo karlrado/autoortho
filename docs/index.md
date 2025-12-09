@@ -71,17 +71,25 @@ Assumptions:
 1. If you haven't install MacFuse or Fuse-T. Fuse-T was used for testing the mac binary but both should work.
 2. Download the most recent packaged release (autortho_mac_####.zip) [from here](https://github.com/ProgrammingDinosaur/autoortho/releases/latest)
 3. Unzip on the location you want.
-4. **Important - Remove Quarantine:** Since this app is unsigned, macOS will block it. Before first run:
-   * **Easy way:** Double-click the included `fix_macos_quarantine.command` script
-   * **Or manually:** Open Terminal and run: `xattr -cr /path/to/AutoOrtho.app`
-   * If you see "Error -47" when launching, this is the quarantine block - run the fix script
-5. Run the program `AutoOrtho.App`
-6. If you still see a security warning: Right-click → Open → Open Anyway, or go to Settings → Privacy and Security → Allow AutoOrtho execution.
-5. Configure your settings and paths for your system 
-6. Download and setup an ortho set from the 'Scenery' tab.
-7. Click 'Run' to run the program
-8. Configure your scenery_packs.ini file appropriately
-9. Run X-Plane and choose a location for an ortho set you have downloaded
+4. Run the program `AutoOrtho.app`
+5. **Important: macOS Quarantine Warning** - This program is currently unsigned. On first run, macOS will block it from opening. You have two options to fix this:
+
+    **Option A (Recommended):** Remove the quarantine attribute using Terminal:
+    ```bash
+    xattr -d com.apple.quarantine /path/to/AutoOrtho.app
+    ```
+    *Tip: You can drag the AutoOrtho.app onto the Terminal window to auto-fill the path.*
+
+    **Option B:** Use System Settings:
+    - Go to **Settings → Privacy and Security**
+    - Scroll down to find the message about `AutoOrtho.app` being blocked
+    - Click **Open Anyway**
+
+6. Configure your settings and paths for your system 
+7. Download and setup an ortho set from the 'Scenery' tab.
+8. Click 'Run' to run the program
+9. Configure your scenery_packs.ini file appropriately
+10. Run X-Plane and choose a location for an ortho set you have downloaded
 
 ---
 

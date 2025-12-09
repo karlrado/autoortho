@@ -137,45 +137,6 @@ This is not supported. Use a local NTFS formatted drive.
 
 ## MacOS issues
 
-### Error -47 or "Operation canceled" on startup
-
-This error occurs when macOS blocks AutoOrtho because it was downloaded from the internet and has a "quarantine" flag. macOS does this for security reasons with unsigned applications.
-
-**Symptoms:**
-- Error dialog showing "-47" or "operation canceled"
-- App refuses to open after download
-- Security warning about unidentified developer
-
-**Solutions (try in order):**
-
-**Option 1: Use the included fix script**
-The macOS zip includes a `fix_macos_quarantine.command` script:
-1. Extract the zip file
-2. Double-click `fix_macos_quarantine.command`
-3. The script will remove the quarantine attribute
-4. Open AutoOrtho.app normally
-
-**Option 2: Right-click to open**
-1. Right-click (or Control-click) on AutoOrtho.app
-2. Select "Open" from the context menu
-3. Click "Open" in the security dialog
-4. The app will now work for future launches
-
-**Option 3: Terminal command**
-1. Open Terminal
-2. Run:
-```bash
-xattr -cr /path/to/AutoOrtho.app
-```
-(Tip: Type `xattr -cr ` then drag the app onto Terminal to auto-fill the path)
-
-**Option 4: System Settings**
-1. Go to System Settings → Privacy & Security
-2. Scroll down to find the blocked app message
-3. Click "Open Anyway"
-
----
-
 ### Flight crashes during loading, X-Plane logs show no detailed errors.
 AutoOrtho Tile Setup and imagery download can take up lots of time while loading the flight and X-Plane freezes in the meantime. MacOS doesn't like the app being frozen and if you click on it or change apps often the system might force close it. Crashing the Simulator. Disabling multithreaded FUSE helps in these cases.
 Solution: 
