@@ -43,11 +43,10 @@ MEMTRACE = False
 log = logging.getLogger(__name__)
 
 
-# Bound global JPEG decode concurrency to reduce memory spikes and failures
-try:
-    _MAX_DECODE = int(getattr(CFG.pydds, 'max_decode_concurrency', CURRENT_CPU_COUNT))
-except Exception:
-    _MAX_DECODE = CURRENT_CPU_COUNT
+# JPEG decode concurrency: auto-tuned for optimal performance
+# Decode is memory-bound, not CPU-bound, so we can safely exceed CPU count
+# Each decode uses ~256KB RAM, so even 64 concurrent = only ~16MB
+_MAX_DECODE = min(CURRENT_CPU_COUNT * 4, 64)
 _decode_sem = threading.Semaphore(_MAX_DECODE)
 
 
@@ -248,6 +247,30 @@ def _calculate_spatial_priority(chunk_row: int, chunk_col: int, chunk_zoom: int,
         return float(base_mipmap_priority)
 
 
+def _safe_paste(dest_img, chunk_img, start_x, start_y):
+    """
+    Paste chunk_img into dest_img at (start_x, start_y) with coordinate validation.
+    
+    Returns True if paste succeeded, False if skipped due to invalid coordinates.
+    Frees chunk_img native buffer after paste.
+    """
+    if start_x < 0 or start_y < 0:
+        log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
+        return False
+    
+    if not dest_img.paste(chunk_img, (start_x, start_y)):
+        log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
+        return False
+    
+    # Free native buffer immediately after paste
+    try:
+        chunk_img.close()
+    except Exception:
+        pass
+    
+    return True
+
+
 def locked(fn):
     @wraps(fn)
     def wrapped(self, *args, **kwargs):
@@ -328,18 +351,13 @@ class Getter(object):
             bump('count', 1)
 
             try:
-                # Mark object as in-flight
-                try:
-                    if hasattr(obj, 'in_queue'):
-                        obj.in_queue = False
-                    if hasattr(obj, 'in_flight'):
-                        obj.in_flight = True
-                except Exception:
-                    pass
+                # Mark chunk as in-flight (Chunk always has these attributes)
+                obj.in_queue = False
+                obj.in_flight = True
                 
                 if not self.get(obj, *args, **kwargs):
                     # Check if chunk is permanently failed before re-submitting
-                    if hasattr(obj, 'permanent_failure') and obj.permanent_failure:
+                    if obj.permanent_failure:
                         log.debug(f"Chunk {obj} permanently failed ({obj.failure_reason}), not re-submitting")
                         continue
                     log.warning(f"Failed getting: {obj} {args} {kwargs}, re-submit.")
@@ -347,36 +365,28 @@ class Getter(object):
             except Exception as err:
                 log.error(f"ERROR {err} getting: {obj} {args} {kwargs}, re-submit.")
                 # Don't re-submit if permanently failed
-                if hasattr(obj, 'permanent_failure') and obj.permanent_failure:
+                if obj.permanent_failure:
                     log.debug(f"Chunk {obj} permanently failed during exception, not re-submitting")
                     continue
                 self.submit(obj, *args, **kwargs)
             finally:
-                try:
-                    if hasattr(obj, 'in_flight'):
-                        obj.in_flight = False
-                except Exception:
-                    pass
+                obj.in_flight = False
 
     def get(obj, *args, **kwargs):
         raise NotImplementedError
 
     def submit(self, obj, *args, **kwargs):
-        # Don't queue permanently failed chunks
-        if hasattr(obj, 'permanent_failure') and obj.permanent_failure:
+        # Don't queue permanently failed chunks (Chunk always has this attribute)
+        if obj.permanent_failure:
             return
         # Coalesce duplicate chunk submissions
-        try:
-            if hasattr(obj, 'ready') and obj.ready.is_set():
-                return  # Already done
-            if hasattr(obj, 'in_queue') and obj.in_queue:
-                return  # Already queued
-            if hasattr(obj, 'in_flight') and obj.in_flight:
-                return  # Currently downloading
-            if hasattr(obj, 'in_queue'):
-                obj.in_queue = True
-        except Exception:
-            pass
+        if obj.ready.is_set():
+            return  # Already done
+        if obj.in_queue:
+            return  # Already queued
+        if obj.in_flight:
+            return  # Currently downloading
+        obj.in_queue = True
         self.queue.put((obj, args, kwargs))
 
     def show_stats(self):
@@ -1449,17 +1459,7 @@ class Tile(object):
                             chunk, chunk_img, start_x, start_y = future.result()
                             completed += 1
                             if chunk_img:
-                                # PHASE 2 FIX #6: Validate coordinates before paste
-                                if start_x >= 0 and start_y >= 0:
-                                    if not new_im.paste(chunk_img, (start_x, start_y)):
-                                        log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
-                                else:
-                                    log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
-                                # Free native buffer immediately after paste
-                                try:
-                                    chunk_img.close()
-                                except Exception:
-                                    pass
+                                _safe_paste(new_im, chunk_img, start_x, start_y)
                         except Exception as exc:
                             log.error(f"Chunk processing failed: {exc}")
                         finally:
@@ -1476,12 +1476,7 @@ class Tile(object):
                 try:
                     chunk, chunk_img, start_x, start_y = future.result()
                     if chunk_img:
-                        # PHASE 2 FIX #6: Validate coordinates before paste
-                        if start_x >= 0 and start_y >= 0:
-                            if not new_im.paste(chunk_img, (start_x, start_y)):
-                                log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
-                        else:
-                            log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
+                        _safe_paste(new_im, chunk_img, start_x, start_y)
                 except Exception as exc:
                     log.error(f"Chunk processing failed: {exc}")
             
@@ -1504,12 +1499,7 @@ class Tile(object):
                     try:
                         chunk, chunk_img, start_x, start_y = future.result()
                         if chunk_img:
-                            # PHASE 2 FIX #6: Validate coordinates before paste
-                            if start_x >= 0 and start_y >= 0:
-                                if not new_im.paste(chunk_img, (start_x, start_y)):
-                                    log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
-                            else:
-                                log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
+                            _safe_paste(new_im, chunk_img, start_x, start_y)
                         else:
                             bump('chunk_missing_count')
                     except Exception as exc:

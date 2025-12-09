@@ -23,8 +23,19 @@ def cleanup_mountpoint(mountpoint):
 
 
 def _is_nuitka_compiled() -> bool:
-    # Nuitka exposes __compiled__ on the module that was compiled.
+    """
+    Check if running as a frozen/compiled application.
+    
+    Works with both Nuitka and PyInstaller:
+    - Nuitka sets __compiled__ on main module
+    - PyInstaller sets sys.frozen = True
+    - Both set sys.frozen for compatibility
+    """
     import sys
+    # Check sys.frozen first (works for both PyInstaller and Nuitka)
+    if getattr(sys, 'frozen', False):
+        return True
+    # Fallback: check Nuitka-specific __compiled__ attribute
     m = sys.modules.get("__main__")
     return bool(getattr(m, "__compiled__", False))
 

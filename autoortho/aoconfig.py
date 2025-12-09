@@ -108,8 +108,6 @@ missing_color = [66, 77, 55]
 compressor = ISPC
 # BC1 or BC3 for dxt1 or dxt5 respectively
 format = BC1
-# Maximum number of concurrent JPEG decode threads (default: CPU count)
-max_decode_concurrency = {os.cpu_count() or 1}
 
 [scenery]
 # Don't cleanup downloads
@@ -154,8 +152,13 @@ prefer_winfsp = True
 
         # Always load initially
         self.ready = self.load()
-        # Save to update new defaults
-        self.save()
+        
+        # Save to update new defaults, but ONLY in the main process.
+        # macfuse worker subprocesses must NOT save config to avoid race conditions
+        # that can overwrite the main process's configuration and reset user settings.
+        # Workers are identified by the AO_RUN_MODE environment variable set during launch.
+        if os.environ.get("AO_RUN_MODE") != "macfuse_worker":
+            self.save()
 
 
     def load(self):
@@ -302,14 +305,15 @@ prefer_winfsp = True
             log.info(f"Creating dir {self.ao_scenery_path}")
             os.makedirs(self.ao_scenery_path)
 
-        # If we patched any values during load, persist them now so next run is stable
+        # If we patched any values during load, persist them now so next run is stable.
+        # Only save in the main process - workers must not write config files.
         if getattr(self, "_patched_during_load", False):
-            try:
-                self.save()
-            except Exception as e:
-                log.error(f"Failed to persist patched config defaults: {e}")
-            finally:
-                self._patched_during_load = False
+            if os.environ.get("AO_RUN_MODE") != "macfuse_worker":
+                try:
+                    self.save()
+                except Exception as e:
+                    log.error(f"Failed to persist patched config defaults: {e}")
+            self._patched_during_load = False
         return
 
 

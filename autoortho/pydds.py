@@ -29,19 +29,29 @@ class rgba_surface(Structure):
         ('stride', c_uint32)
     ]
 
-#_stb = CDLL("/usr/lib/x86_64-linux-gnu/libstb.so")
+def _get_lib_base_path():
+    """Get base path for libraries, handling both dev and frozen (PyInstaller) modes."""
+    if getattr(sys, 'frozen', False):
+        # PyInstaller: libs are in autoortho/lib/<platform>/ relative to exe
+        return os.path.join(os.path.dirname(sys.executable), 'autoortho')
+    else:
+        # Development mode: libs are relative to this file
+        return os.path.dirname(os.path.realpath(__file__))
+
+_lib_base = _get_lib_base_path()
+
 if system_type == 'linux':
     print("Linux detected")
-    _stb_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'linux', 'lib_stb_dxt.so')
-    _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'linux', 'libispc_texcomp.so')
+    _stb_path = os.path.join(_lib_base, 'lib', 'linux', 'lib_stb_dxt.so')
+    _ispc_path = os.path.join(_lib_base, 'lib', 'linux', 'libispc_texcomp.so')
 elif system_type == 'windows':
     print("Windows detected")
-    _stb_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'windows', 'stb_dxt.dll')
-    _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'windows', 'ispc_texcomp.dll')
+    _stb_path = os.path.join(_lib_base, 'lib', 'windows', 'stb_dxt.dll')
+    _ispc_path = os.path.join(_lib_base, 'lib', 'windows', 'ispc_texcomp.dll')
 elif system_type == 'darwin':
     print("macOS detected")
     _stb_path = None
-    _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'macos', 'libispc_texcomp.dylib')
+    _ispc_path = os.path.join(_lib_base, 'lib', 'macos', 'libispc_texcomp.dylib')
 else:
     print("System is not supported")
     exit()

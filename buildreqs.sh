@@ -37,7 +37,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 echo "Upgrading pip and setuptools..."
 pip install -U pip setuptools
-echo "Installing build requirements (including nuitka)..."
+echo "Installing build requirements (including pyinstaller)..."
 pip install -r requirements-build.txt
 echo "Installing runtime requirements..."
 pip install -r requirements.txt
