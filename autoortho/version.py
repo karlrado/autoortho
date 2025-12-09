@@ -24,7 +24,7 @@ def _find_version_file():
         CUR_PATH = os.path.dirname(os.path.realpath(__file__))
         search_paths.append(os.path.join(CUR_PATH, '.version'))
 
-        # Path 2: In case of Nuitka standalone, try relative to
+        # Path 2: For frozen builds (PyInstaller/Nuitka), try relative to
         # sys.executable
         if getattr(sys, 'frozen', False):
             exe_dir = os.path.dirname(os.path.abspath(sys.executable))
@@ -57,5 +57,4 @@ def _find_version_file():
 
     return "unknown"
 
-# TODO: Remove this once the version file is working
-__version__ = "1.4.2" # _find_version_file()
+__version__ = _find_version_file()

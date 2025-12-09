@@ -1,5 +1,11 @@
 import os
 import sys
+import multiprocessing
+
+# CRITICAL: Must be called before ANY other code when frozen with PyInstaller
+# This handles the --multiprocessing-fork arguments that PyInstaller adds
+if getattr(sys, 'frozen', False):
+    multiprocessing.freeze_support()
 
 if os.environ.get("AO_RUN_MODE") == "macfuse_worker":
     # Absolute import is robust under Nuitka for the entry module
@@ -70,22 +76,25 @@ def _global_shutdown(signum=None, frame=None):
     except Exception:
         pass
 
-    # macOS sometimes leaves background workers around; if only daemon
-    # threads remain, or stubborn non-daemon threads won't join, force exit.
+    # Force exit if stubborn threads (like Flask server) won't terminate
+    # This applies to all platforms, not just macOS
     try:
         remaining = [
             t for t in threading.enumerate()
             if t is not threading.current_thread()
         ]
         non_daemons = [t for t in remaining if not t.daemon]
-        if system_type == "darwin" and non_daemons:
+        if non_daemons:
             log.warning(
-                "Force exiting on macOS; non-daemon threads still alive: %s",
+                "Force exiting; non-daemon threads still alive: %s",
                 [t.name for t in non_daemons],
             )
             os._exit(0)
     except Exception:
         pass
+    
+    # Final fallback - force exit after cleanup
+    os._exit(0)
 
 
 # Register the hooks as early as possible

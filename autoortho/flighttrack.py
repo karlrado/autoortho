@@ -21,7 +21,9 @@ RUNNING=True
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app)
+# Explicitly set async_mode='threading' for compatibility with PyInstaller frozen apps
+# Auto-detection fails in frozen environments
+socketio = SocketIO(app, async_mode='threading')
 
 
 class FlightTracker(object):

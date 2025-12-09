@@ -15,3 +15,4 @@ downloads/
 release/
 *.bin
 .version
+dist/

@@ -270,15 +270,34 @@ def open(filename):
     return new
 
 # init code
-if system_type == 'linux':
-    _aoi_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'aoimage.so')
-elif system_type == 'windows':
-    _aoi_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'aoimage.dll')
-elif system_type == 'darwin':
-    _aoi_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'aoimage.dylib')
-else:
-    log.error("System is not supported")
-    exit()
+def _get_aoimage_path():
+    """Get path to aoimage library, handling both dev and frozen (PyInstaller) modes."""
+    if system_type == 'linux':
+        lib_name = 'aoimage.so'
+    elif system_type == 'windows':
+        lib_name = 'aoimage.dll'
+    elif system_type == 'darwin':
+        lib_name = 'aoimage.dylib'
+    else:
+        log.error("System is not supported")
+        sys.exit(1)
+    
+    # Check if running as PyInstaller frozen executable
+    if getattr(sys, 'frozen', False):
+        # PyInstaller: library is in autoortho/aoimage/ relative to exe
+        base_path = os.path.dirname(sys.executable)
+        lib_path = os.path.join(base_path, 'autoortho', 'aoimage', lib_name)
+        if os.path.exists(lib_path):
+            return lib_path
+        # Fallback: check same directory as exe
+        lib_path = os.path.join(base_path, lib_name)
+        if os.path.exists(lib_path):
+            return lib_path
+    
+    # Development mode: library is next to this file
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), lib_name)
+
+_aoi_path = _get_aoimage_path()
 
 # Load C library with error handling to prevent silent crashes
 try:
