@@ -135,6 +135,5 @@ serve_docs:
 
 clean:
 	rm -rf AutoOrtho.app *.zip *.tar.gz *.bin build dist __main__.dist autoortho_release
-	rm -rf *.build *.onefile-build
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find . -type f -name "*.pyc" -delete 2>/dev/null || true

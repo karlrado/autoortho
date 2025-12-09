@@ -117,3 +117,51 @@ results.
 Higher zoom levels will lead to increased resource usage and longer delays
 initially starting up flights.
 
+
+# Building from Source
+
+## Build System
+
+AutoOrtho uses **PyInstaller** to create standalone executables for all platforms (Linux, Windows, macOS). PyInstaller bundles the Python interpreter and all dependencies into a single distributable package.
+
+## Requirements
+
+Install build dependencies:
+```bash
+pip install -r requirements.txt
+pip install -r requirements-build.txt
+```
+
+## Building
+
+The `Makefile` provides targets for each platform:
+
+```bash
+# Linux (creates .tar.gz)
+make lin_tar VERSION=1.0.0
+
+# macOS (creates .app bundle and .zip)
+make mac_app VERSION=1.0.0
+make mac_zip VERSION=1.0.0
+
+# Windows (creates installer .exe and .zip)
+make win_exe VERSION=1.0.0
+make win_zip VERSION=1.0.0
+```
+
+## Output Structure
+
+PyInstaller creates a bundled application with the following structure:
+
+- **Executable**: The main binary (`autoortho`, `autoortho.exe`)
+- **`ao_files/` folder**: Contains the Python runtime, compiled bytecode, and all dependencies
+
+The `ao_files` folder is essential for the application to run. It replaces PyInstaller's default `_internal` folder with a more descriptive name.
+
+## Development
+
+To run from source without building:
+```bash
+python -m autoortho
+```
+
