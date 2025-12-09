@@ -15,14 +15,18 @@ autoortho/.version:
 # =============================================================================
 # Linux Build (PyInstaller)
 # =============================================================================
-lin_bin: autoortho_linux_$(SAFE_VERSION).bin
-autoortho_linux_$(SAFE_VERSION).bin: autoortho/*.py autoortho/.version
+lin_bin: autoortho_linux_$(SAFE_VERSION)
+autoortho_linux_$(SAFE_VERSION): autoortho/*.py autoortho/.version
 	docker run --rm -v `pwd`:/code ubuntu:latest /bin/bash -c "cd /code; ./buildreqs.sh; . .venv/bin/activate; time make bin VERSION=$(VERSION)"
-	mv autoortho_lin.bin $@
+	# Rename output folder to versioned name
+	rm -rf $@
+	mv dist/autoortho $@
 
 lin_tar: autoortho_linux_$(SAFE_VERSION).tar.gz
-autoortho_linux_$(SAFE_VERSION).tar.gz: autoortho_linux_$(SAFE_VERSION).bin
-	chmod a+x $<
+autoortho_linux_$(SAFE_VERSION).tar.gz: autoortho_linux_$(SAFE_VERSION)
+	# Ensure executable is marked executable
+	chmod a+x $</autoortho
+	# Package entire folder (includes ao_files/ with all bundled dependencies)
 	tar -czf $@ $<
 
 bin: autoortho/.version
@@ -37,8 +41,6 @@ bin: autoortho/.version
 		--clean \
 		--log-level INFO \
 		autoortho.spec
-	# Move output for compatibility with existing scripts
-	mv dist/autoortho/autoortho autoortho_lin.bin || true
 
 # =============================================================================
 # macOS Build (PyInstaller)
@@ -134,5 +136,6 @@ serve_docs:
 
 clean:
 	rm -rf AutoOrtho.app *.zip *.tar.gz *.bin build dist __main__.dist autoortho_release
+	rm -rf autoortho_linux_* 2>/dev/null || true
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find . -type f -name "*.pyc" -delete 2>/dev/null || true
