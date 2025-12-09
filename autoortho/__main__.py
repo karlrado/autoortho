@@ -168,11 +168,28 @@ def setuplogs():
 try:
     if system_type == 'linux' and "SSL_CERT_DIR" not in os.environ:
             os.environ["SSL_CERT_DIR"] = "/etc/ssl/certs"
-    if system_type == "darwin" and ".app" in sys.argv[0]:
-        macos_dir = Path(sys.argv[0]).resolve().parents[0]  # .../Contents/MacOS
-        pem = macos_dir / "certifi" / "cacert.pem"
-        if pem.exists():
-            os.environ.setdefault("SSL_CERT_FILE", str(pem))
+    if system_type == "darwin":
+        # Try to find bundled certifi CA bundle for PyInstaller builds
+        # Check multiple possible locations
+        possible_paths = []
+        
+        if getattr(sys, 'frozen', False):
+            # PyInstaller bundle - check relative to executable
+            exe_dir = Path(sys.executable).resolve().parent
+            possible_paths.append(exe_dir / "certifi" / "cacert.pem")
+            # Also check in _MEIPASS (PyInstaller temp directory)
+            if hasattr(sys, '_MEIPASS'):
+                possible_paths.append(Path(sys._MEIPASS) / "certifi" / "cacert.pem")
+        
+        # Try .app bundle location
+        if ".app" in sys.argv[0]:
+            macos_dir = Path(sys.argv[0]).resolve().parents[0]
+            possible_paths.append(macos_dir / "certifi" / "cacert.pem")
+        
+        for pem in possible_paths:
+            if pem.exists():
+                os.environ.setdefault("SSL_CERT_FILE", str(pem))
+                break
 except Exception:
     pass
 
@@ -185,16 +202,27 @@ if __name__ == "__main__":
     except Exception as _fatal_err:
         import traceback
         logging.getLogger(__name__).exception("Fatal error during startup: %s", _fatal_err)
+        log_path = os.path.join(os.path.expanduser("~"), ".autoortho-data", "logs", "autoortho.log")
+        msg = (
+            "AutoOrtho failed to start.\n\n"
+            + str(_fatal_err)
+            + "\n\nSee log for details:\n"
+            + log_path
+        )
         try:
             if os.name == "nt":
                 import ctypes
-                log_path = os.path.join(os.path.expanduser("~"), ".autoortho-data", "logs", "autoortho.log")
-                msg = (
-                    "AutoOrtho failed to start.\n\n"
-                    + str(_fatal_err)
-                    + "\n\nSee log for details:\n"
-                    + log_path
-                )
                 ctypes.windll.user32.MessageBoxW(None, msg, "AutoOrtho Error", 0x00000010)
+            elif system_type == "darwin":
+                # Use osascript to show a native macOS dialog
+                import subprocess
+                apple_script = f'''
+                    display dialog "{msg.replace('"', '\\"').replace(chr(10), '\\n')}" ¬
+                    with title "AutoOrtho Error" ¬
+                    buttons {{"OK"}} ¬
+                    default button "OK" ¬
+                    with icon stop
+                '''
+                subprocess.run(['osascript', '-e', apple_script], capture_output=True)
         except Exception:
             pass

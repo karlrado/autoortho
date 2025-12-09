@@ -134,6 +134,15 @@ else:
 if os.path.exists(license_path):
     datas.append((license_path, f'autoortho/lib/{platform_name}/7zip'))
 
+# SSL Certificates (required for macOS - system certs not accessible in bundled app)
+if sys.platform == 'darwin':
+    import certifi
+    cacert_path = certifi.where()
+    if os.path.exists(cacert_path):
+        # Bundle certifi's CA bundle for SSL verification
+        datas.append((cacert_path, 'certifi'))
+        print(f"Bundling SSL certificates from: {cacert_path}")
+
 # =============================================================================
 # Hidden imports (modules that PyInstaller might miss)
 # =============================================================================
