@@ -28,7 +28,7 @@ import winsetup
 import macsetup
 from utils.mount_utils import (
     cleanup_mountpoint,
-    _is_nuitka_compiled,
+    _is_frozen,
     is_only_ao_placeholder,
     clear_ao_placeholder,
 )
@@ -410,8 +410,8 @@ class AOMount:
 
         env['AO_RUN_MODE'] = 'macfuse_worker'
 
-        # Build the argv. In Nuitka, re-exec the app binary. In dev, run the module.
-        if _is_nuitka_compiled():
+        # Build the argv. When frozen (PyInstaller), re-exec the app binary. In dev, run the module.
+        if _is_frozen():
             cmd = [sys.executable]
         else:
             cmd = [sys.executable, "-m", "autoortho"]
@@ -423,7 +423,7 @@ class AOMount:
         if nothreads:
             cmd.append("--nothreads")
 
-        log.debug("Launching worker: compiled=%s exe=%s cmd=%s", _is_nuitka_compiled(), sys.executable, cmd)
+        log.debug("Launching worker: frozen=%s exe=%s cmd=%s", _is_frozen(), sys.executable, cmd)
 
         log_dir = Path.home() / ".autoortho-data" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)

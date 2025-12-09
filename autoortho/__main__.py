@@ -8,7 +8,6 @@ if getattr(sys, 'frozen', False):
     multiprocessing.freeze_support()
 
 if os.environ.get("AO_RUN_MODE") == "macfuse_worker":
-    # Absolute import is robust under Nuitka for the entry module
     from macfuse_worker import main as _ao_worker_main
     _ao_worker_main()
     os._exit(0)
