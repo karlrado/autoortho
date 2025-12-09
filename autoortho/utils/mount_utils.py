@@ -22,22 +22,15 @@ def cleanup_mountpoint(mountpoint):
         Path(placeholder_path).touch()
 
 
-def _is_nuitka_compiled() -> bool:
+def _is_frozen() -> bool:
     """
-    Check if running as a frozen/compiled application.
+    Check if running as a frozen/compiled application (PyInstaller).
     
-    Works with both Nuitka and PyInstaller:
-    - Nuitka sets __compiled__ on main module
-    - PyInstaller sets sys.frozen = True
-    - Both set sys.frozen for compatibility
+    PyInstaller sets sys.frozen = True when running as a bundled executable.
+    This is used to determine how to launch subprocess workers.
     """
     import sys
-    # Check sys.frozen first (works for both PyInstaller and Nuitka)
-    if getattr(sys, 'frozen', False):
-        return True
-    # Fallback: check Nuitka-specific __compiled__ attribute
-    m = sys.modules.get("__main__")
-    return bool(getattr(m, "__compiled__", False))
+    return getattr(sys, 'frozen', False)
 
 
 def is_only_ao_placeholder(mountpoint: str) -> bool:

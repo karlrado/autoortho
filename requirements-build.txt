@@ -8,8 +8,3 @@
 pyinstaller>=6.17.0
     # Primary build tool - creates standalone executables
     # Uses real CPython interpreter for maximum compatibility
-
-# Optional: Keep nuitka as alternative (comment out if not needed)
-# nuitka==2.8.6
-# ordered-set==4.1.0
-# zstandard==0.24.0
