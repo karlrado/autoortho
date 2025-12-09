@@ -71,8 +71,12 @@ Assumptions:
 1. If you haven't install MacFuse or Fuse-T. Fuse-T was used for testing the mac binary but both should work.
 2. Download the most recent packaged release (autortho_mac_####.zip) [from here](https://github.com/ProgrammingDinosaur/autoortho/releases/latest)
 3. Unzip on the location you want.
-3. Run the program `AutoOrtho.App`
-4. **Important** This program is currently unsigned, a warning will appear on first run, you need to go into Settings -> Privacy and Security -> Allow `AutoOrtho.App` execution -> Open Anyway.
+4. **Important - Remove Quarantine:** Since this app is unsigned, macOS will block it. Before first run:
+   * **Easy way:** Double-click the included `fix_macos_quarantine.command` script
+   * **Or manually:** Open Terminal and run: `xattr -cr /path/to/AutoOrtho.app`
+   * If you see "Error -47" when launching, this is the quarantine block - run the fix script
+5. Run the program `AutoOrtho.App`
+6. If you still see a security warning: Right-click → Open → Open Anyway, or go to Settings → Privacy and Security → Allow AutoOrtho execution.
 5. Configure your settings and paths for your system 
 6. Download and setup an ortho set from the 'Scenery' tab.
 7. Click 'Run' to run the program

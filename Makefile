@@ -83,7 +83,11 @@ AutoOrtho.app: mac_dist
 mac_app: AutoOrtho.app
 
 AutoOrtho_mac_$(SAFE_VERSION).zip: AutoOrtho.app
-	$(ZIP) -r $@ AutoOrtho.app
+	# Include the quarantine fix script alongside the app
+	cp scripts/fix_macos_quarantine.command . 2>/dev/null || true
+	chmod +x fix_macos_quarantine.command 2>/dev/null || true
+	$(ZIP) -r $@ AutoOrtho.app fix_macos_quarantine.command
+	rm -f fix_macos_quarantine.command
 mac_zip: AutoOrtho_mac_$(SAFE_VERSION).zip
 
 # =============================================================================
