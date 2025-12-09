@@ -19,7 +19,7 @@ autoortho/.version:
 lin_bin: autoortho_lin_$(SAFE_VERSION)_${CODE_NAME}.bin
 autoortho_lin_$(SAFE_VERSION)_${CODE_NAME}.bin: autoortho/*.py autoortho/.version
 	docker run --rm -v `pwd`:/code ubuntu:${CODE_NAME} /bin/bash -c "cd /code; ./buildreqs.sh; . .venv/bin/activate; time make bin VERSION=$(VERSION)"
-	mv dist/autoortho/autoortho $@
+	mv autoortho_lin.bin $@
 
 lin_tar: autoortho_linux_$(SAFE_VERSION)_${CODE_NAME}.tar.gz
 autoortho_linux_$(SAFE_VERSION)_${CODE_NAME}.tar.gz: autoortho_lin_$(SAFE_VERSION)_${CODE_NAME}.bin
