@@ -8,10 +8,10 @@ out.dds
 **/libjpeg-turbo-gcc64
 tags
 __main__.*
-autoortho.*
 build/
 cache/
 downloads/
 release/
 *.bin
 .version
+dist/

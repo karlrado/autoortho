@@ -1,5 +1,6 @@
 """module to handle dsf files"""
 import os
+import sys
 import json
 import shutil
 import subprocess
@@ -100,7 +101,13 @@ class DsfUtils:
             lib_subfolder = "macos"
         else:
             raise ValueError(f"Unsupported system type: {system_type}")
-        base_dir = os.path.dirname(os.path.dirname(__file__))
+        
+        # Handle PyInstaller frozen mode
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            base_dir = os.path.join(sys._MEIPASS, 'autoortho')
+        else:
+            base_dir = os.path.dirname(os.path.dirname(__file__))
+        
         binary_name = "DSFTool.exe" if system_type == "windows" else "DSFTool"
         return os.path.join(base_dir, "lib", lib_subfolder, binary_name)
 
@@ -113,7 +120,13 @@ class DsfUtils:
             lib_dir = "macos/7zip/7zz"
         else:
             raise ValueError(f"Unsupported system type: {system_type}")
-        base_dir = os.path.dirname(os.path.dirname(__file__))
+        
+        # Handle PyInstaller frozen mode
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            base_dir = os.path.join(sys._MEIPASS, 'autoortho')
+        else:
+            base_dir = os.path.dirname(os.path.dirname(__file__))
+        
         return os.path.join(base_dir, "lib", lib_dir)
 
     def get_dsf_folder_location(self, dsf_folder, dsf_filename):
