@@ -1,9 +1,35 @@
 import os
+import sys
 import logging
 import shutil
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+
+def safe_ismount(path: str) -> bool:
+    """
+    Safe wrapper for os.path.ismount() that handles Windows-specific exceptions.
+    
+    On Windows, os.path.ismount() can raise OSError [WinError 123] for paths that
+    don't exist yet or contain certain characters (e.g., paths with spaces).
+    This function catches such exceptions and returns False instead.
+    
+    Args:
+        path: The path to check for mount status.
+        
+    Returns:
+        True if the path is a mount point, False otherwise (including error cases).
+    """
+    try:
+        return os.path.ismount(path)
+    except OSError as e:
+        # WinError 123: "The filename, directory name, or volume label syntax is incorrect"
+        # This can happen on Windows for paths that don't exist or have unusual formats
+        if sys.platform == 'win32':
+            log.debug(f"safe_ismount: os.path.ismount({path!r}) raised OSError: {e}")
+            return False
+        raise
 
 
 _IGNORE_FILES = {".DS_Store", ".metadata_never_index"}
@@ -14,7 +40,7 @@ def cleanup_mountpoint(mountpoint):
     if os.path.lexists(mountpoint):
         log.info(f"Cleaning up mountpoint: {mountpoint}")
         os.rmdir(mountpoint)
-    if os.path.ismount(mountpoint):
+    if safe_ismount(mountpoint):
         log.debug(f"Skipping cleanup: still mounted: {mountpoint}")
     else:
         for d in ('Earth nav data', 'terrain', 'textures'):
@@ -29,7 +55,6 @@ def _is_frozen() -> bool:
     PyInstaller sets sys.frozen = True when running as a bundled executable.
     This is used to determine how to launch subprocess workers.
     """
-    import sys
     return getattr(sys, 'frozen', False)
 
 

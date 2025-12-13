@@ -1,5 +1,7 @@
 import os
 import logging
+from utils.mount_utils import safe_ismount
+
 log = logging.getLogger(__name__)
 
 _IGNORE_FILES = {".DS_Store", ".metadata_never_index"}
@@ -45,7 +47,7 @@ def setup_macfuse_mount(path):
         return False
 
     if os.path.lexists(real):
-        if os.path.ismount(real):
+        if safe_ismount(real):
             log.warning(f"Mount point {path} is already mounted")
             return False
         if not os.path.isdir(real):
