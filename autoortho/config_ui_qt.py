@@ -17,7 +17,7 @@ import utils.resources_rc
 from utils.constants import MAPTYPES, system_type
 from utils.mappers import map_kubilus_region_to_simheaven_region
 from utils.dsf_utils import DsfUtils, dsf_utils
-from utils.mount_utils import cleanup_mountpoint
+from utils.mount_utils import cleanup_mountpoint, safe_ismount
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -2134,7 +2134,9 @@ class ConfigUI(QMainWindow):
                 "Invalid Zoom Settings",
                 "Maximum zoom level to near airports must be greater or equal to maximum zoom level."
             )
+            self.max_zoom_near_airports_slider.blockSignals(True)
             self.max_zoom_near_airports_slider.setValue(self.max_zoom_slider.value())
+            self.max_zoom_near_airports_slider.blockSignals(False)
             self.max_zoom_near_airports_label.setText(f"{self.max_zoom_slider.value()}")
 
     def validate_min_and_max_zoom(
@@ -2149,10 +2151,14 @@ class ConfigUI(QMainWindow):
             )
             if instigator == "min":
                 current_value = int(self.min_zoom_label.text())
+                self.min_zoom_slider.blockSignals(True)
                 self.min_zoom_slider.setValue(current_value)
+                self.min_zoom_slider.blockSignals(False)
             elif instigator == "max":
                 current_value = int(self.max_zoom_label.text())
+                self.max_zoom_slider.blockSignals(True)
                 self.max_zoom_slider.setValue(current_value)
+                self.max_zoom_slider.blockSignals(False)
             else:
                 raise ValueError(f"Invalid instigator: {instigator}")
         else:
@@ -2161,7 +2167,9 @@ class ConfigUI(QMainWindow):
             elif instigator == "max":
                 self.max_zoom_label.setText(f"{self.max_zoom_slider.value()}")
                 if self.max_zoom_near_airports_slider.value() < self.max_zoom_slider.value():
+                    self.max_zoom_near_airports_slider.blockSignals(True)
                     self.max_zoom_near_airports_slider.setValue(self.max_zoom_slider.value())
+                    self.max_zoom_near_airports_slider.blockSignals(False)
                     self.max_zoom_near_airports_label.setText(f"{self.max_zoom_slider.value()}")
             else:
                 raise ValueError(f"Invalid instigator: {instigator}")
@@ -2827,11 +2835,8 @@ class ConfigUI(QMainWindow):
                 mount = scenery.get('mount')
                 if not mount:
                     continue
-                try:
-                    if os.path.ismount(mount):
-                        lingering.append(mount)
-                except Exception:
-                    continue
+                if safe_ismount(mount):
+                    lingering.append(mount)
             if not lingering:
                 return True
 
@@ -2863,10 +2868,10 @@ class ConfigUI(QMainWindow):
             import time as _time
             deadline = _time.time() + 10
             while _time.time() < deadline:
-                if not any(os.path.ismount(x) for x in lingering):
+                if not any(safe_ismount(x) for x in lingering):
                     break
                 _time.sleep(0.3)
-            if any(os.path.ismount(x) for x in lingering):
+            if any(safe_ismount(x) for x in lingering):
                 QMessageBox.warning(
                     self,
                     "Unmount Incomplete",

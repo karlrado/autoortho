@@ -31,6 +31,7 @@ from utils.mount_utils import (
     _is_frozen,
     is_only_ao_placeholder,
     clear_ao_placeholder,
+    safe_ismount,
 )
 from utils.constants import MAPTYPES, system_type
 
@@ -44,6 +45,7 @@ import geocoder
 # Import PyQt6 modules
 
 from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QIcon
 import config_ui_qt as config_ui
 USE_QT = True
 
@@ -109,7 +111,7 @@ def setupmount(mountpoint, systemtype):
     had_placeholder = False
 
     # Preflight: ensure mount dir is a directory and not currently mounted
-    if os.path.ismount(mountpoint):
+    if safe_ismount(mountpoint):
         log.warning(f"{mountpoint} is already mounted; attempting to unmount")
         try:
             if systemtype in ("winfsp-FUSE", "dokan-FUSE"):
@@ -140,10 +142,10 @@ def setupmount(mountpoint, systemtype):
         # Wait briefly for unmount to complete
         deadline = time.time() + 10
         while time.time() < deadline:
-            if not os.path.ismount(mountpoint):
+            if not safe_ismount(mountpoint):
                 break
             time.sleep(0.5)
-        if os.path.ismount(mountpoint):
+        if safe_ismount(mountpoint):
             raise MountError(f"{mountpoint} is already mounted")
     # For WinFsp, the directory must NOT exist; let winsetup handle removal of placeholders.
     if systemtype != "winfsp-FUSE":
@@ -808,11 +810,11 @@ class AOMount:
         if not force:
             deadline = time.time() + 10
             while time.time() < deadline:
-                if not os.path.ismount(mountpoint):
+                if not safe_ismount(mountpoint):
                     break
                 time.sleep(0.5)
 
-        if os.path.ismount(mountpoint):
+        if safe_ismount(mountpoint):
             try:
                 import subprocess
                 if system_type == 'darwin':
@@ -926,6 +928,16 @@ def main():
         log.info("Running CFG UI")
         if USE_QT:
             app = QApplication(sys.argv)
+            
+            # Set application icon - required for macOS dock icon visibility
+            if system_type == 'darwin':
+                # Use native macOS icon format
+                app.setWindowIcon(QIcon(":/imgs/ao-icon.icns"))
+            elif system_type == 'windows':
+                app.setWindowIcon(QIcon(":/imgs/ao-icon.ico"))
+            else:
+                app.setWindowIcon(QIcon(":/imgs/ao-icon.png"))
+            
             cfgui = AOMountUI(CFG)
             cfgui.show()
             app.exec()

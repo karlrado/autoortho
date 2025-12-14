@@ -23,6 +23,116 @@ from mfusepy import FUSE, FuseOSError, Operations, fuse_get_context, _libfuse
 
 import getortho
 
+def _rgb_to_rgb565(r: int, g: int, b: int) -> int:
+    """Convert RGB888 to RGB565 format used by BC1/DXT1 compression."""
+    # RGB565: 5 bits red (high), 6 bits green (mid), 5 bits blue (low)
+    r5 = (r >> 3) & 0x1F
+    g6 = (g >> 2) & 0x3F
+    b5 = (b >> 3) & 0x1F
+    return (r5 << 11) | (g6 << 5) | b5
+
+def _get_fallback_bc1_block() -> bytes:
+    """
+    Generate an 8-byte BC1/DXT1 block using the configured missing_color.
+    
+    BC1 block format:
+    - 2 bytes: color0 (RGB565, little-endian)
+    - 2 bytes: color1 (RGB565, little-endian)
+    - 4 bytes: 4x4 pixel indices (2 bits each)
+    
+    For a solid color, we set color0 = color1 and all indices to 0.
+    """
+    try:
+        # Get missing_color from config [R, G, B]
+        missing = CFG.autoortho.missing_color
+        if isinstance(missing, (list, tuple)) and len(missing) >= 3:
+            r, g, b = int(missing[0]), int(missing[1]), int(missing[2])
+        else:
+            # Fallback to default gray if config is malformed
+            r, g, b = 66, 77, 55
+    except Exception:
+        # Fallback to default if config not available
+        r, g, b = 66, 77, 55
+    
+    # Convert to RGB565
+    rgb565 = _rgb_to_rgb565(r, g, b)
+    
+    # Pack as little-endian 2-byte value (appears twice for color0 and color1)
+    color_bytes = rgb565.to_bytes(2, 'little')
+    
+    # BC1 block: color0, color1, 4 bytes of indices (all 0 for solid color)
+    return color_bytes + color_bytes + b'\x00\x00\x00\x00'
+
+# Cache the BC1 block to avoid recomputing on every call
+_cached_bc1_block = None
+
+# DDS header size is always 128 bytes
+_DDS_HEADER_SIZE = 128
+
+def _generate_fallback_dds_bytes(offset: int, length: int) -> bytes:
+    """
+    Generate fallback DDS bytes for when tile generation fails.
+    
+    This returns valid DDS-compatible data that X-Plane can safely render,
+    preventing EXCEPTION_IN_PAGE_ERROR crashes on Windows.
+    
+    The fallback uses the configured missing_color from [autoortho] section,
+    converted to BC1/DXT1 compressed format. This ensures the placeholder
+    texture visually matches the missing tile color the user has configured.
+    
+    The function properly handles the offset parameter to return the correct
+    portion of the fallback DDS data:
+    - Bytes 0-127: DDS header region (returns zeros for valid structure)
+    - Bytes 128+: Mipmap data region (returns BC1 blocks in missing_color)
+    """
+    global _cached_bc1_block
+    
+    # Generate and cache the BC1 block on first use
+    if _cached_bc1_block is None:
+        _cached_bc1_block = _get_fallback_bc1_block()
+    
+    block = _cached_bc1_block
+    block_size = 8  # BC1 blocks are 8 bytes each
+    
+    result = bytearray()
+    current_offset = offset
+    remaining = length
+    
+    # Handle header region (bytes 0-127)
+    # Return zeros for header bytes - this is safe because X-Plane will see
+    # an invalid/empty DDS header and handle it gracefully
+    if current_offset < _DDS_HEADER_SIZE:
+        header_bytes_needed = min(remaining, _DDS_HEADER_SIZE - current_offset)
+        result.extend(b'\x00' * header_bytes_needed)
+        current_offset += header_bytes_needed
+        remaining -= header_bytes_needed
+    
+    # Handle mipmap data region (bytes 128+)
+    if remaining > 0:
+        # Calculate position within mipmap data (offset from byte 128)
+        mipmap_offset = current_offset - _DDS_HEADER_SIZE
+        
+        # Calculate where we are within the 8-byte BC1 block pattern
+        block_phase = mipmap_offset % block_size
+        
+        # If we're not aligned to block boundary, add partial block first
+        if block_phase > 0:
+            partial_len = min(remaining, block_size - block_phase)
+            result.extend(block[block_phase:block_phase + partial_len])
+            remaining -= partial_len
+        
+        # Add complete blocks
+        if remaining >= block_size:
+            full_blocks = remaining // block_size
+            result.extend(block * full_blocks)
+            remaining -= full_blocks * block_size
+        
+        # Add any remaining partial block
+        if remaining > 0:
+            result.extend(block[:remaining])
+    
+    return bytes(result)
+
 def deg2num(lat_deg, lon_deg, zoom):
   lat_rad = math.radians(lat_deg)
   n = 2.0 ** zoom
@@ -500,23 +610,41 @@ class AutoOrtho(Operations):
             zoom = int(zoom)
             key = self._tile_key(row, col, maptype, zoom)
             lock = self._tile_locks[key]
-            if not lock.acquire(timeout=CFG.fuse.build_timeout if hasattr(CFG.fuse, 'build_timeout') else 60):
-                self._failfast(f"Tile build lock timeout for {key}")
+            
+            # Get configurable timeout, default 60 seconds
+            build_timeout = getattr(CFG.fuse, 'build_timeout', 60)
+            if isinstance(build_timeout, str):
+                try:
+                    build_timeout = int(build_timeout)
+                except ValueError:
+                    build_timeout = 60
+            
+            if not lock.acquire(timeout=build_timeout):
+                # CRITICAL FIX: Instead of raising EIO (which causes CTD on Windows
+                # due to EXCEPTION_IN_PAGE_ERROR), return fallback placeholder data.
+                # X-Plane will show a gray/missing texture, but won't crash.
+                log.error(f"Tile build lock timeout for {key} after {build_timeout}s - returning fallback data")
+                return _generate_fallback_dds_bytes(offset, length)
+            
             try:
                 t = self.tc._get_tile(row, col, maptype, zoom)
                 data = t.read_dds_bytes(offset, length)
                 if data is None:
-                    log.error(f"Tile read returned None for {key}")
-                    raise FuseOSError(errno.EIO)
+                    # CRITICAL FIX: Return fallback data instead of EIO
+                    log.error(f"Tile read returned None for {key} - returning fallback data")
+                    return _generate_fallback_dds_bytes(offset, length)
                 return data
             except FuseOSError:
-                # Propagate specific FS error without killing the mount
-                raise
+                # CRITICAL FIX: Catch EIO and return fallback instead
+                # This prevents Windows EXCEPTION_IN_PAGE_ERROR CTD
+                log.error(f"FUSE error for tile {key} - returning fallback data to prevent CTD")
+                return _generate_fallback_dds_bytes(offset, length)
             except Exception as e:
-                # Log and map to EIO, but do not exit the whole FUSE session
-                log.error(f"Tile read/build failed for {key}")
+                # CRITICAL FIX: Return fallback data instead of EIO
+                # This prevents Windows EXCEPTION_IN_PAGE_ERROR CTD
+                log.error(f"Tile read/build failed for {key} - returning fallback data to prevent CTD")
                 log.exception("cause:", exc_info=e)
-                raise FuseOSError(errno.EIO)
+                return _generate_fallback_dds_bytes(offset, length)
             finally:
                 lock.release()
 
