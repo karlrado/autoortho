@@ -7,29 +7,34 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
-def safe_ismount(path: str) -> bool:
+def safe_ismount(path) -> bool:
     """
-    Safe wrapper for os.path.ismount() that handles Windows-specific exceptions.
+    Safe wrapper for os.path.ismount() that handles exceptions gracefully.
     
     On Windows, os.path.ismount() can raise OSError [WinError 123] for paths that
     don't exist yet or contain certain characters (e.g., paths with spaces).
-    This function catches such exceptions and returns False instead.
+    This function also handles TypeError for None or invalid path types.
     
     Args:
-        path: The path to check for mount status.
+        path: The path to check for mount status. Can be str, bytes, or path-like.
+              None or invalid types are handled gracefully.
         
     Returns:
         True if the path is a mount point, False otherwise (including error cases).
     """
+    # Handle None or empty paths before calling os.path.ismount
+    if path is None:
+        return False
+    
     try:
         return os.path.ismount(path)
-    except OSError as e:
-        # WinError 123: "The filename, directory name, or volume label syntax is incorrect"
-        # This can happen on Windows for paths that don't exist or have unusual formats
-        if sys.platform == 'win32':
-            log.debug(f"safe_ismount: os.path.ismount({path!r}) raised OSError: {e}")
-            return False
-        raise
+    except (OSError, TypeError, ValueError) as e:
+        # OSError: WinError 123 "The filename, directory name, or volume label syntax is incorrect"
+        #          Can happen on Windows for paths that don't exist or have unusual formats
+        # TypeError: Raised if path is not a valid path type (e.g., int, object)
+        # ValueError: Raised for embedded null characters or other invalid path values
+        log.debug(f"safe_ismount: os.path.ismount({path!r}) raised {type(e).__name__}: {e}")
+        return False
 
 
 _IGNORE_FILES = {".DS_Store", ".metadata_never_index"}

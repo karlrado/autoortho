@@ -66,6 +66,9 @@ def _get_fallback_bc1_block() -> bytes:
 # Cache the BC1 block to avoid recomputing on every call
 _cached_bc1_block = None
 
+# DDS header size is always 128 bytes
+_DDS_HEADER_SIZE = 128
+
 def _generate_fallback_dds_bytes(offset: int, length: int) -> bytes:
     """
     Generate fallback DDS bytes for when tile generation fails.
@@ -76,6 +79,11 @@ def _generate_fallback_dds_bytes(offset: int, length: int) -> bytes:
     The fallback uses the configured missing_color from [autoortho] section,
     converted to BC1/DXT1 compressed format. This ensures the placeholder
     texture visually matches the missing tile color the user has configured.
+    
+    The function properly handles the offset parameter to return the correct
+    portion of the fallback DDS data:
+    - Bytes 0-127: DDS header region (returns zeros for valid structure)
+    - Bytes 128+: Mipmap data region (returns BC1 blocks in missing_color)
     """
     global _cached_bc1_block
     
@@ -83,22 +91,47 @@ def _generate_fallback_dds_bytes(offset: int, length: int) -> bytes:
     if _cached_bc1_block is None:
         _cached_bc1_block = _get_fallback_bc1_block()
     
-    # BC1 blocks are 8 bytes each
     block = _cached_bc1_block
-    block_size = 8
+    block_size = 8  # BC1 blocks are 8 bytes each
     
-    # Calculate how many complete blocks and remaining bytes we need
-    full_blocks = length // block_size
-    remainder = length % block_size
+    result = bytearray()
+    current_offset = offset
+    remaining = length
     
-    # Build the output efficiently
-    if full_blocks > 0:
-        result = block * full_blocks
-        if remainder > 0:
-            result += block[:remainder]
-        return result
-    else:
-        return block[:length]
+    # Handle header region (bytes 0-127)
+    # Return zeros for header bytes - this is safe because X-Plane will see
+    # an invalid/empty DDS header and handle it gracefully
+    if current_offset < _DDS_HEADER_SIZE:
+        header_bytes_needed = min(remaining, _DDS_HEADER_SIZE - current_offset)
+        result.extend(b'\x00' * header_bytes_needed)
+        current_offset += header_bytes_needed
+        remaining -= header_bytes_needed
+    
+    # Handle mipmap data region (bytes 128+)
+    if remaining > 0:
+        # Calculate position within mipmap data (offset from byte 128)
+        mipmap_offset = current_offset - _DDS_HEADER_SIZE
+        
+        # Calculate where we are within the 8-byte BC1 block pattern
+        block_phase = mipmap_offset % block_size
+        
+        # If we're not aligned to block boundary, add partial block first
+        if block_phase > 0:
+            partial_len = min(remaining, block_size - block_phase)
+            result.extend(block[block_phase:block_phase + partial_len])
+            remaining -= partial_len
+        
+        # Add complete blocks
+        if remaining >= block_size:
+            full_blocks = remaining // block_size
+            result.extend(block * full_blocks)
+            remaining -= full_blocks * block_size
+        
+        # Add any remaining partial block
+        if remaining > 0:
+            result.extend(block[:remaining])
+    
+    return bytes(result)
 
 def deg2num(lat_deg, lon_deg, zoom):
   lat_rad = math.radians(lat_deg)
