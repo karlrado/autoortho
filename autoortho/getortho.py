@@ -1495,17 +1495,26 @@ class Tile(object):
                     processed_chunks.add(id(chunk))
                 
                 # Process results as they complete (parallel, not serial)
-                for future in concurrent.futures.as_completed(unprocessed_futures.keys(), timeout=10):
-                    try:
-                        chunk, chunk_img, start_x, start_y = future.result()
-                        if chunk_img:
-                            _safe_paste(new_im, chunk_img, start_x, start_y)
-                        else:
+                # Use try-except to handle TimeoutError gracefully instead of crashing
+                try:
+                    for future in concurrent.futures.as_completed(unprocessed_futures.keys(), timeout=10):
+                        try:
+                            chunk, chunk_img, start_x, start_y = future.result()
+                            if chunk_img:
+                                _safe_paste(new_im, chunk_img, start_x, start_y)
+                            else:
+                                bump('chunk_missing_count')
+                        except Exception as exc:
+                            chunk = unprocessed_futures.get(future, "unknown")
+                            log.debug(f"Fallback failed for unprocessed chunk {chunk}: {exc}")
                             bump('chunk_missing_count')
-                    except Exception as exc:
-                        chunk = unprocessed_futures.get(future, "unknown")
-                        log.debug(f"Fallback failed for unprocessed chunk {chunk}: {exc}")
-                        bump('chunk_missing_count')
+                except TimeoutError:
+                    # Some futures didn't complete in time - count them as missing
+                    # This prevents crashes when the system is overloaded
+                    unfinished_count = sum(1 for f in unprocessed_futures.keys() if not f.done())
+                    log.warning(f"Fallback processing timeout: {unfinished_count} chunks still pending, marking as missing")
+                    bump('chunk_missing_count', unfinished_count)
+                    bump('fallback_timeout_count')
                     
         finally:
             executor.shutdown(wait=True)
