@@ -25,8 +25,8 @@ if python3 -c 'import sys; exit(0) if sys.version_info.minor < 12 else exit(1)';
     export PYENV_ROOT="$HOME/.pyenv"
     [[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
     eval "$(pyenv init - bash)"
-    pyenv install 3.12.3
-    pyenv global 3.12.3
+    pyenv install 3.12.12
+    pyenv global 3.12.12
 fi
 echo "Using Python version: "
 python3 --version
