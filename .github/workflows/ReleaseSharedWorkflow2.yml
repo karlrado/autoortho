@@ -38,7 +38,10 @@ on:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
 
     env:
       VERNAME: ${{ inputs.version }} 
@@ -63,14 +66,14 @@ jobs:
     - name: Save artifact
       uses: actions/upload-artifact@v4
       with:
-        name: linbin
-        path: autoortho_lin_*.bin
+        name: linbin_${{ matrix.os }}
+        path: autoortho_linux_*
 
     - name: Release
       if: ${{ inputs.relname != '' }}
       uses: softprops/action-gh-release@v1
       with:
-        files: autoortho_lin_*.bin
+        files: autoortho_linux_*
         tag_name: ${{ inputs.relname }}
         prerelease: ${{ inputs.prerelease }}
 

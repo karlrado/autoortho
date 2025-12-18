@@ -2,6 +2,7 @@ ZIP?=zip
 VERSION?=0.0.0
 # Sanitize VERSION for use in filenames (replace any non-safe char with '-')
 SAFE_VERSION:=$(shell echo "$(VERSION)" | sed -e 's/[^A-Za-z0-9._-]/-/g')
+CODE_NAME:=$(shell grep UBUNTU_CODENAME /etc/os-release | cut -d= -f2)
 .PHONY: mac_app clean
 SHELL := /bin/bash
 .ONESHELL:
@@ -15,10 +16,10 @@ autoortho/.version:
 # =============================================================================
 # Linux Build (PyInstaller)
 # =============================================================================
-lin_bin: autoortho_linux_$(SAFE_VERSION)
-autoortho_linux_$(SAFE_VERSION): autoortho/*.py autoortho/.version
+lin_bin: autoortho_linux_$(SAFE_VERSION)_$(CODE_NAME)
+autoortho_linux_$(SAFE_VERSION)_$(CODE_NAME): autoortho/*.py autoortho/.version
 	# Build inside Docker and rename output folder (all as root to avoid permission issues)
-	docker run --rm -v `pwd`:/code ubuntu:latest /bin/bash -c "\
+	docker run --rm -v `pwd`:/code ubuntu:$(CODE_NAME) /bin/bash -c "\
 		cd /code && \
 		./buildreqs.sh && \
 		. .venv/bin/activate && \
@@ -27,10 +28,10 @@ autoortho_linux_$(SAFE_VERSION): autoortho/*.py autoortho/.version
 		mv dist/autoortho autoortho_linux_$(SAFE_VERSION) && \
 		chmod -R a+rw autoortho_linux_$(SAFE_VERSION)"
 
-lin_tar: autoortho_linux_$(SAFE_VERSION).tar.gz
-autoortho_linux_$(SAFE_VERSION).tar.gz: autoortho_linux_$(SAFE_VERSION)
+lin_tar: autoortho_linux_$(SAFE_VERSION)_$(CODE_NAME).tar.gz
+autoortho_linux_$(SAFE_VERSION)_$(CODE_NAME).tar.gz: autoortho_linux_$(SAFE_VERSION)_$(CODE_NAME)
 	# Package entire folder (includes ao_files/ with all bundled dependencies)
-	tar -czf $@ $<
+	tar -czf $@ autoortho_linux_$(SAFE_VERSION)
 
 bin: autoortho/.version
 	# Ensure required Linux libraries and helper binaries are executable before packaging

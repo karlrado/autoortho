@@ -116,6 +116,9 @@ noclean = False
 [fuse]
 # Enable or disable multi-threading when using FUSE
 threading = {False if system_type == "darwin" else True}
+# Timeout in seconds for tile build operations. If a tile takes longer than this,
+# a placeholder will be shown instead of crashing X-Plane. Default: 60
+build_timeout = 60
 
 [flightdata]
 # Local port for map and stats

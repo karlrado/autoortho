@@ -1,10 +1,10 @@
 !define PRODUCT_NAME "AutoOrtho"
 ;!define PRODUCT_VERSION "1.4.2"
-;!define PY_VERSION "3.12.9"
+;!define PY_VERSION "3.12.12"
 ;!define PY_MAJOR_VERSION "3.12"
 ;!define BITNESS "32"
 !define ARCH_TAG ""
-;!define INSTALLER_NAME "AutoOrtho_1.4.2.exe"
+;!define INSTALLER_NAME "AutoOrtho_1.5.1.exe"
 !define INSTALLER_NAME "AutoOrtho.exe"
 !define PRODUCT_ICON "ao-icon.ico"
 
