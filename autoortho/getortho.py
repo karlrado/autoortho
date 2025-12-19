@@ -281,6 +281,136 @@ def locked(fn):
     return wrapped
 
 
+class TimeBudget:
+    """
+    Track elapsed wall-clock time for a single X-Plane tile request.
+    
+    This class solves the per-chunk vs per-request timeout problem:
+    - Previously, each chunk had its own maxwait timeout, leading to
+      serialized chunks taking N * maxwait total time
+    - Now, all chunks share a single time budget, ensuring the total
+      wall-clock time stays close to the configured limit
+    
+    Usage:
+        budget = TimeBudget(max_seconds=2.0)
+        while not budget.exhausted:
+            chunk_ready = budget.wait_with_budget(chunk.ready)
+            if not chunk_ready:
+                break  # Budget exhausted or event not set
+    
+    Thread-safety: Uses time.monotonic() which is thread-safe and immune
+    to system clock adjustments.
+    """
+    
+    # Minimum wait granularity - how often we check if budget is exhausted
+    # during a wait. Smaller = more responsive but slightly more CPU.
+    # 50ms is a good balance: responsive enough for UI, not too chatty.
+    WAIT_GRANULARITY_SEC = 0.05
+    
+    def __init__(self, max_seconds: float):
+        """
+        Initialize a time budget.
+        
+        Args:
+            max_seconds: Maximum wall-clock time allowed for this request.
+                        This should be the value the user expects X-Plane
+                        to actually wait, not a per-chunk timeout.
+        """
+        self.max_seconds = max_seconds
+        self.start_time = time.monotonic()
+        self._exhausted = False
+        self._chunks_processed = 0
+        self._chunks_skipped = 0
+    
+    @property
+    def remaining(self) -> float:
+        """Return remaining time in seconds (never negative)."""
+        return max(0.0, self.max_seconds - self.elapsed)
+    
+    @property 
+    def elapsed(self) -> float:
+        """Return elapsed time since budget creation in seconds."""
+        return time.monotonic() - self.start_time
+    
+    @property
+    def exhausted(self) -> bool:
+        """
+        Check if the time budget is exhausted.
+        
+        Once exhausted, always returns True (sticky flag for efficiency).
+        """
+        if self._exhausted:
+            return True
+        if self.elapsed >= self.max_seconds:
+            self._exhausted = True
+            return True
+        return False
+    
+    def wait_with_budget(self, event: threading.Event) -> bool:
+        """
+        Wait on an event while respecting the remaining time budget.
+        
+        This is the key method that replaces `event.wait(maxwait)` calls.
+        Instead of waiting a fixed time per chunk, we wait only as long
+        as our remaining budget allows.
+        
+        Args:
+            event: A threading.Event to wait on (e.g., chunk.ready)
+        
+        Returns:
+            True if the event was set (success)
+            False if budget exhausted before event was set (timeout)
+        
+        Behavior:
+            - If event is already set, returns immediately with True
+            - If budget is already exhausted, returns event.is_set() immediately
+            - Otherwise, polls the event with WAIT_GRANULARITY_SEC intervals
+              until either the event is set or the budget is exhausted
+        """
+        # Fast path: already set
+        if event.is_set():
+            return True
+        
+        # Fast path: budget already gone
+        if self.exhausted:
+            return event.is_set()
+        
+        # Poll with granularity until event set or budget exhausted
+        while not self.exhausted:
+            wait_time = min(self.remaining, self.WAIT_GRANULARITY_SEC)
+            if wait_time <= 0:
+                break
+            if event.wait(timeout=wait_time):
+                return True
+        
+        # Final check after loop exits
+        return event.is_set()
+    
+    def record_chunk_processed(self):
+        """Record that a chunk was successfully processed."""
+        self._chunks_processed += 1
+    
+    def record_chunk_skipped(self):
+        """Record that a chunk was skipped due to budget exhaustion."""
+        self._chunks_skipped += 1
+    
+    @property
+    def chunks_processed(self) -> int:
+        """Number of chunks successfully processed within budget."""
+        return self._chunks_processed
+    
+    @property
+    def chunks_skipped(self) -> int:
+        """Number of chunks skipped due to budget exhaustion."""
+        return self._chunks_skipped
+    
+    def __repr__(self):
+        return (f"TimeBudget(max={self.max_seconds:.2f}s, "
+                f"elapsed={self.elapsed:.2f}s, "
+                f"remaining={self.remaining:.2f}s, "
+                f"exhausted={self.exhausted})")
+
+
 class Getter(object):
     queue = None
     workers = None
@@ -1161,23 +1291,79 @@ class Tile(object):
         return outfile
 
     @locked
-    def get_img(self, mipmap, startrow=0, endrow=None, maxwait=5, min_zoom=None):
+    def get_img(self, mipmap, startrow=0, endrow=None, maxwait=5, min_zoom=None, time_budget=None):
         #
         # Get an image for a particular mipmap
         #
+        
+        # === TIME BUDGET INITIALIZATION ===
+        # If no time_budget provided, create one based on configuration.
+        # This is the key change: instead of per-chunk maxwait, we now have
+        # a single time budget for the entire tile request.
+        if time_budget is None:
+            use_time_budget = getattr(CFG.autoortho, 'use_time_budget', True)
+            # Handle string 'True'/'False' from config
+            if isinstance(use_time_budget, str):
+                use_time_budget = use_time_budget.lower() in ('true', '1', 'yes', 'on')
+            
+            if use_time_budget:
+                # New time budget system: use tile_time_budget for actual wall-clock limit
+                base_budget = float(getattr(CFG.autoortho, 'tile_time_budget', 2.0))
+                
+                # During startup (before flight starts), allow more time for initial load
+                # This replaces the suspend_maxwait functionality with budget-aware logic
+                if CFG.autoortho.suspend_maxwait and not datareftracker.connected:
+                    # Use 10x budget during startup for quality loading
+                    # This is still bounded, unlike the old "20 seconds per chunk" approach
+                    effective_budget = base_budget * 10.0
+                    log.debug(f"GET_IMG: Startup mode - using extended budget {effective_budget:.1f}s")
+                else:
+                    effective_budget = base_budget
+                
+                time_budget = TimeBudget(effective_budget)
+                log.debug(f"GET_IMG: Created new {time_budget}")
+            else:
+                # Legacy mode: create budget from maxwait parameter
+                # This provides backward compatibility but still uses wall-clock timing
+                effective_maxwait = self.get_maxwait() if maxwait == 5 else maxwait
+                time_budget = TimeBudget(effective_maxwait)
+                log.debug(f"GET_IMG: Legacy mode - using maxwait-based budget {effective_maxwait:.1f}s")
 
-        # CRITICAL: If building mipmap 0, ensure lower mipmaps (1-4) are fully built first
-        # This ensures they're available in self.imgs for fallback upscaling
-        if mipmap == 0 and (startrow == 0 and endrow is None):
-            log.debug(f"GET_IMG: Building mipmap 0, ensuring lower mipmaps are available for fallback")
+        # === OPTIONAL PRE-BUILDING OF LOWER MIPMAPS ===
+        # When building mipmap 0, we can optionally pre-build lower mipmaps (1-4) first.
+        # This ensures they're available in self.imgs for fallback upscaling.
+        # 
+        # However, this is expensive and consumes time budget. Strategy:
+        # - fallback_level < 2: Skip pre-building (fallback chain will use cache if needed)
+        # - fallback_level = 2: Pre-build but respect budget (stop if budget low)
+        # - Always respect time budget to prevent pre-building from consuming everything
+        fallback_level = self.get_fallback_level()
+        
+        if mipmap == 0 and (startrow == 0 and endrow is None) and fallback_level >= 2:
+            log.debug(f"GET_IMG: Building mipmap 0 with fallback_level={fallback_level}, "
+                     f"pre-building lower mipmaps (budget remaining={time_budget.remaining:.2f}s)")
+            
+            # Reserve at least 50% of budget for actual mipmap 0 work
+            min_reserved_budget = time_budget.max_seconds * 0.5
+            
             for lower_mm in range(1, min(self.max_mipmap + 1, 5)):
+                # Stop pre-building if budget is getting low
+                if time_budget.remaining < min_reserved_budget:
+                    log.debug(f"GET_IMG: Stopping pre-build at mipmap {lower_mm} - "
+                             f"reserving budget for mipmap 0 (remaining={time_budget.remaining:.2f}s)")
+                    break
+                
                 if lower_mm not in self.imgs:
                     log.debug(f"GET_IMG: Pre-building mipmap {lower_mm} for fallback support")
                     try:
                         # Build the complete lower mipmap
-                        self.get_img(lower_mm, startrow=0, endrow=None, maxwait=maxwait, min_zoom=min_zoom)
+                        # IMPORTANT: Pass the SAME time_budget to share the wall-clock limit
+                        self.get_img(lower_mm, startrow=0, endrow=None, maxwait=maxwait, 
+                                    min_zoom=min_zoom, time_budget=time_budget)
                     except Exception as e:
                         log.debug(f"GET_IMG: Failed to pre-build mipmap {lower_mm}: {e}")
+        elif mipmap == 0 and (startrow == 0 and endrow is None):
+            log.debug(f"GET_IMG: Skipping pre-build for mipmap 0 (fallback_level={fallback_level})")
 
         # Get effective zoom  
         zoom = min((self.max_zoom - mipmap), self.max_zoom)
@@ -1309,6 +1495,15 @@ class Tile(object):
                 # Return placeholder to prevent crash
                 return (chunk, None, 0, 0)
             
+            # === TIME BUDGET CHECK ===
+            # Early exit if the time budget is exhausted. This is the key improvement:
+            # instead of each chunk waiting maxwait seconds, we check the shared budget.
+            if time_budget.exhausted:
+                log.debug(f"Time budget exhausted (elapsed={time_budget.elapsed:.2f}s), skipping chunk {chunk}")
+                time_budget.record_chunk_skipped()
+                bump('chunk_budget_skipped')
+                return (chunk, None, start_x, start_y)
+            
             # Track if this chunk permanently failed
             is_permanent_failure = chunk.permanent_failure
             if is_permanent_failure:
@@ -1325,10 +1520,11 @@ class Tile(object):
                 chunk_ready = True
                 log.debug(f"Chunk {chunk} already downloaded, proceeding to decode")
             else:
-                # Download in progress, apply maxwait
-                chunk_ready = chunk.ready.wait(maxwait)
+                # Download in progress - use TIME BUDGET instead of fixed maxwait
+                # This ensures we don't wait longer than our total budget allows
+                chunk_ready = time_budget.wait_with_budget(chunk.ready)
                 if not chunk_ready:
-                    log.debug(f"Chunk {chunk} download timed out after {maxwait}s")
+                    log.debug(f"Chunk {chunk} wait ended (budget remaining={time_budget.remaining:.2f}s, exhausted={time_budget.exhausted})")
 
             chunk_img = None
             if chunk_ready and chunk.data:
@@ -1344,37 +1540,55 @@ class Tile(object):
                     chunk_img = None
             
             # FALLBACK CHAIN (in order of preference):
-            # Each fallback only runs if previous ones failed
-            # For permanent failures (404, etc), we ALWAYS try fallbacks to get lower-zoom alternatives
+            # Each fallback only runs if previous ones failed and fallback_level allows it.
+            # For permanent failures (404, etc), we ALWAYS try fallbacks to get lower-zoom alternatives.
+            #
+            # fallback_level controls which fallbacks are enabled:
+            #   0 = None: Skip all fallbacks (fastest, may have missing tiles)
+            #   1 = Cache-only: Fallback 1 (disk cache) + Fallback 2 (built mipmaps)
+            #   2 = Full: All fallbacks including Fallback 3 (network downloads)
             
-            # Fallback 1: Search disk cache for lower-zoom JPEGs
-            if not chunk_img and (not chunk_ready or is_permanent_failure):
-                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Searching disk cache for backup chunk.")
+            # Fallback 1: Search disk cache for lower-zoom JPEGs (enabled if fallback_level >= 1)
+            if not chunk_img and (not chunk_ready or is_permanent_failure) and fallback_level >= 1:
+                log.debug(f"GET_IMG(process_chunk): Fallback 1 - searching disk cache for backup chunk.")
                 chunk_img = self.get_best_chunk(chunk.col, chunk.row, mipmap, zoom)
                 # get_best_chunk bumps 'upscaled_from_jpeg_count' if successful
             
-            # Fallback 2: Scale from already-built mipmaps (if they exist)
-            if not chunk_img:
-                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Attempting scaling from built mipmaps.")
+            # Fallback 2: Scale from already-built mipmaps (enabled if fallback_level >= 1)
+            if not chunk_img and fallback_level >= 1:
+                log.debug(f"GET_IMG(process_chunk): Fallback 2 - scaling from built mipmaps.")
                 chunk_img = self.get_downscaled_from_higher_mipmap(mipmap, chunk.col, chunk.row, zoom)
                 # Note: scaling function bumps its own counters (upscaled_chunk_count or downscaled_chunk_count)
             
-            # Fallback 3: On-demand download of lower-detail chunks
-            if not chunk_img and (not chunk_ready or is_permanent_failure):
-                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Attempting cascading fallback (download).")
-                chunk_img = self.get_or_build_lower_mipmap_chunk(mipmap, chunk.col, chunk.row, zoom)
+            # Fallback 3: On-demand download of lower-detail chunks (enabled if fallback_level >= 2)
+            # This is the expensive network fallback - only use when quality is prioritized
+            if not chunk_img and (not chunk_ready or is_permanent_failure) and fallback_level >= 2:
+                # Also check time budget before network operations
+                if not time_budget.exhausted:
+                    log.debug(f"GET_IMG(process_chunk): Fallback 3 - cascading fallback (network download).")
+                    chunk_img = self.get_or_build_lower_mipmap_chunk(mipmap, chunk.col, chunk.row, zoom, 
+                                                                      time_budget=time_budget)
+                else:
+                    log.debug(f"GET_IMG(process_chunk): Skipping Fallback 3 - budget exhausted")
 
             if not chunk_ready and not chunk_img and not is_permanent_failure:
                 # Ran out of time, lower mipmap.  Retry...
                 # Don't retry permanent failures (404, etc) - they won't succeed
-                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Final retry for {chunk}, WAITING!")
-                bump('retry_chunk_count')
-                # Smart timeout for retry: check if already downloaded
-                if chunk.ready.is_set():
-                    chunk_ready = True
-                    log.debug(f"Chunk {chunk} downloaded during retry, proceeding to decode")
+                # But only retry if we still have time budget remaining
+                if time_budget.exhausted:
+                    log.debug(f"GET_IMG: Skipping final retry for {chunk} - budget exhausted")
+                    time_budget.record_chunk_skipped()
+                    bump('chunk_budget_skipped')
                 else:
-                    chunk_ready = chunk.ready.wait(maxwait)
+                    log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Final retry for {chunk}, WAITING! (budget remaining={time_budget.remaining:.2f}s)")
+                    bump('retry_chunk_count')
+                    # Smart timeout for retry: check if already downloaded
+                    if chunk.ready.is_set():
+                        chunk_ready = True
+                        log.debug(f"Chunk {chunk} downloaded during retry, proceeding to decode")
+                    else:
+                        # Use budget-aware waiting for final retry too
+                        chunk_ready = time_budget.wait_with_budget(chunk.ready)
                 if chunk_ready and chunk.data:
                     log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Final retry for {chunk}, SUCCESS!")
                     try:
@@ -1391,6 +1605,9 @@ class Tile(object):
                 bump('chunk_missing_count')
                 if is_permanent_failure:
                     log.info(f"Chunk {chunk} permanently failed and all fallbacks exhausted")
+            else:
+                # Successfully processed this chunk within budget
+                time_budget.record_chunk_processed()
                 
             return (chunk, chunk_img, start_x, start_y)
         
@@ -1403,18 +1620,18 @@ class Tile(object):
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_pool_workers)
         active_futures = {}
         
-        start_time = time.time()
-        max_total_wait = max(10.0, self.maxchunk_wait * 10)  # At least 10s, or 10x maxwait
-        
         try:
             while len(processed_chunks) < len(chunks):
-                # Safety timeout check
-                if time.time() - start_time > max_total_wait:
-                    chunks_abandoned = len(chunks) - len(processed_chunks)
-                    if chunks_abandoned > 0:
-                        bump('chunk_missing_count', chunks_abandoned)
-                    log.warning(f"Lazy submission timeout after {max_total_wait}s, "
-                               f"processed {len(processed_chunks)}/{len(chunks)} chunks, abandoned {chunks_abandoned}")
+                # === TIME BUDGET CHECK ===
+                # This is the key improvement: check the shared time budget, not a hardcoded timeout.
+                # When budget is exhausted, we stop submitting new work and exit gracefully.
+                if time_budget.exhausted:
+                    chunks_remaining = len(chunks) - len(processed_chunks)
+                    if chunks_remaining > 0:
+                        bump('chunk_budget_exhausted', chunks_remaining)
+                    log.info(f"Time budget exhausted after {time_budget.elapsed:.2f}s for mipmap {mipmap}: "
+                            f"processed {time_budget.chunks_processed}, skipped {time_budget.chunks_skipped}, "
+                            f"remaining {chunks_remaining}/{len(chunks)}")
                     break
                 
                 # Smart early exit - if all started downloads are done, exit
@@ -1439,6 +1656,10 @@ class Tile(object):
                         processed_chunks.add(chunk_id)
                         bump('chunk_missing_count')
                         continue
+                    
+                    # Don't submit new work if budget is exhausted
+                    if time_budget.exhausted:
+                        break
                     
                     # Submit when download has started
                     if chunk.download_started.is_set():
@@ -1484,37 +1705,52 @@ class Tile(object):
             # These would otherwise be left as missing color patches
             unprocessed_chunks = [c for c in chunks if id(c) not in processed_chunks and not c.permanent_failure]
             if unprocessed_chunks:
-                log.info(f"Processing {len(unprocessed_chunks)} chunks that never started downloading (fallback only)")
-                
-                # Submit ALL unprocessed chunks in parallel (not serial!)
-                unprocessed_futures = {}
-                for chunk in unprocessed_chunks:
-                    # Use skip_download_wait=True to go straight to fallbacks
-                    future = executor.submit(process_chunk, chunk, skip_download_wait=True)
-                    unprocessed_futures[future] = chunk
-                    processed_chunks.add(id(chunk))
-                
-                # Process results as they complete (parallel, not serial)
-                # Use try-except to handle TimeoutError gracefully instead of crashing
-                try:
-                    for future in concurrent.futures.as_completed(unprocessed_futures.keys(), timeout=10):
-                        try:
-                            chunk, chunk_img, start_x, start_y = future.result()
-                            if chunk_img:
-                                _safe_paste(new_im, chunk_img, start_x, start_y)
-                            else:
+                # If budget is exhausted, skip expensive fallback processing entirely
+                # The chunks will show as missing color, but we respect the time budget
+                if time_budget.exhausted:
+                    log.info(f"Skipping {len(unprocessed_chunks)} unprocessed chunks - time budget exhausted "
+                            f"(processed={time_budget.chunks_processed}, skipped={time_budget.chunks_skipped})")
+                    bump('chunk_budget_exhausted', len(unprocessed_chunks))
+                else:
+                    log.info(f"Processing {len(unprocessed_chunks)} chunks that never started downloading "
+                            f"(fallback only, budget remaining={time_budget.remaining:.2f}s)")
+                    
+                    # Submit ALL unprocessed chunks in parallel (not serial!)
+                    unprocessed_futures = {}
+                    for chunk in unprocessed_chunks:
+                        # Check budget before each submission to avoid overwhelming
+                        if time_budget.exhausted:
+                            log.debug(f"Budget exhausted while submitting unprocessed chunks, skipping rest")
+                            remaining = len([c for c in unprocessed_chunks if id(c) not in processed_chunks])
+                            bump('chunk_budget_exhausted', remaining)
+                            break
+                        # Use skip_download_wait=True to go straight to fallbacks
+                        future = executor.submit(process_chunk, chunk, skip_download_wait=True)
+                        unprocessed_futures[future] = chunk
+                        processed_chunks.add(id(chunk))
+                    
+                    # Process results as they complete (parallel, not serial)
+                    # Use remaining budget as timeout instead of hardcoded 10s
+                    fallback_timeout = max(1.0, time_budget.remaining)
+                    try:
+                        for future in concurrent.futures.as_completed(unprocessed_futures.keys(), timeout=fallback_timeout):
+                            try:
+                                chunk, chunk_img, start_x, start_y = future.result()
+                                if chunk_img:
+                                    _safe_paste(new_im, chunk_img, start_x, start_y)
+                                else:
+                                    bump('chunk_missing_count')
+                            except Exception as exc:
+                                chunk = unprocessed_futures.get(future, "unknown")
+                                log.debug(f"Fallback failed for unprocessed chunk {chunk}: {exc}")
                                 bump('chunk_missing_count')
-                        except Exception as exc:
-                            chunk = unprocessed_futures.get(future, "unknown")
-                            log.debug(f"Fallback failed for unprocessed chunk {chunk}: {exc}")
-                            bump('chunk_missing_count')
-                except TimeoutError:
-                    # Some futures didn't complete in time - count them as missing
-                    # This prevents crashes when the system is overloaded
-                    unfinished_count = sum(1 for f in unprocessed_futures.keys() if not f.done())
-                    log.warning(f"Fallback processing timeout: {unfinished_count} chunks still pending, marking as missing")
-                    bump('chunk_missing_count', unfinished_count)
-                    bump('fallback_timeout_count')
+                    except TimeoutError:
+                        # Some futures didn't complete in time - count them as missing
+                        # This prevents crashes when the system is overloaded
+                        unfinished_count = sum(1 for f in unprocessed_futures.keys() if not f.done())
+                        log.warning(f"Fallback processing timeout: {unfinished_count} chunks still pending, marking as missing")
+                        bump('chunk_missing_count', unfinished_count)
+                        bump('fallback_timeout_count')
                     
         finally:
             executor.shutdown(wait=True)
@@ -1533,7 +1769,7 @@ class Tile(object):
         # Return image along with mipmap and zoom level this was created at
         return new_im
 
-    def get_or_build_lower_mipmap_chunk(self, target_mipmap, col, row, zoom):
+    def get_or_build_lower_mipmap_chunk(self, target_mipmap, col, row, zoom, time_budget=None):
         """
         Cascading fallback: Try to get/build progressively lower-detail mipmaps.
         Only downloads chunks on-demand when needed (lazy evaluation).
@@ -1541,12 +1777,23 @@ class Tile(object):
         Args:
             target_mipmap: The mipmap level we need (e.g., 0)
             col, row, zoom: Chunk coordinates at target zoom
+            time_budget: Optional TimeBudget to respect (for budget-aware network ops)
         
         Returns:
             Upscaled AoImage or None
         """
+        # Early exit if budget is already exhausted
+        if time_budget and time_budget.exhausted:
+            log.debug(f"Cascading fallback: skipping - time budget exhausted")
+            return None
+        
         # Try each progressively lower-detail mipmap
         for fallback_mipmap in range(target_mipmap + 1, self.max_mipmap + 1):
+            # Check budget at each iteration
+            if time_budget and time_budget.exhausted:
+                log.debug(f"Cascading fallback: stopping at mipmap {fallback_mipmap} - budget exhausted")
+                break
+            
             log.debug(f"Cascading fallback: trying mipmap {fallback_mipmap} for failed mipmap {target_mipmap}")
             
             # Calculate coordinates at fallback mipmap level
@@ -1564,12 +1811,20 @@ class Tile(object):
                     fallback_chunk.ready.set()
                     log.debug(f"Cascading fallback: found cached chunk at mipmap {fallback_mipmap}")
                 else:
-                    # Not in cache, try to download it (with shorter timeout)
+                    # Not in cache, try to download it
+                    # Use budget-aware waiting if budget provided, otherwise use reduced fixed timeout
                     chunk_getter.submit(fallback_chunk)
-                    # Wait with reduced timeout (don't want to cascade delays)
-                    fallback_chunk_ready = fallback_chunk.ready.wait(timeout=min(3.0, self.get_maxwait() / 2))
+                    
+                    if time_budget:
+                        # Use budget-aware waiting
+                        fallback_chunk_ready = time_budget.wait_with_budget(fallback_chunk.ready)
+                    else:
+                        # Legacy: fixed timeout
+                        fallback_chunk_ready = fallback_chunk.ready.wait(timeout=min(3.0, self.get_maxwait() / 2))
+                    
                     if not fallback_chunk_ready:
-                        log.debug(f"Cascading fallback: mipmap {fallback_mipmap} also timed out, trying next level")
+                        log.debug(f"Cascading fallback: mipmap {fallback_mipmap} also timed out "
+                                 f"(budget_exhausted={time_budget.exhausted if time_budget else 'N/A'})")
                         fallback_chunk.close()
                         continue
             
@@ -1833,6 +2088,43 @@ class Tile(object):
         if CFG.autoortho.suspend_maxwait and not datareftracker.connected:
             effective_maxwait = 20
         return effective_maxwait
+
+    def get_fallback_level(self):
+        """Get the fallback level as an integer.
+        
+        Converts string config values to integer:
+        - 'none' -> 0 (skip all fallbacks)
+        - 'cache' -> 1 (disk cache and pre-built mipmaps only)
+        - 'full' -> 2 (all fallbacks including network downloads)
+        
+        For backwards compatibility, also accepts integer strings '0', '1', '2'
+        and boolean True/False (legacy config parsing artifacts).
+        """
+        fb_value = getattr(CFG.autoortho, 'fallback_level', 'cache')
+        
+        # Handle string values
+        if isinstance(fb_value, str):
+            fb_lower = fb_value.lower().strip()
+            if fb_lower == 'none':
+                return 0
+            elif fb_lower == 'cache':
+                return 1
+            elif fb_lower == 'full':
+                return 2
+            else:
+                # Try parsing as integer for backwards compatibility
+                try:
+                    return int(fb_value)
+                except ValueError:
+                    return 1  # Default to cache
+        # Handle boolean (from SectionParser when value was '0' or '1')
+        elif isinstance(fb_value, bool):
+            return 2 if fb_value else 0
+        # Handle integer
+        elif isinstance(fb_value, int):
+            return max(0, min(2, fb_value))
+        else:
+            return 1  # Default to cache
 
     #@profile
     @locked

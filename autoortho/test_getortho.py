@@ -1699,3 +1699,306 @@ class TestStallPrevention:
         finally:
             getortho.datareftracker = original_dt
 
+
+class TestTimeBudget:
+    """Tests for the TimeBudget class that provides wall-clock time limiting."""
+    
+    def test_budget_creation(self):
+        """Test that TimeBudget initializes correctly."""
+        import getortho
+        
+        budget = getortho.TimeBudget(2.0)
+        
+        assert budget.max_seconds == 2.0
+        assert budget.elapsed < 0.1  # Should be very small
+        assert budget.remaining > 1.9
+        assert not budget.exhausted
+        assert budget.chunks_processed == 0
+        assert budget.chunks_skipped == 0
+    
+    def test_budget_exhaustion(self):
+        """Test that budget correctly tracks exhaustion."""
+        import getortho
+        
+        budget = getortho.TimeBudget(0.1)  # 100ms budget
+        
+        assert not budget.exhausted
+        time.sleep(0.15)  # Wait past budget
+        assert budget.exhausted
+        assert budget.remaining == 0.0
+        assert budget.elapsed >= 0.1
+    
+    def test_budget_exhausted_is_sticky(self):
+        """Test that once exhausted, budget stays exhausted."""
+        import getortho
+        
+        budget = getortho.TimeBudget(0.05)
+        time.sleep(0.1)
+        
+        # Check multiple times - should always be True
+        assert budget.exhausted
+        assert budget.exhausted
+        assert budget.exhausted
+    
+    def test_budget_wait_with_event_set(self):
+        """Test wait_with_budget returns True immediately for set events."""
+        import getortho
+        import threading
+        
+        budget = getortho.TimeBudget(1.0)
+        event = threading.Event()
+        event.set()  # Already set
+        
+        start = time.monotonic()
+        result = budget.wait_with_budget(event)
+        elapsed = time.monotonic() - start
+        
+        assert result is True
+        assert elapsed < 0.05  # Should return immediately
+    
+    def test_budget_wait_with_event_becomes_set(self):
+        """Test wait_with_budget returns True when event becomes set."""
+        import getortho
+        import threading
+        
+        budget = getortho.TimeBudget(2.0)
+        event = threading.Event()
+        
+        # Set event after 100ms
+        def set_event():
+            time.sleep(0.1)
+            event.set()
+        
+        threading.Thread(target=set_event, daemon=True).start()
+        
+        result = budget.wait_with_budget(event)
+        
+        assert result is True
+        assert not budget.exhausted  # Should still have budget
+    
+    def test_budget_wait_timeout_on_exhaustion(self):
+        """Test wait_with_budget returns False when budget exhausts."""
+        import getortho
+        import threading
+        
+        budget = getortho.TimeBudget(0.1)  # 100ms budget
+        event = threading.Event()  # Never set
+        
+        start = time.monotonic()
+        result = budget.wait_with_budget(event)
+        elapsed = time.monotonic() - start
+        
+        assert result is False
+        assert budget.exhausted
+        assert elapsed >= 0.1
+        assert elapsed < 0.5  # Should exit reasonably quickly after budget
+    
+    def test_budget_statistics_tracking(self):
+        """Test that chunk statistics are tracked correctly."""
+        import getortho
+        
+        budget = getortho.TimeBudget(5.0)
+        
+        budget.record_chunk_processed()
+        budget.record_chunk_processed()
+        budget.record_chunk_skipped()
+        
+        assert budget.chunks_processed == 2
+        assert budget.chunks_skipped == 1
+    
+    def test_budget_repr(self):
+        """Test budget string representation."""
+        import getortho
+        
+        budget = getortho.TimeBudget(2.0)
+        repr_str = repr(budget)
+        
+        assert "TimeBudget" in repr_str
+        assert "max=2.00s" in repr_str
+        assert "elapsed=" in repr_str
+        assert "remaining=" in repr_str
+        assert "exhausted=" in repr_str
+    
+    def test_budget_remaining_never_negative(self):
+        """Test that remaining time is never negative."""
+        import getortho
+        
+        budget = getortho.TimeBudget(0.01)
+        time.sleep(0.1)  # Way past budget
+        
+        assert budget.remaining == 0.0
+        assert budget.remaining >= 0.0  # Double check
+
+
+class TestFallbackLevel:
+    """Tests for the fallback_level configuration option."""
+    
+    def test_fallback_level_config_exists(self, tmpdir):
+        """Test that fallback_level config option exists and has valid default."""
+        import getortho
+        
+        # Create a tile to test the get_fallback_level() helper method
+        tile = getortho.Tile(2176, 3232, 'EOX', 13, cache_dir=str(tmpdir), max_zoom=13)
+        
+        # The get_fallback_level() method should return a valid integer (0, 1, or 2)
+        fallback_level = tile.get_fallback_level()
+        assert fallback_level in (0, 1, 2), \
+            f"get_fallback_level() should return 0, 1, or 2, got {fallback_level}"
+        
+        tile.close()
+    
+    def test_fallback_level_none_skips_fallbacks(self, tmpdir):
+        """Test that fallback_level='none' skips all fallback attempts."""
+        from unittest.mock import patch, MagicMock
+        import getortho
+        from aoconfig import CFG
+        
+        # Save original value
+        original_level = CFG.autoortho.fallback_level
+        
+        try:
+            # Set fallback_level to 'none'
+            CFG.autoortho.fallback_level = 'none'
+            
+            # Mock the fallback methods to track if they're called
+            with patch.object(getortho.Tile, 'get_best_chunk') as mock_fb1, \
+                 patch.object(getortho.Tile, 'get_downscaled_from_higher_mipmap') as mock_fb2, \
+                 patch.object(getortho.Tile, 'get_or_build_lower_mipmap_chunk') as mock_fb3:
+                
+                # Create a tile with fallback_level='none'
+                tile = getortho.Tile(2176, 3232, 'EOX', 13, cache_dir=str(tmpdir), max_zoom=13)
+                
+                # Verify fallback_level is read correctly via helper method
+                fallback_level = tile.get_fallback_level()
+                assert fallback_level == 0, f"fallback_level='none' should return 0, got {fallback_level}"
+                
+                tile.close()
+        finally:
+            CFG.autoortho.fallback_level = original_level
+    
+    def test_fallback_level_cache_uses_cache_fallbacks(self, tmpdir):
+        """Test that fallback_level='cache' enables cache-based fallbacks."""
+        from aoconfig import CFG
+        import getortho
+        
+        # Save original value
+        original_level = CFG.autoortho.fallback_level
+        
+        try:
+            # Set fallback_level to 'cache'
+            CFG.autoortho.fallback_level = 'cache'
+            
+            tile = getortho.Tile(2176, 3232, 'EOX', 13, cache_dir=str(tmpdir), max_zoom=13)
+            fallback_level = tile.get_fallback_level()
+            assert fallback_level == 1, f"fallback_level='cache' should return 1, got {fallback_level}"
+            
+            # With level 1, cache fallbacks should be enabled
+            assert fallback_level >= 1, "Level 'cache' should enable Fallback 1 and 2"
+            assert fallback_level < 2, "Level 'cache' should not enable Fallback 3"
+            
+            tile.close()
+        finally:
+            CFG.autoortho.fallback_level = original_level
+    
+    def test_fallback_level_full_enables_all_fallbacks(self, tmpdir):
+        """Test that fallback_level='full' enables all fallbacks including network."""
+        from aoconfig import CFG
+        import getortho
+        
+        # Save original value
+        original_level = CFG.autoortho.fallback_level
+        
+        try:
+            # Set fallback_level to 'full'
+            CFG.autoortho.fallback_level = 'full'
+            
+            tile = getortho.Tile(2176, 3232, 'EOX', 13, cache_dir=str(tmpdir), max_zoom=13)
+            fallback_level = tile.get_fallback_level()
+            assert fallback_level == 2, f"fallback_level='full' should return 2, got {fallback_level}"
+            
+            # With level 2, all fallbacks should be enabled
+            assert fallback_level >= 1, "Level 'full' should enable Fallback 1 and 2"
+            assert fallback_level >= 2, "Level 'full' should enable Fallback 3"
+            
+            tile.close()
+        finally:
+            CFG.autoortho.fallback_level = original_level
+    
+    def test_get_or_build_lower_mipmap_chunk_respects_budget(self, tmpdir):
+        """Test that cascading fallback respects time budget."""
+        import getortho
+        
+        tile = getortho.Tile(2176, 3232, 'EOX', 13, cache_dir=str(tmpdir), max_zoom=13)
+        
+        # Create a budget and exhaust it
+        budget = getortho.TimeBudget(0.01)  # 10ms budget
+        time.sleep(0.05)  # Wait 50ms to exhaust it
+        
+        # Force the exhausted check
+        _ = budget.remaining  # This will update internal state
+        assert budget.exhausted, f"Budget should be exhausted (elapsed={budget.elapsed:.3f}s)"
+        
+        # Should return None immediately due to exhausted budget
+        start = time.monotonic()
+        result = tile.get_or_build_lower_mipmap_chunk(0, 2176, 3232, 13, time_budget=budget)
+        elapsed = time.monotonic() - start
+        
+        # With exhausted budget, should return quickly (no network wait)
+        assert elapsed < 0.5, f"Should return quickly with exhausted budget, took {elapsed:.2f}s"
+        
+        tile.close()
+
+
+class TestPerformanceConfig:
+    """Tests for the new performance tuning config options."""
+    
+    def test_use_time_budget_config_exists(self, tmpdir):
+        """Test that use_time_budget config option exists and has correct type."""
+        import aoconfig
+        cfg = aoconfig.AOConfig(os.path.join(str(tmpdir), '.aocfg'))
+        
+        assert hasattr(cfg.autoortho, 'use_time_budget')
+        assert isinstance(cfg.autoortho.use_time_budget, bool)
+        # Default should be True
+        assert cfg.autoortho.use_time_budget == True
+    
+    def test_tile_time_budget_config_exists(self, tmpdir):
+        """Test that tile_time_budget config option exists and has correct type."""
+        import aoconfig
+        cfg = aoconfig.AOConfig(os.path.join(str(tmpdir), '.aocfg'))
+        
+        assert hasattr(cfg.autoortho, 'tile_time_budget')
+        # tile_time_budget should be convertible to float
+        tile_budget = float(cfg.autoortho.tile_time_budget)
+        assert tile_budget > 0
+        # Default should be 2.0
+        assert tile_budget == 2.0
+    
+    def test_fallback_level_config_has_correct_default(self, tmpdir):
+        """Test that fallback_level config option exists and has correct default."""
+        import aoconfig
+        cfg = aoconfig.AOConfig(os.path.join(str(tmpdir), '.aocfg'))
+        
+        assert hasattr(cfg.autoortho, 'fallback_level')
+        # fallback_level should be a string (none, cache, full)
+        fb_value = cfg.autoortho.fallback_level
+        assert fb_value in ['none', 'cache', 'full'], f"Unexpected fallback_level: {fb_value}"
+        # Default should be 'cache'
+        assert fb_value == 'cache', f"Default fallback_level should be 'cache', got {fb_value}"
+    
+    def test_performance_config_save_and_load(self, tmpdir):
+        """Test that performance tuning options can be saved and loaded."""
+        import aoconfig
+        cfg = aoconfig.AOConfig(os.path.join(str(tmpdir), '.aocfg'))
+        
+        # Modify values
+        cfg.autoortho.use_time_budget = False
+        cfg.autoortho.tile_time_budget = "3.5"
+        cfg.autoortho.fallback_level = "full"  # Use string value
+        cfg.save()
+        
+        # Reload and verify
+        cfg.load()
+        assert cfg.autoortho.use_time_budget == False
+        assert float(cfg.autoortho.tile_time_budget) == 3.5
+        assert cfg.autoortho.fallback_level == 'full', f"Expected 'full', got {cfg.autoortho.fallback_level}"

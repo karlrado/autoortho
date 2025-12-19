@@ -95,6 +95,22 @@ maxwait = 0.5
 # loading scenery data prior to starting the flight.  This allows more downloads to
 # succeed and reduce the use of backup chunks and missing chunks at the start of flight.
 suspend_maxwait = True
+# Use time budget system for tile requests. When enabled, the tile_time_budget
+# value represents the actual wall-clock time X-Plane waits for a tile, providing
+# more predictable performance. When disabled, falls back to legacy per-chunk maxwait.
+use_time_budget = True
+# Maximum wall-clock time in seconds for a complete tile request when use_time_budget
+# is enabled. This is the actual time X-Plane will wait before showing partial results.
+# Lower = less stuttering, but may have more missing/low-res tiles
+# Higher = better quality, but more potential for stuttering
+# Recommended: 1.0 (fast), 2.0 (balanced), 5.0 (quality)
+tile_time_budget = 2.0
+# Fallback level when chunks fail to download in time:
+# none = Skip all fallbacks (fastest, may have missing tiles)
+# cache = Use disk cache and already-built mipmaps, no network (balanced)
+# full = All fallbacks including on-demand network downloads (best quality, slowest)
+# Recommended: cache for most users, full if you have fast internet and CPU
+fallback_level = cache
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False
