@@ -246,6 +246,9 @@ class AutoOrtho(Operations):
         self.cache_dir = cache_dir
 
         self.tc = getortho.TileCacher(cache_dir)
+        
+        # Start spatial prefetcher for proactive tile loading
+        getortho.start_prefetcher(self.tc)
     
         #self.path_condition = threading.Condition()
         #self.read_lock = threading.Lock()

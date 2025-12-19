@@ -43,6 +43,159 @@ MEMTRACE = False
 log = logging.getLogger(__name__)
 
 
+# ============================================================================
+# HTTP/2 SUPPORT (OPTIONAL)
+# ============================================================================
+# Try to use httpx for HTTP/2 multiplexing. Falls back to requests if not available.
+# HTTP/2 allows multiple requests over a single connection, reducing latency.
+# ============================================================================
+_HTTPX_AVAILABLE = False
+_httpx = None
+try:
+    import httpx as _httpx
+    _HTTPX_AVAILABLE = True
+    # Silence httpx's verbose request logging (it logs every request at INFO level)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    log.info("httpx available - HTTP/2 support enabled")
+except ImportError:
+    log.debug("httpx not installed - using requests (HTTP/1.1). Install httpx for HTTP/2 support.")
+
+
+class HttpxSessionWrapper:
+    """
+    Wrapper around httpx.Client that provides requests-compatible API.
+    This allows seamless switching between requests and httpx.
+    """
+    
+    def __init__(self, http2=True, pool_size=10, timeout=25):
+        """
+        Initialize httpx client with HTTP/2 support.
+        
+        Args:
+            http2: Enable HTTP/2 (default True)
+            pool_size: Connection pool size
+            timeout: Request timeout in seconds
+        """
+        # httpx uses limits for connection pooling
+        limits = _httpx.Limits(
+            max_keepalive_connections=pool_size,
+            max_connections=pool_size * 2,
+            keepalive_expiry=30.0
+        )
+        
+        # Create httpx client with HTTP/2 enabled
+        self._client = _httpx.Client(
+            http2=http2,
+            limits=limits,
+            timeout=_httpx.Timeout(timeout, connect=5.0),
+            follow_redirects=True
+        )
+        self._http2 = http2
+        
+    def get(self, url, headers=None, timeout=None):
+        """
+        HTTP GET request - returns a requests-compatible response object.
+        
+        Args:
+            url: URL to fetch
+            headers: Optional request headers
+            timeout: Tuple of (connect_timeout, read_timeout) or single value
+        """
+        # Convert requests-style timeout tuple to httpx timeout
+        if isinstance(timeout, tuple):
+            connect_timeout, read_timeout = timeout
+            httpx_timeout = _httpx.Timeout(read_timeout, connect=connect_timeout)
+        elif timeout is not None:
+            httpx_timeout = _httpx.Timeout(timeout)
+        else:
+            httpx_timeout = None
+        
+        try:
+            response = self._client.get(url, headers=headers, timeout=httpx_timeout)
+            # Wrap in a compatible response object
+            return HttpxResponseWrapper(response)
+        except _httpx.TimeoutException as e:
+            raise requests.exceptions.Timeout(str(e))
+        except _httpx.RequestError as e:
+            raise requests.exceptions.RequestException(str(e))
+    
+    def close(self):
+        """Close the underlying httpx client."""
+        try:
+            self._client.close()
+        except Exception:
+            pass
+
+
+class HttpxResponseWrapper:
+    """
+    Wrapper that makes httpx.Response compatible with requests.Response API.
+    """
+    
+    def __init__(self, httpx_response):
+        self._response = httpx_response
+        
+    @property
+    def status_code(self):
+        return self._response.status_code
+    
+    @property
+    def content(self):
+        return self._response.content
+    
+    @property
+    def text(self):
+        return self._response.text
+    
+    @property
+    def headers(self):
+        return dict(self._response.headers)
+    
+    def close(self):
+        try:
+            self._response.close()
+        except Exception:
+            pass
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, *args):
+        self.close()
+
+
+def create_http_session(pool_size=10):
+    """
+    Factory function to create the best available HTTP session.
+    
+    Returns httpx client with HTTP/2 if available, otherwise requests session.
+    Both have compatible APIs via the wrapper classes.
+    """
+    use_http2 = getattr(CFG.autoortho, 'use_http2', True)
+    
+    if _HTTPX_AVAILABLE and use_http2:
+        try:
+            session = HttpxSessionWrapper(http2=True, pool_size=pool_size)
+            log.debug(f"Created httpx session with HTTP/2 (pool_size={pool_size})")
+            return session
+        except Exception as e:
+            log.warning(f"Failed to create httpx session: {e}, falling back to requests")
+    
+    # Fall back to requests
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=pool_size,
+        pool_maxsize=pool_size,
+        max_retries=0,
+        pool_block=True,
+    )
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
+    log.debug(f"Created requests session with HTTP/1.1 (pool_size={pool_size})")
+    return session
+
+
 # JPEG decode concurrency: auto-tuned for optimal performance
 # Decode is memory-bound, not CPU-bound, so we can safely exceed CPU count
 # Each decode uses ~256KB RAM, so even 64 concurrent = only ~16MB
@@ -247,28 +400,54 @@ def _calculate_spatial_priority(chunk_row: int, chunk_col: int, chunk_zoom: int,
         return float(base_mipmap_priority)
 
 
-def _safe_paste(dest_img, chunk_img, start_x, start_y):
+def _safe_paste(dest_img, chunk_img, start_x, start_y, defer_cleanup=False):
     """
     Paste chunk_img into dest_img at (start_x, start_y) with coordinate validation.
     
+    Args:
+        dest_img: Destination AoImage
+        chunk_img: Source chunk AoImage to paste
+        start_x, start_y: Position to paste at
+        defer_cleanup: If True, don't free chunk_img (caller will batch-free later)
+    
     Returns True if paste succeeded, False if skipped due to invalid coordinates.
-    Frees chunk_img native buffer after paste.
     """
     if start_x < 0 or start_y < 0:
         log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
+        if not defer_cleanup:
+            try:
+                chunk_img.close()
+            except Exception:
+                pass
         return False
     
     if not dest_img.paste(chunk_img, (start_x, start_y)):
         log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
+        if not defer_cleanup:
+            try:
+                chunk_img.close()
+            except Exception:
+                pass
         return False
     
-    # Free native buffer immediately after paste
-    try:
-        chunk_img.close()
-    except Exception:
-        pass
+    # Free native buffer immediately unless deferred
+    if not defer_cleanup:
+        try:
+            chunk_img.close()
+        except Exception:
+            pass
     
     return True
+
+
+def _batch_close_images(images):
+    """Batch-close multiple AoImage objects to free native memory."""
+    for img in images:
+        if img is not None:
+            try:
+                img.close()
+            except Exception:
+                pass
 
 
 def locked(fn):
@@ -449,21 +628,11 @@ class Getter(object):
         global STATS
         self.localdata.idx = idx
         
-        # Create thread-local session with optimized pool and NO retries
-        # (Circuit breaker handles retries, not session)
+        # Create thread-local session with HTTP/2 support (if available)
+        # Uses httpx for HTTP/2 multiplexing, falls back to requests
         try:
-            session = requests.Session()
-            # Larger pool to avoid connection stalls
             pool_size = max(4, int(int(CFG.autoortho.fetch_threads) * 1.5))
-            adapter = requests.adapters.HTTPAdapter(
-                pool_connections=pool_size,
-                pool_maxsize=pool_size,
-                max_retries=0,  # Circuit breaker handles retries
-                pool_block=True,
-            )
-            session.mount('https://', adapter)
-            session.mount('http://', adapter)
-            self.localdata.session = session
+            self.localdata.session = create_http_session(pool_size=pool_size)
         except Exception as _e:
             log.warning(f"Failed to initialize thread-local session: {_e}")
             self.localdata.session = requests.Session()
@@ -549,6 +718,340 @@ chunk_getter = ChunkGetter(int(CFG.autoortho.fetch_threads))
 
 log.info(f"chunk_getter: {chunk_getter}")
 #log.info(f"tile_getter: {tile_getter}")
+
+# ============================================================================
+# ASYNC CACHE WRITER
+# ============================================================================
+# A lightweight executor for background cache writes. This allows downloaded
+# chunks to be marked as "ready" immediately after download, rather than
+# waiting for disk I/O to complete. Cache writes are fire-and-forget since
+# a failed write only affects future cache hits, not current processing.
+#
+# Using 2 workers: cache writes are I/O-bound, not CPU-bound, so a small pool
+# is sufficient. More workers would just contend on disk I/O.
+# ============================================================================
+_cache_write_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, 
+    thread_name_prefix="cache_writer"
+)
+
+def _async_cache_write(chunk):
+    """Fire-and-forget cache write. Errors are logged but don't affect processing."""
+    try:
+        # Check if cache directory still exists (may have been cleaned up by temp directory)
+        # This prevents errors when diagnose() temp directories are deleted before async write
+        if not os.path.exists(chunk.cache_dir):
+            log.debug(f"Cache dir gone for {chunk}, skipping async write")
+            return
+        chunk.save_cache()
+    except (FileNotFoundError, OSError) as e:
+        # Directory may have been deleted between check and write (race condition)
+        # This is expected for temporary directories, so just log at debug level
+        log.debug(f"Async cache write skipped for {chunk}: {e}")
+    except Exception as e:
+        log.debug(f"Async cache write failed for {chunk}: {e}")
+
+def shutdown_cache_writer():
+    """Shutdown the cache writer executor gracefully. Called during module cleanup."""
+    try:
+        _cache_write_executor.shutdown(wait=False)
+    except Exception:
+        pass
+
+
+# ============================================================================
+# SPATIAL PREFETCHER
+# ============================================================================
+# Proactively downloads tile chunks ahead of the aircraft based on position
+# and heading. This reduces in-flight stutters by having tiles ready before
+# X-Plane requests them.
+#
+# Key design principles:
+# 1. Low priority: Prefetched chunks don't compete with immediate requests
+# 2. Configurable: Users can enable/disable and tune parameters
+# 3. Conservative: Doesn't overwhelm network or CPU resources
+# 4. Non-blocking: Runs in background, never blocks main processing
+# ============================================================================
+
+class SpatialPrefetcher:
+    """
+    Background prefetcher that anticipates tile needs based on aircraft movement.
+    
+    The prefetcher periodically checks aircraft position and heading, calculates
+    which tiles will be needed, and submits low-priority download requests.
+    """
+    
+    # Priority offset for prefetched chunks (higher = lower priority)
+    # This ensures prefetch doesn't compete with immediate X-Plane requests
+    PREFETCH_PRIORITY_OFFSET = 100
+    
+    # Minimum speed (m/s) to trigger prefetching - don't prefetch when taxiing
+    MIN_SPEED_MPS = 25  # ~50 knots
+    
+    def __init__(self):
+        """Initialize the prefetcher with configuration from aoconfig."""
+        self._thread = None
+        self._stop_event = threading.Event()
+        self._running = False
+        self._prefetch_count = 0
+        self._tile_cacher = None
+        
+        # Track recently prefetched to avoid duplicates
+        # Use an LRU-like structure with max size
+        self._recently_prefetched = set()
+        self._max_recent = 500
+        
+        # Load configuration
+        self._load_config()
+        
+    def _load_config(self):
+        """Load prefetch configuration from aoconfig."""
+        self.enabled = getattr(CFG.autoortho, 'prefetch_enabled', True)
+        self.lookahead_sec = float(getattr(CFG.autoortho, 'prefetch_lookahead', 30))
+        self.interval_sec = float(getattr(CFG.autoortho, 'prefetch_interval', 2.0))
+        self.max_chunks = int(getattr(CFG.autoortho, 'prefetch_max_chunks', 24))
+        
+        # Clamp to reasonable ranges
+        self.lookahead_sec = max(10, min(120, self.lookahead_sec))
+        self.interval_sec = max(1.0, min(10.0, self.interval_sec))
+        self.max_chunks = max(8, min(64, self.max_chunks))
+        
+    def set_tile_cacher(self, tile_cacher):
+        """Set the tile cacher reference for accessing tiles."""
+        self._tile_cacher = tile_cacher
+        
+    def start(self):
+        """Start the background prefetcher thread."""
+        if self._running:
+            return
+            
+        if not self.enabled:
+            log.info("Spatial prefetcher disabled by configuration")
+            return
+            
+        self._stop_event.clear()
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._prefetch_loop,
+            name="SpatialPrefetcher",
+            daemon=True
+        )
+        self._thread.start()
+        log.info(f"Spatial prefetcher started (lookahead={self.lookahead_sec}s, "
+                f"interval={self.interval_sec}s, max_chunks={self.max_chunks})")
+        
+    def stop(self):
+        """Stop the background prefetcher thread."""
+        if not self._running:
+            return
+            
+        self._stop_event.set()
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+        log.info(f"Spatial prefetcher stopped (prefetched {self._prefetch_count} chunks total)")
+        bump('prefetch_total', self._prefetch_count)
+        
+    def _prefetch_loop(self):
+        """Main prefetch loop - runs in background thread."""
+        while not self._stop_event.is_set():
+            try:
+                self._do_prefetch_cycle()
+            except Exception as e:
+                log.debug(f"Prefetch cycle error: {e}")
+            
+            # Wait before next cycle, but allow early exit on stop
+            self._stop_event.wait(timeout=self.interval_sec)
+    
+    def _do_prefetch_cycle(self):
+        """Execute one prefetch cycle."""
+        # Only prefetch when connected to X-Plane and in active flight
+        if not datareftracker.data_valid or not datareftracker.connected:
+            return
+            
+        # Check if tile_cacher is available
+        if self._tile_cacher is None:
+            return
+            
+        # Get current aircraft state
+        lat = datareftracker.lat
+        lon = datareftracker.lon
+        hdg = datareftracker.hdg
+        spd = datareftracker.spd
+        
+        # Validate data
+        if lat < -90 or lat > 90 or lon < -180 or lon > 180:
+            return
+            
+        # Don't prefetch if moving slowly (taxiing, parked)
+        if spd < self.MIN_SPEED_MPS:
+            return
+            
+        # Calculate predicted position
+        distance_m = spd * self.lookahead_sec
+        
+        # Convert heading to radians
+        hdg_rad = math.radians(hdg)
+        
+        # Calculate offset in degrees
+        # 1 degree latitude ≈ 111,320m
+        # 1 degree longitude ≈ 111,320m * cos(latitude)
+        delta_lat = (distance_m * math.cos(hdg_rad)) / 111320
+        cos_lat = math.cos(math.radians(lat))
+        if cos_lat > 0.01:  # Avoid division issues near poles
+            delta_lon = (distance_m * math.sin(hdg_rad)) / (111320 * cos_lat)
+        else:
+            delta_lon = 0
+        
+        predicted_lat = lat + delta_lat
+        predicted_lon = lon + delta_lon
+        
+        # Get tiles along the flight path
+        chunks_submitted = self._prefetch_along_path(
+            lat, lon, predicted_lat, predicted_lon
+        )
+        
+        if chunks_submitted > 0:
+            self._prefetch_count += chunks_submitted
+            log.debug(f"Prefetched {chunks_submitted} chunks (total: {self._prefetch_count})")
+            bump('prefetch_chunk_count', chunks_submitted)
+    
+    def _prefetch_along_path(self, lat1, lon1, lat2, lon2):
+        """
+        Prefetch chunks for tiles along the flight path.
+        
+        Returns number of chunks submitted for prefetch.
+        """
+        chunks_submitted = 0
+        
+        # Get zoom level from config
+        max_zoom = int(getattr(CFG.autoortho, 'max_zoom', 16))
+        
+        # Calculate tile coordinates using Web Mercator projection
+        n = 2 ** max_zoom
+        
+        def latlon_to_tile(lat, lon):
+            """Convert lat/lon to tile coordinates."""
+            x = int((lon + 180) / 360 * n)
+            # Clamp latitude to valid Mercator range
+            lat_clamped = max(-85.0511, min(85.0511, lat))
+            lat_rad = math.radians(lat_clamped)
+            y = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
+            return (x, y)
+        
+        # Get tile coordinates for start and end of path
+        col1, row1 = latlon_to_tile(lat1, lon1)
+        col2, row2 = latlon_to_tile(lat2, lon2)
+        
+        # Get tiles in the bounding box (prioritize destination end)
+        row_min, row_max = min(row1, row2), max(row1, row2)
+        col_min, col_max = min(col1, col2), max(col1, col2)
+        
+        # Limit the search area to avoid excessive prefetching
+        max_tiles = 4  # Max tiles per dimension
+        if row_max - row_min > max_tiles:
+            row_min = row2 - max_tiles // 2
+            row_max = row2 + max_tiles // 2
+        if col_max - col_min > max_tiles:
+            col_min = col2 - max_tiles // 2
+            col_max = col2 + max_tiles // 2
+        
+        # Iterate from destination back to current position
+        for row in range(row_max, row_min - 1, -1):
+            for col in range(col_min, col_max + 1):
+                if chunks_submitted >= self.max_chunks:
+                    return chunks_submitted
+                    
+                # Create unique key for this tile
+                tile_key = (row, col, max_zoom)
+                
+                # Skip if recently prefetched
+                if tile_key in self._recently_prefetched:
+                    continue
+                    
+                # Add to recently prefetched (with size limit)
+                self._recently_prefetched.add(tile_key)
+                if len(self._recently_prefetched) > self._max_recent:
+                    # Remove oldest (arbitrary since set, but prevents unbounded growth)
+                    try:
+                        self._recently_prefetched.pop()
+                    except KeyError:
+                        pass
+                
+                # Prefetch this tile's chunks
+                submitted = self._prefetch_tile(row, col, max_zoom)
+                chunks_submitted += submitted
+                
+        return chunks_submitted
+    
+    def _prefetch_tile(self, row, col, zoom):
+        """
+        Submit prefetch requests for a tile's chunks.
+        
+        Returns number of chunks submitted.
+        """
+        try:
+            # Get maptype from config
+            maptype = getattr(CFG.autoortho, 'maptype_override', None)
+            if not maptype or maptype == "Use tile default":
+                maptype = "EOX"
+            
+            # Try to get or create the tile
+            tile = self._tile_cacher._get_tile(row, col, maptype, zoom)
+            if not tile:
+                return 0
+                
+            # Get chunks for highest detail mipmap
+            if not tile.chunks or zoom not in tile.chunks:
+                # Trigger chunk creation by requesting a mipmap
+                # But don't actually wait - just ensure chunks exist
+                return 0
+                
+            chunks = tile.chunks.get(zoom, [])
+            submitted = 0
+            
+            for chunk in chunks:
+                # Skip if already ready, in flight, or failed
+                if chunk.ready.is_set():
+                    continue
+                if chunk.in_queue or chunk.in_flight:
+                    continue
+                if chunk.permanent_failure:
+                    continue
+                    
+                # Set low priority (higher number = lower priority)
+                chunk.priority = self.PREFETCH_PRIORITY_OFFSET
+                
+                # Submit to chunk getter
+                chunk_getter.submit(chunk)
+                submitted += 1
+                
+                # Stop if we've submitted enough from this tile
+                if submitted >= 4:  # Max 4 chunks per tile per cycle
+                    break
+                    
+            return submitted
+            
+        except Exception as e:
+            log.debug(f"Prefetch error for tile {row},{col}: {e}")
+            return 0
+
+
+# Global prefetcher instance
+spatial_prefetcher = SpatialPrefetcher()
+
+
+def start_prefetcher(tile_cacher):
+    """Start the spatial prefetcher with the given tile cacher."""
+    spatial_prefetcher.set_tile_cacher(tile_cacher)
+    spatial_prefetcher.start()
+
+
+def stop_prefetcher():
+    """Stop the spatial prefetcher."""
+    spatial_prefetcher.stop()
+
 
 # HTTP status codes that indicate permanent failure (no retry)
 PERMANENT_FAILURE_CODES = {400, 401, 404, 405, 406, 410, 451}
@@ -687,9 +1190,18 @@ class Chunk(object):
         if not data:
             return
 
+        # Check if cache directory still exists (may have been deleted by temp cleanup)
+        if not os.path.exists(self.cache_dir):
+            log.debug(f"Cache directory gone for {self}, skipping save")
+            return
+
         # Ensure cache directory exists
         try:
             os.makedirs(self.cache_dir, exist_ok=True)
+        except (FileNotFoundError, OSError):
+            # Directory path is invalid or was deleted
+            log.debug(f"Cannot create cache directory for {self}, skipping save")
+            return
         except Exception:
             pass
 
@@ -700,6 +1212,10 @@ class Chunk(object):
         try:
             with open(temp_filename, 'wb') as h:
                 h.write(data)
+        except FileNotFoundError as e:
+            # Directory was deleted between check and write (race with temp cleanup)
+            log.debug(f"Cache directory deleted during save for {self}: {e}")
+            return
         except Exception as e:
             # Could not write temp file
             try:
@@ -882,8 +1398,19 @@ class Chunk(object):
 
         self.fetchtime = time.monotonic() - self.starttime
 
-        self.save_cache()
+        # OPTIMIZATION: Signal ready BEFORE cache write
+        # The chunk data is already in memory (self.data), so we can mark it
+        # as ready immediately. Cache writes are for future requests only.
         self.ready.set()
+        
+        # Submit cache write asynchronously - fire and forget
+        # This prevents disk I/O from blocking the download worker thread
+        try:
+            _cache_write_executor.submit(_async_cache_write, self)
+        except RuntimeError:
+            # Executor shut down (program exiting), write synchronously as fallback
+            self.save_cache()
+        
         return True
 
     def close(self):
@@ -1338,6 +1865,7 @@ class Tile(object):
         # - fallback_level = 2: Pre-build but respect budget (stop if budget low)
         # - Always respect time budget to prevent pre-building from consuming everything
         fallback_level = self.get_fallback_level()
+        fallback_extends_budget = self.get_fallback_extends_budget()
         
         if mipmap == 0 and (startrow == 0 and endrow is None) and fallback_level >= 2:
             log.debug(f"GET_IMG: Building mipmap 0 with fallback_level={fallback_level}, "
@@ -1527,6 +2055,7 @@ class Tile(object):
                     log.debug(f"Chunk {chunk} wait ended (budget remaining={time_budget.remaining:.2f}s, exhausted={time_budget.exhausted})")
 
             chunk_img = None
+            decode_failed = False
             if chunk_ready and chunk.data:
                 # We returned and have data!
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Ready and found chunk data.")
@@ -1535,9 +2064,21 @@ class Tile(object):
                         chunk_img = AoImage.load_from_memory(chunk.data)
                         if chunk_img is None:
                             log.warning(f"GET_IMG: load_from_memory returned None for {chunk}")
+                            decode_failed = True
                 except Exception as _e:
                     log.error(f"GET_IMG: load_from_memory exception for {chunk}: {_e}")
                     chunk_img = None
+                    decode_failed = True
+            elif chunk_ready and not chunk.data:
+                # Download "succeeded" but returned empty data
+                log.debug(f"GET_IMG: Chunk {chunk} ready but has no data")
+                decode_failed = True
+            
+            # Determine if we need fallbacks:
+            # - chunk didn't download in time (not chunk_ready)
+            # - chunk is permanently failed (404, etc)
+            # - chunk downloaded but decode failed (decode_failed)
+            needs_fallback = not chunk_ready or is_permanent_failure or decode_failed
             
             # FALLBACK CHAIN (in order of preference):
             # Each fallback only runs if previous ones failed and fallback_level allows it.
@@ -1549,7 +2090,7 @@ class Tile(object):
             #   2 = Full: All fallbacks including Fallback 3 (network downloads)
             
             # Fallback 1: Search disk cache for lower-zoom JPEGs (enabled if fallback_level >= 1)
-            if not chunk_img and (not chunk_ready or is_permanent_failure) and fallback_level >= 1:
+            if not chunk_img and needs_fallback and fallback_level >= 1:
                 log.debug(f"GET_IMG(process_chunk): Fallback 1 - searching disk cache for backup chunk.")
                 chunk_img = self.get_best_chunk(chunk.col, chunk.row, mipmap, zoom)
                 # get_best_chunk bumps 'upscaled_from_jpeg_count' if successful
@@ -1562,14 +2103,20 @@ class Tile(object):
             
             # Fallback 3: On-demand download of lower-detail chunks (enabled if fallback_level >= 2)
             # This is the expensive network fallback - only use when quality is prioritized
-            if not chunk_img and (not chunk_ready or is_permanent_failure) and fallback_level >= 2:
-                # Also check time budget before network operations
-                if not time_budget.exhausted:
-                    log.debug(f"GET_IMG(process_chunk): Fallback 3 - cascading fallback (network download).")
-                    chunk_img = self.get_or_build_lower_mipmap_chunk(mipmap, chunk.col, chunk.row, zoom, 
-                                                                      time_budget=time_budget)
+            if not chunk_img and needs_fallback and fallback_level >= 2:
+                # Determine whether to respect or ignore the exhausted budget:
+                # - If fallback_extends_budget is True: ignore exhausted budget (quality priority)
+                # - If fallback_extends_budget is False: respect budget strictly (speed priority)
+                if time_budget.exhausted and not fallback_extends_budget:
+                    log.debug(f"GET_IMG(process_chunk): Skipping Fallback 3 - budget exhausted and fallback_extends_budget=False")
                 else:
-                    log.debug(f"GET_IMG(process_chunk): Skipping Fallback 3 - budget exhausted")
+                    log.debug(f"GET_IMG(process_chunk): Fallback 3 - cascading fallback "
+                             f"(budget_exhausted={time_budget.exhausted}, extends_budget={fallback_extends_budget}).")
+                    # When extends_budget is True and budget is exhausted, pass time_budget=None
+                    # so the cascading function uses its legacy fixed timeout instead of immediately giving up.
+                    cascade_budget = None if (time_budget.exhausted and fallback_extends_budget) else time_budget
+                    chunk_img = self.get_or_build_lower_mipmap_chunk(mipmap, chunk.col, chunk.row, zoom, 
+                                                                      time_budget=cascade_budget)
 
             if not chunk_ready and not chunk_img and not is_permanent_failure:
                 # Ran out of time, lower mipmap.  Retry...
@@ -1611,161 +2158,108 @@ class Tile(object):
                 
             return (chunk, chunk_img, start_x, start_y)
         
-        # Process chunks lazily - only after their download has started
+        # OPTIMIZATION: Submit all chunks to decode executor immediately
+        # Instead of polling for download_started, submit all chunks upfront.
+        # Each worker will wait on its chunk's ready event, sleeping efficiently.
+        # This removes polling overhead (~25ms per iteration) and lets the executor
+        # manage scheduling. The _decode_sem already limits concurrent decodes.
         max_pool_workers = min(CURRENT_CPU_COUNT, len(chunks), _MAX_DECODE)
         
-        processed_chunks = set()
         total_chunks = len(chunks)
         completed = 0
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_pool_workers)
         active_futures = {}
         
         try:
-            while len(processed_chunks) < len(chunks):
+            # Submit all chunks immediately (except permanently failed ones)
+            for chunk in chunks:
+                if chunk.permanent_failure:
+                    bump('chunk_missing_count')
+                    continue
+                future = executor.submit(process_chunk, chunk)
+                active_futures[future] = chunk
+            
+            log.debug(f"GET_IMG: Submitted {len(active_futures)} chunks to decode executor")
+            
+            # Collect results as they complete, respecting time budget
+            while active_futures:
                 # === TIME BUDGET CHECK ===
-                # This is the key improvement: check the shared time budget, not a hardcoded timeout.
-                # When budget is exhausted, we stop submitting new work and exit gracefully.
                 if time_budget.exhausted:
-                    chunks_remaining = len(chunks) - len(processed_chunks)
-                    if chunks_remaining > 0:
-                        bump('chunk_budget_exhausted', chunks_remaining)
+                    remaining = len(active_futures)
+                    if remaining > 0:
+                        bump('chunk_budget_exhausted', remaining)
                     log.info(f"Time budget exhausted after {time_budget.elapsed:.2f}s for mipmap {mipmap}: "
                             f"processed {time_budget.chunks_processed}, skipped {time_budget.chunks_skipped}, "
-                            f"remaining {chunks_remaining}/{len(chunks)}")
+                            f"remaining {remaining}/{total_chunks}")
                     break
                 
-                # Smart early exit - if all started downloads are done, exit
-                # Only use early exit when spatial priorities are active (during flight)
-                # to avoid incomplete mipmaps during initial load or tests
-                if datareftracker.data_valid and datareftracker.connected:
-                    chunks_started = sum(1 for c in chunks if c.download_started.is_set())
-                    if chunks_started > 0 and len(processed_chunks) >= chunks_started:
-                        chunks_never_started = len(chunks) - chunks_started
-                        if chunks_never_started > 0:
-                            log.debug(f"Early exit: {chunks_never_started} chunks never started")
-                        break
+                # Wait for completions with a short timeout to allow budget checks
+                done, pending = concurrent.futures.wait(
+                    active_futures.keys(), 
+                    timeout=0.05,  # Check budget every 50ms
+                    return_when=concurrent.futures.FIRST_COMPLETED
+                )
                 
-                # Find chunks whose downloads have started but haven't been submitted for processing yet
-                for chunk in chunks:
-                    chunk_id = id(chunk)
-                    if chunk_id in processed_chunks:
-                        continue
-                    
-                    # Skip permanently failed chunks immediately
-                    if chunk.permanent_failure:
-                        processed_chunks.add(chunk_id)
-                        bump('chunk_missing_count')
-                        continue
-                    
-                    # Don't submit new work if budget is exhausted
-                    if time_budget.exhausted:
-                        break
-                    
-                    # Submit when download has started
-                    if chunk.download_started.is_set():
-                        future = executor.submit(process_chunk, chunk)
-                        active_futures[future] = chunk
-                        processed_chunks.add(chunk_id)
-                
-                # Process any completed futures
-                if active_futures:
-                    done, pending = concurrent.futures.wait(
-                        active_futures.keys(), 
-                        timeout=0.025,  # Check 4x more frequently
-                        return_when=concurrent.futures.FIRST_COMPLETED
-                    )
-                    
-                    for future in done:
+                for future in done:
+                    try:
+                        chunk, chunk_img, start_x, start_y = future.result()
+                        completed += 1
+                        if chunk_img:
+                            _safe_paste(new_im, chunk_img, start_x, start_y)
+                    except Exception as exc:
+                        log.error(f"Chunk processing failed: {exc}")
+                    finally:
+                        del active_futures[future]
+                    # Progress logging
+                    if total_chunks and (completed % max(1, total_chunks // 4) == 0):
+                        log.debug(f"GET_IMG progress: {completed}/{total_chunks} chunks for mip {mipmap}")
+            
+            # Process any remaining active futures (when budget wasn't exhausted)
+            # Budget exhaustion already logged above, so just drain remaining futures
+            remaining_futures = list(active_futures.keys())
+            if remaining_futures:
+                # Use short timeout to avoid blocking forever
+                timeout = max(0.5, time_budget.remaining) if not time_budget.exhausted else 0.5
+                try:
+                    for future in concurrent.futures.as_completed(remaining_futures, timeout=timeout):
                         try:
                             chunk, chunk_img, start_x, start_y = future.result()
-                            completed += 1
                             if chunk_img:
                                 _safe_paste(new_im, chunk_img, start_x, start_y)
                         except Exception as exc:
                             log.error(f"Chunk processing failed: {exc}")
                         finally:
-                            del active_futures[future]
-                        # Progress logging
-                        if total_chunks and (completed % max(1, total_chunks // 4) == 0):
-                            log.debug(f"GET_IMG progress: {completed}/{total_chunks} chunks for mip {mipmap}")
-                else:
-                    # No active futures yet, wait a bit before checking for started downloads
-                    time.sleep(0.01)  # Check 5x more frequently
-            
-            # Wait for any remaining futures to complete
-            for future in concurrent.futures.as_completed(active_futures.keys()):
-                try:
-                    chunk, chunk_img, start_x, start_y = future.result()
-                    if chunk_img:
-                        _safe_paste(new_im, chunk_img, start_x, start_y)
-                except Exception as exc:
-                    log.error(f"Chunk processing failed: {exc}")
-            
-            # CRITICAL: Process any chunks that never started downloading
-            # These would otherwise be left as missing color patches
-            unprocessed_chunks = [c for c in chunks if id(c) not in processed_chunks and not c.permanent_failure]
-            if unprocessed_chunks:
-                # If budget is exhausted, skip expensive fallback processing entirely
-                # The chunks will show as missing color, but we respect the time budget
-                if time_budget.exhausted:
-                    log.info(f"Skipping {len(unprocessed_chunks)} unprocessed chunks - time budget exhausted "
-                            f"(processed={time_budget.chunks_processed}, skipped={time_budget.chunks_skipped})")
-                    bump('chunk_budget_exhausted', len(unprocessed_chunks))
-                else:
-                    log.info(f"Processing {len(unprocessed_chunks)} chunks that never started downloading "
-                            f"(fallback only, budget remaining={time_budget.remaining:.2f}s)")
-                    
-                    # Submit ALL unprocessed chunks in parallel (not serial!)
-                    unprocessed_futures = {}
-                    for chunk in unprocessed_chunks:
-                        # Check budget before each submission to avoid overwhelming
-                        if time_budget.exhausted:
-                            log.debug(f"Budget exhausted while submitting unprocessed chunks, skipping rest")
-                            remaining = len([c for c in unprocessed_chunks if id(c) not in processed_chunks])
-                            bump('chunk_budget_exhausted', remaining)
-                            break
-                        # Use skip_download_wait=True to go straight to fallbacks
-                        future = executor.submit(process_chunk, chunk, skip_download_wait=True)
-                        unprocessed_futures[future] = chunk
-                        processed_chunks.add(id(chunk))
-                    
-                    # Process results as they complete (parallel, not serial)
-                    # Use remaining budget as timeout instead of hardcoded 10s
-                    fallback_timeout = max(1.0, time_budget.remaining)
-                    try:
-                        for future in concurrent.futures.as_completed(unprocessed_futures.keys(), timeout=fallback_timeout):
-                            try:
-                                chunk, chunk_img, start_x, start_y = future.result()
-                                if chunk_img:
-                                    _safe_paste(new_im, chunk_img, start_x, start_y)
-                                else:
-                                    bump('chunk_missing_count')
-                            except Exception as exc:
-                                chunk = unprocessed_futures.get(future, "unknown")
-                                log.debug(f"Fallback failed for unprocessed chunk {chunk}: {exc}")
-                                bump('chunk_missing_count')
-                    except TimeoutError:
-                        # Some futures didn't complete in time - count them as missing
-                        # This prevents crashes when the system is overloaded
-                        unfinished_count = sum(1 for f in unprocessed_futures.keys() if not f.done())
-                        log.warning(f"Fallback processing timeout: {unfinished_count} chunks still pending, marking as missing")
-                        bump('chunk_missing_count', unfinished_count)
-                        bump('fallback_timeout_count')
-                    
+                            if future in active_futures:
+                                del active_futures[future]
+                except TimeoutError:
+                    unfinished = len([f for f in remaining_futures if not f.done()])
+                    log.debug(f"Timeout waiting for {unfinished} remaining chunks")
+                    bump('chunk_missing_count', unfinished)
         finally:
             executor.shutdown(wait=True)
 
-        if complete_img and mipmap <= self.max_mipmap:
+        # Determine if we need to cache this image for fallback/upscaling
+        should_cache = complete_img and mipmap <= self.max_mipmap
+        
+        if should_cache:
             log.debug(f"GET_IMG: Save complete image for later...")
             # Store image with metadata (col, row, zoom) for coordinate mapping in upscaling
             self.imgs[mipmap] = (new_im, col, row, zoom)
 
         log.debug(f"GET_IMG: DONE!  IMG created {new_im}")
 
+        # OPTIMIZATION: In-place desaturation when image isn't cached
+        # Only copy when image was saved to cache AND needs desaturation
         if seasons_enabled:
             saturation = 0.01 * season_saturation_locked(self.row, self.col, self.tilename_zoom)
             if saturation < 1.0:    # desaturation is expensive
-                new_im = new_im.copy().desaturate(saturation)
+                if should_cache:
+                    # Must copy because original is cached for fallback use
+                    new_im = new_im.copy().desaturate(saturation)
+                else:
+                    # In-place desaturation - no copy needed, saves memory allocation
+                    new_im.desaturate(saturation)
+        
         # Return image along with mipmap and zoom level this was created at
         return new_im
 
@@ -2125,6 +2619,28 @@ class Tile(object):
             return max(0, min(2, fb_value))
         else:
             return 1  # Default to cache
+
+    def get_fallback_extends_budget(self):
+        """Check if fallbacks should extend beyond the time budget.
+        
+        When True and fallback_level is 'full', network fallbacks will continue
+        even after the tile time budget is exhausted (prioritizing quality over timing).
+        
+        When False, fallbacks respect the time budget strictly (prioritizing timing over quality).
+        
+        Returns:
+            bool: True if fallbacks should ignore budget exhaustion
+        """
+        fb_value = getattr(CFG.autoortho, 'fallback_extends_budget', False)
+        
+        # Handle string values from config
+        if isinstance(fb_value, str):
+            return fb_value.lower().strip() in ('true', '1', 'yes', 'on')
+        # Handle boolean directly
+        elif isinstance(fb_value, bool):
+            return fb_value
+        else:
+            return False  # Default: respect budget
 
     #@profile
     @locked

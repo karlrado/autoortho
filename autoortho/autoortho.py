@@ -275,9 +275,13 @@ def diagnose(CFG):
     for maptype in MAPTYPES:
         if maptype == "Use tile default":
             continue
-        with tempfile.TemporaryDirectory() as tmpdir:
+        # Use ignore_cleanup_errors=True to handle race with async cache writes
+        # The async cache writer may still be writing when the temp dir is cleaned up
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             c = getortho.Chunk(2176, 3232, maptype, 13, cache_dir=tmpdir)
             ret = c.get()
+            # Give async cache writer a moment to complete or detect deleted dir
+            time.sleep(0.1)
             if ret:
                 log.info(f"    Maptype: {maptype} OK!")
             else:
@@ -696,6 +700,14 @@ class AOMount:
     def unmount_sceneries(self, force=False):
         log.info("Unmounting ...")
         self.mounts_running = False
+        
+        # Stop spatial prefetcher
+        try:
+            import getortho
+            getortho.stop_prefetcher()
+        except Exception as e:
+            log.debug(f"Error stopping prefetcher: {e}")
+        
         for scenery in self.cfg.scenery_mounts:
             self.unmount(scenery.get('mount'), force)
 

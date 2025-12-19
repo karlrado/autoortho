@@ -1202,17 +1202,16 @@ class ConfigUI(QMainWindow):
 
         # Max wait time
         maxwait_layout = QHBoxLayout()
-        self.maxwait_label_title = QLabel("Max wait time (seconds):")
-        self.maxwait_label_title.setToolTip(
-            "Legacy per-chunk timeout (used when 'Use time budget system' is disabled).\n\n"
+        maxwait_label = QLabel("Max wait time (seconds):")
+        maxwait_label.setToolTip(
             "Maximum time to wait for single imagery downloads before timing out.\n"
             "Lower values = faster response but may have green or blank tiles\n"
-            "Higher values = better chance at getting tiles but stutters while they load\n"
+            "Higher values = better change at getting tiles but stutters and missing tiles while they load\n"
             "Default: 0.5 seconds\n"
             "Optimal: 2 seconds is a good compromise.\n"
             "Increase this if you are using higher zoom levels and/or have a slow internet connection."
         )
-        maxwait_layout.addWidget(self.maxwait_label_title)
+        maxwait_layout.addWidget(maxwait_label)
         self.maxwait_slider = ModernSlider()
         self.maxwait_slider.setRange(1, 100)
         self.maxwait_slider.setSingleStep(1)
@@ -1232,16 +1231,15 @@ class ConfigUI(QMainWindow):
         autoortho_layout.addLayout(maxwait_layout)
 
         suspend_maxwait_layout = QHBoxLayout()
-        self.suspend_maxwait_check = QCheckBox("Extended timeout during startup")
+        self.suspend_maxwait_check = QCheckBox("Suspend max wait during startup")
         self.suspend_maxwait_check.setChecked(self.cfg.autoortho.suspend_maxwait)
         self.suspend_maxwait_check.setObjectName('suspend_maxwait')
         self.suspend_maxwait_check.setToolTip(
-            "Use extended timeouts while loading scenery before the flight starts.\n\n"
-            "When enabled:\n"
-            "  • With time budget: Uses 10x the tile time budget during startup\n"
-            "  • Without time budget: Uses 20 seconds per chunk during startup\n\n"
-            "This reduces backup (low res) textures and missing (grey) textures\n"
-            "at the cost of longer initial load times."
+            "Suspend the effect of max wait (by temporarily increasing it to a large\n"
+            "value) while loading scenery before the start of the flight.\n"
+            "This reduces backup (low res) textures and missing (grey) textures.\n"
+            "The specified max wait time is used after the flight starts.\n"
+            "This may increase the scenery load time before the start of the flight."
         )
         suspend_maxwait_layout.addWidget(self.suspend_maxwait_check)
         autoortho_layout.addLayout(suspend_maxwait_layout)
@@ -1317,21 +1315,22 @@ class ConfigUI(QMainWindow):
             "Lower values = less stuttering, but may have more missing/low-res tiles\n"
             "Higher values = better quality, but more potential for stuttering\n\n"
             "Recommended values:\n"
-            "  • 1.0 - Fast (best for weaker CPUs or slow networks)\n"
-            "  • 2.0 - Balanced (good for most users)\n"
-            "  • 5.0 - Quality (for fast CPUs and networks)"
+            "  • 10.0 - Fast (best for weaker CPUs or slow networks)\n"
+            "  • 20.0 - Balanced (good for most users)\n"
+            "  • 30.0 - Quality (for fast CPUs and networks)"
         )
         tile_budget_layout.addWidget(self.tile_budget_label_title)
         self.tile_budget_slider = ModernSlider()
-        # Range: 0.5 to 10.0 seconds, with 0.5 precision (slider value = seconds * 2)
-        self.tile_budget_slider.setRange(1, 20)  # 0.5 to 10.0 in 0.5 increments
+        # Range: 0.5 to 15.0 seconds, with 0.5 precision (slider value = seconds * 2)
+        # Each tile has 256 chunks (16x16), so adequate time is needed for full quality
+        self.tile_budget_slider.setRange(1, 60)  # 0.5 to 60.0 in 0.5 increments
         self.tile_budget_slider.setSingleStep(1)
         tile_budget_value = int(float(self.cfg.autoortho.tile_time_budget) * 2)
-        tile_budget_value = max(1, min(20, tile_budget_value))  # Clamp to valid range
+        tile_budget_value = max(1, min(60, tile_budget_value))  # Clamp to valid range
         self.tile_budget_slider.setValue(tile_budget_value)
         self.tile_budget_slider.setObjectName('tile_time_budget')
         self.tile_budget_slider.setToolTip(
-            "Drag to adjust tile time budget (0.5-10.0 seconds)"
+            "Drag to adjust tile time budget (0.5-60.0 seconds)"
         )
         self.tile_budget_value_label = QLabel(f"{float(self.cfg.autoortho.tile_time_budget):.1f}")
         self.tile_budget_slider.valueChanged.connect(
@@ -1375,9 +1374,80 @@ class ConfigUI(QMainWindow):
             "Select fallback behavior when chunks timeout"
         )
         self.fallback_level_combo.currentIndexChanged.connect(self._sync_preset_from_values)
+        self.fallback_level_combo.currentIndexChanged.connect(self._update_fallback_extends_control)
         fallback_layout.addWidget(self.fallback_level_combo)
         fallback_layout.addStretch()
         autoortho_layout.addLayout(fallback_layout)
+        
+        # Fallback extends budget checkbox (only relevant when fallback_level is 'full')
+        fallback_extends_layout = QHBoxLayout()
+        self.fallback_extends_budget_check = QCheckBox("Allow fallbacks to extend time budget")
+        fb_extends_value = getattr(self.cfg.autoortho, 'fallback_extends_budget', False)
+        if isinstance(fb_extends_value, str):
+            fb_extends_checked = fb_extends_value.lower().strip() in ('true', '1', 'yes', 'on')
+        else:
+            fb_extends_checked = bool(fb_extends_value)
+        self.fallback_extends_budget_check.setChecked(fb_extends_checked)
+        self.fallback_extends_budget_check.setToolTip(
+            "When enabled with 'Full' fallback level, network fallbacks will continue\n"
+            "even after the time budget is exhausted. This prioritizes image quality\n"
+            "over strict timing, which may cause longer load times on slow networks.\n\n"
+            "• Enabled: Better quality, may cause longer loading (quality priority)\n"
+            "• Disabled: Strict timing, may have some missing tiles (speed priority)"
+        )
+        fallback_extends_layout.addWidget(self.fallback_extends_budget_check)
+        fallback_extends_layout.addStretch()
+        autoortho_layout.addLayout(fallback_extends_layout)
+        
+        # Initially update the enabled state
+        self._update_fallback_extends_control()
+
+        # Prefetch Settings Sub-section
+        prefetch_header = QLabel("Prefetching")
+        prefetch_header.setStyleSheet("font-weight: bold; font-size: 12px; color: #8ab4f8; margin-top: 10px;")
+        autoortho_layout.addWidget(prefetch_header)
+        
+        # Prefetch enable checkbox
+        prefetch_enable_layout = QHBoxLayout()
+        self.prefetch_enabled_check = QCheckBox("Enable spatial prefetching")
+        self.prefetch_enabled_check.setChecked(
+            getattr(self.cfg.autoortho, 'prefetch_enabled', True)
+        )
+        self.prefetch_enabled_check.setToolTip(
+            "Proactively download tiles ahead of the aircraft to reduce stutters.\n"
+            "Uses aircraft heading and speed to predict which tiles will be needed."
+        )
+        self.prefetch_enabled_check.stateChanged.connect(self._update_prefetch_controls)
+        prefetch_enable_layout.addWidget(self.prefetch_enabled_check)
+        prefetch_enable_layout.addStretch()
+        autoortho_layout.addLayout(prefetch_enable_layout)
+        
+        # Prefetch lookahead slider
+        lookahead_layout = QHBoxLayout()
+        self.prefetch_lookahead_label = QLabel("Lookahead time:")
+        self.prefetch_lookahead_label.setToolTip(
+            "How far ahead (in seconds) to prefetch tiles.\n"
+            "Higher = more tiles prefetched, uses more bandwidth\n"
+            "Lower = fewer tiles prefetched, less bandwidth usage"
+        )
+        lookahead_layout.addWidget(self.prefetch_lookahead_label)
+        
+        self.prefetch_lookahead_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.prefetch_lookahead_slider.setRange(10, 120)  # 10-120 seconds
+        self.prefetch_lookahead_slider.setValue(
+            int(float(getattr(self.cfg.autoortho, 'prefetch_lookahead', 30)))
+        )
+        self.prefetch_lookahead_slider.setObjectName('prefetch_lookahead')
+        self.prefetch_lookahead_value = QLabel(f"{self.prefetch_lookahead_slider.value()}s")
+        self.prefetch_lookahead_slider.valueChanged.connect(
+            lambda v: self.prefetch_lookahead_value.setText(f"{v}s")
+        )
+        lookahead_layout.addWidget(self.prefetch_lookahead_slider)
+        lookahead_layout.addWidget(self.prefetch_lookahead_value)
+        autoortho_layout.addLayout(lookahead_layout)
+        
+        # Initialize prefetch control states
+        self._update_prefetch_controls()
 
         # Initialize preset tracking flag and sync control states
         self._applying_preset = False
@@ -2317,33 +2387,67 @@ class ConfigUI(QMainWindow):
         """Update enabled state of performance tuning controls based on use_time_budget checkbox."""
         use_time_budget = self.use_time_budget_check.isChecked()
         
+        # When time budget is enabled:
+        # - Enable tile_budget_slider (the new control)
+        # When time budget is disabled:
+        # - Disable tile_budget_slider
+        
+        self.tile_budget_slider.setEnabled(use_time_budget)
+        self.tile_budget_label_title.setEnabled(use_time_budget)
+        self.tile_budget_value_label.setEnabled(use_time_budget)
+        
+        # Update visual styling to indicate disabled state
+        disabled_style = "color: #666;"
+        enabled_style = ""
+        
+        self.tile_budget_label_title.setStyleSheet(enabled_style if use_time_budget else disabled_style)
+        self.tile_budget_value_label.setStyleSheet(enabled_style if use_time_budget else disabled_style)
+        
+        # Note: We keep maxwait controls always enabled since they serve as
+        # the fallback per-chunk timeout and are still used internally.
+        # This provides backwards compatibility.
+        
+        # Update preset selector to reflect current settings
+        self._sync_preset_from_values()
+
+    def _update_prefetch_controls(self):
+        """Update enabled state of prefetch controls based on enable checkbox."""
+        enabled = self.prefetch_enabled_check.isChecked()
+        
+        self.prefetch_lookahead_slider.setEnabled(enabled)
+        self.prefetch_lookahead_label.setEnabled(enabled)
+        self.prefetch_lookahead_value.setEnabled(enabled)
+        
         # Update visual styling
         disabled_style = "color: #666;"
         enabled_style = ""
         
-        # When time budget is ENABLED:
-        # - Enable tile_budget_slider (the new control)
-        # - Disable legacy maxwait controls (they're less relevant)
-        self.tile_budget_slider.setEnabled(use_time_budget)
-        self.tile_budget_label_title.setEnabled(use_time_budget)
-        self.tile_budget_value_label.setEnabled(use_time_budget)
-        self.tile_budget_label_title.setStyleSheet(enabled_style if use_time_budget else disabled_style)
-        self.tile_budget_value_label.setStyleSheet(enabled_style if use_time_budget else disabled_style)
+        self.prefetch_lookahead_label.setStyleSheet(enabled_style if enabled else disabled_style)
+        self.prefetch_lookahead_value.setStyleSheet(enabled_style if enabled else disabled_style)
+
+    def _update_fallback_extends_control(self):
+        """Update enabled state of fallback_extends_budget based on fallback level.
         
-        # When time budget is DISABLED:
-        # - Enable legacy maxwait controls
-        # - Disable tile_budget_slider
-        self.maxwait_slider.setEnabled(not use_time_budget)
-        self.maxwait_label_title.setEnabled(not use_time_budget)
-        self.maxwait_label.setEnabled(not use_time_budget)
-        self.maxwait_label_title.setStyleSheet(disabled_style if use_time_budget else enabled_style)
-        self.maxwait_label.setStyleSheet(disabled_style if use_time_budget else enabled_style)
+        The 'allow fallbacks to extend budget' option is only relevant when
+        fallback_level is 'Full' (index 2), since that's the only level that
+        does network fallbacks.
+        """
+        is_full_fallback = self.fallback_level_combo.currentIndex() == 2
+        self.fallback_extends_budget_check.setEnabled(is_full_fallback)
         
-        # suspend_maxwait is always relevant (affects both modes)
-        # but update its label to indicate current mode
-        
-        # Update preset selector to reflect current settings
-        self._sync_preset_from_values()
+        # Update tooltip to explain why it's disabled
+        if is_full_fallback:
+            self.fallback_extends_budget_check.setToolTip(
+                "When enabled, network fallbacks will continue even after the time budget\n"
+                "is exhausted. This prioritizes image quality over strict timing.\n\n"
+                "• Enabled: Better quality, may cause longer loading (quality priority)\n"
+                "• Disabled: Strict timing, may have some missing tiles (speed priority)"
+            )
+        else:
+            self.fallback_extends_budget_check.setToolTip(
+                "This option only applies when 'Full (Best Quality)' fallback is selected.\n"
+                "Select 'Full' fallback level to enable this option."
+            )
 
     def _sync_preset_from_values(self):
         """Sync the preset dropdown based on current control values."""
@@ -2359,10 +2463,11 @@ class ConfigUI(QMainWindow):
         
         # Determine which preset matches current settings
         # Preset definitions: (use_time_budget, tile_budget, fallback_level)
+        # Note: Each tile has 256 chunks (16x16), so adequate time is needed
         presets = {
-            1: (True, 5.0, 0),   # Fast
-            2: (True, 10.0, 1),   # Balanced
-            3: (True, 15.0, 2),   # Quality
+            1: (True, 3.0, 0),   # Fast: 3s budget, no fallbacks
+            2: (True, 5.0, 1),   # Balanced: 5s budget, cache fallbacks
+            3: (True, 10.0, 2),  # Quality: 10s budget, full fallbacks
         }
         
         matched_preset = 0  # Default to Custom
@@ -2418,10 +2523,11 @@ class ConfigUI(QMainWindow):
         self._applying_preset = True
         try:
             # Preset definitions: (use_time_budget, tile_budget, fallback_level)
+            # Note: Each tile has 256 chunks (16x16), so adequate time is needed
             presets = {
-                1: (True, 1.0, 0),   # Fast
-                2: (True, 2.0, 1),   # Balanced
-                3: (True, 5.0, 2),   # Quality
+                1: (True, 3.0, 0),   # Fast: 3s budget, no fallbacks
+                2: (True, 5.0, 1),   # Balanced: 5s budget, cache fallbacks
+                3: (True, 10.0, 2),  # Quality: 10s budget, full fallbacks
             }
             
             if index in presets:
@@ -3058,6 +3164,13 @@ class ConfigUI(QMainWindow):
             )
             self.cfg.autoortho.fallback_level = self._fallback_index_to_str(
                 self.fallback_level_combo.currentIndex()
+            )
+            self.cfg.autoortho.fallback_extends_budget = self.fallback_extends_budget_check.isChecked()
+            
+            # Prefetch settings
+            self.cfg.autoortho.prefetch_enabled = self.prefetch_enabled_check.isChecked()
+            self.cfg.autoortho.prefetch_lookahead = str(
+                self.prefetch_lookahead_slider.value()
             )
             
             self.cfg.autoortho.fetch_threads = str(

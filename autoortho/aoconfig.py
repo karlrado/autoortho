@@ -101,16 +101,35 @@ suspend_maxwait = True
 use_time_budget = True
 # Maximum wall-clock time in seconds for a complete tile request when use_time_budget
 # is enabled. This is the actual time X-Plane will wait before showing partial results.
+# Each tile has up to 256 chunks (16x16), so adequate time is needed for full quality.
 # Lower = less stuttering, but may have more missing/low-res tiles
 # Higher = better quality, but more potential for stuttering
-# Recommended: 1.0 (fast), 2.0 (balanced), 5.0 (quality)
-tile_time_budget = 2.0
+# Recommended: 3.0 (fast), 5.0 (balanced), 10.0 (quality)
+tile_time_budget = 5.0
 # Fallback level when chunks fail to download in time:
 # none = Skip all fallbacks (fastest, may have missing tiles)
 # cache = Use disk cache and already-built mipmaps, no network (balanced)
 # full = All fallbacks including on-demand network downloads (best quality, slowest)
 # Recommended: cache for most users, full if you have fast internet and CPU
 fallback_level = cache
+# When enabled with fallback_level=full, network fallbacks will continue even after
+# the tile time budget is exhausted. This prioritizes quality over strict timing.
+# True = Better quality, may cause longer load times when network is slow
+# False = Strict timing, fallbacks respect budget (may have more missing tiles)
+# Recommended: False for stutter-free experience, True for maximum quality
+fallback_extends_budget = False
+# Spatial prefetching - proactively downloads tiles ahead of aircraft
+# Enable/disable prefetching (True/False)
+prefetch_enabled = True
+# How far ahead to prefetch in seconds of flight time (10-120)
+prefetch_lookahead = 30
+# How often to check for prefetch opportunities in seconds (1-10)
+prefetch_interval = 2.0
+# Maximum chunks to prefetch per cycle (8-64)
+prefetch_max_chunks = 24
+# Use HTTP/2 multiplexing if httpx is installed (recommended for faster downloads)
+# HTTP/2 allows multiple requests over a single connection, reducing latency
+use_http2 = True
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False
