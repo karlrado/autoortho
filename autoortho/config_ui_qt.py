@@ -2360,9 +2360,9 @@ class ConfigUI(QMainWindow):
         # Determine which preset matches current settings
         # Preset definitions: (use_time_budget, tile_budget, fallback_level)
         presets = {
-            1: (True, 1.0, 0),   # Fast
-            2: (True, 2.0, 1),   # Balanced
-            3: (True, 5.0, 2),   # Quality
+            1: (True, 5.0, 0),   # Fast
+            2: (True, 10.0, 1),   # Balanced
+            3: (True, 15.0, 2),   # Quality
         }
         
         matched_preset = 0  # Default to Custom
