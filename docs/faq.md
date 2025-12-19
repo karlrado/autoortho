@@ -39,16 +39,134 @@ If AutoOrtho suddenly stops working after it previously worked, check that the `
 
 ## General Issues
 
-### I see occasional blurry and/or green tiles
-There is a timeout for how long the system waits for individual satellite
-images.  You can adjust how long the system waits for high resolution
-images by adjusting the 'max_wait' setting (in seconds) in your configuration
-file.  Lower resolution tiles are used when available as a fall back.  The
-green tile is used as a last resort.
+<a name="missing-color-tiles"></a>
+### I see occasional blurry and/or green (missing color) tiles
 
-By making this too high you risk introducing lag, stuttering, and delays.
-However this may need to be increased for users that are far from source
-servers or have slow internet connections.
+Missing color tiles (typically green) occur when AutoOrtho cannot retrieve imagery within the time budget. This section explains why this happens and how to minimize it.
+
+#### Why do missing color tiles happen?
+
+1. **Time Budget Exhaustion:** Each tile request has a time limit. If chunks don't download in time, they may appear as missing color.
+2. **Network Issues:** Slow or unreliable internet connections cause downloads to timeout.
+3. **Server Issues:** The imagery servers may be slow or temporarily unavailable.
+4. **CPU Limitations:** If your CPU can't decode images fast enough, chunks may not complete in time.
+
+#### How to minimize missing color tiles
+
+**Quick Fix - Increase Time Budget:**
+1. Open AutoOrtho Settings
+2. Go to the Settings tab → Performance Tuning section
+3. Increase "Tile Time Budget" to 15-20 seconds
+4. This gives more time for chunks to download
+
+**Enable Full Fallbacks:**
+1. Set "Fallback Level" to "Full (Best Quality)"
+2. Enable "Allow fallbacks to extend time budget"
+3. This allows AutoOrtho to download lower-detail alternatives when high-detail fails
+
+**Recommended settings for minimal missing tiles:**
+```ini
+use_time_budget = True
+tile_time_budget = 20.0
+fallback_level = full
+fallback_extends_budget = True
+```
+
+**Trade-off Warning:** Higher time budgets and extended fallbacks may cause longer loading times and occasional stuttering. See the [Performance Tuning Guide](performance.md) for a detailed explanation of the quality vs. speed trade-off.
+
+---
+
+### Why are there so many missing tiles even with "Full" fallback enabled?
+
+If you're seeing many missing tiles with `fallback_level = full`, check these:
+
+1. **Budget still limiting fallbacks:** By default, even with "full" fallbacks, network fallbacks respect the time budget. Enable "Allow fallbacks to extend time budget" (`fallback_extends_budget = True`) to let fallbacks continue after the budget is exhausted.
+
+2. **New area without cache:** The first time you fly over an area, there's no cached data for fallbacks to use. Fly the same route again and you should see fewer missing tiles.
+
+3. **All fallbacks failing:** In rare cases (server issues, network problems), all fallback levels may fail. Check the AutoOrtho logs for error messages.
+
+---
+
+### How do I get the smoothest flying experience with minimal stutters?
+
+Stuttering occurs when X-Plane waits for AutoOrtho to provide imagery. To minimize stutters:
+
+1. **Use Time Budget System:** Keep `use_time_budget = True` (default)
+2. **Use reasonable budget:** Set `tile_time_budget` to 5-10 seconds
+3. **Use cache-only fallbacks:** Set `fallback_level = cache` to avoid network delays during fallbacks
+4. **Enable prefetching:** Keep `prefetch_enabled = True` to download tiles ahead of your aircraft
+5. **Increase prefetch lookahead:** Set `prefetch_lookahead = 60` or higher for faster aircraft
+
+**Recommended settings for stutter-free flying:**
+```ini
+use_time_budget = True
+tile_time_budget = 5.0
+fallback_level = cache
+fallback_extends_budget = False
+prefetch_enabled = True
+prefetch_lookahead = 60
+```
+
+**Trade-off:** You may see occasional blurry or missing tiles, but your flight will be smoother.
+
+---
+
+### Why does loading take so long at startup?
+
+At startup, X-Plane requests the initial scenery tiles. Loading time depends on:
+
+1. **Number of tiles:** Higher zoom levels = more chunks to download
+2. **Network speed:** Slower connections = longer downloads
+3. **CPU speed:** Slower CPUs = longer decode/compress times
+4. **Time budget:** Higher budgets = more time spent per tile
+
+**To speed up startup:**
+- Use a lower `tile_time_budget` (5-10 seconds)
+- Enable `suspend_maxwait = True` to use extended timeouts only during startup
+- The second time you load the same area will be faster (cached data)
+
+---
+
+### What do the Performance Tuning settings mean?
+
+| Setting | What it controls |
+|---------|-----------------|
+| **Tile Time Budget** | Total seconds to wait for a tile before returning partial results |
+| **Fallback Level** | How aggressively to find replacement imagery for failed chunks |
+| **Fallback Extends Budget** | Whether to continue network fallbacks after budget is exhausted |
+| **Prefetch Enabled** | Whether to download tiles ahead of your aircraft |
+| **Prefetch Lookahead** | How many seconds of flight time to prefetch ahead |
+
+For detailed explanations, see the [Performance Tuning Guide](performance.md).
+
+---
+
+### I changed the settings but nothing seems different
+
+1. **Restart AutoOrtho:** Some settings require a restart to take effect
+2. **Clear cache:** Old cached data may affect results. Try clearing the cache
+3. **Fly a new route:** Cached areas will use existing data. Try an area you haven't visited
+4. **Check config file:** Verify your `~/.autoortho` file has the expected values
+
+---
+
+### What's the difference between maxwait and tile_time_budget?
+
+| Setting | Scope | Behavior |
+|---------|-------|----------|
+| `maxwait` (legacy) | Per-chunk timeout | Each of 256 chunks waits up to this long |
+| `tile_time_budget` (new) | Whole-tile budget | Total wall-clock time for entire tile request |
+
+**Example:** With `maxwait = 1.5s` and 256 chunks:
+- Worst case: 256 × 1.5s = 384 seconds (due to serial execution)
+- Actual time varies widely based on parallelism
+
+**Example:** With `tile_time_budget = 10s`:
+- Always completes in 10 seconds (predictable)
+- May have some missing chunks if network is slow
+
+**Recommendation:** Keep `use_time_budget = True` to use the new predictable system.
 
 ### I see a messge in the logs, but otherwise things work fine.
 The log will log various things, typically info and warnings can be ignored
