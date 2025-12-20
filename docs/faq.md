@@ -53,19 +53,26 @@ Missing color tiles (typically green) occur when AutoOrtho cannot retrieve image
 
 #### How to minimize missing color tiles
 
-**Quick Fix - Increase Time Budget:**
+**Option 1 - Lower Zoom Level (Most Effective):**
+Each zoom level requires 4× more resources. Lowering your max zoom dramatically reduces missing tiles:
+1. Open AutoOrtho Settings
+2. Lower "Max Zoom Level" from ZL17/18 to ZL16 or ZL15
+3. This reduces chunks per tile from 1024/4096 down to 256/64
+
+**Option 2 - Increase Time Budget:**
 1. Open AutoOrtho Settings
 2. Go to the Settings tab → Performance Tuning section
 3. Increase "Tile Time Budget" to 15-20 seconds
 4. This gives more time for chunks to download
 
-**Enable Full Fallbacks:**
+**Option 3 - Enable Full Fallbacks:**
 1. Set "Fallback Level" to "Full (Best Quality)"
 2. Enable "Allow fallbacks to extend time budget"
 3. This allows AutoOrtho to download lower-detail alternatives when high-detail fails
 
 **Recommended settings for minimal missing tiles:**
 ```ini
+maptype_override_zoom = 16
 use_time_budget = True
 tile_time_budget = 20.0
 fallback_level = full
@@ -116,15 +123,27 @@ prefetch_lookahead = 60
 
 At startup, X-Plane requests the initial scenery tiles. Loading time depends on:
 
-1. **Number of tiles:** Higher zoom levels = more chunks to download
-2. **Network speed:** Slower connections = longer downloads
-3. **CPU speed:** Slower CPUs = longer decode/compress times
-4. **Time budget:** Higher budgets = more time spent per tile
+1. **Zoom level (biggest factor):** Each zoom level increase requires **4× more resources**
+2. **Number of tiles:** More tiles = more total work
+3. **Network speed:** Slower connections = longer downloads
+4. **CPU speed:** Slower CPUs = longer decode/compress times
+5. **Time budget:** Higher budgets = more time spent per tile
 
 **To speed up startup:**
+- **Lower your Max Zoom Level** - This has the biggest impact! ZL16→ZL15 is 4× faster
 - Use a lower `tile_time_budget` (5-10 seconds)
 - Enable `suspend_maxwait = True` to use extended timeouts only during startup
 - The second time you load the same area will be faster (cached data)
+
+**Zoom Level Resource Scaling:**
+| Zoom | Chunks/Tile | Relative Load Time |
+|------|-------------|-------------------|
+| ZL15 | 64 | 1× (baseline) |
+| ZL16 | 256 | 4× |
+| ZL17 | 1024 | 16× |
+| ZL18 | 4096 | 64× |
+
+See the [Performance Tuning Guide](performance.md#zoom-level-critical-performance-factor) for detailed zoom level recommendations.
 
 ---
 

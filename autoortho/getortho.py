@@ -208,6 +208,10 @@ tile_stats = StatTracker(20, 12)
 mm_stats = StatTracker(0, 5)
 partial_stats = StatTracker()
 
+# Track FULL tile creation duration (download + compose + compress)
+# This is the key metric for tuning tile_time_budget
+tile_creation_stats = StatTracker(0, 5, default=0, maxlen=50)
+
 stats_batcher = None
 
 
@@ -237,6 +241,67 @@ def bump_many(d: dict):
         stats_batcher.add_many(d)
     else:
         inc_many(d)
+
+
+def get_tile_creation_stats():
+    """
+    Get tile creation statistics for monitoring and tuning.
+    
+    Returns a dictionary with:
+    - count: Number of tiles created
+    - avg_time_s: Average creation time in seconds
+    - avg_time_by_mipmap: Dict of mipmap level -> average time in seconds
+    - averages: Rolling averages from tile_creation_stats (last 50 samples per mipmap)
+    
+    This is useful for tuning tile_time_budget - the average creation time
+    gives a good baseline for how long tiles actually take to create.
+    """
+    result = {
+        'count': 0,
+        'avg_time_s': 0.0,
+        'avg_time_by_mipmap': {},
+        'averages': {},
+    }
+    
+    try:
+        # Get counter-based stats (aggregate across all time)
+        from aostats import get_stat
+        count = get_stat('tile_create_count')
+        total_time_ms = get_stat('tile_create_time_total_ms')
+        
+        result['count'] = count
+        if count > 0:
+            result['avg_time_s'] = round(total_time_ms / count / 1000.0, 3)
+        
+        # Get per-mipmap averages from counters
+        for mm_level in range(5):
+            mm_count = get_stat(f'mm_count:{mm_level}')
+            mm_time = get_stat(f'tile_create_time_ms:{mm_level}')
+            if mm_count > 0:
+                result['avg_time_by_mipmap'][mm_level] = round(mm_time / mm_count / 1000.0, 3)
+        
+        # Get rolling averages from StatTracker (recent samples)
+        result['averages'] = dict(tile_creation_stats.averages)
+        
+    except Exception as e:
+        log.debug(f"get_tile_creation_stats error: {e}")
+    
+    return result
+
+
+def log_tile_creation_summary():
+    """Log a summary of tile creation statistics."""
+    stats = get_tile_creation_stats()
+    if stats['count'] > 0:
+        log.info(f"TILE CREATION STATS: {stats['count']} tiles created, "
+                f"avg time: {stats['avg_time_s']:.2f}s")
+        if stats['avg_time_by_mipmap']:
+            mm_str = ", ".join(f"MM{k}: {v:.2f}s" for k, v in sorted(stats['avg_time_by_mipmap'].items()))
+            log.info(f"  Per-mipmap averages: {mm_str}")
+        if stats['averages']:
+            recent_str = ", ".join(f"MM{k}: {v:.2f}s" for k, v in sorted(stats['averages'].items()) if v > 0)
+            if recent_str:
+                log.info(f"  Recent averages (last 50): {recent_str}")
 
 
 seasons_enabled = CFG.seasons.enabled
@@ -2650,6 +2715,9 @@ class Tile(object):
         # Otherwise we risk contention such as waiting get_img call attempting to build an image as 
         # another thread closes chunks.
         #
+        
+        # Start timing FULL tile creation (download + compose + compress)
+        tile_creation_start = time.time()
 
         log.debug(f"GET_MIPMAP: {self}")
 
@@ -2664,7 +2732,7 @@ class Tile(object):
             return True
 
         self.ready.clear()
-        start_time = time.time()
+        compress_start_time = time.time()
         try:
             if mipmap == 0:
                 self.dds.gen_mipmaps(new_im, mipmap, 0) 
@@ -2674,21 +2742,35 @@ class Tile(object):
             pass
             #new_im.close()
 
-        end_time = time.time()
+        compress_end_time = time.time()
         self.ready.set()
 
+        # Calculate timing metrics
         zoom = self.max_zoom - mipmap
-        tile_time = end_time - start_time
-        mm_stats.set(mipmap, tile_time)
+        compress_time = compress_end_time - compress_start_time
+        total_creation_time = compress_end_time - tile_creation_start
+        
+        # Track compression time (legacy stat)
+        mm_stats.set(mipmap, compress_time)
+        
+        # Track FULL tile creation time (new stat for tuning tile_time_budget)
+        tile_creation_stats.set(mipmap, total_creation_time)
 
-        # Record mm stats via counters for aggregation
+        # Record stats via counters for aggregation
         try:
             bump_many({
                 f"mm_count:{mipmap}": 1,
-                f"mm_time_total_ms:{mipmap}": int(tile_time * 1000)
+                f"mm_compress_time_ms:{mipmap}": int(compress_time * 1000),
+                f"tile_create_time_ms:{mipmap}": int(total_creation_time * 1000),
+                "tile_create_count": 1,
+                "tile_create_time_total_ms": int(total_creation_time * 1000),
             })
         except Exception:
             pass
+        
+        # Log the creation time for visibility
+        log.debug(f"GET_MIPMAP: Tile {self} mipmap {mipmap} created in {total_creation_time:.2f}s "
+                 f"(download+compose: {total_creation_time - compress_time:.2f}s, compress: {compress_time:.2f}s)")
 
         # Don't close all chunks since we don't gen all mipmaps 
         if mipmap == 0:
