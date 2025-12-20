@@ -172,6 +172,33 @@ When enabled, network fallbacks (Fallback 3) will continue even after the tile t
 
 ---
 
+#### Extended Fallback Timeout (`fallback_timeout`)
+- **Type:** Float (seconds)
+- **Default:** 3.0
+- **Range:** 1.0 - 10.0 seconds
+- **Config file:** `fallback_timeout = 3.0`
+
+**Only applies when `fallback_extends_budget = True`.**
+
+When extended fallbacks are enabled, this controls how long each lower-detail mipmap level waits for its chunks to download. The total additional time is this value multiplied by the number of mipmap levels tried (typically 3-4 levels).
+
+| Value | Per-Level Wait | Total Extra Time (4 levels) | Use Case |
+|-------|----------------|----------------------------|----------|
+| 1.5s | 1.5 seconds | ~6 seconds | Fast - minimize extra wait |
+| 3.0s | 3.0 seconds | ~12 seconds | Balanced (default) |
+| 5.0s | 5.0 seconds | ~20 seconds | Quality - more time for slow connections |
+| 10.0s | 10.0 seconds | ~40 seconds | Maximum - ensure fallbacks succeed |
+
+**Example calculation:**
+- `tile_time_budget = 10s` (exhausted after 10 seconds)
+- `fallback_timeout = 3.0s`
+- Fallback tries mipmap levels 1, 2, 3, 4 → 4 levels × 3.0s = 12 seconds max
+- **Total worst-case time:** 10s + 12s = **22 seconds**
+
+**Recommendation:** Start with 3.0s. If you see fallbacks timing out (check logs), increase to 5.0s. If loading is too slow, decrease to 1.5s.
+
+---
+
 ### Spatial Prefetching
 
 The prefetching system proactively downloads tiles ahead of your aircraft to reduce in-flight stuttering.
@@ -194,22 +221,29 @@ When enabled, AutoOrtho monitors your aircraft's position, heading, and speed to
 ---
 
 #### Lookahead Time (`prefetch_lookahead`)
-- **Type:** Integer (seconds)
-- **Default:** 30
-- **Range:** 10 - 120 seconds
-- **Config file:** `prefetch_lookahead = 30`
+- **Type:** Integer (minutes)
+- **Default:** 10
+- **Range:** 1 - 60 minutes
+- **Config file:** `prefetch_lookahead = 10`
 
-How far ahead (in seconds of flight time) to prefetch tiles.
+How far ahead (in minutes of flight time) to prefetch tiles.
 
-| Value | Use Case |
-|-------|----------|
-| 10-20s | Slow aircraft (GA, helicopters) |
-| 30-60s | Medium speed (turboprops, regional jets) |
-| 60-120s | Fast aircraft (jets, supersonic) |
+| Value | At 150 kts | At 300 kts | At 500 kts | Use Case |
+|-------|-----------|-----------|-----------|----------|
+| 5 min | ~12nm | ~25nm | ~42nm | Conservative, less bandwidth |
+| 10 min | ~25nm | ~50nm | ~83nm | Balanced (default) |
+| 20 min | ~50nm | ~100nm | ~166nm | Longer flights, faster aircraft |
+| 30 min | ~75nm | ~150nm | ~250nm | Cross-country flights |
+| 60 min | ~150nm | ~300nm | ~500nm | Maximum prefetch coverage |
 
-**Example:** At 300 knots ground speed with 60 second lookahead:
-- Distance: 300 kts × 60s ÷ 3600 = 5 nautical miles ahead
-- AutoOrtho will prefetch tiles up to 5nm in front of you
+**Example:** At 300 knots ground speed with 10 minute lookahead:
+- Distance: 300 kts × 10 min = 50 nautical miles ahead
+- AutoOrtho will prefetch tiles up to 50nm in front of you
+
+**Recommendation:** 
+- Short flights / GA: 5-10 minutes
+- Medium flights / Jets: 10-20 minutes  
+- Long haul / Fast jets: 20-30 minutes
 
 ---
 
@@ -350,6 +384,85 @@ Each tile creation has two main phases:
 The stats show both the total time and compression-only time, letting you identify bottlenecks:
 - If compression time is high → CPU-bound, consider lowering zoom level
 - If download time is high → Network-bound, check internet speed
+
+---
+
+## Time-Based Exclusion
+
+AutoOrtho includes a time-based exclusion feature that allows you to automatically disable AutoOrtho scenery during specific time ranges in the simulator. This is useful for night flying when satellite imagery provides little benefit.
+
+### How It Works
+
+When time exclusion is active:
+
+1. AutoOrtho monitors the simulator's local time via the `sim/time/local_time_sec` dataref
+2. During the exclusion period, DSF files are hidden from X-Plane
+3. X-Plane falls back to its default scenery (which often has better night lighting)
+4. When the exclusion period ends, AutoOrtho scenery becomes available again
+
+### Safety Features
+
+The time exclusion system includes important safety features:
+
+- **Active DSF Protection:** DSF files that are currently in use by X-Plane will NOT be hidden, even if the exclusion period starts. This prevents crashes or graphical glitches.
+- **Gradual Transition:** Only new DSF requests are blocked during exclusion. Previously loaded scenery continues to work until X-Plane naturally releases it.
+
+### Configuration
+
+#### Enable Time Exclusion (`enabled`)
+- **Type:** Boolean (True/False)
+- **Default:** False
+- **Config file:** `[time_exclusion]` section, `enabled = True`
+
+Enable or disable the time-based exclusion feature.
+
+#### Start Time (`start_time`)
+- **Type:** String (HH:MM format)
+- **Default:** 22:00
+- **Config file:** `start_time = 22:00`
+
+The time when the exclusion period begins (24-hour format). For example, "22:00" for 10 PM.
+
+#### End Time (`end_time`)
+- **Type:** String (HH:MM format)
+- **Default:** 06:00
+- **Config file:** `end_time = 06:00`
+
+The time when the exclusion period ends (24-hour format). For example, "06:00" for 6 AM.
+
+### Example Configuration
+
+To disable AutoOrtho between 10 PM and 6 AM (night hours):
+
+```ini
+[time_exclusion]
+enabled = True
+start_time = 22:00
+end_time = 06:00
+```
+
+### Overnight Ranges
+
+The system correctly handles overnight time ranges. For example, if you set:
+- Start: 22:00 (10 PM)
+- End: 06:00 (6 AM)
+
+AutoOrtho will be disabled from 10 PM until 6 AM the next morning.
+
+### UI Configuration
+
+You can configure time exclusion in the AutoOrtho Settings tab:
+
+1. Go to **Settings** tab
+2. Find the **Time Exclusion Settings** group
+3. Check **Enable time-based exclusion**
+4. Set the **Start time** and **End time** in HH:MM format
+
+### Use Cases
+
+- **Night Flying:** Satellite imagery is often dark or less useful at night. Default X-Plane scenery may have better night lighting.
+- **Performance Optimization:** Reduce network usage and CPU load during night hours when visual quality matters less.
+- **Dawn/Dusk Flying:** Exclude twilight hours when satellite imagery transitions may look unrealistic.
 
 ---
 

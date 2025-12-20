@@ -16,6 +16,7 @@ from functools import wraps, lru_cache
 
 from aoconfig import CFG
 from utils.constants import system_type
+from time_exclusion import time_exclusion_manager
 import logging
 log = logging.getLogger(__name__)
 
@@ -265,6 +266,10 @@ class AutoOrtho(Operations):
         self._ft_start_lock = threading.Lock()
 
         self.use_ns = kwargs.get("use_ns", False)
+        
+        # Initialize time exclusion manager with dataref tracker
+        from datareftrack import dt as datareftracker
+        time_exclusion_manager.set_dataref_tracker(datareftracker)
 
     # Helpers
     # =======
@@ -421,11 +426,21 @@ class AutoOrtho(Operations):
                 return 22369776
 
 
-    @lru_cache(maxsize=1024)
     def getattr(self, path, fh=None):
         log.debug(f"GETATTR {path}")
+        
+        # Check for DSF time exclusion (not cached to allow dynamic hiding)
+        if self.dsf_re.match(path):
+            if time_exclusion_manager.should_hide_dsf(path):
+                log.debug(f"GETATTR: Hiding DSF due to time exclusion: {path}")
+                raise FuseOSError(errno.ENOENT)
+        
+        # Use cached implementation for everything else
+        return self._getattr_cached(path, fh)
 
-
+    @lru_cache(maxsize=1024)
+    def _getattr_cached(self, path, fh=None):
+        """Cached implementation of getattr for non-excluded files."""
         m = self.dds_re.match(path)
 
         now = int(time.time())
@@ -482,15 +497,23 @@ class AutoOrtho(Operations):
         log.debug(f"GETATTR: ATTRS: {attrs}")
         return attrs
 
-    @lru_cache(maxsize=1024)
     def readdir(self, path, fh):
-
+        """List directory contents, filtering DSF files during time exclusion."""
         if path in ["/textures", "/terrain"]:
             return ['.', '..', 'AOISWORKING']
 
         full_path = self._full_path(path)
         if os.path.isdir(full_path):
-            return ['.', '..', *os.listdir(full_path)]
+            entries = ['.', '..']
+            for entry in os.listdir(full_path):
+                # Check if this is a DSF file that should be hidden
+                entry_path = os.path.join(path, entry)
+                if entry.endswith('.dsf'):
+                    if time_exclusion_manager.should_hide_dsf(entry_path):
+                        log.debug(f"READDIR: Hiding DSF due to time exclusion: {entry}")
+                        continue
+                entries.append(entry)
+            return entries
         return ['.', '..']
 
     def readlink(self, path):
@@ -570,8 +593,16 @@ class AutoOrtho(Operations):
         full_path = self._full_path(path)
         log.debug(f"OPEN: FULLPATH {full_path}")
 
+        # Handle DSF files with time exclusion tracking
         if self.dsf_re.match(path):
+            # Check if DSF should be hidden (but not if already in use)
+            if time_exclusion_manager.should_hide_dsf(path):
+                log.info(f"OPEN: DSF hidden due to time exclusion: {path}")
+                raise FuseOSError(errno.ENOENT)
+            
             log.info(f"OPEN: Detected DSF open: {path}")
+            # Register this DSF as being in use (prevents hiding during active use)
+            time_exclusion_manager.register_dsf_open(path)
         
         dds_match = self.dds_re.match(path)
         if dds_match:
@@ -692,6 +723,12 @@ class AutoOrtho(Operations):
     #@locked
     def release(self, path, fh):
         log.debug(f"RELEASE: {path}")
+        
+        # Unregister DSF close for time exclusion tracking
+        if self.dsf_re.match(path):
+            log.debug(f"RELEASE: DSF closed: {path}")
+            time_exclusion_manager.register_dsf_close(path)
+        
         dds_match = self.dds_re.match(path)
         if dds_match:
             row, col, maptype, zoom = dds_match.groups()

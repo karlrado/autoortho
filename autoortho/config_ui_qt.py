@@ -1395,9 +1395,39 @@ class ConfigUI(QMainWindow):
             "• Enabled: Better quality, may cause longer loading (quality priority)\n"
             "• Disabled: Strict timing, may have some missing tiles (speed priority)"
         )
+        self.fallback_extends_budget_check.stateChanged.connect(self._update_fallback_extends_control)
         fallback_extends_layout.addWidget(self.fallback_extends_budget_check)
         fallback_extends_layout.addStretch()
         autoortho_layout.addLayout(fallback_extends_layout)
+        
+        # Fallback timeout slider (per-level timeout when extends_budget is enabled)
+        fallback_timeout_layout = QHBoxLayout()
+        self.fallback_timeout_label = QLabel("Extended fallback timeout:")
+        self.fallback_timeout_label.setToolTip(
+            "Timeout per mipmap level when using extended fallbacks.\n"
+            "When 'Allow fallbacks to extend time budget' is enabled,\n"
+            "each lower-detail level gets this much time to download.\n\n"
+            "Total extra time = this × number of levels (typically 3-4)\n"
+            "Example: 3.0s × 4 levels = 12 seconds max additional time"
+        )
+        fallback_timeout_layout.addWidget(self.fallback_timeout_label)
+        
+        self.fallback_timeout_slider = ModernSlider(Qt.Orientation.Horizontal)
+        # Range: 1.0 to 10.0 seconds, with 0.5 precision (slider value = seconds * 2)
+        self.fallback_timeout_slider.setRange(2, 20)  # 1.0 to 10.0 in 0.5 increments
+        self.fallback_timeout_slider.setSingleStep(1)
+        fallback_timeout_value = int(float(getattr(self.cfg.autoortho, 'fallback_timeout', 3.0)) * 2)
+        fallback_timeout_value = max(2, min(20, fallback_timeout_value))  # Clamp to valid range
+        self.fallback_timeout_slider.setValue(fallback_timeout_value)
+        self.fallback_timeout_slider.setObjectName('fallback_timeout')
+        self.fallback_timeout_slider.setToolTip("Drag to adjust fallback timeout (1.0-10.0 seconds)")
+        self.fallback_timeout_value_label = QLabel(f"{fallback_timeout_value / 2.0:.1f}s")
+        self.fallback_timeout_slider.valueChanged.connect(
+            lambda v: self.fallback_timeout_value_label.setText(f"{v / 2.0:.1f}s")
+        )
+        fallback_timeout_layout.addWidget(self.fallback_timeout_slider)
+        fallback_timeout_layout.addWidget(self.fallback_timeout_value_label)
+        autoortho_layout.addLayout(fallback_timeout_layout)
         
         # Initially update the enabled state
         self._update_fallback_extends_control()
@@ -1422,25 +1452,29 @@ class ConfigUI(QMainWindow):
         prefetch_enable_layout.addStretch()
         autoortho_layout.addLayout(prefetch_enable_layout)
         
-        # Prefetch lookahead slider
+        # Prefetch lookahead slider (in minutes)
         lookahead_layout = QHBoxLayout()
         self.prefetch_lookahead_label = QLabel("Lookahead time:")
         self.prefetch_lookahead_label.setToolTip(
-            "How far ahead (in seconds) to prefetch tiles.\n"
-            "Higher = more tiles prefetched, uses more bandwidth\n"
-            "Lower = fewer tiles prefetched, less bandwidth usage"
+            "How far ahead (in minutes) to prefetch tiles.\n"
+            "Higher = more tiles prefetched ahead, uses more bandwidth and memory\n"
+            "Lower = fewer tiles prefetched, less resource usage\n\n"
+            "Example at 300 knots:\n"
+            "  • 5 min = ~25nm ahead\n"
+            "  • 10 min = ~50nm ahead\n"
+            "  • 30 min = ~150nm ahead"
         )
         lookahead_layout.addWidget(self.prefetch_lookahead_label)
         
         self.prefetch_lookahead_slider = ModernSlider(Qt.Orientation.Horizontal)
-        self.prefetch_lookahead_slider.setRange(10, 120)  # 10-120 seconds
+        self.prefetch_lookahead_slider.setRange(1, 60)  # 1-60 minutes
         self.prefetch_lookahead_slider.setValue(
-            int(float(getattr(self.cfg.autoortho, 'prefetch_lookahead', 30)))
+            int(float(getattr(self.cfg.autoortho, 'prefetch_lookahead', 10)))
         )
         self.prefetch_lookahead_slider.setObjectName('prefetch_lookahead')
-        self.prefetch_lookahead_value = QLabel(f"{self.prefetch_lookahead_slider.value()}s")
+        self.prefetch_lookahead_value = QLabel(f"{self.prefetch_lookahead_slider.value()} min")
         self.prefetch_lookahead_slider.valueChanged.connect(
-            lambda v: self.prefetch_lookahead_value.setText(f"{v}s")
+            lambda v: self.prefetch_lookahead_value.setText(f"{v} min")
         )
         lookahead_layout.addWidget(self.prefetch_lookahead_slider)
         lookahead_layout.addWidget(self.prefetch_lookahead_value)
@@ -1895,6 +1929,88 @@ class ConfigUI(QMainWindow):
 
         self.settings_layout.addWidget(flightdata_group)
 
+        # Time Exclusion Settings group
+        time_exclusion_group = QGroupBox("Time Exclusion Settings")
+        time_exclusion_layout = QVBoxLayout()
+        time_exclusion_group.setLayout(time_exclusion_layout)
+
+        # Info label
+        time_exclusion_info = QLabel(
+            "Configure a time range during which AutoOrtho scenery will be disabled.\n"
+            "X-Plane will use default scenery during this time (e.g., for night flying)."
+        )
+        time_exclusion_info.setStyleSheet("color: #888; font-size: 11px;")
+        time_exclusion_info.setWordWrap(True)
+        time_exclusion_layout.addWidget(time_exclusion_info)
+        
+        time_exclusion_layout.addSpacing(5)
+
+        # Enable checkbox
+        self.time_exclusion_enabled_check = QCheckBox("Enable time-based exclusion")
+        time_exclusion_enabled = getattr(self.cfg.time_exclusion, 'enabled', False)
+        self.time_exclusion_enabled_check.setChecked(time_exclusion_enabled)
+        self.time_exclusion_enabled_check.setObjectName('time_exclusion_enabled')
+        self.time_exclusion_enabled_check.setToolTip(
+            "When enabled, AutoOrtho scenery will be hidden from X-Plane\n"
+            "during the specified time range (based on simulator local time).\n"
+            "X-Plane will fall back to default scenery during this period.\n"
+            "Useful for night flying when satellite imagery is less useful."
+        )
+        self.time_exclusion_enabled_check.toggled.connect(self._on_time_exclusion_toggled)
+        time_exclusion_layout.addWidget(self.time_exclusion_enabled_check)
+
+        # Time range inputs
+        time_range_layout = QHBoxLayout()
+        
+        # Start time
+        start_time_label = QLabel("Start time:")
+        start_time_label.setToolTip("Start of exclusion period (24-hour format HH:MM)")
+        time_range_layout.addWidget(start_time_label)
+        
+        self.time_exclusion_start_edit = QLineEdit(
+            str(getattr(self.cfg.time_exclusion, 'start_time', '22:00'))
+        )
+        self.time_exclusion_start_edit.setObjectName('time_exclusion_start_time')
+        self.time_exclusion_start_edit.setMaximumWidth(80)
+        self.time_exclusion_start_edit.setPlaceholderText("HH:MM")
+        self.time_exclusion_start_edit.setToolTip(
+            "Start time for exclusion in 24-hour format (e.g., 22:00 for 10 PM)"
+        )
+        time_range_layout.addWidget(self.time_exclusion_start_edit)
+        
+        time_range_layout.addSpacing(20)
+        
+        # End time
+        end_time_label = QLabel("End time:")
+        end_time_label.setToolTip("End of exclusion period (24-hour format HH:MM)")
+        time_range_layout.addWidget(end_time_label)
+        
+        self.time_exclusion_end_edit = QLineEdit(
+            str(getattr(self.cfg.time_exclusion, 'end_time', '06:00'))
+        )
+        self.time_exclusion_end_edit.setObjectName('time_exclusion_end_time')
+        self.time_exclusion_end_edit.setMaximumWidth(80)
+        self.time_exclusion_end_edit.setPlaceholderText("HH:MM")
+        self.time_exclusion_end_edit.setToolTip(
+            "End time for exclusion in 24-hour format (e.g., 06:00 for 6 AM)"
+        )
+        time_range_layout.addWidget(self.time_exclusion_end_edit)
+        
+        time_range_layout.addStretch()
+        time_exclusion_layout.addLayout(time_range_layout)
+
+        # Example label
+        time_example_label = QLabel(
+            "Example: 22:00 to 06:00 hides AutoOrtho during night hours"
+        )
+        time_example_label.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
+        time_exclusion_layout.addWidget(time_example_label)
+
+        # Set initial enabled state for time inputs
+        self._set_time_exclusion_controls_enabled(time_exclusion_enabled)
+
+        self.settings_layout.addWidget(time_exclusion_group)
+
         self.settings_layout.addStretch()
 
     def show_missing_color_dialog(self):
@@ -1955,6 +2071,24 @@ class ConfigUI(QMainWindow):
                     slider.setEnabled(enabled)
             if self.compress_dsf_check is not None:
                 self.compress_dsf_check.setEnabled(enabled)
+        except Exception:
+            pass
+
+    def _on_time_exclusion_toggled(self):
+        """Handle time exclusion checkbox toggle."""
+        try:
+            enabled = self.time_exclusion_enabled_check.isChecked()
+            self._set_time_exclusion_controls_enabled(enabled)
+        except Exception:
+            pass
+
+    def _set_time_exclusion_controls_enabled(self, enabled):
+        """Enable/disable time exclusion time input fields."""
+        try:
+            if hasattr(self, 'time_exclusion_start_edit'):
+                self.time_exclusion_start_edit.setEnabled(enabled)
+            if hasattr(self, 'time_exclusion_end_edit'):
+                self.time_exclusion_end_edit.setEnabled(enabled)
         except Exception:
             pass
 
@@ -2426,16 +2560,33 @@ class ConfigUI(QMainWindow):
         self.prefetch_lookahead_value.setStyleSheet(enabled_style if enabled else disabled_style)
 
     def _update_fallback_extends_control(self):
-        """Update enabled state of fallback_extends_budget based on fallback level.
+        """Update enabled state of fallback_extends_budget and timeout based on fallback level.
         
         The 'allow fallbacks to extend budget' option is only relevant when
         fallback_level is 'Full' (index 2), since that's the only level that
         does network fallbacks.
+        
+        The fallback timeout slider is only relevant when extends_budget is enabled.
         """
         is_full_fallback = self.fallback_level_combo.currentIndex() == 2
+        extends_budget = self.fallback_extends_budget_check.isChecked()
+        
+        # Enable extends_budget checkbox only for Full fallback
         self.fallback_extends_budget_check.setEnabled(is_full_fallback)
         
-        # Update tooltip to explain why it's disabled
+        # Enable timeout slider only when Full fallback AND extends_budget is checked
+        timeout_enabled = is_full_fallback and extends_budget
+        self.fallback_timeout_slider.setEnabled(timeout_enabled)
+        self.fallback_timeout_label.setEnabled(timeout_enabled)
+        self.fallback_timeout_value_label.setEnabled(timeout_enabled)
+        
+        # Style for enabled/disabled labels
+        enabled_style = ""
+        disabled_style = "color: #666666;"
+        self.fallback_timeout_label.setStyleSheet(enabled_style if timeout_enabled else disabled_style)
+        self.fallback_timeout_value_label.setStyleSheet(enabled_style if timeout_enabled else disabled_style)
+        
+        # Update tooltips to explain why controls are disabled
         if is_full_fallback:
             self.fallback_extends_budget_check.setToolTip(
                 "When enabled, network fallbacks will continue even after the time budget\n"
@@ -2447,6 +2598,18 @@ class ConfigUI(QMainWindow):
             self.fallback_extends_budget_check.setToolTip(
                 "This option only applies when 'Full (Best Quality)' fallback is selected.\n"
                 "Select 'Full' fallback level to enable this option."
+            )
+        
+        if timeout_enabled:
+            self.fallback_timeout_label.setToolTip(
+                "Timeout per mipmap level when using extended fallbacks.\n"
+                "Each lower-detail level gets this much time to download.\n\n"
+                "Total extra time = this × number of levels (typically 3-4)\n"
+                "Example: 3.0s × 4 levels = 12 seconds max additional time"
+            )
+        else:
+            self.fallback_timeout_label.setToolTip(
+                "Enable 'Allow fallbacks to extend time budget' to configure this setting."
             )
 
     def _sync_preset_from_values(self):
@@ -3166,6 +3329,9 @@ class ConfigUI(QMainWindow):
                 self.fallback_level_combo.currentIndex()
             )
             self.cfg.autoortho.fallback_extends_budget = self.fallback_extends_budget_check.isChecked()
+            self.cfg.autoortho.fallback_timeout = str(
+                self.fallback_timeout_slider.value() / 2.0
+            )
             
             # Prefetch settings
             self.cfg.autoortho.prefetch_enabled = self.prefetch_enabled_check.isChecked()
@@ -3214,6 +3380,14 @@ class ConfigUI(QMainWindow):
             self.cfg.seasons.sum_saturation = str(self.sum_sat_slider.value())
             self.cfg.seasons.fal_saturation = str(self.fal_sat_slider.value())
             self.cfg.seasons.win_saturation = str(self.win_sat_slider.value())
+
+            # Time exclusion settings
+            if hasattr(self, 'time_exclusion_enabled_check'):
+                self.cfg.time_exclusion.enabled = self.time_exclusion_enabled_check.isChecked()
+            if hasattr(self, 'time_exclusion_start_edit'):
+                self.cfg.time_exclusion.start_time = self.time_exclusion_start_edit.text()
+            if hasattr(self, 'time_exclusion_end_edit'):
+                self.cfg.time_exclusion.end_time = self.time_exclusion_end_edit.text()
 
         self.cfg.save()
         self.ready.set()

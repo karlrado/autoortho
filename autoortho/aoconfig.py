@@ -118,11 +118,21 @@ fallback_level = cache
 # False = Strict timing, fallbacks respect budget (may have more missing tiles)
 # Recommended: False for stutter-free experience, True for maximum quality
 fallback_extends_budget = False
+# Timeout per mipmap level when using extended fallbacks (in seconds)
+# When fallback_extends_budget is True, each lower-detail mipmap level
+# gets this much time to download. Total extra time = this × number of levels tried.
+# Example: 3.0 seconds × 4 levels = 12 seconds max additional time
+# Range: 1.0 - 10.0 seconds
+# Recommended: 3.0 (balanced), 5.0 (quality), 1.5 (fast)
+fallback_timeout = 3.0
 # Spatial prefetching - proactively downloads tiles ahead of aircraft
 # Enable/disable prefetching (True/False)
 prefetch_enabled = True
-# How far ahead to prefetch in seconds of flight time (10-120)
-prefetch_lookahead = 30
+# How far ahead to prefetch in minutes of flight time (1-60)
+# Higher = more tiles prefetched ahead, uses more bandwidth and memory
+# Lower = fewer tiles prefetched, less resource usage
+# Recommended: 5 (fast aircraft), 10 (balanced), 20 (slow internet)
+prefetch_lookahead = 10
 # How often to check for prefetch opportunities in seconds (1-10)
 prefetch_interval = 2.0
 # Maximum chunks to prefetch per cycle (8-64)
@@ -180,6 +190,15 @@ compress_dsf = True
 
 [windows]
 prefer_winfsp = True
+
+[time_exclusion]
+# Enable time-based AutoOrtho exclusion. When active during the specified time range,
+# AutoOrtho's scenery will be hidden and X-Plane will use its default scenery instead.
+enabled = False
+# Start time for exclusion in 24-hour format (HH:MM), e.g. "22:00" for 10 PM
+start_time = 22:00
+# End time for exclusion in 24-hour format (HH:MM), e.g. "06:00" for 6 AM
+end_time = 06:00
 """
 
     def __init__(self, conf_file=None):

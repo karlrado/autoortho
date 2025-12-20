@@ -872,12 +872,14 @@ class SpatialPrefetcher:
     def _load_config(self):
         """Load prefetch configuration from aoconfig."""
         self.enabled = getattr(CFG.autoortho, 'prefetch_enabled', True)
-        self.lookahead_sec = float(getattr(CFG.autoortho, 'prefetch_lookahead', 30))
+        # Lookahead is now configured in MINUTES, convert to seconds
+        lookahead_min = float(getattr(CFG.autoortho, 'prefetch_lookahead', 10))
+        self.lookahead_sec = lookahead_min * 60  # Convert minutes to seconds
         self.interval_sec = float(getattr(CFG.autoortho, 'prefetch_interval', 2.0))
         self.max_chunks = int(getattr(CFG.autoortho, 'prefetch_max_chunks', 24))
         
-        # Clamp to reasonable ranges
-        self.lookahead_sec = max(10, min(120, self.lookahead_sec))
+        # Clamp to reasonable ranges (1-60 minutes = 60-3600 seconds)
+        self.lookahead_sec = max(60, min(3600, self.lookahead_sec))
         self.interval_sec = max(1.0, min(10.0, self.interval_sec))
         self.max_chunks = max(8, min(64, self.max_chunks))
         
@@ -902,7 +904,7 @@ class SpatialPrefetcher:
             daemon=True
         )
         self._thread.start()
-        log.info(f"Spatial prefetcher started (lookahead={self.lookahead_sec}s, "
+        log.info(f"Spatial prefetcher started (lookahead={self.lookahead_sec/60:.0f}min, "
                 f"interval={self.interval_sec}s, max_chunks={self.max_chunks})")
         
     def stop(self):
@@ -1533,7 +1535,11 @@ class Tile(object):
 
         self.bytes_read = 0
         self.lowest_offset = 99999999
-
+        
+        # Track when this tile was first requested for accurate tile creation time stats
+        self.first_request_time = None
+        # Track if tile completion has been reported (to avoid double-counting)
+        self._completion_reported = False
 
         #self.tile_condition = threading.Condition()
         if min_zoom:
@@ -1821,6 +1827,10 @@ class Tile(object):
 
     def read_dds_bytes(self, offset, length):
         log.debug(f"READ DDS BYTES: {offset} {length}")
+        
+        # Track when this tile was first requested (for accurate tile creation time stats)
+        if self.first_request_time is None:
+            self.first_request_time = time.monotonic()
        
         if offset > 0 and offset < self.lowest_offset:
             self.lowest_offset = offset
@@ -2378,8 +2388,9 @@ class Tile(object):
                         # Use budget-aware waiting
                         fallback_chunk_ready = time_budget.wait_with_budget(fallback_chunk.ready)
                     else:
-                        # Legacy: fixed timeout
-                        fallback_chunk_ready = fallback_chunk.ready.wait(timeout=min(3.0, self.get_maxwait() / 2))
+                        # Extended fallback mode: use configurable per-level timeout
+                        fallback_timeout = float(getattr(CFG.autoortho, 'fallback_timeout', 3.0))
+                        fallback_chunk_ready = fallback_chunk.ready.wait(timeout=fallback_timeout)
                     
                     if not fallback_chunk_ready:
                         log.debug(f"Cascading fallback: mipmap {fallback_mipmap} also timed out "
@@ -2756,19 +2767,39 @@ class Tile(object):
         # Track FULL tile creation time (new stat for tuning tile_time_budget)
         tile_creation_stats.set(mipmap, total_creation_time)
 
-        # Record stats via counters for aggregation
+        # Record per-mipmap stats via counters for aggregation
         try:
             bump_many({
                 f"mm_count:{mipmap}": 1,
                 f"mm_compress_time_ms:{mipmap}": int(compress_time * 1000),
                 f"tile_create_time_ms:{mipmap}": int(total_creation_time * 1000),
-                "tile_create_count": 1,
-                "tile_create_time_total_ms": int(total_creation_time * 1000),
             })
         except Exception:
             pass
         
-        # Log the creation time for visibility
+        # Only report tile completion stats when mipmap 0 is done (full tile delivered to X-Plane)
+        # This tracks the same time window as TimeBudget: from first request to tile release
+        if mipmap == 0 and not self._completion_reported:
+            self._completion_reported = True
+            # Calculate time from first X-Plane request to completion
+            if self.first_request_time is not None:
+                tile_completion_time = time.monotonic() - self.first_request_time
+            else:
+                # Fallback: use the mipmap creation time if first_request_time wasn't set
+                tile_completion_time = total_creation_time
+            
+            try:
+                bump_many({
+                    "tile_create_count": 1,
+                    "tile_create_time_total_ms": int(tile_completion_time * 1000),
+                })
+            except Exception:
+                pass
+            
+            log.debug(f"GET_MIPMAP: Tile {self} COMPLETED in {tile_completion_time:.2f}s "
+                     f"(mipmap 0 done, time from first request)")
+        
+        # Log per-mipmap creation time for visibility
         log.debug(f"GET_MIPMAP: Tile {self} mipmap {mipmap} created in {total_creation_time:.2f}s "
                  f"(download+compose: {total_creation_time - compress_time:.2f}s, compress: {compress_time:.2f}s)")
 
