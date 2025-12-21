@@ -1413,14 +1413,14 @@ class ConfigUI(QMainWindow):
         fallback_timeout_layout.addWidget(self.fallback_timeout_label)
         
         self.fallback_timeout_slider = ModernSlider(Qt.Orientation.Horizontal)
-        # Range: 1.0 to 10.0 seconds, with 0.5 precision (slider value = seconds * 2)
-        self.fallback_timeout_slider.setRange(2, 20)  # 1.0 to 10.0 in 0.5 increments
+        # Range: 1.0 to 30.0 seconds, with 0.5 precision (slider value = seconds * 2)
+        self.fallback_timeout_slider.setRange(2, 60)  # 1.0 to 30.0 in 0.5 increments
         self.fallback_timeout_slider.setSingleStep(1)
         fallback_timeout_value = int(float(getattr(self.cfg.autoortho, 'fallback_timeout', 3.0)) * 2)
-        fallback_timeout_value = max(2, min(20, fallback_timeout_value))  # Clamp to valid range
+        fallback_timeout_value = max(2, min(60, fallback_timeout_value))  # Clamp to valid range
         self.fallback_timeout_slider.setValue(fallback_timeout_value)
         self.fallback_timeout_slider.setObjectName('fallback_timeout')
-        self.fallback_timeout_slider.setToolTip("Drag to adjust fallback timeout (1.0-10.0 seconds)")
+        self.fallback_timeout_slider.setToolTip("Drag to adjust fallback timeout (1.0-30.0 seconds)")
         self.fallback_timeout_value_label = QLabel(f"{fallback_timeout_value / 2.0:.1f}s")
         self.fallback_timeout_slider.valueChanged.connect(
             lambda v: self.fallback_timeout_value_label.setText(f"{v / 2.0:.1f}s")
@@ -2006,6 +2006,20 @@ class ConfigUI(QMainWindow):
         time_example_label.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
         time_exclusion_layout.addWidget(time_example_label)
 
+        time_exclusion_layout.addSpacing(5)
+
+        # Default to exclusion checkbox
+        self.time_exclusion_default_check = QCheckBox("Start Flight with AutoOrtho Exclusion")
+        default_to_exclusion = getattr(self.cfg.time_exclusion, 'default_to_exclusion', False)
+        self.time_exclusion_default_check.setChecked(default_to_exclusion)
+        self.time_exclusion_default_check.setObjectName('time_exclusion_default')
+        self.time_exclusion_default_check.setToolTip(
+            "When enabled, AutoOrtho will start with exclusion active until X-Plane starts\n"
+            "sending sim time data. This ensures night flights start with default scenery from the very beginning. Useful for night flights.\n\n"
+            "When disabled, AutoOrtho will start with normal operation until X-Plane starts sending sim time data."
+        )
+        time_exclusion_layout.addWidget(self.time_exclusion_default_check)
+
         # Set initial enabled state for time inputs
         self._set_time_exclusion_controls_enabled(time_exclusion_enabled)
 
@@ -2089,6 +2103,8 @@ class ConfigUI(QMainWindow):
                 self.time_exclusion_start_edit.setEnabled(enabled)
             if hasattr(self, 'time_exclusion_end_edit'):
                 self.time_exclusion_end_edit.setEnabled(enabled)
+            if hasattr(self, 'time_exclusion_default_check'):
+                self.time_exclusion_default_check.setEnabled(enabled)
         except Exception:
             pass
 
@@ -3388,6 +3404,8 @@ class ConfigUI(QMainWindow):
                 self.cfg.time_exclusion.start_time = self.time_exclusion_start_edit.text()
             if hasattr(self, 'time_exclusion_end_edit'):
                 self.cfg.time_exclusion.end_time = self.time_exclusion_end_edit.text()
+            if hasattr(self, 'time_exclusion_default_check'):
+                self.cfg.time_exclusion.default_to_exclusion = self.time_exclusion_default_check.isChecked()
 
         self.cfg.save()
         self.ready.set()

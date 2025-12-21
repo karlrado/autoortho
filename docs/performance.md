@@ -430,6 +430,26 @@ The time when the exclusion period begins (24-hour format). For example, "22:00"
 
 The time when the exclusion period ends (24-hour format). For example, "06:00" for 6 AM.
 
+#### Default to Exclusion (`default_to_exclusion`)
+- **Type:** Boolean (True/False)
+- **Default:** False
+- **Config file:** `default_to_exclusion = False`
+
+Controls behavior when sim time is not yet available (before flight starts):
+
+| Setting | Behavior |
+|---------|----------|
+| **False** (default) | AutoOrtho works normally until sim time confirms exclusion |
+| **True** | Assume exclusion is active until sim time proves otherwise |
+
+**When to enable:**
+- You want night flights to start with default scenery from the very beginning
+- You don't want any AutoOrtho scenery loaded before sim time is available
+
+**When to keep disabled:**
+- You prefer AutoOrtho to work normally during loading screens
+- You only want exclusion to apply when sim time is confirmed
+
 ### Example Configuration
 
 To disable AutoOrtho between 10 PM and 6 AM (night hours):
@@ -439,6 +459,17 @@ To disable AutoOrtho between 10 PM and 6 AM (night hours):
 enabled = True
 start_time = 22:00
 end_time = 06:00
+default_to_exclusion = False
+```
+
+To ensure exclusion is active from the moment AutoOrtho starts (before sim time is available):
+
+```ini
+[time_exclusion]
+enabled = True
+start_time = 22:00
+end_time = 06:00
+default_to_exclusion = True
 ```
 
 ### Overnight Ranges

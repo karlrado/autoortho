@@ -63,11 +63,17 @@ class FlightTracker(object):
         RequestDataRefs(self.sock, CFG.flightdata.xplane_udp_port)
         data, addr = self.sock.recvfrom(1024)
         values = DecodePacket(data)
-        lat = values[0][0]
-        lon = values[1][0]
-        alt = values[3][0]
-        hdg = values[4][0]
-        spd = values[6][0]
+        
+        # Safely extract values - packet may not contain all expected datarefs
+        try:
+            lat = values[0][0]
+            lon = values[1][0]
+            alt = values[3][0]
+            hdg = values[4][0]
+            spd = values[6][0]
+        except KeyError as e:
+            log.debug(f"Incomplete packet in get_info, missing dataref index {e}")
+            return (self.lat, self.lon, self.alt, self.hdg, self.spd)  # Return last known values
 
         return (lat, lon, alt, hdg, spd)
 
@@ -115,11 +121,18 @@ class FlightTracker(object):
             self.connected = True
 
             values = DecodePacket(data)
-            lat = values[0][0]
-            lon = values[1][0]
-            alt = values[3][0]
-            hdg = values[4][0]
-            spd = values[6][0]
+            
+            # Safely extract values - packet may not contain all expected datarefs
+            try:
+                lat = values[0][0]
+                lon = values[1][0]
+                alt = values[3][0]
+                hdg = values[4][0]
+                spd = values[6][0]
+            except KeyError as e:
+                # Incomplete packet - missing expected dataref indices
+                log.debug(f"Incomplete packet, missing dataref index {e}. Waiting for complete data...")
+                continue
 
             log.debug(f"Lat: {lat}, Lon: {lon}, Alt: {alt}")
             

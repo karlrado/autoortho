@@ -104,8 +104,8 @@ use_time_budget = True
 # Each tile has up to 256 chunks (16x16), so adequate time is needed for full quality.
 # Lower = less stuttering, but may have more missing/low-res tiles
 # Higher = better quality, but more potential for stuttering
-# Recommended: 3.0 (fast), 5.0 (balanced), 10.0 (quality)
-tile_time_budget = 5.0
+# Recommended: 10.0 (fast), 20.0 (balanced), 30.0 (quality)
+tile_time_budget = 10.0
 # Fallback level when chunks fail to download in time:
 # none = Skip all fallbacks (fastest, may have missing tiles)
 # cache = Use disk cache and already-built mipmaps, no network (balanced)
@@ -199,6 +199,10 @@ enabled = False
 start_time = 22:00
 # End time for exclusion in 24-hour format (HH:MM), e.g. "06:00" for 6 AM
 end_time = 06:00
+# When enabled, assume exclusion is active until sim time is available.
+# Useful to ensure night flights start with default scenery from the beginning.
+# When disabled, AutoOrtho works normally until sim time confirms exclusion.
+default_to_exclusion = False
 """
 
     def __init__(self, conf_file=None):

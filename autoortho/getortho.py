@@ -2833,16 +2833,21 @@ class Tile(object):
     def close(self):
         log.debug(f"Closing {self}")
 
-        if self.dds.mipmap_list[0].retrieved:
-            if self.bytes_read < self.dds.mipmap_list[0].length:
-                log.warning(f"TILE: {self} retrieved mipmap 0, but only read {self.bytes_read}. Lowest offset: {self.lowest_offset}")
-            else:
-                log.debug(f"TILE: {self} retrieved mipmap 0, full read of mipmap! {self.bytes_read}.")
-
-
+        # Check refs first - if still referenced, don't close yet
         if self.refs > 0:
             log.warning(f"TILE: Trying to close, but has refs: {self.refs}")
             return
+
+        # Log mipmap retrieval status (safely check dds first)
+        if self.dds is not None:
+            try:
+                if self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
+                    if self.bytes_read < self.dds.mipmap_list[0].length:
+                        log.warning(f"TILE: {self} retrieved mipmap 0, but only read {self.bytes_read}. Lowest offset: {self.lowest_offset}")
+                    else:
+                        log.debug(f"TILE: {self} retrieved mipmap 0, full read of mipmap! {self.bytes_read}.")
+            except (AttributeError, IndexError):
+                pass  # DDS structure incomplete, continue with cleanup
 
         # ------------------------------------------------------------------
         # Memory-reclamation additions
@@ -2858,21 +2863,36 @@ class Tile(object):
                     im = img_data
                 
                 if im is not None and hasattr(im, "close"):
-                    im.close()
+                    try:
+                        im.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         finally:
             self.imgs.clear()
 
         # 2) Release DDS mip-map ByteIO buffers so the underlying bytes
         #    are no longer referenced from Python.
         if self.dds is not None:
-            for mm in getattr(self.dds, "mipmap_list", []):
-                mm.databuffer = None
+            try:
+                for mm in getattr(self.dds, "mipmap_list", []):
+                    mm.databuffer = None
+            except Exception:
+                pass
             # Drop the DDS object reference itself
             self.dds = None
 
-        for chunks in self.chunks.values():
-            for chunk in chunks:
-                chunk.close()
+        # 3) Close all chunks
+        try:
+            for chunks in self.chunks.values():
+                for chunk in chunks:
+                    try:
+                        chunk.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         self.chunks = {}
         
 
@@ -3037,6 +3057,10 @@ class TileCacher(object):
         # Faster cadence when a shared stats store is present (macOS parent)
         fast_mode = self._has_shared_store()
         poll_interval = 3 if fast_mode else 15
+        
+        # Maximum tile count before forced eviction (prevents memory bloat from tile object overhead)
+        # Each tile object costs ~10-50KB in overhead even without loaded data
+        max_tile_count = 5000
 
         while True:
             process = psutil.Process(os.getpid())
@@ -3066,12 +3090,26 @@ class TileCacher(object):
             # Hysteresis target: evict down to limit - headroom
             headroom = max(int(self.cache_mem_lim * self.evict_hysteresis_frac), self.evict_headroom_min_bytes)
             target_bytes = max(0, int(self.cache_mem_lim) - headroom)
+            
+            # Check if we need to evict based on tile count (prevents unbounded tile accumulation)
+            tile_count = len(self.tiles)
+            need_tile_count_eviction = tile_count > max_tile_count
 
             # Leader election: only one worker performs eviction when shared store is present
-            if effective_mem > self.cache_mem_lim:
+            need_mem_eviction = effective_mem > self.cache_mem_lim
+            if need_mem_eviction or need_tile_count_eviction:
                 if not self._try_acquire_evict_leader():
                     time.sleep(poll_interval)
                     continue
+                    
+            # Evict if too many tiles (regardless of memory)
+            if need_tile_count_eviction:
+                target_tile_count = int(max_tile_count * 0.8)  # Evict down to 80% of max
+                tiles_to_evict = tile_count - target_tile_count
+                if tiles_to_evict > 0:
+                    log.info(f"Tile count eviction: {tile_count} tiles, evicting {tiles_to_evict} to reach {target_tile_count}")
+                    with self.tc_lock:
+                        self._evict_batch(tiles_to_evict)
 
             # Evict while above target using adaptive batch sizing
             while self.tiles and effective_mem > target_bytes:
