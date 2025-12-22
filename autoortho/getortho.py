@@ -2460,8 +2460,8 @@ class Tile(object):
                     # Must copy because original is cached for fallback use
                     new_im = new_im.copy().desaturate(saturation)
                 else:
-                    # In-place desaturation - no copy needed, saves memory allocation
-                    new_im.desaturate(saturation)
+                    # In-place desaturation - assign result for error handling
+                    new_im = new_im.desaturate(saturation)
         
         # Return image along with mipmap and zoom level this was created at
         return new_im
@@ -2495,6 +2495,12 @@ class Tile(object):
         # - Mipmap 3 (ZL13): 4 chunks, very fast, 8x upscale (lower quality)
         # We use mipmap 2 as a balance between speed and quality
         target_mipmap = min(2, self.max_mipmap)
+        
+        # Skip if target_mipmap is 0 - we're already building mipmap 0,
+        # so building it again as a "fallback" is redundant
+        if target_mipmap == 0:
+            log.debug("Lazy build: max_mipmap is 0, no lower-detail mipmap available")
+            return False
         
         # Skip if we somehow already have this mipmap
         if target_mipmap in self.imgs:
@@ -2988,7 +2994,8 @@ class Tile(object):
             else:
                 # Try parsing as integer for backwards compatibility
                 try:
-                    return int(fb_value)
+                    # Clamp to valid range 0-2
+                    return max(0, min(2, int(fb_value)))
                 except ValueError:
                     return 1  # Default to cache
         # Handle boolean (from SectionParser when value was '0' or '1')
@@ -3032,7 +3039,8 @@ class Tile(object):
         #
         
         # Start timing FULL tile creation (download + compose + compress)
-        tile_creation_start = time.time()
+        # Use monotonic() for consistent interval measurement (immune to clock adjustments)
+        tile_creation_start = time.monotonic()
 
         log.debug(f"GET_MIPMAP: {self}")
 
@@ -3065,7 +3073,7 @@ class Tile(object):
             return True
 
         self.ready.clear()
-        compress_start_time = time.time()
+        compress_start_time = time.monotonic()
         try:
             if mipmap == 0:
                 self.dds.gen_mipmaps(new_im, mipmap, 0) 
@@ -3075,7 +3083,7 @@ class Tile(object):
             pass
             #new_im.close()
 
-        compress_end_time = time.time()
+        compress_end_time = time.monotonic()
         self.ready.set()
 
         # Calculate timing metrics

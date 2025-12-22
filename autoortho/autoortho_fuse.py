@@ -435,15 +435,44 @@ class AutoOrtho(Operations):
                 log.debug(f"GETATTR: Hiding DSF due to time exclusion: {path}")
                 raise FuseOSError(errno.ENOENT)
         
-        # Use cached implementation for everything else
-        return self._getattr_cached(path, fh)
-
-    @lru_cache(maxsize=1024)
-    def _getattr_cached(self, path, fh=None):
-        """Cached implementation of getattr for non-excluded files."""
-        m = self.dds_re.match(path)
-
+        # Generate fresh timestamps for each call
         now = int(time.time())
+        
+        m = self.dds_re.match(path)
+        if m:
+            # DDS files are virtual - use cached size calculation but fresh timestamps
+            return self._getattr_dds(path, m, now)
+        elif path.endswith(".poison"):
+            return self._getattr_poison(now)
+        elif path.endswith("AOISWORKING"):
+            return self._getattr_marker(now)
+        else:
+            # Real filesystem files - never cache, always get fresh stats
+            return self._getattr_real_file(path)
+
+    def _get_dds_size_cached(self, row, col, maptype, zoom):
+        """Get DDS size from cache or compute it.
+        
+        Uses _size_cache dict which can be updated with actual tile sizes
+        when tiles are opened (see open() method). This allows the cache
+        to reflect real sizes once known, rather than being stuck with
+        computed approximations.
+        """
+        key = (row, col, maptype, zoom)
+        dds_size = self._size_cache.get(key)
+        if dds_size is None:
+            dds_size = self._calculate_dds_size(str(zoom))
+            # Store computed size for future calls until actual size is known
+            self._size_cache[key] = dds_size
+        return dds_size
+
+    def _getattr_dds(self, path, match, now):
+        """Get attributes for virtual DDS files."""
+        self._ensure_flighttrack_started(reason_path=path)
+        row, col, maptype, zoom = match.groups()
+        dds_size = self._get_dds_size_cached(int(row), int(col), maptype, int(zoom))
+        log.debug("GETATTR: Fetch for path: %s", path)
+        
         attrs = {
             'st_atime': now, 
             'st_ctime': now, 
@@ -453,47 +482,64 @@ class AutoOrtho(Operations):
             'st_nlink': 1,
             'st_uid': self.default_uid,
             'st_gid': self.default_gid,
+            'st_size': dds_size,
         }
-        if m:
-            self._ensure_flighttrack_started(reason_path=path)
-            row, col, maptype, zoom = m.groups()
-            key = (int(row), int(col), maptype, int(zoom))
-            dds_size = self._size_cache.get(key)
-            log.debug("GETATTR: Fetch for path: %s", path)
-            if dds_size is None:
-                dds_size = self._calculate_dds_size(zoom)
+        log.debug(f"GETATTR: ATTRS: {attrs}")
+        return attrs
 
-            attrs['st_size'] = dds_size
+    def _getattr_poison(self, now):
+        """Handle poison pill for shutdown."""
+        log.info("Poison pill.  Exiting!")
+        fuse_ptr = ctypes.c_void_p(_libfuse.fuse_get_context().contents.fuse)
+        do_fuse_exit(fuse_ptr=fuse_ptr)
+        
+        attrs = {
+            'st_atime': now, 
+            'st_ctime': now, 
+            'st_mtime': now,
+            'st_mode': 33206,
+            'st_blksize': 32768,
+            'st_nlink': 1,
+            'st_uid': self.default_uid,
+            'st_gid': self.default_gid,
+            'st_size': 0,
+        }
+        return attrs
 
-        elif path.endswith(".poison"):
+    def _getattr_marker(self, now):
+        """Get attributes for AOISWORKING marker file."""
+        attrs = {
+            'st_atime': now, 
+            'st_ctime': now, 
+            'st_mtime': now,
+            'st_mode': 33206,
+            'st_blksize': 32768,
+            'st_nlink': 1,
+            'st_uid': self.default_uid,
+            'st_gid': self.default_gid,
+            'st_size': 0,
+        }
+        return attrs
 
-            attrs['st_size'] = 0
-            log.info("Poison pill.  Exiting!")
-            fuse_ptr = ctypes.c_void_p(_libfuse.fuse_get_context().contents.fuse)
-            do_fuse_exit(fuse_ptr=fuse_ptr)
-
-        elif path.endswith("AOISWORKING"):
-            attrs['st_size'] = 0
-
-        else:
-            full_path = self._full_path(path)
-            exists = os.path.exists(full_path)
-            log.debug(f"GETATTR FULLPATH {full_path}  Exists? {exists}")
-            st = os.lstat(full_path)
-            log.debug(f"GETATTR: Orig stat: {st}")
-            attrs = {k: getattr(st, k) for k in (
-                'st_atime',
-                'st_ctime',
-                'st_gid',
-                'st_mode',
-                'st_mtime',
-                'st_nlink',
-                'st_size',
-                'st_uid',
-                'st_ino',
-                'st_dev',
-                )}
-
+    def _getattr_real_file(self, path):
+        """Get attributes for real filesystem files - never cached."""
+        full_path = self._full_path(path)
+        exists = os.path.exists(full_path)
+        log.debug(f"GETATTR FULLPATH {full_path}  Exists? {exists}")
+        st = os.lstat(full_path)
+        log.debug(f"GETATTR: Orig stat: {st}")
+        attrs = {k: getattr(st, k) for k in (
+            'st_atime',
+            'st_ctime',
+            'st_gid',
+            'st_mode',
+            'st_mtime',
+            'st_nlink',
+            'st_size',
+            'st_uid',
+            'st_ino',
+            'st_dev',
+        )}
         log.debug(f"GETATTR: ATTRS: {attrs}")
         return attrs
 

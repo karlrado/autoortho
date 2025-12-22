@@ -323,8 +323,10 @@ class StatsBatcher:
             self._flush_unlocked()
 
     def stop(self):
-        self._stop.set()
+        # Flush BEFORE setting stop flag, otherwise _flush_unlocked() will
+        # detect the stop flag and discard the buffer instead of flushing
         self.flush()
+        self._stop.set()
 
     def _flush_unlocked(self):
         if not self._buf:

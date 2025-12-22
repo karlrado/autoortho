@@ -318,13 +318,16 @@ class DatarefTracker(object):
                     log.info("Flight is starting.")
                     self.connected = True
 
-                if len(values) == 6:
+                # Accept 5 or 6 values for backward compatibility
+                # (6th value is local_time_sec, added later)
+                if len(values) >= 5:
                     lat = values[0]
                     lon = values[1]
                     alt = values[2]
                     hdg = values[3]
                     spd = values[4]
-                    local_time = values[5]
+                    # local_time is optional (6th value) for backward compat
+                    local_time = values[5] if len(values) >= 6 else None
 
                     # Validate position data
                     if self._validate_position(lat, lon, alt):
@@ -333,11 +336,15 @@ class DatarefTracker(object):
                         self.alt = alt
                         self.hdg = hdg
                         self.spd = spd
-                        self.local_time_sec = local_time
+                        # Only update local_time_sec if we received it
+                        if local_time is not None:
+                            self.local_time_sec = local_time
                         self.data_valid = True
                     else:
                         self.data_valid = False
                 else:
+                    # Not enough values - log and mark invalid
+                    log.debug(f"Incomplete packet: got {len(values)}, need 5+")
                     self.data_valid = False
 
             # Debug logging (uncomment if needed)
