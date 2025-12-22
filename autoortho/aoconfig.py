@@ -87,14 +87,66 @@ min_zoom = 12
 max_zoom = 16
 # Maximum zoom level to allow near airports. Zoom level around airports used by default is 18.
 max_zoom_near_airports = 18
-# Max time to wait for images.  Higher numbers mean better quality, but more
-# stutters.  Lower numbers will be more responsive at the expense of
-# ocassional low quality tiles.
-maxwait = 0.5
+# Per-chunk maximum wait time in seconds. This limits how long to wait for a SINGLE
+# chunk download before moving on. Works in combination with tile_time_budget:
+# - tile_time_budget: Total time for entire tile (all chunks combined)
+# - maxwait: Maximum time per individual chunk download
+# A chunk download will end when EITHER limit is reached, whichever comes first.
+# This prevents a single slow chunk from consuming the entire tile budget.
+# Recommended: 2.0 (fast networks), 5.0 (normal), 10.0 (slow networks)
+maxwait = 5.0
 # Temporarily increase maxwait to an effectively infinite value while X-Plane is
 # loading scenery data prior to starting the flight.  This allows more downloads to
 # succeed and reduce the use of backup chunks and missing chunks at the start of flight.
 suspend_maxwait = True
+# Use time budget system for tile requests. When enabled, the tile_time_budget
+# value represents the total wall-clock time for an ENTIRE tile (all mipmaps),
+# providing more predictable loading times. When disabled, falls back to legacy
+# per-chunk maxwait timing.
+use_time_budget = True
+# Maximum wall-clock time in seconds for a COMPLETE tile (all 5 mipmap levels).
+# IMPORTANT: This measures ACTIVE PROCESSING time only - queue wait time doesn't count.
+# The budget starts when chunks actually begin downloading, not when the tile is first requested.
+# This ensures fair time allocation when many tiles are requested simultaneously.
+# After this time, the tile is built with whatever has been downloaded.
+# Lower = faster loading, but may have more partial/blurry tiles
+# Higher = better quality, but longer initial load times
+# Recommended: 60.0 (fast), 120.0 (balanced), 300.0 (quality)
+tile_time_budget = 120.0
+# Fallback level when chunks fail to download in time:
+# none = Skip all fallbacks (fastest, may have missing tiles)
+# cache = Use disk cache and already-built mipmaps, no network (balanced)
+# full = All fallbacks including on-demand network downloads (best quality, slowest)
+# Recommended: cache for most users, full if you have fast internet and CPU
+fallback_level = cache
+# When enabled with fallback_level=full, network fallbacks will continue even after
+# the tile time budget is exhausted. This prioritizes quality over strict timing.
+# True = Better quality, may cause longer load times when network is slow
+# False = Strict timing, fallbacks respect budget (may have more missing tiles)
+# Recommended: False for stutter-free experience, True for maximum quality
+fallback_extends_budget = False
+# Timeout per mipmap level when using extended fallbacks (in seconds)
+# When fallback_extends_budget is True, each lower-detail mipmap level
+# gets this much time to download. Total extra time = this × number of levels tried.
+# Example: 10 seconds × 4 levels = 40 seconds max additional time
+# Range: 10 - 120 seconds
+# Recommended: 3.0 (balanced), 5.0 (quality), 1.5 (fast)
+fallback_timeout = 30.0
+# Spatial prefetching - proactively downloads tiles ahead of aircraft
+# Enable/disable prefetching (True/False)
+prefetch_enabled = True
+# How far ahead to prefetch in minutes of flight time (1-60)
+# Higher = more tiles prefetched ahead, uses more bandwidth and memory
+# Lower = fewer tiles prefetched, less resource usage
+# Recommended: 5 (fast aircraft), 10 (balanced), 20 (slow internet)
+prefetch_lookahead = 10
+# How often to check for prefetch opportunities in seconds (1-10)
+prefetch_interval = 2.0
+# Maximum chunks to prefetch per cycle (8-64)
+prefetch_max_chunks = 24
+# Use HTTP/2 multiplexing if httpx is installed (recommended for faster downloads)
+# HTTP/2 allows multiple requests over a single connection, reducing latency
+use_http2 = True
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False
@@ -145,6 +197,19 @@ compress_dsf = True
 
 [windows]
 prefer_winfsp = True
+
+[time_exclusion]
+# Enable time-based AutoOrtho exclusion. When active during the specified time range,
+# AutoOrtho's scenery will be hidden and X-Plane will use its default scenery instead.
+enabled = False
+# Start time for exclusion in 24-hour format (HH:MM), e.g. "22:00" for 10 PM
+start_time = 22:00
+# End time for exclusion in 24-hour format (HH:MM), e.g. "06:00" for 6 AM
+end_time = 06:00
+# When enabled, assume exclusion is active until sim time is available.
+# Useful to ensure night flights start with default scenery from the beginning.
+# When disabled, AutoOrtho works normally until sim time confirms exclusion.
+default_to_exclusion = False
 """
 
     def __init__(self, conf_file=None):

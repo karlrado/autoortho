@@ -202,6 +202,29 @@ class AOStats(object):
             time.sleep(10)
             try:
                 snap = _store.snapshot() if _store else dict(STATS.items())
+                
+                # Calculate tile creation averages from counters
+                tile_create_count = snap.get('tile_create_count', 0)
+                tile_create_time_total_ms = snap.get('tile_create_time_total_ms', 0)
+                
+                if tile_create_count > 0:
+                    avg_creation_time_ms = tile_create_time_total_ms / tile_create_count
+                    avg_creation_time_s = avg_creation_time_ms / 1000.0
+                    
+                    # Add computed averages to display
+                    snap['tile_create_avg_ms'] = int(avg_creation_time_ms)
+                    snap['tile_create_avg_s'] = round(avg_creation_time_s, 2)
+                    
+                    # Calculate per-mipmap averages
+                    mm_avgs = {}
+                    for mm_level in range(5):
+                        mm_count = snap.get(f'mm_count:{mm_level}', 0)
+                        mm_time = snap.get(f'tile_create_time_ms:{mm_level}', 0)
+                        if mm_count > 0:
+                            mm_avgs[mm_level] = round(mm_time / mm_count / 1000.0, 2)
+                    if mm_avgs:
+                        snap['tile_create_avg_by_mm'] = mm_avgs
+                
                 log.info(f"STATS: {snap}")
             except Exception as e:
                 log.debug(f"aostats.show error: {e}")
@@ -300,20 +323,40 @@ class StatsBatcher:
             self._flush_unlocked()
 
     def stop(self):
-        self._stop.set()
+        # Flush BEFORE setting stop flag, otherwise _flush_unlocked() will
+        # detect the stop flag and discard the buffer instead of flushing
         self.flush()
+        self._stop.set()
 
     def _flush_unlocked(self):
         if not self._buf:
             return
+        # If stopping, don't bother flushing - manager may already be gone
+        if self._stop.is_set():
+            self._buf = {}
+            return
         payload, self._buf = self._buf, {}
         try:
             inc_many(payload)
+        except (ConnectionResetError, BrokenPipeError, EOFError, OSError):
+            # Manager already shut down - discard stats silently
+            pass
         except Exception:
             # As a safety net, fall back to single increments.
+            # But check if we're stopping to avoid cascade errors
+            if self._stop.is_set():
+                return
             for k, v in payload.items():
-                inc_stat(k, v)
+                try:
+                    inc_stat(k, v)
+                except (ConnectionResetError, BrokenPipeError, EOFError, OSError):
+                    # Manager shut down mid-fallback - stop trying
+                    break
 
     def _loop(self):
         while not self._stop.wait(self._flush_interval):
-            self.flush()
+            try:
+                self.flush()
+            except (ConnectionResetError, BrokenPipeError, EOFError, OSError):
+                # Manager shut down - exit loop silently
+                break

@@ -32,3 +32,16 @@ This folder can be set to any convenient location with enough space for scenery 
 
 The configuration file `.autoortho` is located in the user's home directory.  
 
+## Performance Tuning
+
+AutoOrtho includes advanced performance settings that allow you to balance image quality against loading times and stuttering. These settings are available in the Settings tab under "Performance Tuning".
+
+Key settings include:
+- **Tile Time Budget** - Maximum time to wait for a tile before returning results
+- **Fallback Level** - How aggressively to find replacement imagery for failed chunks
+- **Spatial Prefetching** - Proactively download tiles ahead of your aircraft
+
+For detailed configuration options and recommended settings for different use cases, see the [Performance Tuning Guide](performance.md).
+
+For troubleshooting missing tiles or stuttering issues, see the [FAQ](faq.md#missing-color-tiles).
+

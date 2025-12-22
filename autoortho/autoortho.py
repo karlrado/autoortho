@@ -275,9 +275,13 @@ def diagnose(CFG):
     for maptype in MAPTYPES:
         if maptype == "Use tile default":
             continue
-        with tempfile.TemporaryDirectory() as tmpdir:
+        # Use ignore_cleanup_errors=True to handle race with async cache writes
+        # The async cache writer may still be writing when the temp dir is cleaned up
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             c = getortho.Chunk(2176, 3232, maptype, 13, cache_dir=tmpdir)
             ret = c.get()
+            # Give async cache writer a moment to complete or detect deleted dir
+            time.sleep(0.1)
             if ret:
                 log.info(f"    Maptype: {maptype} OK!")
             else:
@@ -465,6 +469,20 @@ class AOMount:
         while True:
             time.sleep(10)
             snap = self._shared_store.snapshot()
+            
+            # Compute tile completion averages from counters
+            try:
+                tile_create_count = snap.get('tile_create_count', 0)
+                tile_create_time_total_ms = snap.get('tile_create_time_total_ms', 0)
+                
+                if tile_create_count > 0:
+                    avg_creation_time_ms = tile_create_time_total_ms / tile_create_count
+                    avg_creation_time_s = avg_creation_time_ms / 1000.0
+                    snap['tile_create_avg_ms'] = int(avg_creation_time_ms)
+                    snap['tile_create_avg_s'] = round(avg_creation_time_s, 2)
+            except Exception:
+                pass
+            
             log.info(f"STATS: {snap}")
 
     def start_reporter(self, interval_sec: float = 10.0):
@@ -594,9 +612,34 @@ class AOMount:
                     except Exception:
                         filtered = snap
 
+                    # Compute tile completion averages from counters
+                    try:
+                        tile_create_count = filtered.get('tile_create_count', 0)
+                        tile_create_time_total_ms = filtered.get('tile_create_time_total_ms', 0)
+                        
+                        if tile_create_count > 0:
+                            avg_creation_time_ms = tile_create_time_total_ms / tile_create_count
+                            avg_creation_time_s = avg_creation_time_ms / 1000.0
+                            
+                            # Add computed averages to display
+                            filtered['tile_create_avg_ms'] = int(avg_creation_time_ms)
+                            filtered['tile_create_avg_s'] = round(avg_creation_time_s, 2)
+                            
+                            # Calculate per-mipmap averages
+                            mm_avgs = {}
+                            for mm_level in range(5):
+                                mm_count = snap.get(f'mm_count:{mm_level}', 0)
+                                mm_time = snap.get(f'tile_create_time_ms:{mm_level}', 0)
+                                if mm_count > 0:
+                                    mm_avgs[mm_level] = round(mm_time / mm_count / 1000.0, 2)
+                            if mm_avgs:
+                                filtered['tile_create_avg_by_mm'] = mm_avgs
+                    except Exception:
+                        pass
+                    
                     # Ensure nested dicts are logged with numerically sorted keys
                     try:
-                        for _name in ('mm_counts', 'mm_averages', 'partial_mm_counts', 'partial_mm_averages'):
+                        for _name in ('mm_counts', 'mm_averages', 'partial_mm_counts', 'partial_mm_averages', 'tile_create_avg_by_mm'):
                             _val = filtered.get(_name)
                             if isinstance(_val, dict) and _val:
                                 try:
@@ -696,6 +739,14 @@ class AOMount:
     def unmount_sceneries(self, force=False):
         log.info("Unmounting ...")
         self.mounts_running = False
+        
+        # Stop spatial prefetcher
+        try:
+            import getortho
+            getortho.stop_prefetcher()
+        except Exception as e:
+            log.debug(f"Error stopping prefetcher: {e}")
+        
         for scenery in self.cfg.scenery_mounts:
             self.unmount(scenery.get('mount'), force)
 

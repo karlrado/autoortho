@@ -20,6 +20,67 @@ from utils.constants import system_type
 import logging
 log = logging.getLogger(__name__)
 
+# --- BC1/DXT1 fallback block generation for missing_color ---
+# Used when a mipmap databuffer is None to provide a visible fallback instead of garbage
+
+def _rgb_to_rgb565(r: int, g: int, b: int) -> int:
+    """Convert 8-bit RGB to RGB565 format."""
+    r5 = (r >> 3) & 0x1F
+    g6 = (g >> 2) & 0x3F
+    b5 = (b >> 3) & 0x1F
+    return (r5 << 11) | (g6 << 5) | b5
+
+def _get_missing_color_bc1_block(blocksize: int = 8) -> bytes:
+    """
+    Generate a BC1/DXT1 (8 bytes) or BC3/DXT5 (16 bytes) block using missing_color.
+    This provides a visible fallback when a mipmap buffer wasn't generated.
+    """
+    try:
+        missing = CFG.autoortho.missing_color
+        if isinstance(missing, (list, tuple)) and len(missing) >= 3:
+            r, g, b = int(missing[0]), int(missing[1]), int(missing[2])
+        else:
+            r, g, b = 66, 77, 55  # Default missing color
+    except Exception:
+        r, g, b = 66, 77, 55
+    
+    rgb565 = _rgb_to_rgb565(r, g, b)
+    color_bytes = rgb565.to_bytes(2, 'little')
+    
+    if blocksize == 16:
+        # BC3/DXT5: 8 bytes alpha (all opaque) + 8 bytes color
+        # Alpha block: alpha0=255, alpha1=255, then 6 bytes of indices (all 0)
+        alpha_block = b'\xFF\xFF\x00\x00\x00\x00\x00\x00'
+        color_block = color_bytes + color_bytes + b'\x00\x00\x00\x00'
+        return alpha_block + color_block
+    else:
+        # BC1/DXT1: 2 bytes color0, 2 bytes color1, 4 bytes indices
+        return color_bytes + color_bytes + b'\x00\x00\x00\x00'
+
+# Cache the BC1 block to avoid recomputing
+_cached_bc1_block_8 = None
+_cached_bc1_block_16 = None
+
+def get_fallback_bytes(length: int, blocksize: int = 8) -> bytes:
+    """
+    Generate fallback bytes for missing mipmap data using the configured missing_color.
+    Returns BC1/BC3 blocks that render as the missing_color instead of garbage.
+    """
+    global _cached_bc1_block_8, _cached_bc1_block_16
+    
+    if blocksize == 16:
+        if _cached_bc1_block_16 is None:
+            _cached_bc1_block_16 = _get_missing_color_bc1_block(16)
+        block = _cached_bc1_block_16
+    else:
+        if _cached_bc1_block_8 is None:
+            _cached_bc1_block_8 = _get_missing_color_bc1_block(8)
+        block = _cached_bc1_block_8
+    
+    # Generate enough blocks to cover the requested length
+    num_blocks = (length + blocksize - 1) // blocksize
+    return (block * num_blocks)[:length]
+
 # Define rgba_surface structure BEFORE it's referenced in library setup
 class rgba_surface(Structure):
     _fields_ = [
@@ -332,19 +393,19 @@ class DDS(Structure):
                     # ~We have remaining length in current mipmap~
                     #
                     if mipmap.databuffer is None:
-                        log.warning(f"PYDDS: No buffer for {mipmap.idx}!")
-                        #data = b''
-                        data = b'\x88' * length
-                        log.warning(f"PYDDS: adding to outdata {remaining_mipmap_len} bytes for {mipmap.idx}.")
+                        log.warning(f"PYDDS: No buffer for mipmap {mipmap.idx}! Using missing_color fallback.")
+                        # Use proper BC1/BC3 blocks with missing_color instead of garbage
+                        data = get_fallback_bytes(length, self.blocksize)
                     else:
                         log.debug("We have a mipmap and adequated remaining length")
                         mipmap.databuffer.seek(mipmap_pos)
                         data = mipmap.databuffer.read(length)
                         ret_len = length - len(data)
                         if ret_len != 0:
-                            # This should be impossible
-                            log.error(f"PYDDS  Didn't retrieve full length.  Fill empty bytes.  This is not good! mmpos: {mipmap_pos} retlen: {ret_len} reqlen: {length} mm:{mipmap.idx}")
-                            data += b'\xFF' * ret_len
+                            # This should be impossible but handle gracefully
+                            log.error(f"PYDDS: Didn't retrieve full length from buffer! mmpos: {mipmap_pos} missing: {ret_len} requested: {length} mipmap: {mipmap.idx}")
+                            # Use proper BC1/BC3 blocks with missing_color instead of garbage
+                            data += get_fallback_bytes(ret_len, self.blocksize)
                                 
                     outdata += data
                     self.position += length
@@ -362,11 +423,9 @@ class DDS(Structure):
                         # Mipmap not fully retrieved.  Mimpamp buffer may exist for partially retreived mipmap 0, but
                         # we *must* make sure the full size is available.
                         # 
-                        #log.warning(f"PYDDS: No buffer for {mipmap.idx}, Attempt to fill {remaining_mipmap_len} bytes")
-                        log.warning(f"PYDDS: No buffer for {mipmap.idx}!")
-                        #data = b''
-                        data = b'\x88' * remaining_mipmap_len
-                        log.warning(f"PYDDS: adding to outdata {remaining_mipmap_len} bytes for {mipmap.idx}.")
+                        log.warning(f"PYDDS: No buffer for mipmap {mipmap.idx}! Using missing_color fallback for {remaining_mipmap_len} bytes.")
+                        # Use proper BC1/BC3 blocks with missing_color instead of garbage
+                        data = get_fallback_bytes(remaining_mipmap_len, self.blocksize)
                     else:    
                         # Mipmap is retrieved
                         mipmap.databuffer.seek(mipmap_pos)
@@ -375,10 +434,9 @@ class DDS(Structure):
                     # Make sure we retrieved all the expected data from the mipmap we can.
                     ret_len = remaining_mipmap_len - len(data)
                     if ret_len != 0:
-                        log.error(f"PYDDS: ERROR! Didn't retrieve full length of mipmap for {mipmap.idx}!")
-                        log.error(f"PYDDS: Didn't retrieve full length.  Fill empty bytes {ret_len}")
-                        # Pretty sure this causes visual corruption
-                        data += b'\x88' * ret_len
+                        log.error(f"PYDDS: ERROR! Didn't retrieve full length of mipmap {mipmap.idx}! Filling {ret_len} bytes with missing_color.")
+                        # Use proper BC1/BC3 blocks with missing_color instead of garbage
+                        data += get_fallback_bytes(ret_len, self.blocksize)
 
                     outdata += data
 
