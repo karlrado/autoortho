@@ -590,26 +590,28 @@ class TimeBudget:
             return True
         return False
     
-    def wait_with_budget(self, event: threading.Event) -> bool:
+    def wait_with_budget(self, event: threading.Event, max_single_wait: float = None) -> bool:
         """
-        Wait on an event while respecting the remaining time budget.
+        Wait on an event while respecting both the time budget AND an optional per-chunk maxwait.
         
-        This is the key method that replaces `event.wait(maxwait)` calls.
-        Instead of waiting a fixed time per chunk, we wait only as long
-        as our remaining budget allows.
+        This combines two timeout mechanisms:
+        1. Time budget: Total wall-clock time for the entire tile
+        2. Max single wait: Per-chunk timeout (like the old maxwait parameter)
         
         Args:
             event: A threading.Event to wait on (e.g., chunk.ready)
+            max_single_wait: Optional per-chunk timeout in seconds. If provided,
+                           the wait will not exceed this time even if budget remains.
+                           This corresponds to the old "maxwait" config setting.
         
         Returns:
             True if the event was set (success)
-            False if budget exhausted before event was set (timeout)
+            False if budget exhausted or max_single_wait exceeded before event was set
         
         Behavior:
             - If event is already set, returns immediately with True
             - If budget is already exhausted, returns event.is_set() immediately
-            - Otherwise, polls the event with WAIT_GRANULARITY_SEC intervals
-              until either the event is set or the budget is exhausted
+            - Otherwise, waits up to min(remaining_budget, max_single_wait)
         """
         # Fast path: already set
         if event.is_set():
@@ -619,9 +621,23 @@ class TimeBudget:
         if self.exhausted:
             return event.is_set()
         
-        # Poll with granularity until event set or budget exhausted
+        # Track start time for max_single_wait
+        single_wait_start = time.monotonic() if max_single_wait else None
+        
+        # Poll with granularity until event set or budget/maxwait exhausted
         while not self.exhausted:
-            wait_time = min(self.remaining, self.WAIT_GRANULARITY_SEC)
+            # Check max_single_wait limit
+            if max_single_wait is not None:
+                single_elapsed = time.monotonic() - single_wait_start
+                if single_elapsed >= max_single_wait:
+                    log.debug(f"max_single_wait ({max_single_wait:.2f}s) exceeded")
+                    break
+                single_remaining = max_single_wait - single_elapsed
+            else:
+                single_remaining = float('inf')
+            
+            # Wait the minimum of: budget remaining, single wait remaining, granularity
+            wait_time = min(self.remaining, single_remaining, self.WAIT_GRANULARITY_SEC)
             if wait_time <= 0:
                 break
             if event.wait(timeout=wait_time):
@@ -1540,6 +1556,21 @@ class Tile(object):
         self.first_request_time = None
         # Track if tile completion has been reported (to avoid double-counting)
         self._completion_reported = False
+        # Tile-level time budget - shared across all mipmap builds for this tile
+        # This ensures the budget limits the ENTIRE tile processing, not per-mipmap
+        self._tile_time_budget = None
+        
+        # === SHARED FALLBACK CHUNK POOL ===
+        # When multiple chunks fail and need the same parent chunk at a lower zoom,
+        # we share the download instead of fetching it multiple times.
+        # Key: (col, row, zoom) -> Chunk object
+        # Example: 4 ZL16 chunks that all need (2,2,ZL15) share one download.
+        self._fallback_chunk_pool = {}
+        self._fallback_pool_lock = threading.Lock()
+        
+        # Track if lazy mipmap building has been triggered for this tile
+        # This prevents repeated attempts after the first failure triggers a lazy build
+        self._lazy_build_attempted = False
 
         #self.tile_condition = threading.Condition()
         if min_zoom:
@@ -1772,8 +1803,9 @@ class Tile(object):
 
         log.debug(f"Startrow: {startrow} Endrow: {endrow} bytes_per_chunk_row: {bytes_per_chunk_row} width_px: {base_width_px} height_px: {base_height_px}")
         
+        # Pass the tile-level budget to get_img so it's shared across all partial reads
         new_im = self.get_img(mipmap, startrow, endrow,
-                maxwait=self.get_maxwait())
+                maxwait=self.get_maxwait(), time_budget=self._tile_time_budget)
         if not new_im:
             log.debug("No updates, so no image generated")
             return True
@@ -1829,8 +1861,11 @@ class Tile(object):
         log.debug(f"READ DDS BYTES: {offset} {length}")
         
         # Track when this tile was first requested (for accurate tile creation time stats)
+        # NOTE: We do NOT create the time budget here because queue wait time shouldn't count.
+        # The budget is created lazily in get_img() when actual processing begins.
         if self.first_request_time is None:
             self.first_request_time = time.monotonic()
+            log.debug(f"READ_DDS_BYTES: First request for tile, budget will start when processing begins")
        
         if offset > 0 and offset < self.lowest_offset:
             self.lowest_offset = offset
@@ -1899,74 +1934,55 @@ class Tile(object):
         #
         
         # === TIME BUDGET INITIALIZATION ===
-        # If no time_budget provided, create one based on configuration.
-        # This is the key change: instead of per-chunk maxwait, we now have
-        # a single time budget for the entire tile request.
-        if time_budget is None:
+        # The time budget is created lazily here on first get_img call, NOT when X-Plane
+        # first requests the tile. This ensures queue wait time doesn't count against the budget.
+        # Only actual processing time (chunk downloads, composition, compression) is measured.
+        #
+        # The budget is stored on self._tile_time_budget so it's shared across all mipmap
+        # builds for this tile. If time_budget is explicitly provided (e.g., for pre-builds),
+        # use that instead.
+        
+        if time_budget is not None:
+            # Explicit budget provided (e.g., recursive pre-build calls) - use it
+            log.debug(f"GET_IMG: Using provided budget (elapsed={time_budget.elapsed:.2f}s, remaining={time_budget.remaining:.2f}s)")
+        elif self._tile_time_budget is not None:
+            # Budget already created for this tile - reuse it
+            time_budget = self._tile_time_budget
+            log.debug(f"GET_IMG: Using existing tile budget (elapsed={time_budget.elapsed:.2f}s, remaining={time_budget.remaining:.2f}s)")
+        else:
+            # First get_img call for this tile - create the budget NOW (processing begins)
             use_time_budget = getattr(CFG.autoortho, 'use_time_budget', True)
-            # Handle string 'True'/'False' from config
             if isinstance(use_time_budget, str):
                 use_time_budget = use_time_budget.lower() in ('true', '1', 'yes', 'on')
             
             if use_time_budget:
-                # New time budget system: use tile_time_budget for actual wall-clock limit
-                base_budget = float(getattr(CFG.autoortho, 'tile_time_budget', 2.0))
-                
-                # During startup (before flight starts), allow more time for initial load
-                # This replaces the suspend_maxwait functionality with budget-aware logic
+                base_budget = float(getattr(CFG.autoortho, 'tile_time_budget', 5.0))
                 if CFG.autoortho.suspend_maxwait and not datareftracker.connected:
-                    # Use 10x budget during startup for quality loading
-                    # This is still bounded, unlike the old "20 seconds per chunk" approach
                     effective_budget = base_budget * 10.0
-                    log.debug(f"GET_IMG: Startup mode - using extended budget {effective_budget:.1f}s")
+                    log.debug(f"GET_IMG: Startup mode - creating tile budget {effective_budget:.1f}s")
                 else:
                     effective_budget = base_budget
-                
+                    log.debug(f"GET_IMG: Creating tile budget {effective_budget:.1f}s (processing begins now)")
                 time_budget = TimeBudget(effective_budget)
-                log.debug(f"GET_IMG: Created new {time_budget}")
             else:
                 # Legacy mode: create budget from maxwait parameter
-                # This provides backward compatibility but still uses wall-clock timing
                 effective_maxwait = self.get_maxwait() if maxwait == 5 else maxwait
                 time_budget = TimeBudget(effective_maxwait)
-                log.debug(f"GET_IMG: Legacy mode - using maxwait-based budget {effective_maxwait:.1f}s")
+                log.debug(f"GET_IMG: Legacy mode - budget {effective_maxwait:.1f}s")
+            
+            # Store on tile for sharing across all mipmap builds
+            self._tile_time_budget = time_budget
 
-        # === OPTIONAL PRE-BUILDING OF LOWER MIPMAPS ===
-        # When building mipmap 0, we can optionally pre-build lower mipmaps (1-4) first.
-        # This ensures they're available in self.imgs for fallback upscaling.
+        # === FALLBACK CONFIGURATION ===
+        # Get fallback settings for use by the fallback chain in process_chunk().
         # 
-        # However, this is expensive and consumes time budget. Strategy:
-        # - fallback_level < 2: Skip pre-building (fallback chain will use cache if needed)
-        # - fallback_level = 2: Pre-build but respect budget (stop if budget low)
-        # - Always respect time budget to prevent pre-building from consuming everything
+        # NOTE: Pre-building of lower mipmaps was removed due to severe diminishing returns:
+        # - Cost: Paid on 100% of new tiles (85 extra downloads + 1-3s delay)
+        # - Benefit: Only helped when mipmap 0 chunks fail (<5% of cases)
+        # - Alternative: Fallback 3 (Cascading Download) handles failures on-demand
+        #   with much lower overhead since it only activates when needed.
         fallback_level = self.get_fallback_level()
         fallback_extends_budget = self.get_fallback_extends_budget()
-        
-        if mipmap == 0 and (startrow == 0 and endrow is None) and fallback_level >= 2:
-            log.debug(f"GET_IMG: Building mipmap 0 with fallback_level={fallback_level}, "
-                     f"pre-building lower mipmaps (budget remaining={time_budget.remaining:.2f}s)")
-            
-            # Reserve at least 50% of budget for actual mipmap 0 work
-            min_reserved_budget = time_budget.max_seconds * 0.5
-            
-            for lower_mm in range(1, min(self.max_mipmap + 1, 5)):
-                # Stop pre-building if budget is getting low
-                if time_budget.remaining < min_reserved_budget:
-                    log.debug(f"GET_IMG: Stopping pre-build at mipmap {lower_mm} - "
-                             f"reserving budget for mipmap 0 (remaining={time_budget.remaining:.2f}s)")
-                    break
-                
-                if lower_mm not in self.imgs:
-                    log.debug(f"GET_IMG: Pre-building mipmap {lower_mm} for fallback support")
-                    try:
-                        # Build the complete lower mipmap
-                        # IMPORTANT: Pass the SAME time_budget to share the wall-clock limit
-                        self.get_img(lower_mm, startrow=0, endrow=None, maxwait=maxwait, 
-                                    min_zoom=min_zoom, time_budget=time_budget)
-                    except Exception as e:
-                        log.debug(f"GET_IMG: Failed to pre-build mipmap {lower_mm}: {e}")
-        elif mipmap == 0 and (startrow == 0 and endrow is None):
-            log.debug(f"GET_IMG: Skipping pre-build for mipmap 0 (fallback_level={fallback_level})")
 
         # Get effective zoom  
         zoom = min((self.max_zoom - mipmap), self.max_zoom)
@@ -2060,24 +2076,102 @@ class Tile(object):
         
         log.debug(f"GET_IMG: Create new image: Zoom: {zoom} | {(img_width, img_height)}")
         
-        new_im = AoImage.new(
-            "RGBA",
-            (img_width, img_height),
-            (
-                CFG.autoortho.missing_color[0],
-                CFG.autoortho.missing_color[1],
-                CFG.autoortho.missing_color[2],
-            ),
-        )
+        # === PRE-INITIALIZE BASE LAYER FOR MIPMAP 0 ===
+        # When building mipmap 0 (highest detail), instead of starting with a blank 
+        # missing_color image, we initialize with an upscaled lower mipmap.
+        # This ensures any chunks that are skipped due to budget exhaustion still 
+        # show a blurry-but-colored texture instead of visible holes.
+        #
+        # Why this works:
+        # - Mipmaps are built 4->3->2->1->0, so lower mipmaps are usually available
+        # - Chunks overwrite the base as they complete (progressive refinement)
+        # - No hole detection needed - base layer guarantees coverage
+        # - Single upscale operation (efficient) vs per-hole fills
+        #
+        # Fallback order: mipmap 1 (best quality) -> 2 -> 3 -> 4 -> missing_color
+        
+        new_im = None
+        prefill_source_mm = None
+        
+        if mipmap == 0 and fallback_level >= 1:
+            # Try to find the best available lower mipmap to use as base
+            for source_mm in [1, 2, 3, 4]:
+                if source_mm > self.max_mipmap:
+                    continue
+                    
+                img_data = self.imgs.get(source_mm)
+                if not img_data:
+                    continue
+                
+                # Extract image from tuple format (image, col, row, zoom)
+                if isinstance(img_data, tuple):
+                    source_img = img_data[0]
+                else:
+                    source_img = img_data
+                
+                if source_img is None or getattr(source_img, '_freed', False):
+                    continue
+                
+                # Calculate scale factor: mipmap 1->0 = 2x, mipmap 2->0 = 4x, etc.
+                scale_factor = 1 << source_mm  # 2^source_mm
+                
+                # Verify source image dimensions match expected size
+                expected_source_width = img_width >> source_mm
+                expected_source_height = img_height >> source_mm
+                
+                if source_img._width != expected_source_width or source_img._height != expected_source_height:
+                    log.debug(f"GET_IMG: Prefill skipping mipmap {source_mm} - size mismatch: "
+                             f"got {source_img._width}x{source_img._height}, expected {expected_source_width}x{expected_source_height}")
+                    continue
+                
+                # Upscale to mipmap 0 size
+                log.debug(f"GET_IMG: Pre-initializing mipmap 0 base from mipmap {source_mm} "
+                         f"({source_img._width}x{source_img._height} -> {img_width}x{img_height}, scale={scale_factor}x)")
+                
+                try:
+                    new_im = source_img.scale(scale_factor)
+                    if new_im is not None and new_im._width == img_width and new_im._height == img_height:
+                        prefill_source_mm = source_mm
+                        bump(f'mipmap0_prefill_from_mm{source_mm}')
+                        log.debug(f"GET_IMG: Successfully pre-initialized base from mipmap {source_mm}")
+                        break
+                    else:
+                        # Scale failed or wrong size - clean up and try next
+                        if new_im is not None:
+                            try:
+                                new_im.close()
+                            except Exception:
+                                pass
+                        new_im = None
+                        log.debug(f"GET_IMG: Prefill scale from mipmap {source_mm} failed or wrong size")
+                except Exception as e:
+                    log.warning(f"GET_IMG: Prefill scale from mipmap {source_mm} exception: {e}")
+                    new_im = None
+        
+        # Fall back to missing_color if no lower mipmap available or prefill disabled
+        if new_im is None:
+            new_im = AoImage.new(
+                "RGBA",
+                (img_width, img_height),
+                (
+                    CFG.autoortho.missing_color[0],
+                    CFG.autoortho.missing_color[1],
+                    CFG.autoortho.missing_color[2],
+                ),
+            )
+            if mipmap == 0 and fallback_level >= 1:
+                log.debug(f"GET_IMG: No lower mipmap available for prefill, using missing_color")
+        else:
+            log.debug(f"GET_IMG: Using prefilled base from mipmap {prefill_source_mm}")
 
         log.debug(f"GET_IMG: Will use image {new_im}")
 
         # Check if we have any chunks to process
         if len(chunks) == 0:
             log.warning(f"GET_IMG: No chunks created for zoom {zoom}, mipmap {mipmap}")
-            # Create a placeholder image with the expected dimensions
-            placeholder_img = AoImage.new('RGBA', (img_width, img_height), (128, 128, 128))
-            return placeholder_img
+            # Return the missing_color filled image we already created
+            # This ensures consistency - X-Plane sees missing_color, not arbitrary gray
+            return new_im
             
         def process_chunk(chunk, skip_download_wait=False):
             """Process a single chunk and return (chunk, chunk_img, start_x, start_y)"""
@@ -2123,11 +2217,12 @@ class Tile(object):
                 chunk_ready = True
                 log.debug(f"Chunk {chunk} already downloaded, proceeding to decode")
             else:
-                # Download in progress - use TIME BUDGET instead of fixed maxwait
-                # This ensures we don't wait longer than our total budget allows
-                chunk_ready = time_budget.wait_with_budget(chunk.ready)
+                # Download in progress - use BOTH time budget AND per-chunk maxwait
+                # This respects the total tile budget while also limiting per-chunk waits
+                # The wait ends when either: budget exhausted, maxwait reached, or event set
+                chunk_ready = time_budget.wait_with_budget(chunk.ready, max_single_wait=maxwait)
                 if not chunk_ready:
-                    log.debug(f"Chunk {chunk} wait ended (budget remaining={time_budget.remaining:.2f}s, exhausted={time_budget.exhausted})")
+                    log.debug(f"Chunk {chunk} wait ended (budget remaining={time_budget.remaining:.2f}s, maxwait={maxwait:.1f}s)")
 
             chunk_img = None
             decode_failed = False
@@ -2170,7 +2265,17 @@ class Tile(object):
                 chunk_img = self.get_best_chunk(chunk.col, chunk.row, mipmap, zoom)
                 # get_best_chunk bumps 'upscaled_from_jpeg_count' if successful
             
+            # === LAZY BUILD TRIGGER ===
+            # If Fallback 1 failed and we're building mipmap 0, trigger a lazy build
+            # of a lower mipmap (mipmap 2) to enable Fallback 2 for subsequent failures.
+            # This is on-demand (only when failures occur) unlike the removed pre-building.
+            if not chunk_img and mipmap == 0 and fallback_level >= 1:
+                if not self._lazy_build_attempted:
+                    log.debug(f"GET_IMG(process_chunk): Triggering lazy build after first failure")
+                    self._try_lazy_build_fallback_mipmap(time_budget)
+            
             # Fallback 2: Scale from already-built mipmaps (enabled if fallback_level >= 1)
+            # Now may have something to use thanks to lazy build above
             if not chunk_img and fallback_level >= 1:
                 log.debug(f"GET_IMG(process_chunk): Fallback 2 - scaling from built mipmaps.")
                 chunk_img = self.get_downscaled_from_higher_mipmap(mipmap, chunk.col, chunk.row, zoom)
@@ -2194,23 +2299,37 @@ class Tile(object):
                                                                       time_budget=cascade_budget)
 
             if not chunk_ready and not chunk_img and not is_permanent_failure:
-                # Ran out of time, lower mipmap.  Retry...
-                # Don't retry permanent failures (404, etc) - they won't succeed
-                # But only retry if we still have time budget remaining
+                # === FINAL RETRY (OPTIMIZED) ===
+                # Only worth retrying if the chunk download is still pending.
+                # Pending means: in queue, in flight, or already completed (ready).
+                # If none of these are true, the download failed and won't be retried
+                # by the worker - so waiting would be pointless.
+                download_pending = chunk.in_flight or chunk.in_queue or chunk.ready.is_set()
+                
                 if time_budget.exhausted:
                     log.debug(f"GET_IMG: Skipping final retry for {chunk} - budget exhausted")
                     time_budget.record_chunk_skipped()
                     bump('chunk_budget_skipped')
+                elif not download_pending:
+                    # Download failed completely and won't be retried - skip waiting
+                    log.debug(f"GET_IMG: Skipping retry for {chunk} - download not pending "
+                             f"(in_flight={chunk.in_flight}, in_queue={chunk.in_queue})")
+                    bump('chunk_retry_skipped_not_pending')
                 else:
-                    log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Final retry for {chunk}, WAITING! (budget remaining={time_budget.remaining:.2f}s)")
+                    # Download still in progress or just completed - worth checking
+                    log.debug(f"GET_IMG: Final retry for {chunk} "
+                             f"(in_flight={chunk.in_flight}, in_queue={chunk.in_queue}, "
+                             f"budget remaining={time_budget.remaining:.2f}s)")
                     bump('retry_chunk_count')
-                    # Smart timeout for retry: check if already downloaded
+                    
                     if chunk.ready.is_set():
+                        # Completed during fallback attempts
                         chunk_ready = True
-                        log.debug(f"Chunk {chunk} downloaded during retry, proceeding to decode")
+                        log.debug(f"Chunk {chunk} completed during fallbacks, proceeding to decode")
                     else:
-                        # Use budget-aware waiting for final retry too
-                        chunk_ready = time_budget.wait_with_budget(chunk.ready)
+                        # Still in progress - wait with reduced timeout (1s max for retry)
+                        chunk_ready = time_budget.wait_with_budget(chunk.ready, max_single_wait=1.0)
+                
                 if chunk_ready and chunk.data:
                     log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Final retry for {chunk}, SUCCESS!")
                     try:
@@ -2310,8 +2429,17 @@ class Tile(object):
                     unfinished = len([f for f in remaining_futures if not f.done()])
                     log.debug(f"Timeout waiting for {unfinished} remaining chunks")
                     bump('chunk_missing_count', unfinished)
+                    # Cancel remaining futures to free resources
+                    for future in remaining_futures:
+                        if not future.done():
+                            future.cancel()
+                    # Clear remaining references
+                    active_futures.clear()
         finally:
-            executor.shutdown(wait=True)
+            # Use wait=False to avoid blocking on cancelled/timed-out futures
+            # The futures will complete in the background but we won't wait for them
+            # Since process_chunk checks time_budget.exhausted, they should exit quickly
+            executor.shutdown(wait=False, cancel_futures=True)
 
         # Determine if we need to cache this image for fallback/upscaling
         should_cache = complete_img and mipmap <= self.max_mipmap
@@ -2338,10 +2466,126 @@ class Tile(object):
         # Return image along with mipmap and zoom level this was created at
         return new_im
 
+    def _try_lazy_build_fallback_mipmap(self, time_budget=None):
+        """
+        Lazy build a lower-detail mipmap when the first chunk failure occurs.
+        
+        This is triggered on-demand (not proactively like pre-building) to provide
+        Fallback 2 support. When a mipmap 0 chunk fails, we quickly build mipmap 2
+        (which has only 16 chunks at ZL14 vs 256 at ZL16), enabling subsequent
+        failing chunks to upscale from the built image.
+        
+        Key differences from pre-building:
+        - Only runs when a failure actually occurs (not on every tile)
+        - Only runs once per tile (tracked by _lazy_build_attempted)
+        - Uses reduced time budget to avoid blocking
+        - Builds mipmap 2 (faster than mipmap 1, still useful for upscaling)
+        
+        Returns:
+            True if a mipmap was successfully built, False otherwise
+        """
+        # Only attempt once per tile
+        if self._lazy_build_attempted:
+            return False
+        
+        self._lazy_build_attempted = True
+        
+        # Choose which mipmap to build:
+        # - Mipmap 2 (ZL14): 16 chunks, fast to build, 4x upscale to mipmap 0
+        # - Mipmap 3 (ZL13): 4 chunks, very fast, 8x upscale (lower quality)
+        # We use mipmap 2 as a balance between speed and quality
+        target_mipmap = min(2, self.max_mipmap)
+        
+        # Skip if we somehow already have this mipmap
+        if target_mipmap in self.imgs:
+            log.debug(f"Lazy build: mipmap {target_mipmap} already exists")
+            return True
+        
+        # Calculate available budget for lazy build
+        # Use at most 1.5 seconds or 30% of remaining budget
+        if time_budget and not time_budget.exhausted:
+            max_lazy_budget = min(1.5, time_budget.remaining * 0.3)
+            if max_lazy_budget < 0.3:
+                log.debug(f"Lazy build: insufficient budget ({max_lazy_budget:.2f}s), skipping")
+                return False
+            lazy_budget = TimeBudget(max_lazy_budget)
+        else:
+            # No budget or exhausted - use a small fixed budget
+            lazy_budget = TimeBudget(1.0)
+        
+        log.debug(f"Lazy build: triggering build of mipmap {target_mipmap} "
+                 f"(budget={lazy_budget.max_seconds:.2f}s)")
+        bump('lazy_build_triggered')
+        
+        try:
+            # Build the lower mipmap
+            # This will populate self.imgs[target_mipmap] for Fallback 2 to use
+            result = self.get_img(
+                target_mipmap, 
+                startrow=0, 
+                endrow=None, 
+                maxwait=1.0,
+                time_budget=lazy_budget
+            )
+            
+            if result and target_mipmap in self.imgs:
+                log.debug(f"Lazy build: successfully built mipmap {target_mipmap}")
+                bump('lazy_build_success')
+                return True
+            else:
+                log.debug(f"Lazy build: mipmap {target_mipmap} build returned but not in imgs")
+                return False
+                
+        except Exception as e:
+            log.debug(f"Lazy build: failed to build mipmap {target_mipmap}: {e}")
+            bump('lazy_build_failed')
+            return False
+
+    def _get_shared_fallback_chunk(self, col, row, zoom):
+        """
+        Get or create a fallback chunk from the shared pool.
+        
+        This enables chunk sharing: when multiple high-zoom chunks fail and need
+        the same parent chunk, they share a single download instead of each
+        downloading it independently.
+        
+        Thread-safe: Uses a lock to prevent race conditions.
+        
+        Args:
+            col, row, zoom: Coordinates of the fallback chunk to get/create
+            
+        Returns:
+            Chunk object (may already be ready, in-flight, or newly created)
+        """
+        key = (col, row, zoom)
+        
+        with self._fallback_pool_lock:
+            if key in self._fallback_chunk_pool:
+                chunk = self._fallback_chunk_pool[key]
+                log.debug(f"Reusing shared fallback chunk {chunk} from pool")
+                bump('fallback_chunk_pool_hit')
+                return chunk
+            
+            # Create new chunk and add to pool
+            chunk = Chunk(col, row, self.maptype, zoom, cache_dir=self.cache_dir)
+            self._fallback_chunk_pool[key] = chunk
+            bump('fallback_chunk_pool_miss')
+            
+            # Check cache - if hit, it's ready immediately
+            if chunk.ready.is_set():
+                log.debug(f"Created shared fallback chunk {chunk} - already cached")
+            else:
+                log.debug(f"Created shared fallback chunk {chunk} - needs download")
+            
+            return chunk
+
     def get_or_build_lower_mipmap_chunk(self, target_mipmap, col, row, zoom, time_budget=None):
         """
         Cascading fallback: Try to get/build progressively lower-detail mipmaps.
         Only downloads chunks on-demand when needed (lazy evaluation).
+        
+        OPTIMIZED: Uses shared chunk pool to prevent duplicate downloads.
+        When multiple chunks fail and need the same parent, they share one download.
         
         Args:
             target_mipmap: The mipmap level we need (e.g., 0)
@@ -2371,72 +2615,72 @@ class Tile(object):
             fallback_row = row >> mipmap_diff
             fallback_zoom = zoom - mipmap_diff
             
-            # Try to get the chunk at this fallback level
-            fallback_chunk = Chunk(fallback_col, fallback_row, self.maptype, fallback_zoom, cache_dir=self.cache_dir)
+            # OPTIMIZED: Use shared pool to prevent duplicate downloads
+            # Multiple failing chunks that need the same parent share one download
+            fallback_chunk = self._get_shared_fallback_chunk(fallback_col, fallback_row, fallback_zoom)
             
-            # Check cache first
+            # If not ready, submit for download and wait
             if not fallback_chunk.ready.is_set():
-                if fallback_chunk.get_cache():
-                    fallback_chunk.ready.set()
-                    log.debug(f"Cascading fallback: found cached chunk at mipmap {fallback_mipmap}")
-                else:
-                    # Not in cache, try to download it
-                    # Use budget-aware waiting if budget provided, otherwise use reduced fixed timeout
+                # Submit if not already in flight or queue
+                if not fallback_chunk.in_flight and not fallback_chunk.in_queue:
                     chunk_getter.submit(fallback_chunk)
-                    
-                    if time_budget:
-                        # Use budget-aware waiting
-                        fallback_chunk_ready = time_budget.wait_with_budget(fallback_chunk.ready)
-                    else:
-                        # Extended fallback mode: use configurable per-level timeout
-                        fallback_timeout = float(getattr(CFG.autoortho, 'fallback_timeout', 3.0))
-                        fallback_chunk_ready = fallback_chunk.ready.wait(timeout=fallback_timeout)
-                    
-                    if not fallback_chunk_ready:
-                        log.debug(f"Cascading fallback: mipmap {fallback_mipmap} also timed out "
-                                 f"(budget_exhausted={time_budget.exhausted if time_budget else 'N/A'})")
-                        fallback_chunk.close()
-                        continue
-            
-            # We have the chunk data, decode and upscale it
-            if fallback_chunk.data:
-                try:
-                    with _decode_sem:
-                        fallback_img = AoImage.load_from_memory(fallback_chunk.data)
-                        if fallback_img is None:
-                            log.warning(f"GET_IMG: Fallback load_from_memory returned None for {fallback_chunk}")
-                            continue
-                    
-                    # Calculate which portion to extract and upscale
-                    scale_factor = 1 << mipmap_diff
-                    offset_col = col % scale_factor
-                    offset_row = row % scale_factor
-                    
-                    log.debug(f"CASCADE DEBUG: target=({col},{row}), fallback_chunk=({fallback_col},{fallback_row}), offset=({offset_col},{offset_row}), scale={scale_factor}")
-                    
-                    # Pixel position in fallback image
-                    pixel_x = offset_col * (256 // scale_factor)
-                    pixel_y = offset_row * (256 // scale_factor)
-                    crop_size = 256 // scale_factor
-                    
-                    # Upscale to 256x256
-                    upscaled = fallback_img.crop_and_upscale(
-                        pixel_x, pixel_y, crop_size, crop_size, scale_factor
-                    )
-                    
-                    log.debug(f"Cascading fallback SUCCESS: upscaled mipmap {fallback_mipmap} -> {target_mipmap} at {col}x{row} (scale {scale_factor}x)")
-                    bump('upscaled_chunk_count')
-                    bump('chunk_from_cascade_fallback')
-                    
-                    fallback_chunk.close()
-                    return upscaled
-                    
-                except Exception as e:
-                    log.warning(f"Cascading fallback: failed to upscale from mipmap {fallback_mipmap}: {e}")
-                    fallback_chunk.close()
+                
+                # Wait for download with budget awareness
+                if time_budget:
+                    fallback_chunk_ready = time_budget.wait_with_budget(fallback_chunk.ready)
+                else:
+                    fallback_timeout = float(getattr(CFG.autoortho, 'fallback_timeout', 3.0))
+                    fallback_chunk_ready = fallback_chunk.ready.wait(timeout=fallback_timeout)
+                
+                if not fallback_chunk_ready:
+                    log.debug(f"Cascading fallback: mipmap {fallback_mipmap} timed out "
+                             f"(budget_exhausted={time_budget.exhausted if time_budget else 'N/A'})")
+                    # Don't close - shared pool manages lifecycle
                     continue
             
-            fallback_chunk.close()
+            # Chunk is ready - check if we have valid data
+            if not fallback_chunk.data:
+                log.debug(f"Cascading fallback: chunk {fallback_chunk} ready but no data")
+                continue
+            
+            # Decode and upscale
+            try:
+                with _decode_sem:
+                    fallback_img = AoImage.load_from_memory(fallback_chunk.data)
+                    if fallback_img is None:
+                        log.warning(f"Cascading fallback: load_from_memory returned None for {fallback_chunk}")
+                        continue
+                
+                # Calculate which portion to extract and upscale
+                scale_factor = 1 << mipmap_diff
+                offset_col = col % scale_factor
+                offset_row = row % scale_factor
+                
+                log.debug(f"CASCADE DEBUG: target=({col},{row}), fallback_chunk=({fallback_col},{fallback_row}), "
+                         f"offset=({offset_col},{offset_row}), scale={scale_factor}")
+                
+                # Pixel position in fallback image
+                pixel_x = offset_col * (256 // scale_factor)
+                pixel_y = offset_row * (256 // scale_factor)
+                crop_size = 256 // scale_factor
+                
+                # Upscale to 256x256
+                upscaled = fallback_img.crop_and_upscale(
+                    pixel_x, pixel_y, crop_size, crop_size, scale_factor
+                )
+                
+                log.debug(f"Cascading fallback SUCCESS: upscaled mipmap {fallback_mipmap} -> {target_mipmap} "
+                         f"at {col}x{row} (scale {scale_factor}x)")
+                bump('upscaled_chunk_count')
+                bump('chunk_from_cascade_fallback')
+                
+                # Don't close fallback_chunk - shared pool manages lifecycle
+                # Other threads may still be using this chunk
+                return upscaled
+                
+            except Exception as e:
+                log.warning(f"Cascading fallback: failed to upscale from mipmap {fallback_mipmap}: {e}")
+                continue
         
         log.debug(f"Cascading fallback: all mipmaps failed for {col}x{row} at mipmap {target_mipmap}")
         return None
@@ -2586,14 +2830,28 @@ class Tile(object):
         return None
 
     def get_best_chunk(self, col, row, mm, zoom):
-        # For adaptive system, search up to actual_max_zoom level
+        """
+        Search disk cache for lower-zoom JPEG chunks and upscale to fill missing chunk.
+        
+        OPTIMIZED: Uses direct filesystem checks instead of creating Chunk objects.
+        This avoids the overhead of creating threading primitives (Event objects)
+        for each cache lookup. Only reads file data when cache hit is confirmed.
+        
+        Args:
+            col, row: Chunk coordinates at target zoom
+            mm: Target mipmap level
+            zoom: Target zoom level
+            
+        Returns:
+            Upscaled AoImage or None if no cached fallback found
+        """
         max_search_zoom = self.max_zoom
 
         for i in range(mm + 1, self.max_mipmap + 1):
             # Difference between requested mm and found image mm level
             diff = i - mm
             
-            # Equivalent col, row, zl
+            # Equivalent col, row, zl at lower zoom
             col_p = col >> diff
             row_p = row >> diff
             zoom_p = zoom - i
@@ -2604,22 +2862,67 @@ class Tile(object):
 
             scalefactor = min(1 << diff, 16)
 
-            # Check if we have a cached chunk
-            c = Chunk(col_p, row_p, self.maptype, zoom_p, cache_dir=self.cache_dir)
-            log.debug(f"Check cache for {c}")
-            cached = c.get_cache()
-            if not cached:
-                c.close()
+            # OPTIMIZED: Direct cache path check without Chunk object creation
+            # This avoids creating threading.Event objects for each lookup
+            chunk_id = f"{col_p}_{row_p}_{zoom_p}_{self.maptype}"
+            cache_path = os.path.join(self.cache_dir, f"{chunk_id}.jpg")
+            
+            # Fast existence check - avoids Chunk object overhead
+            if not os.path.isfile(cache_path):
+                bump('chunk_miss')
                 continue
+            
+            # Cache file exists - read and validate
+            bump('chunk_hit')
+            log.debug(f"Found cache file for {chunk_id}, reading...")
+            
+            # Read file data with retry for Windows file locking
+            data = None
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    data = Path(cache_path).read_bytes()
+                    break
+                except PermissionError:
+                    if attempt < max_attempts:
+                        time.sleep(0.02 * attempt)
+                        continue
+                    log.debug(f"Permission denied reading cache {cache_path}")
+                    break
+                except FileNotFoundError:
+                    # File was deleted between check and read (race condition)
+                    break
+                except OSError as e:
+                    winerr = getattr(e, 'winerror', None)
+                    if winerr in (5, 32, 33) and attempt < max_attempts:
+                        time.sleep(0.02 * attempt)
+                        continue
+                    log.debug(f"OSError reading cache {cache_path}: {e}")
+                    break
+            
+            if not data:
+                continue
+            
+            # Validate JPEG header
+            if not _is_jpeg(data[:3]):
+                log.debug(f"Cache file {cache_path} not a valid JPEG")
+                continue
+            
+            # Touch the file to update mtime for LRU cache management
+            try:
+                os.utime(cache_path, None)
+            except (FileNotFoundError, PermissionError):
+                pass
         
             log.debug(f"Found cached JPEG for {col}x{row}x{zoom} (mm{mm}) at {col_p}x{row_p}x{zoom_p} (mm{i}), upscaling {scalefactor}x")
+            
             # Offset into chunk
             col_offset = col % scalefactor
             row_offset = row % scalefactor
 
             log.debug(f"UPSCALE DEBUG: col={col}, row={row}, col_p={col_p}, row_p={row_p}, col_offset={col_offset}, row_offset={row_offset}, scalefactor={scalefactor}")
 
-            # Pixel width
+            # Pixel dimensions to extract from source
             w_p = max(1, 256 >> diff)
             h_p = max(1, 256 >> diff)
 
@@ -2627,26 +2930,27 @@ class Tile(object):
 
             # Load image to crop
             try:
-                img_p = AoImage.load_from_memory(c.data)
+                img_p = AoImage.load_from_memory(data)
             except Exception as e:
-                log.error(f"Exception loading chunk {c} into memory: {e}")
-                c.close()
+                log.error(f"Exception loading cached JPEG {chunk_id} into memory: {e}")
                 continue
             
             if not img_p:
-                log.warning(f"Failed to load chunk {c} into memory (returned None).")
-                c.close()
+                log.warning(f"Failed to load cached JPEG {chunk_id} into memory (returned None).")
                 continue
 
-            # Crop
-            crop_img = AoImage.new('RGBA', (w_p, h_p), (0,255,0))
+            # Crop the relevant portion
+            crop_img = AoImage.new('RGBA', (w_p, h_p), (0, 255, 0))
             img_p.crop(crop_img, (col_offset * w_p, row_offset * h_p))
             chunk_img = crop_img.scale(scalefactor)
 
-            # Close the cache chunk to free memory before returning
-            c.close()
+            # Free source image memory
+            try:
+                img_p.close()
+            except Exception:
+                pass
             
-            # Track upscaling from cached JPEGs separately
+            # Track upscaling from cached JPEGs
             bump('upscaled_from_jpeg_count')
             return chunk_img
 
@@ -2734,10 +3038,28 @@ class Tile(object):
 
         if mipmap > self.max_mipmap:
             mipmap = self.max_mipmap
+        
+        # === BUDGET TIMING ===
+        # The tile budget starts when get_img() is first called, NOT when X-Plane first
+        # requests the tile. This means queue wait time doesn't count against the budget.
+        # Only actual processing time (chunk downloads, composition, compression) counts.
+        #
+        # NOTE: We intentionally do NOT skip get_img/gen_mipmaps when budget is exhausted.
+        # Even if the budget is exhausted, we must still:
+        # 1. Call get_img() to create an image filled with missing_color
+        # 2. Call gen_mipmaps() to compress it into the DDS buffer
+        # This ensures X-Plane receives a valid DDS with missing_color tiles instead of
+        # black/uninitialized data. Once X-Plane reads a DDS, it's cached and won't refresh.
+        # The get_img() method handles budget exhaustion gracefully by skipping chunk downloads
+        # but still returning a valid (missing_color filled) image for compression.
+        
+        if self._tile_time_budget and self._tile_time_budget.exhausted:
+            log.debug(f"GET_MIPMAP: Tile budget exhausted, will build mipmap {mipmap} with missing_color (no new downloads)")
 
         # We can have multiple threads wait on get_img ...
         log.debug(f"GET_MIPMAP: Next call is get_img which may block!.............")
-        new_im = self.get_img(mipmap, maxwait=self.get_maxwait())
+        # Pass the tile-level budget to get_img so it's shared across all mipmap builds
+        new_im = self.get_img(mipmap, maxwait=self.get_maxwait(), time_budget=self._tile_time_budget)
         if not new_im:
             log.debug("GET_MIPMAP: No updates, so no image generated")
             return True
@@ -2895,6 +3217,18 @@ class Tile(object):
             pass
         self.chunks = {}
         
+        # 4) Close all fallback chunks in the shared pool
+        try:
+            with self._fallback_pool_lock:
+                for chunk in self._fallback_chunk_pool.values():
+                    try:
+                        chunk.close()
+                    except Exception:
+                        pass
+                self._fallback_chunk_pool.clear()
+        except Exception:
+            pass
+
 
 class TileCacher(object):
     hits = 0

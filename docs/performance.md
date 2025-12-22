@@ -99,19 +99,22 @@ When enabled, AutoOrtho uses a wall-clock time limit for tile requests instead o
 - **Range:** 0.5 - 30.0 seconds
 - **Config file:** `tile_time_budget = 5.0`
 
-The maximum wall-clock time AutoOrtho will spend loading a single tile. Each tile consists of up to 256 chunks (16×16 grid) that need to be downloaded, decoded, and compressed.
+The maximum wall-clock time for a **complete tile** (all mipmap levels combined). This budget measures **active processing time only** - queue wait time doesn't count. The budget starts when AutoOrtho actually begins processing the tile's chunks, not when the tile is first requested.
 
 | Value | Use Case | Effect |
 |-------|----------|--------|
-| 3.0 - 5.0s | Fast/smooth experience | Less waiting, but some tiles may be incomplete |
+| 3.0 - 5.0s | Fast/smooth experience | Quicker loading, but more partial tiles |
 | 5.0 - 15.0s | Balanced | Good quality with reasonable loading times |
 | 15.0 - 30.0s | Maximum quality | Complete tiles, but longer loading times |
 
 **How it works:**
-1. X-Plane requests a tile from AutoOrtho
-2. AutoOrtho starts downloading all 256 chunks in parallel
-3. After `tile_time_budget` seconds, AutoOrtho returns whatever it has completed
-4. Any incomplete chunks use fallback images (from cache, scaling, or lower detail)
+1. X-Plane requests a tile from AutoOrtho (tile enters processing queue)
+2. **Budget timer starts** when AutoOrtho actually begins downloading/processing chunks for this tile
+3. AutoOrtho builds all mipmaps (4 → 3 → 2 → 1 → 0) sharing this budget
+4. After `tile_time_budget` seconds of active processing, AutoOrtho builds the DDS with whatever is complete
+5. Any incomplete areas use the configured `missing_color`
+
+**Note:** Queue wait time (when other tiles are being processed first) does NOT count against the budget. This ensures fair time allocation even when many tiles are requested simultaneously.
 
 **Note:** Each tile covers a large geographic area (approximately 1 square degree of latitude/longitude at zoom 16). Higher budgets allow more time for all chunks to download and process.
 

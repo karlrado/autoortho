@@ -87,25 +87,32 @@ min_zoom = 12
 max_zoom = 16
 # Maximum zoom level to allow near airports. Zoom level around airports used by default is 18.
 max_zoom_near_airports = 18
-# Max time to wait for images.  Higher numbers mean better quality, but more
-# stutters.  Lower numbers will be more responsive at the expense of
-# ocassional low quality tiles.
-maxwait = 0.5
+# Per-chunk maximum wait time in seconds. This limits how long to wait for a SINGLE
+# chunk download before moving on. Works in combination with tile_time_budget:
+# - tile_time_budget: Total time for entire tile (all chunks combined)
+# - maxwait: Maximum time per individual chunk download
+# A chunk download will end when EITHER limit is reached, whichever comes first.
+# This prevents a single slow chunk from consuming the entire tile budget.
+# Recommended: 2.0 (fast networks), 5.0 (normal), 10.0 (slow networks)
+maxwait = 5.0
 # Temporarily increase maxwait to an effectively infinite value while X-Plane is
 # loading scenery data prior to starting the flight.  This allows more downloads to
 # succeed and reduce the use of backup chunks and missing chunks at the start of flight.
 suspend_maxwait = True
 # Use time budget system for tile requests. When enabled, the tile_time_budget
-# value represents the actual wall-clock time X-Plane waits for a tile, providing
-# more predictable performance. When disabled, falls back to legacy per-chunk maxwait.
+# value represents the total wall-clock time for an ENTIRE tile (all mipmaps),
+# providing more predictable loading times. When disabled, falls back to legacy
+# per-chunk maxwait timing.
 use_time_budget = True
-# Maximum wall-clock time in seconds for a complete tile request when use_time_budget
-# is enabled. This is the actual time X-Plane will wait before showing partial results.
-# Each tile has up to 256 chunks (16x16), so adequate time is needed for full quality.
-# Lower = less stuttering, but may have more missing/low-res tiles
-# Higher = better quality, but more potential for stuttering
-# Recommended: 10.0 (fast), 20.0 (balanced), 30.0 (quality)
-tile_time_budget = 10.0
+# Maximum wall-clock time in seconds for a COMPLETE tile (all 5 mipmap levels).
+# IMPORTANT: This measures ACTIVE PROCESSING time only - queue wait time doesn't count.
+# The budget starts when chunks actually begin downloading, not when the tile is first requested.
+# This ensures fair time allocation when many tiles are requested simultaneously.
+# After this time, the tile is built with whatever has been downloaded.
+# Lower = faster loading, but may have more partial/blurry tiles
+# Higher = better quality, but longer initial load times
+# Recommended: 60.0 (fast), 120.0 (balanced), 300.0 (quality)
+tile_time_budget = 120.0
 # Fallback level when chunks fail to download in time:
 # none = Skip all fallbacks (fastest, may have missing tiles)
 # cache = Use disk cache and already-built mipmaps, no network (balanced)
@@ -121,10 +128,10 @@ fallback_extends_budget = False
 # Timeout per mipmap level when using extended fallbacks (in seconds)
 # When fallback_extends_budget is True, each lower-detail mipmap level
 # gets this much time to download. Total extra time = this × number of levels tried.
-# Example: 3.0 seconds × 4 levels = 12 seconds max additional time
-# Range: 1.0 - 10.0 seconds
+# Example: 10 seconds × 4 levels = 40 seconds max additional time
+# Range: 10 - 120 seconds
 # Recommended: 3.0 (balanced), 5.0 (quality), 1.5 (fast)
-fallback_timeout = 3.0
+fallback_timeout = 30.0
 # Spatial prefetching - proactively downloads tiles ahead of aircraft
 # Enable/disable prefetching (True/False)
 prefetch_enabled = True
