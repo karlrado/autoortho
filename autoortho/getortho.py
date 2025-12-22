@@ -816,6 +816,7 @@ _cache_write_executor = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="cache_writer"
 )
 
+
 def _async_cache_write(chunk):
     """Fire-and-forget cache write. Errors are logged but don't affect processing."""
     try:
@@ -832,10 +833,29 @@ def _async_cache_write(chunk):
     except Exception as e:
         log.debug(f"Async cache write failed for {chunk}: {e}")
 
+
 def shutdown_cache_writer():
     """Shutdown the cache writer executor gracefully. Called during module cleanup."""
     try:
         _cache_write_executor.shutdown(wait=False)
+    except Exception:
+        pass
+
+
+def flush_cache_writer(timeout=5.0):
+    """Wait for all pending cache writes to complete.
+    
+    This is useful for tests that need to verify cache contents after
+    get_img() returns. Since cache writes are asynchronous, you need to
+    call this before checking for cached files.
+    
+    Args:
+        timeout: Maximum time to wait in seconds (default: 5.0)
+    """
+    try:
+        # Submit a no-op task and wait for it - this ensures all prior tasks complete
+        future = _cache_write_executor.submit(lambda: None)
+        future.result(timeout=timeout)
     except Exception:
         pass
 

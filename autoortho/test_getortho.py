@@ -340,6 +340,10 @@ def test_get_best_chunks_all(mm, tmpdir):
     # Verify we get a match
     tile.get_img(mm)
 
+    # Wait for async cache writes to complete before checking for cached files
+    # This is necessary because get_img() uses an async executor for cache writes
+    getortho.flush_cache_writer()
+
     for x in range(16):
         for y in range(16):
             ret = tile.get_best_chunk(17408+x, 25856+y, 0, 16)
