@@ -842,7 +842,7 @@ def shutdown_cache_writer():
         pass
 
 
-def flush_cache_writer(timeout=5.0):
+def flush_cache_writer(timeout=10.0):
     """Wait for all pending cache writes to complete.
     
     This is useful for tests that need to verify cache contents after
@@ -850,12 +850,15 @@ def flush_cache_writer(timeout=5.0):
     call this before checking for cached files.
     
     Args:
-        timeout: Maximum time to wait in seconds (default: 5.0)
+        timeout: Maximum time to wait in seconds (default: 10.0)
     """
     try:
-        # Submit a no-op task and wait for it - this ensures all prior tasks complete
-        future = _cache_write_executor.submit(lambda: None)
-        future.result(timeout=timeout)
+        # Submit no-op tasks to ALL workers and wait for all of them.
+        # With max_workers=2, we need 2 no-ops to ensure all prior tasks complete.
+        # This handles the case where both workers are busy with cache writes.
+        futures = [_cache_write_executor.submit(lambda: None) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=timeout)
     except Exception:
         pass
 

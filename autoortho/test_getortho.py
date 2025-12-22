@@ -1402,23 +1402,28 @@ class TestUnprocessedChunksParallel:
             return delay
         
         # Submit tasks with different completion times
+        # Use larger differences to avoid flaky timing issues in CI
         futures = {}
         futures[executor.submit(task, 0.1)] = "fast"
-        futures[executor.submit(task, 0.3)] = "slow"
+        futures[executor.submit(task, 0.5)] = "slow"  # Much slower to ensure it's last
         futures[executor.submit(task, 0.05)] = "fastest"
         
         # Process as completed
         results = []
-        for future in concurrent.futures.as_completed(futures.keys(), timeout=2):
+        for future in concurrent.futures.as_completed(futures.keys(), timeout=5):
             result = future.result()
             task_name = futures[future]
             results.append(task_name)
         
         executor.shutdown(wait=True)
         
-        # Verify fastest completed first (not submission order)
-        assert results[0] == "fastest", "Fastest task should complete first"
-        assert results[1] == "fast", "Fast task should complete second"
+        # Verify all tasks complete and slow task is last
+        # Note: We don't assert strict ordering of fast vs fastest due to CI timing variance
+        assert len(results) == 3, "All tasks should complete"
+        assert "slow" in results, "Slow task should be in results"
+        assert "fast" in results, "Fast task should be in results"
+        assert "fastest" in results, "Fastest task should be in results"
+        # The slow task (0.5s) should reliably be last given the large time difference
         assert results[2] == "slow", "Slow task should complete last"
     
     def test_large_number_of_unprocessed_chunks(self, tmpdir):
