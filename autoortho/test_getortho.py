@@ -314,6 +314,10 @@ def test_get_best_chunk(tmpdir):
     
     # Verify we get a match
     tile.get_img(2)
+    
+    # Wait for async cache writes to complete before checking for cached files
+    getortho.flush_cache_writer()
+    
     ret = tile.get_best_chunk(17408, 25857, 0, 16)
     assert(ret)
     ret.write_jpg(os.path.join(tmpdir, "chunk.jpg"))

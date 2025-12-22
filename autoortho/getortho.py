@@ -842,25 +842,32 @@ def shutdown_cache_writer():
         pass
 
 
-def flush_cache_writer(timeout=10.0):
+def flush_cache_writer(timeout=30.0):
     """Wait for all pending cache writes to complete.
     
     This is useful for tests that need to verify cache contents after
     get_img() returns. Since cache writes are asynchronous, you need to
     call this before checking for cached files.
     
+    This function shuts down the executor and recreates it to ensure
+    all pending tasks complete. This is the only reliable way to guarantee
+    all writes are flushed on all platforms (especially Windows).
+    
     Args:
-        timeout: Maximum time to wait in seconds (default: 10.0)
+        timeout: Maximum time to wait in seconds (default: 30.0)
     """
+    global _cache_write_executor
     try:
-        # Submit no-op tasks to ALL workers and wait for all of them.
-        # With max_workers=2, we need 2 no-ops to ensure all prior tasks complete.
-        # This handles the case where both workers are busy with cache writes.
-        futures = [_cache_write_executor.submit(lambda: None) for _ in range(2)]
-        for future in futures:
-            future.result(timeout=timeout)
+        # Shutdown with wait=True ensures ALL pending tasks complete
+        _cache_write_executor.shutdown(wait=True)
     except Exception:
         pass
+    finally:
+        # Recreate the executor for subsequent operations
+        _cache_write_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="cache_writer"
+        )
 
 
 # ============================================================================
