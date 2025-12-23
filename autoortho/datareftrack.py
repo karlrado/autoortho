@@ -57,6 +57,8 @@ class DatarefTracker(object):
          "The ground speed of the aircraft", 0),
         ("sim/time/local_time_sec", "s",
          "Local time (seconds since midnight)", 0),
+        ("sim/flightmodel2/position/pressure_altitude", "ft",
+         "Pressure altitude in standard atmosphere", 0),
     ]
     # fmt:on
 
@@ -76,6 +78,7 @@ class DatarefTracker(object):
         self.hdg = -1.0
         self.spd = -1.0
         self.local_time_sec = -1.0  # Local time (seconds since midnight)
+        self.pressure_alt = -1.0  # Pressure altitude in feet
         self.connected = False
         self.data_valid = False
 
@@ -133,7 +136,8 @@ class DatarefTracker(object):
 
         Returns:
             dict: Flight data with keys 'lat', 'lon', 'alt', 'hdg',
-                  'spd', 'local_time_sec', 'connected', 'data_valid', 'timestamp'.
+                  'spd', 'local_time_sec', 'pressure_alt', 'connected',
+                  'data_valid', 'timestamp'.
                   Returns None if not connected or data is invalid.
         """
         with self._lock:
@@ -146,6 +150,7 @@ class DatarefTracker(object):
                 'hdg': self.hdg,
                 'spd': self.spd,
                 'local_time_sec': self.local_time_sec,
+                'pressure_alt': self.pressure_alt,
                 'connected': self.connected,
                 'data_valid': self.data_valid,
                 'timestamp': time.time()
@@ -162,6 +167,18 @@ class DatarefTracker(object):
             if not self.connected or not self.data_valid:
                 return -1.0
             return self.local_time_sec
+
+    def get_pressure_alt(self):
+        """
+        Thread-safe getter for pressure altitude.
+
+        Returns:
+            float: Pressure altitude in feet, or -1 if not available.
+        """
+        with self._lock:
+            if not self.connected or not self.data_valid:
+                return -1.0
+            return self.pressure_alt
 
     def start(self):
         """Start the UDP listening thread."""
@@ -318,8 +335,8 @@ class DatarefTracker(object):
                     log.info("Flight is starting.")
                     self.connected = True
 
-                # Accept 5 or 6 values for backward compatibility
-                # (6th value is local_time_sec, added later)
+                # Accept 5, 6, or 7 values for backward compatibility
+                # (6th value is local_time_sec, 7th is pressure_alt)
                 if len(values) >= 5:
                     lat = values[0]
                     lon = values[1]
@@ -328,6 +345,8 @@ class DatarefTracker(object):
                     spd = values[4]
                     # local_time is optional (6th value) for backward compat
                     local_time = values[5] if len(values) >= 6 else None
+                    # pressure_alt is optional (7th value)
+                    pressure_alt = values[6] if len(values) >= 7 else None
 
                     # Validate position data
                     if self._validate_position(lat, lon, alt):
@@ -339,6 +358,9 @@ class DatarefTracker(object):
                         # Only update local_time_sec if we received it
                         if local_time is not None:
                             self.local_time_sec = local_time
+                        # Only update pressure_alt if we received it
+                        if pressure_alt is not None:
+                            self.pressure_alt = pressure_alt
                         self.data_valid = True
                     else:
                         self.data_valid = False
