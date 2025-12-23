@@ -35,6 +35,8 @@ from utils.constants import (
     LOOKAHEAD_TIME_SEC,
 )
 from utils.apple_token_service import apple_token_service
+from utils.dynamic_zoom import DynamicZoomManager
+from utils.altitude_predictor import predict_altitude_at_closest_approach
 
 from datareftrack import dt as datareftracker
 
@@ -978,32 +980,48 @@ class SpatialPrefetcher:
             self._stop_event.wait(timeout=self.interval_sec)
     
     def _do_prefetch_cycle(self):
-        """Execute one prefetch cycle."""
-        # Only prefetch when connected to X-Plane and in active flight
-        if not datareftracker.data_valid or not datareftracker.connected:
-            return
-            
+        """
+        Execute one prefetch cycle.
+
+        Uses 60-second averaged heading and speed when available for more
+        stable predictions. Falls back to instantaneous values if averages
+        aren't available yet. Position is always instantaneous since that's
+        where the aircraft actually is.
+        """
         # Check if tile_cacher is available
         if self._tile_cacher is None:
             return
-            
-        # Get current aircraft state
+
+        # Try to get 60-second averaged flight data for stable prediction
+        averages = datareftracker.get_flight_averages()
+
+        if averages is not None:
+            # Use averaged heading and speed for more stable predictions
+            hdg = averages['heading']
+            spd = averages['ground_speed_mps']
+        else:
+            # Fall back to instantaneous values if no averages available
+            # This happens at flight start before 60 seconds of data
+            if not datareftracker.data_valid or not datareftracker.connected:
+                return
+            hdg = datareftracker.hdg
+            spd = datareftracker.spd
+
+        # Always use instantaneous position (that's where we actually are)
         lat = datareftracker.lat
         lon = datareftracker.lon
-        hdg = datareftracker.hdg
-        spd = datareftracker.spd
-        
-        # Validate data
+
+        # Validate position data
         if lat < -90 or lat > 90 or lon < -180 or lon > 180:
             return
-            
+
         # Don't prefetch if moving slowly (taxiing, parked)
         if spd < self.MIN_SPEED_MPS:
             return
-            
-        # Calculate predicted position
+
+        # Calculate predicted position using (potentially averaged) heading/speed
         distance_m = spd * self.lookahead_sec
-        
+
         # Convert heading to radians
         hdg_rad = math.radians(hdg)
         
@@ -3322,6 +3340,22 @@ class TileCacher(object):
         self.target_zoom_level_near_airports = int(CFG.autoortho.max_zoom_near_airports)
         log.info(f"Target zoom level set to ZL{self.target_zoom_level}")
 
+        # Dynamic zoom configuration
+        # When "dynamic", zoom level is computed based on predicted altitude at tile
+        # When "fixed" (default), uses the configured max_zoom value
+        self.max_zoom_mode = str(CFG.autoortho.max_zoom_mode).lower()
+        self.dynamic_zoom_manager = DynamicZoomManager()
+        if self.max_zoom_mode == "dynamic":
+            self.dynamic_zoom_manager.load_from_config(
+                CFG.autoortho.dynamic_zoom_steps
+            )
+            step_count = len(self.dynamic_zoom_manager.get_steps())
+            log.info(f"Dynamic zoom enabled with {step_count} quality step(s)")
+            if step_count > 0:
+                log.info(f"Dynamic zoom steps: {self.dynamic_zoom_manager.get_summary()}")
+        else:
+            log.info("Using fixed max zoom level")
+
         self.clean_t = threading.Thread(target=self.clean, daemon=True)
         self.clean_t.start()
 
@@ -3330,11 +3364,98 @@ class TileCacher(object):
             self.enable_cache = True
             self.cache_tile_lim = 50
     
-    def _get_target_zoom_level(self, default_zoom: int) -> int:
+    def _compute_dynamic_zoom(self, row: int, col: int, tile_zoom: int) -> int:
+        """
+        Compute dynamic zoom level based on predicted altitude at tile.
+
+        Uses the aircraft's averaged flight data (heading, speed, vertical speed)
+        to predict what altitude the aircraft will be at when it reaches the
+        closest point to this tile. Then returns the appropriate zoom level
+        from the configured quality steps.
+
+        Args:
+            row: Tile row coordinate
+            col: Tile column coordinate
+            tile_zoom: Default zoom level for this tile
+
+        Returns:
+            The computed max zoom level for this tile
+        """
+        # Get flight averages for prediction
+        averages = datareftracker.get_flight_averages()
+
+        # If no valid averages, try to use current altitude
+        if averages is None:
+            with datareftracker._lock:
+                if datareftracker.data_valid and datareftracker.pressure_alt > 0:
+                    return self.dynamic_zoom_manager.get_zoom_for_altitude(
+                        datareftracker.pressure_alt
+                    )
+            # Fall back to base step or fixed zoom
+            base = self.dynamic_zoom_manager.get_base_step()
+            return base.zoom_level if base else self.target_zoom_level
+
+        # Get current position (with lock for thread safety)
+        with datareftracker._lock:
+            if not datareftracker.data_valid:
+                base = self.dynamic_zoom_manager.get_base_step()
+                return base.zoom_level if base else self.target_zoom_level
+
+            aircraft_lat = datareftracker.lat
+            aircraft_lon = datareftracker.lon
+            aircraft_alt_ft = datareftracker.pressure_alt
+
+        # Get tile center coordinates
+        tile_lat, tile_lon = _chunk_to_latlon(row, col, tile_zoom)
+
+        # Predict altitude at closest approach
+        predicted_alt, will_approach = predict_altitude_at_closest_approach(
+            aircraft_lat=aircraft_lat,
+            aircraft_lon=aircraft_lon,
+            aircraft_alt_ft=aircraft_alt_ft,
+            aircraft_hdg=averages['heading'],
+            aircraft_speed_mps=averages['ground_speed_mps'],
+            vertical_speed_fpm=averages['vertical_speed_fpm'],
+            tile_lat=tile_lat,
+            tile_lon=tile_lon
+        )
+
+        # Get zoom level for predicted altitude
+        # Use airport zoom level when near airports (tile_zoom == 18)
+        if tile_zoom == 18 and not CFG.autoortho.using_custom_tiles:
+            return self.dynamic_zoom_manager.get_airport_zoom_for_altitude(predicted_alt)
+        return self.dynamic_zoom_manager.get_zoom_for_altitude(predicted_alt)
+
+    def _get_target_zoom_level(self, default_zoom: int, row: int = None, col: int = None) -> int:
+        """
+        Get target zoom level for a tile.
+
+        In fixed mode: Uses the configured max_zoom (current behavior)
+        In dynamic mode: Computes zoom based on predicted altitude at tile
+
+        Args:
+            default_zoom: The default/base zoom level for this tile
+            row: Tile row coordinate (required for dynamic mode)
+            col: Tile column coordinate (required for dynamic mode)
+
+        Returns:
+            The target zoom level, capped to tile's max supported zoom
+        """
+        # Dynamic mode - compute based on altitude prediction
+        if self.max_zoom_mode == "dynamic" and row is not None and col is not None:
+            dynamic_zoom = self._compute_dynamic_zoom(row, col, default_zoom)
+            # Still cap to tile's max supported zoom (default + 1 is X-Plane's limit)
+            return min(default_zoom + 1, dynamic_zoom)
+
+        # Fixed mode - existing behavior
         if CFG.autoortho.using_custom_tiles:
             uncapped_target_zoom = self.target_zoom_level
         else:
-            uncapped_target_zoom = self.target_zoom_level_near_airports if default_zoom == 18 else self.target_zoom_level
+            uncapped_target_zoom = (
+                self.target_zoom_level_near_airports
+                if default_zoom == 18
+                else self.target_zoom_level
+            )
         return min(default_zoom + 1, uncapped_target_zoom)
 
     def _to_tile_id(self, row, col, map_type, zoom):
@@ -3558,12 +3679,13 @@ class TileCacher(object):
             if not tile:
                 self.misses += 1
                 bump('tile_mem_miss')
-                # Use target zoom level directly - much cleaner than offset calculations
+                # Use target zoom level - supports both fixed and dynamic modes
+                # Pass row/col for dynamic zoom computation based on predicted altitude
                 tile = Tile(
                     col, row, map_type, zoom, 
                     cache_dir=self.cache_dir,
                     min_zoom=self.min_zoom,
-                    max_zoom=self._get_target_zoom_level(zoom),
+                    max_zoom=self._get_target_zoom_level(zoom, row=row, col=col),
                 )
                 self.tiles[idx] = tile
                 # New tile becomes MRU

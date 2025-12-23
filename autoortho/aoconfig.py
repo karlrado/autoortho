@@ -87,6 +87,16 @@ min_zoom = 12
 max_zoom = 16
 # Maximum zoom level to allow near airports. Zoom level around airports used by default is 18.
 max_zoom_near_airports = 18
+# Dynamic zoom mode: "fixed" (current behavior) or "dynamic" (altitude-based quality steps)
+# Fixed: Uses max_zoom slider value for all tiles
+# Dynamic: Uses altitude-based quality steps defined in dynamic_zoom_steps
+max_zoom_mode = fixed
+# Quality steps for dynamic zoom mode. List of altitude/zoom pairs.
+# Format: [{{"altitude_ft": <altitude>, "zoom_level": <zoom>}}, ...]
+# Example: [{{"altitude_ft": -1000, "zoom_level": 17}}, {{"altitude_ft": 20000, "zoom_level": 15}}]
+# Altitude is "at or above" - tiles are rendered at the zoom level of the highest matching altitude.
+# The base step (altitude_ft: -1000) cannot be removed and serves as the ground-level default.
+dynamic_zoom_steps = []
 # Per-chunk maximum wait time in seconds. This limits how long to wait for a SINGLE
 # chunk download before moving on. Works in combination with tile_time_budget:
 # - tile_time_budget: Total time for entire tile (all chunks combined)

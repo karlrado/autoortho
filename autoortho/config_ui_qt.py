@@ -18,13 +18,16 @@ from utils.constants import MAPTYPES, system_type
 from utils.mappers import map_kubilus_region_to_simheaven_region
 from utils.dsf_utils import DsfUtils, dsf_utils
 from utils.mount_utils import cleanup_mountpoint, safe_ismount
+from utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QPushButton, QLabel, QLineEdit, QCheckBox, QComboBox,
     QSlider, QTextEdit, QFileDialog, QMessageBox, QScrollArea,
     QSplashScreen, QGroupBox, QProgressBar, QStatusBar, QFrame, QSpinBox,
-    QColorDialog, QRadioButton, QMenu, QStyle
+    QColorDialog, QRadioButton, QMenu, QStyle,
+    QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QInputDialog,
+    QHeaderView
 )
 from PySide6.QtCore import (
     Qt, QThread, Signal, QTimer, QSize, QPoint, QObject
@@ -353,6 +356,282 @@ class ModernSpinBox(QSpinBox):
                 height: 12px;
             }
         """)
+
+
+class QualityStepsDialog(QDialog):
+    """
+    Dialog for managing dynamic zoom quality steps.
+    
+    Allows users to define altitude-based zoom level thresholds.
+    Each step specifies a max zoom level for altitudes at or above
+    a threshold. The base step (-1000 ft) cannot be removed.
+    """
+    
+    def __init__(self, parent=None, manager=None, current_max_zoom=16):
+        """
+        Initialize the quality steps dialog.
+        
+        Args:
+            parent: Parent widget
+            manager: DynamicZoomManager instance (creates new if None)
+            current_max_zoom: Current fixed max zoom (for initializing base step)
+        """
+        super().__init__(parent)
+        self.manager = manager if manager is not None else DynamicZoomManager()
+        self.current_max_zoom = current_max_zoom
+        self.setWindowTitle("Dynamic Zoom - Quality Steps")
+        self.setMinimumSize(550, 450)
+        self._setup_ui()
+        
+    def _setup_ui(self):
+        """Set up the dialog UI."""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+        
+        # Info label
+        info = QLabel(
+            "Define maximum zoom levels for different altitude ranges.\n"
+            "Cruising at higher altitudes doesn't need as much detail - saves VRAM and speeds up loading.\n"
+            "'Near Airports' uses higher zoom when approaching airports.\n"
+            "The base level (-1000 ft) is the default for ground level and cannot be removed."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #aaa; padding: 10px; background: #333; border-radius: 5px;")
+        layout.addWidget(info)
+        
+        # Steps table
+        self.steps_table = QTableWidget()
+        self.steps_table.setColumnCount(4)
+        self.steps_table.setHorizontalHeaderLabels([
+            "Altitude (ft)", "Max Zoom Level", "Near Airports", "Actions"
+        ])
+        self.steps_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.steps_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.steps_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.steps_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.steps_table.setColumnWidth(3, 100)
+        self.steps_table.verticalHeader().setDefaultSectionSize(36)  # Ensure enough row height
+        self.steps_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #2d2d2d;
+                border: 1px solid #444;
+                border-radius: 5px;
+            }
+            QTableWidget::item {
+                padding: 5px;
+            }
+            QHeaderView::section {
+                background-color: #3d3d3d;
+                padding: 8px;
+                border: none;
+                border-bottom: 1px solid #555;
+            }
+            QSpinBox {
+                background-color: #3d3d3d;
+                border: 1px solid #555;
+                border-radius: 3px;
+                padding: 4px;
+                color: white;
+                min-height: 24px;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                width: 16px;
+            }
+        """)
+        layout.addWidget(self.steps_table)
+        
+        # Add step button
+        add_btn = StyledButton("Add Quality Step")
+        add_btn.clicked.connect(self._add_step)
+        layout.addWidget(add_btn)
+        
+        # Dialog buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | 
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        
+        self._refresh_table()
+    
+    def _refresh_table(self):
+        """Refresh the steps table from manager."""
+        steps = self.manager.get_steps()
+        self.steps_table.setRowCount(len(steps))
+        
+        for i, step in enumerate(steps):
+            # Altitude (editable except for base)
+            alt_item = QTableWidgetItem(str(step.altitude_ft))
+            if step.altitude_ft == BASE_ALTITUDE_FT:
+                alt_item.setFlags(alt_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                alt_item.setToolTip("Base altitude cannot be changed")
+                alt_item.setBackground(QColor(60, 60, 60))
+            self.steps_table.setItem(i, 0, alt_item)
+            
+            # Zoom level - use QSpinBox for proper validation (12-17 range)
+            zoom_spinbox = QSpinBox()
+            zoom_spinbox.setMinimum(12)
+            zoom_spinbox.setMaximum(17)
+            zoom_spinbox.setValue(min(17, max(12, step.zoom_level)))  # Clamp to valid range
+            zoom_spinbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            zoom_spinbox.setProperty("altitude_ft", step.altitude_ft)
+            zoom_spinbox.setProperty("row", i)
+            self.steps_table.setCellWidget(i, 1, zoom_spinbox)
+            
+            # Airport zoom level - use QSpinBox for proper validation (12-18 range)
+            airport_zoom_spinbox = QSpinBox()
+            airport_zoom_spinbox.setMinimum(12)
+            airport_zoom_spinbox.setMaximum(18)
+            airport_zoom_spinbox.setValue(min(18, max(12, step.zoom_level_airports)))
+            airport_zoom_spinbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            airport_zoom_spinbox.setProperty("altitude_ft", step.altitude_ft)
+            airport_zoom_spinbox.setProperty("row", i)
+            self.steps_table.setCellWidget(i, 2, airport_zoom_spinbox)
+            
+            # Connect validation: airport zoom must be >= regular zoom
+            zoom_spinbox.valueChanged.connect(
+                lambda val, row=i: self._validate_zoom_pair(row, "zoom")
+            )
+            airport_zoom_spinbox.valueChanged.connect(
+                lambda val, row=i: self._validate_zoom_pair(row, "airport")
+            )
+            
+            # Delete button (not for base)
+            if step.altitude_ft != BASE_ALTITUDE_FT:
+                del_btn = QPushButton("Remove")
+                del_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #8b3030;
+                        color: white;
+                        border: none;
+                        padding: 3px 8px;
+                        border-radius: 3px;
+                    }
+                    QPushButton:hover {
+                        background-color: #a04040;
+                    }
+                """)
+                # Capture altitude value in lambda closure
+                del_btn.clicked.connect(
+                    lambda checked, alt=step.altitude_ft: self._remove_step(alt)
+                )
+                self.steps_table.setCellWidget(i, 3, del_btn)
+            else:
+                # Empty cell for base step
+                self.steps_table.setCellWidget(i, 3, QLabel(""))
+    
+    def _add_step(self):
+        """Add a new quality step."""
+        # Show dialog to enter altitude
+        altitude, ok = QInputDialog.getInt(
+            self, "Add Quality Step", 
+            "Altitude (ft) - step applies at and above this altitude:",
+            10000, 0, 60000, 1000
+        )
+        if not ok:
+            return
+            
+        # Show dialog to enter zoom level
+        zoom, ok = QInputDialog.getInt(
+            self, "Add Quality Step", 
+            "Maximum Zoom Level (12-17):",
+            15, 12, 17, 1
+        )
+        if not ok:
+            return
+        
+        # Show dialog to enter airport zoom level
+        airport_zoom, ok = QInputDialog.getInt(
+            self, "Add Quality Step", 
+            "Maximum Zoom Level Near Airports (12-18):",
+            min(18, zoom + 1), 12, 18, 1  # Default to one level higher than normal
+        )
+        if not ok:
+            return
+        
+        # Validate: airport zoom must be >= regular zoom
+        if airport_zoom < zoom:
+            QMessageBox.warning(
+                self, "Invalid Zoom Settings",
+                f"Airport zoom level ({airport_zoom}) cannot be lower than regular zoom level ({zoom}).\n"
+                "Setting airport zoom to match regular zoom."
+            )
+            airport_zoom = zoom
+            
+        if not self.manager.add_step(altitude, zoom, airport_zoom):
+            QMessageBox.warning(
+                self, "Duplicate Altitude", 
+                f"A quality step at {altitude} ft already exists.\n"
+                "Please choose a different altitude or edit the existing step."
+            )
+            return
+            
+        self._refresh_table()
+    
+    def _remove_step(self, altitude: int):
+        """Remove a quality step."""
+        self.manager.remove_step(altitude)
+        self._refresh_table()
+    
+    def _validate_zoom_pair(self, row: int, changed: str):
+        """
+        Validate that airport zoom >= regular zoom for a row.
+        
+        Args:
+            row: The table row to validate
+            changed: Which spinbox changed ("zoom" or "airport")
+        """
+        zoom_spinbox = self.steps_table.cellWidget(row, 1)
+        airport_spinbox = self.steps_table.cellWidget(row, 2)
+        
+        if not zoom_spinbox or not airport_spinbox:
+            return
+        
+        zoom_val = zoom_spinbox.value()
+        airport_val = airport_spinbox.value()
+        
+        if airport_val < zoom_val:
+            # Block signals to prevent recursion
+            if changed == "zoom":
+                # User increased zoom, bump airport to match
+                airport_spinbox.blockSignals(True)
+                airport_spinbox.setValue(zoom_val)
+                airport_spinbox.blockSignals(False)
+            else:
+                # User decreased airport zoom below zoom, bump it back up
+                airport_spinbox.blockSignals(True)
+                airport_spinbox.setValue(zoom_val)
+                airport_spinbox.blockSignals(False)
+    
+    def _on_accept(self):
+        """Handle dialog acceptance - apply table edits to manager."""
+        # Apply any table edits to manager
+        for i in range(self.steps_table.rowCount()):
+            alt_item = self.steps_table.item(i, 0)
+            zoom_spinbox = self.steps_table.cellWidget(i, 1)
+            airport_zoom_spinbox = self.steps_table.cellWidget(i, 2)
+            if alt_item and zoom_spinbox and isinstance(zoom_spinbox, QSpinBox):
+                try:
+                    alt = int(alt_item.text())
+                    zoom = zoom_spinbox.value()  # Already validated by spinbox
+                    airport_zoom = None
+                    if airport_zoom_spinbox and isinstance(airport_zoom_spinbox, QSpinBox):
+                        airport_zoom = airport_zoom_spinbox.value()
+                    self.manager.update_step(alt, zoom, airport_zoom)
+                except ValueError:
+                    pass
+        self.accept()
+    
+    def get_manager(self) -> DynamicZoomManager:
+        """
+        Get the configured manager after dialog closes.
+        
+        Returns:
+            The DynamicZoomManager with any changes applied
+        """
+        return self.manager
 
 
 class ConfigUI(QMainWindow):
@@ -1143,6 +1422,34 @@ class ConfigUI(QMainWindow):
         min_zoom_layout.addWidget(self.min_zoom_label)
         autoortho_layout.addLayout(min_zoom_layout)
 
+        # === Max Zoom Mode Toggle ===
+        # Allows switching between Fixed (single value) and Dynamic (altitude-based)
+        max_zoom_mode_layout = QHBoxLayout()
+        max_zoom_mode_label = QLabel("Max Zoom Mode:")
+        max_zoom_mode_label.setToolTip(
+            "Fixed: Use a single max zoom level for all tiles.\n"
+            "Dynamic: Use different zoom levels based on aircraft altitude."
+        )
+        max_zoom_mode_layout.addWidget(max_zoom_mode_label)
+        
+        self.max_zoom_mode_combo = QComboBox()
+        self.max_zoom_mode_combo.addItems(["Fixed", "Dynamic"])
+        current_mode = str(getattr(self.cfg.autoortho, 'max_zoom_mode', 'fixed')).lower()
+        self.max_zoom_mode_combo.setCurrentText("Dynamic" if current_mode == "dynamic" else "Fixed")
+        self.max_zoom_mode_combo.setToolTip(
+            "Fixed: Single max zoom for all tiles (simpler)\n"
+            "Dynamic: Altitude-based zoom levels (saves VRAM at altitude)"
+        )
+        self.max_zoom_mode_combo.currentTextChanged.connect(self._on_zoom_mode_changed)
+        max_zoom_mode_layout.addWidget(self.max_zoom_mode_combo)
+        max_zoom_mode_layout.addStretch()
+        autoortho_layout.addLayout(max_zoom_mode_layout)
+
+        # === Fixed Mode Controls (wrapped in widget for show/hide) ===
+        self.fixed_zoom_widget = QWidget()
+        fixed_zoom_layout = QVBoxLayout(self.fixed_zoom_widget)
+        fixed_zoom_layout.setContentsMargins(0, 0, 0, 0)
+        
         max_zoom_tooltip = (
             "Maximum zoom level for imagery downloads.\n"
             "Higher values = more detail but larger downloads and more VRAM usage.\n"
@@ -1152,12 +1459,12 @@ class ConfigUI(QMainWindow):
             max_zoom_tooltip += "IMPORTANT: You are using custom tiles, you can set this to 19 if your tiles are built for higher ZL it.\n"
             "But be aware that in-game zoom level will be capped to tile default zoom level + 1 (only X-Plane 12)."
 
-        max_zoom_layout = QHBoxLayout()
+        fixed_max_zoom_row = QHBoxLayout()
         max_zoom_label = QLabel("Maximum zoom level:")
         max_zoom_label.setToolTip(max_zoom_tooltip)
-        max_zoom_layout.addWidget(max_zoom_label)
+        fixed_max_zoom_row.addWidget(max_zoom_label)
         self.max_zoom_slider = ModernSlider()
-        self.max_zoom_slider.setRange(12, 17 if not self.cfg.autoortho.using_custom_tiles else 19) # Max X-Plane allows is tile zoom + 1 , 17 accounts for kubilus mesh
+        self.max_zoom_slider.setRange(12, 17 if not self.cfg.autoortho.using_custom_tiles else 19)
         self.max_zoom_slider.setValue(int(self.cfg.autoortho.max_zoom))
         self.max_zoom_slider.setObjectName('max_zoom')
         self.max_zoom_slider.setToolTip(
@@ -1169,12 +1476,45 @@ class ConfigUI(QMainWindow):
                 self.validate_min_and_max_zoom("max")
             )
         )
-        max_zoom_layout.addWidget(self.max_zoom_slider)
-        max_zoom_layout.addWidget(self.max_zoom_label)
-        autoortho_layout.addLayout(max_zoom_layout)
+        fixed_max_zoom_row.addWidget(self.max_zoom_slider)
+        fixed_max_zoom_row.addWidget(self.max_zoom_label)
+        fixed_zoom_layout.addLayout(fixed_max_zoom_row)
+        
+        autoortho_layout.addWidget(self.fixed_zoom_widget)
 
-        # Max zoom near airports
-        max_zoom_near_airports_layout = QHBoxLayout()
+        # === Dynamic Mode Controls (wrapped in widget for show/hide) ===
+        self.dynamic_zoom_widget = QWidget()
+        dynamic_zoom_layout = QVBoxLayout(self.dynamic_zoom_widget)
+        dynamic_zoom_layout.setContentsMargins(0, 0, 0, 0)
+        
+        dynamic_info = QLabel(
+            "Dynamic zoom adjusts detail based on altitude. "
+            "Higher = less detail (saves VRAM and makes scenery loading faster at cruise)."
+        )
+        dynamic_info.setStyleSheet("color: #888; font-size: 11px;")
+        dynamic_info.setWordWrap(True)
+        dynamic_zoom_layout.addWidget(dynamic_info)
+        
+        dynamic_btn_row = QHBoxLayout()
+        self.dynamic_zoom_btn = StyledButton("Configure Quality Steps...")
+        self.dynamic_zoom_btn.clicked.connect(self._open_quality_steps_dialog)
+        dynamic_btn_row.addWidget(self.dynamic_zoom_btn)
+        dynamic_btn_row.addStretch()
+        dynamic_zoom_layout.addLayout(dynamic_btn_row)
+        
+        self.dynamic_zoom_summary = QLabel("No steps configured")
+        self.dynamic_zoom_summary.setStyleSheet("color: #6da4e3; padding-left: 5px;")
+        dynamic_zoom_layout.addWidget(self.dynamic_zoom_summary)
+        
+        autoortho_layout.addWidget(self.dynamic_zoom_widget)
+        
+        # Initialize dynamic zoom manager (visibility updated after all widgets created)
+        self._init_dynamic_zoom_manager()
+
+        # Max zoom near airports (wrapped in widget for show/hide with fixed mode)
+        self.max_zoom_near_airports_widget = QWidget()
+        max_zoom_near_airports_layout = QHBoxLayout(self.max_zoom_near_airports_widget)
+        max_zoom_near_airports_layout.setContentsMargins(0, 0, 0, 0)
         max_zoom_near_airports_label = QLabel("Max zoom near airports:")
         max_zoom_near_airports_label.setToolTip(
             "Maximum zoom level to allow near airports. Zoom level around airports used by default is 18."
@@ -1198,7 +1538,10 @@ class ConfigUI(QMainWindow):
         max_zoom_near_airports_layout.addWidget(self.max_zoom_near_airports_label)
 
         if not self.cfg.autoortho.using_custom_tiles:
-            autoortho_layout.addLayout(max_zoom_near_airports_layout)
+            autoortho_layout.addWidget(self.max_zoom_near_airports_widget)
+
+        # Now update visibility after all zoom widgets are created
+        self._update_zoom_mode_visibility()
 
         # Performance Tuning Section
         # Separator line for visual grouping
@@ -2541,13 +2884,74 @@ class ConfigUI(QMainWindow):
         self.prefetch_lookahead_slider.setEnabled(enabled)
         self.prefetch_lookahead_label.setEnabled(enabled)
         self.prefetch_lookahead_value.setEnabled(enabled)
+
+    def _init_dynamic_zoom_manager(self):
+        """Initialize the dynamic zoom manager from config."""
+        self._dynamic_zoom_manager = DynamicZoomManager()
+        existing_steps = getattr(self.cfg.autoortho, 'dynamic_zoom_steps', [])
         
-        # Update visual styling
-        disabled_style = "color: #666;"
-        enabled_style = ""
+        if existing_steps and existing_steps != [] and existing_steps != "[]":
+            self._dynamic_zoom_manager.load_from_config(existing_steps)
+        else:
+            # Initialize with current fixed max zoom values as base step
+            max_zoom = int(self.cfg.autoortho.max_zoom)
+            max_zoom_airports = int(self.cfg.autoortho.max_zoom_near_airports)
+            self._dynamic_zoom_manager.set_base_zoom(max_zoom, max_zoom_airports)
         
-        self.prefetch_lookahead_label.setStyleSheet(enabled_style if enabled else disabled_style)
-        self.prefetch_lookahead_value.setStyleSheet(enabled_style if enabled else disabled_style)
+        self._update_dynamic_summary()
+
+    def _on_zoom_mode_changed(self, mode: str):
+        """Handle zoom mode toggle between Fixed and Dynamic."""
+        is_dynamic = mode == "Dynamic"
+        
+        # If switching to dynamic for first time and no steps configured
+        if is_dynamic and self._dynamic_zoom_manager.is_empty():
+            # Initialize with current fixed max zoom values
+            max_zoom = int(self.cfg.autoortho.max_zoom)
+            max_zoom_airports = int(self.cfg.autoortho.max_zoom_near_airports)
+            self._dynamic_zoom_manager.set_base_zoom(max_zoom, max_zoom_airports)
+            self._update_dynamic_summary()
+        
+        self._update_zoom_mode_visibility()
+
+    def _update_zoom_mode_visibility(self):
+        """Show/hide zoom controls based on selected mode."""
+        is_dynamic = self.max_zoom_mode_combo.currentText() == "Dynamic"
+        self.fixed_zoom_widget.setVisible(not is_dynamic)
+        self.dynamic_zoom_widget.setVisible(is_dynamic)
+        # Also hide/show the airport zoom slider (only visible in fixed mode)
+        if hasattr(self, 'max_zoom_near_airports_widget'):
+            self.max_zoom_near_airports_widget.setVisible(not is_dynamic)
+
+    def _open_quality_steps_dialog(self):
+        """Open the quality steps configuration dialog."""
+        dialog = QualityStepsDialog(
+            self, 
+            manager=self._dynamic_zoom_manager,
+            current_max_zoom=int(self.cfg.autoortho.max_zoom)
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._dynamic_zoom_manager = dialog.get_manager()
+            self._update_dynamic_summary()
+
+    def _update_dynamic_summary(self):
+        """Update the summary label for dynamic zoom steps."""
+        if not hasattr(self, '_dynamic_zoom_manager') or not hasattr(self, 'dynamic_zoom_summary'):
+            return
+        
+        steps = self._dynamic_zoom_manager.get_steps()
+        if not steps:
+            self.dynamic_zoom_summary.setText("No steps configured")
+        else:
+            # Show steps sorted by altitude (ascending for display)
+            sorted_steps = sorted(steps, key=lambda s: s.altitude_ft)
+            text = ", ".join(
+                f"ZL{s.zoom_level}@{s.altitude_ft:+}ft" 
+                for s in sorted_steps[:3]
+            )
+            if len(sorted_steps) > 3:
+                text += f" (+{len(sorted_steps)-3} more)"
+            self.dynamic_zoom_summary.setText(text)
 
     def _update_fallback_extends_control(self):
         """Update enabled state of fallback_extends_budget and timeout based on fallback level.
@@ -3233,6 +3637,13 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.min_zoom = str(self.min_zoom_slider.value())
             self.cfg.autoortho.max_zoom_near_airports = str(self.max_zoom_near_airports_slider.value())
             self.cfg.autoortho.max_zoom = str(self.max_zoom_slider.value())
+            
+            # Dynamic zoom settings
+            zoom_mode = "dynamic" if self.max_zoom_mode_combo.currentText() == "Dynamic" else "fixed"
+            self.cfg.autoortho.max_zoom_mode = zoom_mode
+            if hasattr(self, '_dynamic_zoom_manager'):
+                self.cfg.autoortho.dynamic_zoom_steps = self._dynamic_zoom_manager.save_to_config()
+            
             self.cfg.autoortho.maxwait = str(
                 self.maxwait_slider.value() / 10.0
             )

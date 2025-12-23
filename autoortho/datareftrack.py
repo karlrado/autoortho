@@ -14,15 +14,237 @@ Connection State:
 """
 
 import binascii
+import math
 import time
 import struct
 import socket
 import threading
+from collections import deque
+from dataclasses import dataclass
+from typing import Optional
+
 from aoconfig import CFG
 import logging
 
 log = logging.getLogger(__name__)
 UDP_IP = "127.0.0.1"
+
+
+# =============================================================================
+# Flight Data Averaging
+# =============================================================================
+# Maintains a rolling 60-second window of flight samples for computing
+# smoothed/averaged values used in predictive tile loading calculations.
+# This reduces jitter from instantaneous readings and provides better
+# estimates for vertical speed and heading trends.
+# =============================================================================
+
+
+@dataclass
+class FlightSample:
+    """
+    A single flight data sample with timestamp.
+    
+    Used by FlightDataAverager to maintain a history of recent
+    flight data for computing rolling averages.
+    """
+    timestamp: float    # Time when sample was recorded (time.time())
+    lat: float          # Latitude in degrees
+    lon: float          # Longitude in degrees
+    alt_ft: float       # Pressure altitude in feet
+    hdg: float          # Heading in degrees (0-360)
+    spd: float          # Ground speed in m/s
+
+
+class FlightDataAverager:
+    """
+    Maintains a 60-second rolling window of flight samples
+    and computes averaged values for predictive calculations.
+    
+    The averager provides smoothed values for:
+    - Vertical speed (computed from altitude change over time)
+    - Heading (circular average to handle 359->1 wraparound)
+    - Ground speed (simple arithmetic average)
+    
+    Thread Safety:
+        All public methods are thread-safe. The averager uses its own
+        lock separate from DatarefTracker to minimize contention.
+    
+    Usage:
+        averager = FlightDataAverager()
+        averager.add_sample(lat, lon, alt_ft, hdg, spd)
+        averages = averager.get_averages()
+        if averages:
+            vs = averages['vertical_speed_fpm']
+    """
+    
+    # Configuration constants
+    WINDOW_SEC = 60.0       # Rolling window duration in seconds
+    MIN_SAMPLES = 3         # Minimum samples needed for valid average
+    MAX_SAMPLES = 600       # Maximum samples to store (~10 samples/sec max)
+    MIN_TIME_DELTA = 0.01   # Minimum time delta in minutes (~0.6 seconds)
+    
+    def __init__(self):
+        """Initialize with empty sample buffer."""
+        self._samples: deque = deque(maxlen=self.MAX_SAMPLES)
+        self._lock = threading.Lock()
+        
+        # Cached averages (updated on each add_sample call)
+        self._avg_vertical_speed_fpm = 0.0  # feet per minute
+        self._avg_heading = 0.0             # degrees (0-360)
+        self._avg_ground_speed_mps = 0.0    # m/s
+        self._is_valid = False
+    
+    def add_sample(self, lat: float, lon: float, alt_ft: float,
+                   hdg: float, spd: float) -> None:
+        """
+        Add a new flight data sample and update cached averages.
+        
+        This method is called from the UDP listener thread each time
+        valid flight data is received from X-Plane. Samples older than
+        WINDOW_SEC are automatically pruned.
+        
+        Args:
+            lat: Latitude in degrees
+            lon: Longitude in degrees
+            alt_ft: Pressure altitude in feet
+            hdg: Heading in degrees (0-360)
+            spd: Ground speed in m/s
+        """
+        now = time.time()
+        sample = FlightSample(
+            timestamp=now,
+            lat=lat,
+            lon=lon,
+            alt_ft=alt_ft,
+            hdg=hdg,
+            spd=spd
+        )
+        
+        with self._lock:
+            self._samples.append(sample)
+            self._prune_old_samples(now)
+            self._update_averages()
+    
+    def _prune_old_samples(self, now: float) -> None:
+        """
+        Remove samples older than the window.
+        
+        Called internally while holding the lock.
+        
+        Args:
+            now: Current timestamp for comparison
+        """
+        cutoff = now - self.WINDOW_SEC
+        while self._samples and self._samples[0].timestamp < cutoff:
+            self._samples.popleft()
+    
+    def _update_averages(self) -> None:
+        """
+        Compute rolling averages from current samples.
+        
+        Called internally while holding the lock after each sample
+        is added. Updates the cached average values.
+        """
+        if len(self._samples) < self.MIN_SAMPLES:
+            self._is_valid = False
+            return
+        
+        samples = list(self._samples)
+        
+        # --- Vertical Speed ---
+        # Computed as (last_alt - first_alt) / time_delta
+        # This gives average climb/descent rate over the window
+        first, last = samples[0], samples[-1]
+        time_delta_min = (last.timestamp - first.timestamp) / 60.0
+        
+        if time_delta_min > self.MIN_TIME_DELTA:
+            alt_delta_ft = last.alt_ft - first.alt_ft
+            self._avg_vertical_speed_fpm = alt_delta_ft / time_delta_min
+        else:
+            self._avg_vertical_speed_fpm = 0.0
+        
+        # --- Ground Speed ---
+        # Simple arithmetic average of all samples
+        self._avg_ground_speed_mps = sum(s.spd for s in samples) / len(samples)
+        
+        # --- Heading ---
+        # Circular average to handle wraparound (e.g., 359° -> 1°)
+        # Uses vector addition: average of unit vectors in heading direction
+        sin_sum = sum(math.sin(math.radians(s.hdg)) for s in samples)
+        cos_sum = sum(math.cos(math.radians(s.hdg)) for s in samples)
+        self._avg_heading = math.degrees(math.atan2(sin_sum, cos_sum)) % 360
+        
+        self._is_valid = True
+    
+    def get_averages(self) -> Optional[dict]:
+        """
+        Get current averaged values.
+        
+        Returns:
+            dict with keys:
+                - 'vertical_speed_fpm': Average climb/descent rate (ft/min)
+                - 'heading': Average heading (degrees, 0-360)
+                - 'ground_speed_mps': Average ground speed (m/s)
+            Returns None if not enough samples are available.
+        """
+        with self._lock:
+            if not self._is_valid:
+                return None
+            return {
+                'vertical_speed_fpm': self._avg_vertical_speed_fpm,
+                'heading': self._avg_heading,
+                'ground_speed_mps': self._avg_ground_speed_mps,
+            }
+    
+    def get_vertical_speed_fpm(self) -> Optional[float]:
+        """
+        Get the averaged vertical speed.
+        
+        Returns:
+            Vertical speed in feet per minute, or None if not valid.
+            Positive = climbing, Negative = descending
+        """
+        with self._lock:
+            if not self._is_valid:
+                return None
+            return self._avg_vertical_speed_fpm
+    
+    def clear(self) -> None:
+        """
+        Clear all samples and reset state.
+        
+        Called when connection to X-Plane is lost to ensure stale
+        data isn't used when connection is re-established.
+        """
+        with self._lock:
+            self._samples.clear()
+            self._avg_vertical_speed_fpm = 0.0
+            self._avg_heading = 0.0
+            self._avg_ground_speed_mps = 0.0
+            self._is_valid = False
+    
+    def is_valid(self) -> bool:
+        """Check if averages are currently valid."""
+        with self._lock:
+            return self._is_valid
+    
+    def sample_count(self) -> int:
+        """Get the current number of samples in the buffer."""
+        with self._lock:
+            return len(self._samples)
+    
+    def get_window_duration(self) -> float:
+        """
+        Get the actual time span covered by current samples.
+        
+        Returns:
+            Duration in seconds, or 0 if fewer than 2 samples.
+        """
+        with self._lock:
+            if len(self._samples) < 2:
+                return 0.0
+            return self._samples[-1].timestamp - self._samples[0].timestamp
 
 
 class DatarefTracker(object):
@@ -85,6 +307,10 @@ class DatarefTracker(object):
         # Thread management
         self.t = None
         self.running = False
+
+        # Flight data averaging for predictive calculations
+        # Maintains a 60-second rolling window of samples
+        self.flight_averager = FlightDataAverager()
 
         # Socket
         self.sock = socket.socket(
@@ -299,6 +525,10 @@ class DatarefTracker(object):
                     self.connected = False
                     self.data_valid = False
 
+                # Clear flight averager when connection is lost
+                # This ensures stale data isn't used when reconnecting
+                self.flight_averager.clear()
+
                 # Check if we're shutting down before recreating socket
                 if self._shutdown_flag.is_set():
                     break
@@ -362,6 +592,17 @@ class DatarefTracker(object):
                         if pressure_alt is not None:
                             self.pressure_alt = pressure_alt
                         self.data_valid = True
+
+                        # Feed sample to flight averager for predictive calculations
+                        # Only add sample if we have valid pressure altitude
+                        if self.pressure_alt > 0:
+                            self.flight_averager.add_sample(
+                                lat=self.lat,
+                                lon=self.lon,
+                                alt_ft=self.pressure_alt,
+                                hdg=self.hdg,
+                                spd=self.spd
+                            )
                     else:
                         self.data_valid = False
                 else:
@@ -486,6 +727,25 @@ class DatarefTracker(object):
                     self.datarefs[idx][0]
                 )
         return retvalues
+
+    def get_flight_averages(self) -> Optional[dict]:
+        """
+        Get 60-second averaged flight data for predictive calculations.
+
+        This provides smoothed values suitable for predicting future
+        aircraft position and altitude. Used by the dynamic zoom system
+        to determine appropriate zoom levels based on predicted altitude
+        at closest approach to tiles.
+
+        Returns:
+            dict with keys:
+                - 'vertical_speed_fpm': Average climb/descent rate (ft/min)
+                - 'heading': Average heading (degrees, 0-360)
+                - 'ground_speed_mps': Average ground speed (m/s)
+            Returns None if not enough samples are available or if
+            not connected to X-Plane.
+        """
+        return self.flight_averager.get_averages()
 
 
 dt = DatarefTracker()
