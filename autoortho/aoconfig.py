@@ -220,6 +220,19 @@ end_time = 06:00
 # Useful to ensure night flights start with default scenery from the beginning.
 # When disabled, AutoOrtho works normally until sim time confirms exclusion.
 default_to_exclusion = False
+
+[simbrief]
+# SimBrief user ID for flight plan integration
+userid = 
+# Use SimBrief flight data for dynamic zoom level and pre-fetching calculations
+use_flight_data = False
+# Radius in nautical miles to consider fixes when calculating altitude for a tile
+# All fixes within this radius are considered, and the lowest altitude is used
+route_consideration_radius_nm = 50
+# If the aircraft deviates more than this distance (nm) from the route, fall back to DataRef-based calculations
+route_deviation_threshold_nm = 40
+# Radius in nautical miles around waypoints to prefetch tiles
+route_prefetch_radius_nm = 40
 """
 
     def __init__(self, conf_file=None):

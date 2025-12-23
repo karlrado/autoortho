@@ -37,6 +37,7 @@ from utils.constants import (
 from utils.apple_token_service import apple_token_service
 from utils.dynamic_zoom import DynamicZoomManager
 from utils.altitude_predictor import predict_altitude_at_closest_approach
+from utils.simbrief_flight import simbrief_flight_manager
 
 from datareftrack import dt as datareftracker
 
@@ -983,15 +984,257 @@ class SpatialPrefetcher:
         """
         Execute one prefetch cycle.
 
-        Uses 60-second averaged heading and speed when available for more
-        stable predictions. Falls back to instantaneous values if averages
-        aren't available yet. Position is always instantaneous since that's
-        where the aircraft actually is.
+        If SimBrief flight data is loaded and enabled, prefetches along the
+        flight plan waypoints. Otherwise, uses velocity-based prediction.
+        
+        Falls back to velocity-based prefetching if aircraft deviates from route.
         """
         # Check if tile_cacher is available
         if self._tile_cacher is None:
             return
 
+        # Always use instantaneous position (that's where we actually are)
+        if not datareftracker.data_valid or not datareftracker.connected:
+            return
+            
+        lat = datareftracker.lat
+        lon = datareftracker.lon
+
+        # Validate position data
+        if lat < -90 or lat > 90 or lon < -180 or lon > 180:
+            return
+
+        # Check if SimBrief flight path prefetching should be used
+        if self._should_use_simbrief_prefetch(lat, lon):
+            chunks_submitted = self._prefetch_along_flight_plan(lat, lon)
+            if chunks_submitted > 0:
+                self._prefetch_count += chunks_submitted
+                log.debug(f"Prefetched {chunks_submitted} chunks along flight plan (total: {self._prefetch_count})")
+                bump('prefetch_chunk_count', chunks_submitted)
+            return
+        
+        # Fall back to velocity-based prefetching
+        self._do_velocity_prefetch_cycle(lat, lon)
+    
+    def _should_use_simbrief_prefetch(self, lat: float, lon: float) -> bool:
+        """
+        Check if SimBrief flight path prefetching should be used.
+        
+        Returns True if:
+        - SimBrief flight data is loaded
+        - use_flight_data toggle is enabled
+        - Aircraft is on-route (within deviation threshold)
+        """
+        # Check if SimBrief integration is enabled
+        if not hasattr(CFG, 'simbrief'):
+            return False
+        
+        use_flight_data = getattr(CFG.simbrief, 'use_flight_data', False)
+        if isinstance(use_flight_data, str):
+            use_flight_data = use_flight_data.lower() in ('true', '1', 'yes', 'on')
+        
+        if not use_flight_data:
+            return False
+        
+        # Check if flight data is loaded
+        if not simbrief_flight_manager.is_loaded:
+            return False
+        
+        # Get deviation threshold from config
+        deviation_threshold = float(getattr(CFG.simbrief, 'route_deviation_threshold_nm', 40))
+        
+        # Check if aircraft is on-route
+        return simbrief_flight_manager.is_on_route(lat, lon, deviation_threshold)
+    
+    def _prefetch_along_flight_plan(self, lat: float, lon: float) -> int:
+        """
+        Prefetch tiles along the SimBrief flight plan waypoints.
+        
+        Gets upcoming waypoints from current position and prefetches tiles
+        in a radius around each waypoint, working forward from current position.
+        
+        Uses the flight plan altitude at each waypoint to determine the
+        appropriate zoom level, matching what will actually be displayed.
+        
+        Returns number of chunks submitted.
+        """
+        chunks_submitted = 0
+        
+        # Get prefetch radius from config
+        prefetch_radius_nm = float(getattr(CFG.simbrief, 'route_prefetch_radius_nm', 40))
+        
+        # Get upcoming fixes (limited number to avoid overwhelming)
+        upcoming_fixes = simbrief_flight_manager.get_upcoming_fixes(lat, lon, count=15)
+        
+        if not upcoming_fixes:
+            return 0
+        
+        # Prefetch around each upcoming fix, stopping when we hit max chunks
+        for fix in upcoming_fixes:
+            if chunks_submitted >= self.max_chunks:
+                break
+            
+            # Determine zoom level based on the AGL altitude at this waypoint
+            # AGL (Above Ground Level) is used because it represents actual height
+            # above the terrain being viewed, which is more relevant for imagery quality
+            zoom_level = self._get_zoom_for_altitude(fix.altitude_agl_ft)
+            
+            log.debug(f"Prefetch fix {fix.ident}: MSL={fix.altitude_ft}ft, "
+                     f"GND={fix.ground_height_ft}ft, AGL={fix.altitude_agl_ft}ft -> ZL{zoom_level}")
+            
+            # Prefetch tiles around this waypoint at the appropriate zoom level
+            submitted = self._prefetch_waypoint_area(
+                fix.lat, fix.lon, prefetch_radius_nm, zoom_level
+            )
+            chunks_submitted += submitted
+        
+        return chunks_submitted
+    
+    def _prefetch_waypoint_area(self, waypoint_lat: float, waypoint_lon: float,
+                                  radius_nm: float, zoom: int) -> int:
+        """
+        Prefetch tiles within a radius around a waypoint.
+        
+        Returns number of chunks submitted.
+        """
+        chunks_submitted = 0
+        
+        # Convert radius to degrees (approximate)
+        # 1 nm ≈ 1/60 degree latitude
+        radius_deg_lat = radius_nm / 60.0
+        radius_deg_lon = radius_nm / (60.0 * math.cos(math.radians(waypoint_lat)))
+        
+        # Calculate tile coordinates
+        n = 2 ** zoom
+        
+        def latlon_to_tile(lat, lon):
+            """Convert lat/lon to tile coordinates."""
+            x = int((lon + 180) / 360 * n)
+            lat_clamped = max(-85.0511, min(85.0511, lat))
+            lat_rad = math.radians(lat_clamped)
+            y = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
+            return (x, y)
+        
+        # Get tile range for the area
+        col_center, row_center = latlon_to_tile(waypoint_lat, waypoint_lon)
+        col_min, row_min = latlon_to_tile(
+            waypoint_lat + radius_deg_lat,
+            waypoint_lon - radius_deg_lon
+        )
+        col_max, row_max = latlon_to_tile(
+            waypoint_lat - radius_deg_lat,
+            waypoint_lon + radius_deg_lon
+        )
+        
+        # Limit the area to prevent too many tiles
+        max_tiles_per_dim = 3
+        if row_max - row_min > max_tiles_per_dim:
+            row_min = row_center - max_tiles_per_dim // 2
+            row_max = row_center + max_tiles_per_dim // 2
+        if col_max - col_min > max_tiles_per_dim:
+            col_min = col_center - max_tiles_per_dim // 2
+            col_max = col_center + max_tiles_per_dim // 2
+        
+        # Prefetch tiles in the area
+        for row in range(row_min, row_max + 1):
+            for col in range(col_min, col_max + 1):
+                if chunks_submitted >= self.max_chunks:
+                    return chunks_submitted
+                
+                # Create unique key for this tile
+                tile_key = (row, col, zoom)
+                
+                # Skip if recently prefetched
+                if tile_key in self._recently_prefetched:
+                    continue
+                
+                # Add to recently prefetched
+                self._recently_prefetched.add(tile_key)
+                if len(self._recently_prefetched) > self._max_recent:
+                    try:
+                        self._recently_prefetched.pop()
+                    except KeyError:
+                        pass
+                
+                # Prefetch this tile
+                submitted = self._prefetch_tile(row, col, zoom)
+                chunks_submitted += submitted
+        
+        return chunks_submitted
+    
+    def _get_zoom_for_altitude(self, altitude_ft: int) -> int:
+        """
+        Get the appropriate zoom level for a given altitude.
+        
+        Uses the TileCacher's dynamic zoom manager if available and in dynamic mode.
+        Falls back to fixed max_zoom otherwise.
+        
+        Args:
+            altitude_ft: Altitude in feet
+            
+        Returns:
+            Appropriate zoom level for the altitude
+        """
+        # Check if we have access to the tile cacher and it's in dynamic mode
+        if self._tile_cacher is not None:
+            max_zoom_mode = getattr(CFG.autoortho, 'max_zoom_mode', 'fixed')
+            if max_zoom_mode == 'dynamic' and hasattr(self._tile_cacher, 'dynamic_zoom_manager'):
+                zoom = self._tile_cacher.dynamic_zoom_manager.get_zoom_for_altitude(altitude_ft)
+                log.debug(f"Dynamic zoom for altitude {altitude_ft}ft: ZL{zoom}")
+                return zoom
+        
+        # Fall back to fixed max_zoom
+        return int(getattr(CFG.autoortho, 'max_zoom', 16))
+    
+    def _get_predicted_altitude(self, lat: float, lon: float, 
+                                  hdg: float, spd: float, 
+                                  target_lat: float, target_lon: float) -> int:
+        """
+        Predict altitude at a target position based on current flight parameters.
+        
+        Uses vertical speed to estimate altitude change over the distance.
+        
+        Returns:
+            Predicted altitude in feet
+        """
+        # Get current altitude and vertical speed
+        with datareftracker._lock:
+            if not datareftracker.data_valid:
+                return int(getattr(CFG.autoortho, 'max_zoom', 16))
+            current_alt = datareftracker.pressure_alt
+        
+        averages = datareftracker.get_flight_averages()
+        if averages is None:
+            return int(current_alt)
+        
+        vs_fpm = averages.get('vertical_speed_fpm', 0)
+        
+        # Calculate distance to target
+        delta_lat = target_lat - lat
+        delta_lon = target_lon - lon
+        cos_lat = math.cos(math.radians(lat))
+        distance_m = math.sqrt((delta_lat * 111320) ** 2 + (delta_lon * 111320 * cos_lat) ** 2)
+        
+        # Calculate time to reach target
+        if spd > 0:
+            time_sec = distance_m / spd
+        else:
+            time_sec = 0
+        
+        # Predict altitude change
+        alt_change = vs_fpm * (time_sec / 60)  # Convert seconds to minutes
+        predicted_alt = current_alt + alt_change
+        
+        # Clamp to reasonable values
+        return max(0, int(predicted_alt))
+    
+    def _do_velocity_prefetch_cycle(self, lat: float, lon: float):
+        """
+        Execute velocity-based prefetch cycle.
+        
+        Uses heading and speed to predict future position and prefetch tiles.
+        Uses predicted altitude to determine appropriate zoom level.
+        """
         # Try to get 60-second averaged flight data for stable prediction
         averages = datareftracker.get_flight_averages()
 
@@ -1001,19 +1244,8 @@ class SpatialPrefetcher:
             spd = averages['ground_speed_mps']
         else:
             # Fall back to instantaneous values if no averages available
-            # This happens at flight start before 60 seconds of data
-            if not datareftracker.data_valid or not datareftracker.connected:
-                return
             hdg = datareftracker.hdg
             spd = datareftracker.spd
-
-        # Always use instantaneous position (that's where we actually are)
-        lat = datareftracker.lat
-        lon = datareftracker.lon
-
-        # Validate position data
-        if lat < -90 or lat > 90 or lon < -180 or lon > 180:
-            return
 
         # Don't prefetch if moving slowly (taxiing, parked)
         if spd < self.MIN_SPEED_MPS:
@@ -1038,29 +1270,39 @@ class SpatialPrefetcher:
         predicted_lat = lat + delta_lat
         predicted_lon = lon + delta_lon
         
-        # Get tiles along the flight path
+        # Calculate predicted altitude at destination for zoom level determination
+        predicted_alt = self._get_predicted_altitude(lat, lon, hdg, spd, predicted_lat, predicted_lon)
+        zoom_level = self._get_zoom_for_altitude(predicted_alt)
+        
+        # Get tiles along the flight path at the appropriate zoom level
         chunks_submitted = self._prefetch_along_path(
-            lat, lon, predicted_lat, predicted_lon
+            lat, lon, predicted_lat, predicted_lon, zoom_level
         )
         
         if chunks_submitted > 0:
             self._prefetch_count += chunks_submitted
-            log.debug(f"Prefetched {chunks_submitted} chunks (total: {self._prefetch_count})")
+            log.debug(f"Prefetched {chunks_submitted} chunks at ZL{zoom_level} (alt={predicted_alt}ft, total: {self._prefetch_count})")
             bump('prefetch_chunk_count', chunks_submitted)
     
-    def _prefetch_along_path(self, lat1, lon1, lat2, lon2):
+    def _prefetch_along_path(self, lat1, lon1, lat2, lon2, zoom_level: int = None):
         """
         Prefetch chunks for tiles along the flight path.
+        
+        Args:
+            lat1, lon1: Start position (current aircraft position)
+            lat2, lon2: End position (predicted position)
+            zoom_level: Zoom level to prefetch at. If None, uses config max_zoom.
         
         Returns number of chunks submitted for prefetch.
         """
         chunks_submitted = 0
         
-        # Get zoom level from config
-        max_zoom = int(getattr(CFG.autoortho, 'max_zoom', 16))
+        # Use provided zoom level or fall back to config
+        if zoom_level is None:
+            zoom_level = int(getattr(CFG.autoortho, 'max_zoom', 16))
         
         # Calculate tile coordinates using Web Mercator projection
-        n = 2 ** max_zoom
+        n = 2 ** zoom_level
         
         def latlon_to_tile(lat, lon):
             """Convert lat/lon to tile coordinates."""
@@ -1095,7 +1337,7 @@ class SpatialPrefetcher:
                     return chunks_submitted
                     
                 # Create unique key for this tile
-                tile_key = (row, col, max_zoom)
+                tile_key = (row, col, zoom_level)
                 
                 # Skip if recently prefetched
                 if tile_key in self._recently_prefetched:
@@ -1111,7 +1353,7 @@ class SpatialPrefetcher:
                         pass
                 
                 # Prefetch this tile's chunks
-                submitted = self._prefetch_tile(row, col, max_zoom)
+                submitted = self._prefetch_tile(row, col, zoom_level)
                 chunks_submitted += submitted
                 
         return chunks_submitted
@@ -3372,6 +3614,10 @@ class TileCacher(object):
         to predict what altitude the aircraft will be at when it reaches the
         closest point to this tile. Then returns the appropriate zoom level
         from the configured quality steps.
+        
+        If SimBrief flight data is loaded and the "use_flight_data" toggle is enabled,
+        and the aircraft is on-route, uses the flight plan altitude for that position
+        instead of DataRef-based prediction.
 
         Args:
             row: Tile row coordinate
@@ -3380,6 +3626,102 @@ class TileCacher(object):
 
         Returns:
             The computed max zoom level for this tile
+        """
+        # Get tile center coordinates (needed for both methods)
+        tile_lat, tile_lon = _chunk_to_latlon(row, col, tile_zoom)
+        
+        # Check if SimBrief flight data should be used
+        simbrief_altitude_agl = self._get_simbrief_altitude_for_tile(tile_lat, tile_lon)
+        if simbrief_altitude_agl is not None:
+            # Use SimBrief flight plan AGL altitude for zoom calculation
+            log.debug(f"Using SimBrief AGL altitude {simbrief_altitude_agl}ft for tile at {tile_lat:.2f},{tile_lon:.2f}")
+            if tile_zoom == 18 and not CFG.autoortho.using_custom_tiles:
+                return self.dynamic_zoom_manager.get_airport_zoom_for_altitude(simbrief_altitude_agl)
+            return self.dynamic_zoom_manager.get_zoom_for_altitude(simbrief_altitude_agl)
+        
+        # Fall back to DataRef-based calculation
+        return self._compute_dynamic_zoom_from_datarefs(row, col, tile_zoom, tile_lat, tile_lon)
+    
+    def _get_simbrief_altitude_for_tile(self, tile_lat: float, tile_lon: float) -> Optional[int]:
+        """
+        Get conservative AGL altitude from SimBrief flight plan for a tile position.
+        
+        Returns the planned altitude Above Ground Level (AGL) if:
+        - SimBrief flight data is loaded
+        - The "use_flight_data" toggle is enabled
+        - The aircraft is currently on-route (within deviation threshold)
+        
+        When multiple waypoints are within the consideration radius:
+        - Uses the LOWEST flight altitude (MSL) - accounts for descent
+        - Uses the HIGHEST ground elevation - accounts for mountains
+        - Conservative AGL = lowest_MSL - highest_ground
+        
+        This ensures maximum detail when flying over areas with varied terrain
+        (e.g., descending over mountains).
+        
+        AGL Calculation:
+            AGL = MSL altitude - terrain elevation (ground_height from SimBrief)
+            
+            AGL is used because it represents the actual height above the terrain
+            being viewed. This is more relevant for imagery quality:
+            - 10,000 ft MSL over 5,000 ft mountains = 5,000 ft AGL (needs higher zoom)
+            - 10,000 ft MSL over the ocean = 10,000 ft AGL (can use lower zoom)
+        
+        Args:
+            tile_lat: Tile center latitude
+            tile_lon: Tile center longitude
+            
+        Returns:
+            Conservative AGL altitude in feet if SimBrief data should be used, None otherwise
+        """
+        # Check if SimBrief integration is enabled
+        if not hasattr(CFG, 'simbrief'):
+            return None
+        
+        use_flight_data = getattr(CFG.simbrief, 'use_flight_data', False)
+        if isinstance(use_flight_data, str):
+            use_flight_data = use_flight_data.lower() in ('true', '1', 'yes', 'on')
+        
+        if not use_flight_data:
+            return None
+        
+        # Check if flight data is loaded
+        if not simbrief_flight_manager.is_loaded:
+            return None
+        
+        # Get aircraft position to check if on-route
+        with datareftracker._lock:
+            if not datareftracker.data_valid:
+                return None
+            aircraft_lat = datareftracker.lat
+            aircraft_lon = datareftracker.lon
+        
+        # Get deviation threshold from config
+        deviation_threshold = float(getattr(CFG.simbrief, 'route_deviation_threshold_nm', 40))
+        
+        # Check if aircraft is on-route
+        if not simbrief_flight_manager.is_on_route(aircraft_lat, aircraft_lon, deviation_threshold):
+            log.debug(f"Aircraft deviated from route, using DataRef-based zoom calculation")
+            return None
+        
+        # Get consideration radius from config
+        consideration_radius = float(getattr(CFG.simbrief, 'route_consideration_radius_nm', 50))
+        
+        # Get AGL altitude at tile position (uses lowest AGL of fixes within radius)
+        # use_agl=True returns Above Ground Level altitude for better terrain awareness
+        altitude_agl = simbrief_flight_manager.get_altitude_at_position(
+            tile_lat, tile_lon, consideration_radius, use_agl=True
+        )
+        
+        return altitude_agl
+    
+    def _compute_dynamic_zoom_from_datarefs(self, row: int, col: int, tile_zoom: int,
+                                             tile_lat: float, tile_lon: float) -> int:
+        """
+        Compute dynamic zoom level using DataRef-based altitude prediction.
+        
+        This is the fallback method when SimBrief data is not available or
+        when the aircraft has deviated from the planned route.
         """
         # Get flight averages for prediction
         averages = datareftracker.get_flight_averages()
@@ -3404,9 +3746,6 @@ class TileCacher(object):
             aircraft_lat = datareftracker.lat
             aircraft_lon = datareftracker.lon
             aircraft_alt_ft = datareftracker.pressure_alt
-
-        # Get tile center coordinates
-        tile_lat, tile_lon = _chunk_to_latlon(row, col, tile_zoom)
 
         # Predict altitude at closest approach
         predicted_alt, will_approach = predict_altitude_at_closest_approach(

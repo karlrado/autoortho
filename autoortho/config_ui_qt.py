@@ -227,6 +227,47 @@ class RestoreDefaultDsfsWorker(QThread):
             self.error.emit(self.region_id, str(err))
             log.error(tb)
 
+
+class SimBriefFetchWorker(QThread):
+    """Worker thread for fetching SimBrief flight plan data"""
+    success = Signal(dict)  # flight data
+    error = Signal(str)  # error message
+    
+    SIMBRIEF_API_URL = "https://www.simbrief.com/api/xml.fetcher.php"
+    
+    def __init__(self, userid):
+        super().__init__()
+        self.userid = userid
+    
+    def run(self):
+        try:
+            url = f"{self.SIMBRIEF_API_URL}?userid={self.userid}&json=1"
+            response = requests.get(url, timeout=15)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            # Check for API-level errors
+            fetch_info = data.get('fetch', {})
+            status = fetch_info.get('status', '')
+            if status.lower().startswith('error'):
+                self.error.emit(status)
+                return
+            
+            self.success.emit(data)
+            
+        except requests.exceptions.Timeout:
+            self.error.emit("Request timed out. Please check your internet connection.")
+        except requests.exceptions.ConnectionError:
+            self.error.emit("Connection error. Please check your internet connection.")
+        except requests.exceptions.HTTPError as e:
+            self.error.emit(f"HTTP error: {e.response.status_code}")
+        except ValueError as e:
+            self.error.emit(f"Invalid response from SimBrief: {str(e)}")
+        except Exception as e:
+            self.error.emit(f"Unexpected error: {str(e)}")
+
+
 class StyledButton(QPushButton):
     """Custom styled button with hover effects"""
     def __init__(self, text, primary=False):
@@ -1077,6 +1118,131 @@ class ConfigUI(QMainWindow):
 
 
         layout.addWidget(options_group)
+
+        # SimBrief Integration group
+        simbrief_group = QGroupBox("SimBrief Integration")
+        simbrief_layout = QVBoxLayout()
+        simbrief_group.setLayout(simbrief_layout)
+
+        # User ID row
+        userid_layout = QHBoxLayout()
+        userid_label = QLabel("SimBrief User ID:")
+        userid_label.setToolTip(
+            "Your SimBrief Pilot ID.\n"
+            "Find it at: SimBrief → Account Settings → Pilot ID"
+        )
+        userid_layout.addWidget(userid_label)
+        
+        self.simbrief_userid_edit = QLineEdit(
+            getattr(self.cfg.simbrief, 'userid', '') if hasattr(self.cfg, 'simbrief') else ''
+        )
+        self.simbrief_userid_edit.setObjectName('simbrief_userid')
+        self.simbrief_userid_edit.setPlaceholderText("Enter your SimBrief Pilot ID")
+        self.simbrief_userid_edit.setToolTip("Your SimBrief Pilot ID (numeric)")
+        self.simbrief_userid_edit.textChanged.connect(self._on_simbrief_userid_changed)
+        userid_layout.addWidget(self.simbrief_userid_edit)
+        
+        simbrief_layout.addLayout(userid_layout)
+
+        # Fetch button (only visible when userid is set)
+        self.simbrief_fetch_btn = StyledButton("Fetch Flight Data")
+        self.simbrief_fetch_btn.setToolTip("Fetch the latest flight plan from SimBrief")
+        self.simbrief_fetch_btn.clicked.connect(self._on_simbrief_fetch)
+        simbrief_layout.addWidget(self.simbrief_fetch_btn)
+
+        # Flight info display area (hidden initially)
+        self.simbrief_info_frame = QFrame()
+        self.simbrief_info_frame.setStyleSheet("""
+            QFrame {
+                background-color: #2A2A2A;
+                border: 1px solid #3A3A3A;
+                border-radius: 6px;
+                padding: 10px;
+            }
+        """)
+        simbrief_info_layout = QVBoxLayout()
+        simbrief_info_layout.setSpacing(8)
+        self.simbrief_info_frame.setLayout(simbrief_info_layout)
+
+        # Flight route header
+        self.simbrief_route_label = QLabel("")
+        self.simbrief_route_label.setStyleSheet("""
+            QLabel {
+                font-size: 16px;
+                font-weight: bold;
+                color: #6da4e3;
+            }
+        """)
+        simbrief_info_layout.addWidget(self.simbrief_route_label)
+
+        # Flight details grid
+        self.simbrief_details_label = QLabel("")
+        self.simbrief_details_label.setStyleSheet("""
+            QLabel {
+                color: #E0E0E0;
+                font-size: 13px;
+            }
+        """)
+        self.simbrief_details_label.setWordWrap(True)
+        simbrief_info_layout.addWidget(self.simbrief_details_label)
+
+        # Error label (hidden initially)
+        self.simbrief_error_label = QLabel("")
+        self.simbrief_error_label.setStyleSheet("""
+            QLabel {
+                color: #ff6b6b;
+                font-size: 13px;
+                padding: 8px;
+                background-color: #3a2a2a;
+                border-radius: 4px;
+            }
+        """)
+        self.simbrief_error_label.setWordWrap(True)
+        self.simbrief_error_label.hide()
+        simbrief_info_layout.addWidget(self.simbrief_error_label)
+
+        # Toggle for using flight data (only visible when flight data is loaded)
+        self.simbrief_use_flight_data_check = QCheckBox(
+            "Use Flight Data for Dynamic Zoom Level and Pre-fetching Calculations"
+        )
+        self.simbrief_use_flight_data_check.setToolTip(
+            "When enabled, AutoOrtho uses the SimBrief flight plan to:\n\n"
+            "• Dynamic Zoom: Uses conservative AGL (Above Ground Level) altitude\n"
+            "  to determine the appropriate zoom level for tiles.\n\n"
+            "• Pre-fetching: Downloads tiles along your flight path ahead of time,\n"
+            "  at the appropriate zoom level for each waypoint's AGL altitude.\n\n"
+            "Conservative AGL calculation (when multiple waypoints are nearby):\n"
+            "  • Uses LOWEST flight altitude (MSL) - accounts for descent\n"
+            "  • Uses HIGHEST ground elevation - accounts for mountains\n"
+            "  • AGL = lowest_MSL - highest_ground = most conservative result\n\n"
+            "Why AGL? It represents actual height above terrain:\n"
+            "  • 10,000ft MSL over 5,000ft mountains = 5,000ft AGL (higher zoom)\n"
+            "  • 10,000ft MSL over ocean = 10,000ft AGL (lower zoom)\n\n"
+            "If you deviate more than 40nm from the route, AutoOrtho falls back\n"
+            "to DataRef-based calculations using aircraft speed and heading."
+        )
+        # Load saved value from config
+        use_flight_data = False
+        if hasattr(self.cfg, 'simbrief'):
+            use_flight_data = getattr(self.cfg.simbrief, 'use_flight_data', False)
+            if isinstance(use_flight_data, str):
+                use_flight_data = use_flight_data.lower() in ('true', '1', 'yes', 'on')
+        self.simbrief_use_flight_data_check.setChecked(use_flight_data)
+        self.simbrief_use_flight_data_check.setObjectName('simbrief_use_flight_data')
+        self.simbrief_use_flight_data_check.hide()  # Hidden until flight data is loaded
+        simbrief_info_layout.addWidget(self.simbrief_use_flight_data_check)
+
+        self.simbrief_info_frame.hide()
+        simbrief_layout.addWidget(self.simbrief_info_frame)
+
+        # Store the current flight data
+        self.simbrief_flight_data = None
+        self.simbrief_fetch_worker = None
+
+        # Update initial visibility
+        self._update_simbrief_ui_state()
+
+        layout.addWidget(simbrief_group)
     
         # Set the content widget to the scroll area
         scroll_area.setWidget(setup_content)
@@ -3057,6 +3223,162 @@ class ConfigUI(QMainWindow):
         else:
             self.cfg.autoortho.simheaven_compat = False
 
+    def _on_simbrief_userid_changed(self, text):
+        """Handle SimBrief User ID text change"""
+        self._update_simbrief_ui_state()
+        # Update config
+        if hasattr(self.cfg, 'simbrief'):
+            self.cfg.simbrief.userid = text.strip()
+
+    def _update_simbrief_ui_state(self):
+        """Update SimBrief UI visibility based on current state"""
+        userid = self.simbrief_userid_edit.text().strip()
+        has_userid = bool(userid)
+        
+        # Show/hide fetch button based on whether we have a user ID
+        self.simbrief_fetch_btn.setVisible(has_userid)
+        
+        # Hide error when user ID changes
+        self.simbrief_error_label.hide()
+        
+        # If no user ID and we had flight data, clear it
+        if not has_userid:
+            self.simbrief_info_frame.hide()
+            self.simbrief_use_flight_data_check.hide()
+            self.simbrief_flight_data = None
+            
+            # Clear the flight manager
+            from utils.simbrief_flight import simbrief_flight_manager
+            simbrief_flight_manager.clear()
+
+    def _on_simbrief_fetch(self):
+        """Handle SimBrief fetch button click"""
+        userid = self.simbrief_userid_edit.text().strip()
+        if not userid:
+            return
+        
+        # Disable button while fetching
+        self.simbrief_fetch_btn.setEnabled(False)
+        self.simbrief_fetch_btn.setText("Fetching...")
+        self.simbrief_error_label.hide()
+        
+        # Create and start worker
+        self.simbrief_fetch_worker = SimBriefFetchWorker(userid)
+        self.simbrief_fetch_worker.success.connect(self._on_simbrief_fetch_success)
+        self.simbrief_fetch_worker.error.connect(self._on_simbrief_fetch_error)
+        self.simbrief_fetch_worker.finished.connect(self._on_simbrief_fetch_finished)
+        self.simbrief_fetch_worker.start()
+
+    def _on_simbrief_fetch_success(self, data):
+        """Handle successful SimBrief fetch"""
+        self.simbrief_flight_data = data
+        self._display_simbrief_flight_info(data)
+        self.simbrief_info_frame.show()
+        self.simbrief_error_label.hide()
+        self.simbrief_use_flight_data_check.show()  # Show toggle when flight data loaded
+        
+        # Load flight data into the global flight manager for use by dynamic zoom and prefetcher
+        from utils.simbrief_flight import simbrief_flight_manager
+        if simbrief_flight_manager.load_flight_data(data):
+            log.info(f"SimBrief flight loaded into manager: {simbrief_flight_manager.origin} -> {simbrief_flight_manager.destination}")
+        else:
+            log.warning("Failed to load SimBrief flight data into manager")
+        
+        log.info("SimBrief flight data fetched successfully")
+
+    def _on_simbrief_fetch_error(self, error_msg):
+        """Handle SimBrief fetch error"""
+        self.simbrief_error_label.setText(f"⚠ {error_msg}")
+        self.simbrief_error_label.show()
+        self.simbrief_info_frame.show()
+        self.simbrief_route_label.setText("")
+        self.simbrief_details_label.setText("")
+        self.simbrief_use_flight_data_check.hide()  # Hide toggle on error
+        self.simbrief_flight_data = None
+        
+        # Clear the flight manager
+        from utils.simbrief_flight import simbrief_flight_manager
+        simbrief_flight_manager.clear()
+        
+        log.warning(f"SimBrief fetch error: {error_msg}")
+
+    def _on_simbrief_fetch_finished(self):
+        """Handle SimBrief fetch completion (success or error)"""
+        self.simbrief_fetch_btn.setEnabled(True)
+        self.simbrief_fetch_btn.setText("Fetch Flight Data")
+
+    def _display_simbrief_flight_info(self, data):
+        """Display SimBrief flight information in the UI"""
+        try:
+            origin = data.get('origin', {})
+            destination = data.get('destination', {})
+            general = data.get('general', {})
+            aircraft = data.get('aircraft', {})
+            times = data.get('times', {})
+            navlog = data.get('navlog', {})
+            
+            # Route header
+            origin_icao = origin.get('icao_code', '????')
+            dest_icao = destination.get('icao_code', '????')
+            origin_name = origin.get('name', '')
+            dest_name = destination.get('name', '')
+            
+            route_text = f"{origin_icao} → {dest_icao}"
+            self.simbrief_route_label.setText(route_text)
+            
+            # Flight details
+            flight_number = general.get('flight_number', 'N/A')
+            aircraft_icao = aircraft.get('icaocode', 'N/A')
+            aircraft_name = aircraft.get('name', '')
+            
+            # Calculate flight time
+            est_time_enroute = times.get('est_time_enroute', '0')
+            try:
+                ete_seconds = int(est_time_enroute)
+                hours = ete_seconds // 3600
+                minutes = (ete_seconds % 3600) // 60
+                flight_time = f"{hours}h {minutes:02d}m"
+            except (ValueError, TypeError):
+                flight_time = "N/A"
+            
+            # Get cruise altitude and format as flight level
+            cruise_altitude_raw = general.get('initial_altitude', '')
+            try:
+                cruise_alt_ft = int(cruise_altitude_raw)
+                # Flight level = altitude / 100 (e.g., 30000 ft = FL300)
+                cruise_altitude = f"FL{cruise_alt_ft // 100}"
+            except (ValueError, TypeError):
+                cruise_altitude = cruise_altitude_raw if cruise_altitude_raw else "N/A"
+            
+            # Get number of waypoints
+            fixes = navlog.get('fix', [])
+            num_fixes = len(fixes) if isinstance(fixes, list) else 0
+            
+            # Get route
+            route_str = general.get('route', '')
+            # Truncate if too long
+            if len(route_str) > 80:
+                route_str = route_str[:77] + "..."
+            
+            details = (
+                f"<b>Flight:</b> {flight_number}<br>"
+                f"<b>Aircraft:</b> {aircraft_icao} ({aircraft_name})<br>"
+                f"<b>Route:</b> {origin_name} → {dest_name}<br>"
+                f"<b>Cruise Altitude:</b> {cruise_altitude}<br>"
+                f"<b>Est. Flight Time:</b> {flight_time}<br>"
+                f"<b>Waypoints:</b> {num_fixes} fixes"
+            )
+            
+            if route_str:
+                details += f"<br><b>Route:</b> <span style='color: #aaa; font-size: 11px;'>{route_str}</span>"
+            
+            self.simbrief_details_label.setText(details)
+            
+        except Exception as e:
+            log.error(f"Error displaying SimBrief flight info: {e}")
+            self.simbrief_error_label.setText(f"Error parsing flight data: {str(e)}")
+            self.simbrief_error_label.show()
+
     def browse_folder(self, line_edit):
         """Open folder browser dialog"""
         folder = QFileDialog.getExistingDirectory(
@@ -3717,6 +4039,13 @@ class ConfigUI(QMainWindow):
                 self.cfg.time_exclusion.end_time = self.time_exclusion_end_edit.text()
             if hasattr(self, 'time_exclusion_default_check'):
                 self.cfg.time_exclusion.default_to_exclusion = self.time_exclusion_default_check.isChecked()
+
+        # SimBrief settings
+        if hasattr(self.cfg, 'simbrief'):
+            if hasattr(self, 'simbrief_userid_edit'):
+                self.cfg.simbrief.userid = self.simbrief_userid_edit.text().strip()
+            if hasattr(self, 'simbrief_use_flight_data_check'):
+                self.cfg.simbrief.use_flight_data = self.simbrief_use_flight_data_check.isChecked()
 
         self.cfg.save()
         self.ready.set()
