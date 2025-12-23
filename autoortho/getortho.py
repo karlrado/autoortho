@@ -1103,15 +1103,22 @@ class SpatialPrefetcher:
         Submit prefetch requests for a tile's chunks.
         
         Returns number of chunks submitted.
+        
+        IMPORTANT: Uses _open_tile()/_close_tile() pair to properly manage refs.
+        This ensures prefetched tiles can be evicted when no longer needed.
         """
+        # Get maptype from config
+        maptype = getattr(CFG.autoortho, 'maptype_override', None)
+        if not maptype or maptype == "Use tile default":
+            maptype = "EOX"
+        
+        tile = None
         try:
-            # Get maptype from config
-            maptype = getattr(CFG.autoortho, 'maptype_override', None)
-            if not maptype or maptype == "Use tile default":
-                maptype = "EOX"
-            
-            # Try to get or create the tile
-            tile = self._tile_cacher._get_tile(row, col, maptype, zoom)
+            # Use _open_tile() to properly increment refs (balanced with _close_tile below)
+            # This ensures prefetched tiles don't accumulate refs and block eviction.
+            # Previous bug: _get_tile() incremented refs for new tiles but we never
+            # called _close_tile(), causing refs to stay elevated and preventing eviction.
+            tile = self._tile_cacher._open_tile(row, col, maptype, zoom)
             if not tile:
                 return 0
                 
@@ -1149,6 +1156,15 @@ class SpatialPrefetcher:
         except Exception as e:
             log.debug(f"Prefetch error for tile {row},{col}: {e}")
             return 0
+        finally:
+            # Always close the tile to decrement refs - this balances _open_tile() above.
+            # The tile stays in the cache (enable_cache=True) but with refs decremented,
+            # allowing eviction to work properly when the tile is no longer needed.
+            if tile is not None:
+                try:
+                    self._tile_cacher._close_tile(row, col, maptype, zoom)
+                except Exception:
+                    pass  # Don't let close errors mask the original exception
 
 
 # Global prefetcher instance
