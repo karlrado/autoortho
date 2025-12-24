@@ -1144,11 +1144,25 @@ class ConfigUI(QMainWindow):
         
         simbrief_layout.addLayout(userid_layout)
 
+        # Button row for Fetch and Unload
+        simbrief_btn_layout = QHBoxLayout()
+        simbrief_btn_layout.setSpacing(10)
+        
         # Fetch button (only visible when userid is set)
         self.simbrief_fetch_btn = StyledButton("Fetch Flight Data")
         self.simbrief_fetch_btn.setToolTip("Fetch the latest flight plan from SimBrief")
         self.simbrief_fetch_btn.clicked.connect(self._on_simbrief_fetch)
-        simbrief_layout.addWidget(self.simbrief_fetch_btn)
+        simbrief_btn_layout.addWidget(self.simbrief_fetch_btn)
+        
+        # Unload button (only visible when flight data is loaded)
+        self.simbrief_unload_btn = StyledButton("Unload Flight")
+        self.simbrief_unload_btn.setToolTip("Clear the loaded flight plan data")
+        self.simbrief_unload_btn.clicked.connect(self._on_simbrief_unload)
+        self.simbrief_unload_btn.hide()  # Hidden until flight is loaded
+        simbrief_btn_layout.addWidget(self.simbrief_unload_btn)
+        
+        simbrief_btn_layout.addStretch()
+        simbrief_layout.addLayout(simbrief_btn_layout)
 
         # Flight info display area (hidden initially)
         self.simbrief_info_frame = QFrame()
@@ -3246,6 +3260,7 @@ class ConfigUI(QMainWindow):
         if not has_userid:
             self.simbrief_info_frame.hide()
             self.simbrief_use_flight_data_check.hide()
+            self.simbrief_unload_btn.hide()
             self.simbrief_flight_data = None
             
             # Clear the flight manager
@@ -3277,6 +3292,7 @@ class ConfigUI(QMainWindow):
         self.simbrief_info_frame.show()
         self.simbrief_error_label.hide()
         self.simbrief_use_flight_data_check.show()  # Show toggle when flight data loaded
+        self.simbrief_unload_btn.show()  # Show unload button when flight is loaded
         
         # Load flight data into the global flight manager for use by dynamic zoom and prefetcher
         from utils.simbrief_flight import simbrief_flight_manager
@@ -3295,6 +3311,7 @@ class ConfigUI(QMainWindow):
         self.simbrief_route_label.setText("")
         self.simbrief_details_label.setText("")
         self.simbrief_use_flight_data_check.hide()  # Hide toggle on error
+        self.simbrief_unload_btn.hide()  # Hide unload button on error
         self.simbrief_flight_data = None
         
         # Clear the flight manager
@@ -3307,6 +3324,26 @@ class ConfigUI(QMainWindow):
         """Handle SimBrief fetch completion (success or error)"""
         self.simbrief_fetch_btn.setEnabled(True)
         self.simbrief_fetch_btn.setText("Fetch Flight Data")
+
+    def _on_simbrief_unload(self):
+        """Handle SimBrief unload button click - clears flight data"""
+        # Clear stored flight data
+        self.simbrief_flight_data = None
+        
+        # Clear the global flight manager
+        from utils.simbrief_flight import simbrief_flight_manager
+        simbrief_flight_manager.clear()
+        
+        # Hide flight info UI
+        self.simbrief_info_frame.hide()
+        self.simbrief_use_flight_data_check.hide()
+        self.simbrief_unload_btn.hide()
+        self.simbrief_error_label.hide()
+        
+        # Uncheck the toggle since there's no flight data
+        self.simbrief_use_flight_data_check.setChecked(False)
+        
+        log.info("SimBrief flight data unloaded")
 
     def _display_simbrief_flight_info(self, data):
         """Display SimBrief flight information in the UI"""

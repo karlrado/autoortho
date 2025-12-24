@@ -187,15 +187,19 @@ def create_http_session(pool_size=10):
     
     # Fall back to requests
     session = requests.Session()
+    # IMPORTANT: pool_block=False prevents indefinite blocking when connection pool
+    # is exhausted. With True, requests would block forever waiting for a connection
+    # if all connections are busy (e.g., slow servers). With False, a ConnectionError
+    # is raised immediately, allowing the retry logic to handle it gracefully.
     adapter = requests.adapters.HTTPAdapter(
         pool_connections=pool_size,
         pool_maxsize=pool_size,
         max_retries=0,
-        pool_block=True,
+        pool_block=False,  # Don't block - fail fast and retry
     )
     session.mount('https://', adapter)
     session.mount('http://', adapter)
-    log.debug(f"Created requests session with HTTP/1.1 (pool_size={pool_size})")
+    log.debug(f"Created requests session with HTTP/1.1 (pool_size={pool_size}, pool_block=False)")
     return session
 
 
@@ -1778,6 +1782,11 @@ class Chunk(object):
 
             bump('bytes_dl', len(self.data))
                 
+        except requests.exceptions.ConnectionError as err:
+            # Connection pool exhausted or network issue - don't spam logs, just track
+            bump('connection_pool_error')
+            log.debug(f"Connection error for chunk {self}: {err}")
+            return False
         except Exception as err:
             log.warning(f"Failed to get chunk {self} on server {server}. Err: {err} URL: {self.url}")
             return False
