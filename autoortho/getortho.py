@@ -1197,11 +1197,11 @@ class SpatialPrefetcher:
         Returns:
             Predicted altitude in feet
         """
-        # Get current altitude and vertical speed
+        # Get current altitude AGL and vertical speed
         with datareftracker._lock:
             if not datareftracker.data_valid:
                 return int(getattr(CFG.autoortho, 'max_zoom', 16))
-            current_alt = datareftracker.pressure_alt
+            current_alt = datareftracker.alt_agl_ft
         
         averages = datareftracker.get_flight_averages()
         if averages is None:
@@ -3726,12 +3726,12 @@ class TileCacher(object):
         # Get flight averages for prediction
         averages = datareftracker.get_flight_averages()
 
-        # If no valid averages, try to use current altitude
+        # If no valid averages, try to use current altitude (AGL)
         if averages is None:
             with datareftracker._lock:
-                if datareftracker.data_valid and datareftracker.pressure_alt > 0:
+                if datareftracker.data_valid and datareftracker.alt_agl_ft > 0:
                     return self.dynamic_zoom_manager.get_zoom_for_altitude(
-                        datareftracker.pressure_alt
+                        datareftracker.alt_agl_ft
                     )
             # Fall back to base step or fixed zoom
             base = self.dynamic_zoom_manager.get_base_step()
@@ -3745,9 +3745,9 @@ class TileCacher(object):
 
             aircraft_lat = datareftracker.lat
             aircraft_lon = datareftracker.lon
-            aircraft_alt_ft = datareftracker.pressure_alt
+            aircraft_alt_ft = datareftracker.alt_agl_ft
 
-        # Predict altitude at closest approach
+        # Predict altitude at closest approach (using AGL for terrain-aware calculations)
         predicted_alt, will_approach = predict_altitude_at_closest_approach(
             aircraft_lat=aircraft_lat,
             aircraft_lon=aircraft_lon,

@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Dynamic zoom level management based on altitude.
+Dynamic zoom level management based on altitude AGL (Above Ground Level).
 
 Quality Steps define max zoom levels for different altitude ranges.
 The system selects the appropriate zoom level based on predicted
-altitude at the closest approach to each tile.
+AGL altitude at the closest approach to each tile.
+
+Using AGL instead of MSL (Mean Sea Level) altitude provides more accurate
+imagery quality decisions based on actual height above terrain:
+    - 10,000ft MSL over 5,000ft mountains = 5,000ft AGL (higher zoom needed)
+    - 10,000ft MSL over ocean = 10,000ft AGL (lower zoom acceptable)
 
 Configuration Integration:
     - Steps are stored in CFG.autoortho.dynamic_zoom_steps as a list of dicts
@@ -16,7 +21,7 @@ Usage:
 
     manager = DynamicZoomManager()
     manager.load_from_config(CFG.autoortho.dynamic_zoom_steps)
-    zoom = manager.get_zoom_for_altitude(25000)  # Returns appropriate ZL
+    zoom = manager.get_zoom_for_altitude(5000)  # Returns appropriate ZL for 5000ft AGL
 """
 
 from dataclasses import dataclass
@@ -26,9 +31,9 @@ import logging
 log = logging.getLogger(__name__)
 
 
-# Base altitude threshold (feet) - cannot be modified by users
-# This represents ground level and below
-BASE_ALTITUDE_FT = -1000
+# Base altitude threshold (feet AGL) - cannot be modified by users
+# This represents ground level (AGL = 0)
+BASE_ALTITUDE_FT = 0
 
 # Default zoom level when no steps are configured
 DEFAULT_ZOOM_LEVEL = 16
@@ -41,16 +46,16 @@ MAX_ZOOM_LEVEL = 19
 @dataclass
 class QualityStep:
     """
-    A single zoom level threshold defined by altitude.
+    A single zoom level threshold defined by altitude AGL.
 
     Attributes:
-        altitude_ft: Altitude threshold in feet (at or above this altitude)
+        altitude_ft: Altitude threshold in feet AGL (at or above this altitude)
         zoom_level: Maximum zoom level to use at this altitude and above
         zoom_level_airports: Maximum zoom level near airports at this altitude
 
     Example:
         QualityStep(altitude_ft=20000, zoom_level=15, zoom_level_airports=16)
-        means "at or above 20,000 ft, use max zoom 15, but 16 near airports"
+        means "at or above 20,000 ft AGL, use max zoom 15, but 16 near airports"
     """
 
     altitude_ft: int

@@ -93,9 +93,9 @@ max_zoom_near_airports = 18
 max_zoom_mode = fixed
 # Quality steps for dynamic zoom mode. List of altitude/zoom pairs.
 # Format: [{{"altitude_ft": <altitude>, "zoom_level": <zoom>}}, ...]
-# Example: [{{"altitude_ft": -1000, "zoom_level": 17}}, {{"altitude_ft": 20000, "zoom_level": 15}}]
+# Example: [{{"altitude_ft": 0, "zoom_level": 17}}, {{"altitude_ft": 20000, "zoom_level": 15}}]
 # Altitude is "at or above" - tiles are rendered at the zoom level of the highest matching altitude.
-# The base step (altitude_ft: -1000) cannot be removed and serves as the ground-level default.
+# The base step (altitude_ft: 0) cannot be removed and serves as the ground-level default.
 dynamic_zoom_steps = []
 # Per-chunk maximum wait time in seconds. This limits how long to wait for a SINGLE
 # chunk download before moving on. Works in combination with tile_time_budget:
@@ -213,9 +213,9 @@ prefer_winfsp = True
 # AutoOrtho's scenery will be hidden and X-Plane will use its default scenery instead.
 enabled = False
 # Start time for exclusion in 24-hour format (HH:MM), e.g. "22:00" for 10 PM
-start_time = 22:00
+start_time = 23:00
 # End time for exclusion in 24-hour format (HH:MM), e.g. "06:00" for 6 AM
-end_time = 06:00
+end_time = 05:00
 # When enabled, assume exclusion is active until sim time is available.
 # Useful to ensure night flights start with default scenery from the beginning.
 # When disabled, AutoOrtho works normally until sim time confirms exclusion.

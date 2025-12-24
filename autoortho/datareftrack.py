@@ -5,7 +5,18 @@ DatarefTracker: Thread-safe X-Plane dataref collection via UDP.
 
 This module provides a singleton DatarefTracker instance that connects
 to X-Plane via UDP to receive real-time flight data (position, heading,
-speed, altitude).
+speed, altitude AGL).
+
+Altitude Handling:
+    Uses AGL (Above Ground Level) altitude from X-Plane's y_agl dataref
+    instead of MSL (Mean Sea Level) pressure altitude. This provides
+    more accurate terrain-aware calculations for:
+    - Dynamic zoom level decisions
+    - Predictive tile loading
+    - Spatial prefetching
+    
+    AGL represents actual height above the terrain being viewed, which
+    is more relevant for imagery quality decisions.
 
 Connection State:
     The tracker automatically connects when X-Plane is running a flight
@@ -51,7 +62,7 @@ class FlightSample:
     timestamp: float    # Time when sample was recorded (time.time())
     lat: float          # Latitude in degrees
     lon: float          # Longitude in degrees
-    alt_ft: float       # Pressure altitude in feet
+    alt_agl_ft: float   # Altitude Above Ground Level (AGL) in feet
     hdg: float          # Heading in degrees (0-360)
     spd: float          # Ground speed in m/s
 
@@ -62,9 +73,13 @@ class FlightDataAverager:
     and computes averaged values for predictive calculations.
     
     The averager provides smoothed values for:
-    - Vertical speed (computed from altitude change over time)
+    - Vertical speed (computed from AGL altitude change over time)
     - Heading (circular average to handle 359->1 wraparound)
     - Ground speed (simple arithmetic average)
+    
+    Note: Uses AGL (Above Ground Level) altitude instead of MSL for
+    more accurate terrain-aware calculations. This provides better
+    imagery quality decisions when flying over varied terrain.
     
     Thread Safety:
         All public methods are thread-safe. The averager uses its own
@@ -72,7 +87,7 @@ class FlightDataAverager:
     
     Usage:
         averager = FlightDataAverager()
-        averager.add_sample(lat, lon, alt_ft, hdg, spd)
+        averager.add_sample(lat, lon, alt_agl_ft, hdg, spd)
         averages = averager.get_averages()
         if averages:
             vs = averages['vertical_speed_fpm']
@@ -95,7 +110,7 @@ class FlightDataAverager:
         self._avg_ground_speed_mps = 0.0    # m/s
         self._is_valid = False
     
-    def add_sample(self, lat: float, lon: float, alt_ft: float,
+    def add_sample(self, lat: float, lon: float, alt_agl_ft: float,
                    hdg: float, spd: float) -> None:
         """
         Add a new flight data sample and update cached averages.
@@ -107,7 +122,7 @@ class FlightDataAverager:
         Args:
             lat: Latitude in degrees
             lon: Longitude in degrees
-            alt_ft: Pressure altitude in feet
+            alt_agl_ft: Altitude Above Ground Level (AGL) in feet
             hdg: Heading in degrees (0-360)
             spd: Ground speed in m/s
         """
@@ -116,7 +131,7 @@ class FlightDataAverager:
             timestamp=now,
             lat=lat,
             lon=lon,
-            alt_ft=alt_ft,
+            alt_agl_ft=alt_agl_ft,
             hdg=hdg,
             spd=spd
         )
@@ -155,11 +170,12 @@ class FlightDataAverager:
         # --- Vertical Speed ---
         # Computed as (last_alt - first_alt) / time_delta
         # This gives average climb/descent rate over the window
+        # Uses AGL altitude for terrain-aware calculations
         first, last = samples[0], samples[-1]
         time_delta_min = (last.timestamp - first.timestamp) / 60.0
         
         if time_delta_min > self.MIN_TIME_DELTA:
-            alt_delta_ft = last.alt_ft - first.alt_ft
+            alt_delta_ft = last.alt_agl_ft - first.alt_agl_ft
             self._avg_vertical_speed_fpm = alt_delta_ft / time_delta_min
         else:
             self._avg_vertical_speed_fpm = 0.0
@@ -272,15 +288,13 @@ class DatarefTracker(object):
         ("sim/flightmodel/position/longitude", "°E",
          "The longitude of the aircraft", 6),
         ("sim/flightmodel/position/y_agl", "m",
-         "AGL", 0),
+         "Altitude Above Ground Level (AGL) in meters", 0),
         ("sim/flightmodel/position/mag_psi", "°",
          "The real magnetic heading of the aircraft", 0),
         ("sim/flightmodel/position/groundspeed", "m/s",
          "The ground speed of the aircraft", 0),
         ("sim/time/local_time_sec", "s",
          "Local time (seconds since midnight)", 0),
-        ("sim/flightmodel2/position/pressure_altitude", "ft",
-         "Pressure altitude in standard atmosphere", 0),
     ]
     # fmt:on
 
@@ -296,11 +310,11 @@ class DatarefTracker(object):
         # Flight data (protected by _lock)
         self.lat = -1.0
         self.lon = -1.0
-        self.alt = -1.0
+        self.alt_agl_m = -1.0      # Altitude AGL in meters (raw from X-Plane)
+        self.alt_agl_ft = -1.0     # Altitude AGL in feet (converted)
         self.hdg = -1.0
         self.spd = -1.0
         self.local_time_sec = -1.0  # Local time (seconds since midnight)
-        self.pressure_alt = -1.0  # Pressure altitude in feet
         self.connected = False
         self.data_valid = False
 
@@ -361,9 +375,8 @@ class DatarefTracker(object):
         Thread-safe getter for all flight data.
 
         Returns:
-            dict: Flight data with keys 'lat', 'lon', 'alt', 'hdg',
-                  'spd', 'local_time_sec', 'pressure_alt', 'connected',
-                  'data_valid', 'timestamp'.
+            dict: Flight data with keys 'lat', 'lon', 'alt_agl_ft', 'hdg',
+                  'spd', 'local_time_sec', 'connected', 'data_valid', 'timestamp'.
                   Returns None if not connected or data is invalid.
         """
         with self._lock:
@@ -372,11 +385,10 @@ class DatarefTracker(object):
             return {
                 'lat': self.lat,
                 'lon': self.lon,
-                'alt': self.alt,
+                'alt_agl_ft': self.alt_agl_ft,
                 'hdg': self.hdg,
                 'spd': self.spd,
                 'local_time_sec': self.local_time_sec,
-                'pressure_alt': self.pressure_alt,
                 'connected': self.connected,
                 'data_valid': self.data_valid,
                 'timestamp': time.time()
@@ -394,17 +406,17 @@ class DatarefTracker(object):
                 return -1.0
             return self.local_time_sec
 
-    def get_pressure_alt(self):
+    def get_alt_agl_ft(self):
         """
-        Thread-safe getter for pressure altitude.
+        Thread-safe getter for altitude Above Ground Level (AGL).
 
         Returns:
-            float: Pressure altitude in feet, or -1 if not available.
+            float: Altitude AGL in feet, or -1 if not available.
         """
         with self._lock:
             if not self.connected or not self.data_valid:
                 return -1.0
-            return self.pressure_alt
+            return self.alt_agl_ft
 
     def start(self):
         """Start the UDP listening thread."""
@@ -565,41 +577,40 @@ class DatarefTracker(object):
                     log.info("Flight is starting.")
                     self.connected = True
 
-                # Accept 5, 6, or 7 values for backward compatibility
-                # (6th value is local_time_sec, 7th is pressure_alt)
+                # Accept 5 or 6 values
+                # Datarefs: lat, lon, y_agl (m), hdg, spd, local_time_sec
                 if len(values) >= 5:
                     lat = values[0]
                     lon = values[1]
-                    alt = values[2]
+                    alt_agl_m = values[2]  # y_agl in meters
                     hdg = values[3]
                     spd = values[4]
-                    # local_time is optional (6th value) for backward compat
+                    # local_time is optional (6th value)
                     local_time = values[5] if len(values) >= 6 else None
-                    # pressure_alt is optional (7th value)
-                    pressure_alt = values[6] if len(values) >= 7 else None
+
+                    # Convert AGL from meters to feet (1 meter = 3.28084 feet)
+                    alt_agl_ft = alt_agl_m * 3.28084
 
                     # Validate position data
-                    if self._validate_position(lat, lon, alt):
+                    if self._validate_position(lat, lon, alt_agl_m):
                         self.lat = lat
                         self.lon = lon
-                        self.alt = alt
+                        self.alt_agl_m = alt_agl_m
+                        self.alt_agl_ft = alt_agl_ft
                         self.hdg = hdg
                         self.spd = spd
                         # Only update local_time_sec if we received it
                         if local_time is not None:
                             self.local_time_sec = local_time
-                        # Only update pressure_alt if we received it
-                        if pressure_alt is not None:
-                            self.pressure_alt = pressure_alt
                         self.data_valid = True
 
                         # Feed sample to flight averager for predictive calculations
-                        # Only add sample if we have valid pressure altitude
-                        if self.pressure_alt > 0:
+                        # Uses AGL altitude for terrain-aware calculations
+                        if self.alt_agl_ft > 0:
                             self.flight_averager.add_sample(
                                 lat=self.lat,
                                 lon=self.lon,
-                                alt_ft=self.pressure_alt,
+                                alt_agl_ft=self.alt_agl_ft,
                                 hdg=self.hdg,
                                 spd=self.spd
                             )

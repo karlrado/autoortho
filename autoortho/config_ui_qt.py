@@ -405,7 +405,7 @@ class QualityStepsDialog(QDialog):
     
     Allows users to define altitude-based zoom level thresholds.
     Each step specifies a max zoom level for altitudes at or above
-    a threshold. The base step (-1000 ft) cannot be removed.
+    a threshold. The base step (0 ft AGL) cannot be removed.
     """
     
     def __init__(self, parent=None, manager=None, current_max_zoom=16):
@@ -434,7 +434,7 @@ class QualityStepsDialog(QDialog):
             "Define maximum zoom levels for different altitude ranges.\n"
             "Cruising at higher altitudes doesn't need as much detail - saves VRAM and speeds up loading.\n"
             "'Near Airports' uses higher zoom when approaching airports.\n"
-            "The base level (-1000 ft) is the default for ground level and cannot be removed."
+            "The base level (0 ft AGL) is the default for ground level and cannot be removed."
         )
         info.setWordWrap(True)
         info.setStyleSheet("color: #aaa; padding: 10px; background: #333; border-radius: 5px;")
@@ -1219,7 +1219,7 @@ class ConfigUI(QMainWindow):
             "  • 10,000ft MSL over 5,000ft mountains = 5,000ft AGL (higher zoom)\n"
             "  • 10,000ft MSL over ocean = 10,000ft AGL (lower zoom)\n\n"
             "If you deviate more than 40nm from the route, AutoOrtho falls back\n"
-            "to DataRef-based calculations using aircraft speed and heading."
+            "to DataRef-based AGL calculations using X-Plane's y_agl dataref."
         )
         # Load saved value from config
         use_flight_data = False
@@ -3110,9 +3110,10 @@ class ConfigUI(QMainWindow):
             self.dynamic_zoom_summary.setText("No steps configured")
         else:
             # Show steps sorted by altitude (ascending for display)
+            # Format: ZL{normal}/ZL{airports}@{altitude}ft
             sorted_steps = sorted(steps, key=lambda s: s.altitude_ft)
             text = ", ".join(
-                f"ZL{s.zoom_level}@{s.altitude_ft:+}ft" 
+                f"ZL{s.zoom_level}/ZL{s.zoom_level_airports}@{s.altitude_ft:+}ft" 
                 for s in sorted_steps[:3]
             )
             if len(sorted_steps) > 3:
