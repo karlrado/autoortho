@@ -46,160 +46,26 @@ MEMTRACE = False
 log = logging.getLogger(__name__)
 
 
-# ============================================================================
-# HTTP/2 SUPPORT (OPTIONAL)
-# ============================================================================
-# Try to use httpx for HTTP/2 multiplexing. Falls back to requests if not available.
-# HTTP/2 allows multiple requests over a single connection, reducing latency.
-# ============================================================================
-_HTTPX_AVAILABLE = False
-_httpx = None
-try:
-    import httpx as _httpx
-    _HTTPX_AVAILABLE = True
-    # Silence httpx's verbose request logging (it logs every request at INFO level)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    log.info("httpx available - HTTP/2 support enabled")
-except ImportError:
-    log.debug("httpx not installed - using requests (HTTP/1.1). Install httpx for HTTP/2 support.")
-
-
-class HttpxSessionWrapper:
-    """
-    Wrapper around httpx.Client that provides requests-compatible API.
-    This allows seamless switching between requests and httpx.
-    """
-    
-    def __init__(self, http2=True, pool_size=10, timeout=25):
-        """
-        Initialize httpx client with HTTP/2 support.
-        
-        Args:
-            http2: Enable HTTP/2 (default True)
-            pool_size: Connection pool size
-            timeout: Request timeout in seconds
-        """
-        # httpx uses limits for connection pooling
-        limits = _httpx.Limits(
-            max_keepalive_connections=pool_size,
-            max_connections=pool_size * 2,
-            keepalive_expiry=30.0
-        )
-        
-        # Create httpx client with HTTP/2 enabled
-        self._client = _httpx.Client(
-            http2=http2,
-            limits=limits,
-            timeout=_httpx.Timeout(timeout, connect=5.0),
-            follow_redirects=True
-        )
-        self._http2 = http2
-        
-    def get(self, url, headers=None, timeout=None):
-        """
-        HTTP GET request - returns a requests-compatible response object.
-        
-        Args:
-            url: URL to fetch
-            headers: Optional request headers
-            timeout: Tuple of (connect_timeout, read_timeout) or single value
-        """
-        # Convert requests-style timeout tuple to httpx timeout
-        if isinstance(timeout, tuple):
-            connect_timeout, read_timeout = timeout
-            httpx_timeout = _httpx.Timeout(read_timeout, connect=connect_timeout)
-        elif timeout is not None:
-            httpx_timeout = _httpx.Timeout(timeout)
-        else:
-            httpx_timeout = None
-        
-        try:
-            response = self._client.get(url, headers=headers, timeout=httpx_timeout)
-            # Wrap in a compatible response object
-            return HttpxResponseWrapper(response)
-        except _httpx.TimeoutException as e:
-            raise requests.exceptions.Timeout(str(e))
-        except _httpx.RequestError as e:
-            raise requests.exceptions.RequestException(str(e))
-    
-    def close(self):
-        """Close the underlying httpx client."""
-        try:
-            self._client.close()
-        except Exception:
-            pass
-
-
-class HttpxResponseWrapper:
-    """
-    Wrapper that makes httpx.Response compatible with requests.Response API.
-    """
-    
-    def __init__(self, httpx_response):
-        self._response = httpx_response
-        
-    @property
-    def status_code(self):
-        return self._response.status_code
-    
-    @property
-    def content(self):
-        return self._response.content
-    
-    @property
-    def text(self):
-        return self._response.text
-    
-    @property
-    def headers(self):
-        return dict(self._response.headers)
-    
-    def close(self):
-        try:
-            self._response.close()
-        except Exception:
-            pass
-    
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, *args):
-        self.close()
-
-
 def create_http_session(pool_size=10):
     """
-    Factory function to create the best available HTTP session.
+    Factory function to create an HTTP session with connection pooling.
     
-    Returns httpx client with HTTP/2 if available, otherwise requests session.
-    Both have compatible APIs via the wrapper classes.
+    Returns a requests session configured with connection pooling.
+    
+    IMPORTANT: pool_block=False ensures requests fail fast when the pool is
+    exhausted, rather than blocking indefinitely. This prevents deadlocks
+    when servers slow down or rate-limit connections.
     """
-    use_http2 = getattr(CFG.autoortho, 'use_http2', True)
-    
-    if _HTTPX_AVAILABLE and use_http2:
-        try:
-            session = HttpxSessionWrapper(http2=True, pool_size=pool_size)
-            log.debug(f"Created httpx session with HTTP/2 (pool_size={pool_size})")
-            return session
-        except Exception as e:
-            log.warning(f"Failed to create httpx session: {e}, falling back to requests")
-    
-    # Fall back to requests
     session = requests.Session()
-    # IMPORTANT: pool_block=False prevents indefinite blocking when connection pool
-    # is exhausted. With True, requests would block forever waiting for a connection
-    # if all connections are busy (e.g., slow servers). With False, a ConnectionError
-    # is raised immediately, allowing the retry logic to handle it gracefully.
     adapter = requests.adapters.HTTPAdapter(
         pool_connections=pool_size,
         pool_maxsize=pool_size,
         max_retries=0,
-        pool_block=False,  # Don't block - fail fast and retry
+        pool_block=False,  # Fail fast instead of blocking on pool exhaustion
     )
     session.mount('https://', adapter)
     session.mount('http://', adapter)
-    log.debug(f"Created requests session with HTTP/1.1 (pool_size={pool_size}, pool_block=False)")
+    log.debug(f"Created requests session (pool_size={pool_size})")
     return session
 
 
@@ -250,65 +116,6 @@ def bump_many(d: dict):
         inc_many(d)
 
 
-def get_tile_creation_stats():
-    """
-    Get tile creation statistics for monitoring and tuning.
-    
-    Returns a dictionary with:
-    - count: Number of tiles created
-    - avg_time_s: Average creation time in seconds
-    - avg_time_by_mipmap: Dict of mipmap level -> average time in seconds
-    - averages: Rolling averages from tile_creation_stats (last 50 samples per mipmap)
-    
-    This is useful for tuning tile_time_budget - the average creation time
-    gives a good baseline for how long tiles actually take to create.
-    """
-    result = {
-        'count': 0,
-        'avg_time_s': 0.0,
-        'avg_time_by_mipmap': {},
-        'averages': {},
-    }
-    
-    try:
-        # Get counter-based stats (aggregate across all time)
-        from aostats import get_stat
-        count = get_stat('tile_create_count')
-        total_time_ms = get_stat('tile_create_time_total_ms')
-        
-        result['count'] = count
-        if count > 0:
-            result['avg_time_s'] = round(total_time_ms / count / 1000.0, 3)
-        
-        # Get per-mipmap averages from counters
-        for mm_level in range(5):
-            mm_count = get_stat(f'mm_count:{mm_level}')
-            mm_time = get_stat(f'tile_create_time_ms:{mm_level}')
-            if mm_count > 0:
-                result['avg_time_by_mipmap'][mm_level] = round(mm_time / mm_count / 1000.0, 3)
-        
-        # Get rolling averages from StatTracker (recent samples)
-        result['averages'] = dict(tile_creation_stats.averages)
-        
-    except Exception as e:
-        log.debug(f"get_tile_creation_stats error: {e}")
-    
-    return result
-
-
-def log_tile_creation_summary():
-    """Log a summary of tile creation statistics."""
-    stats = get_tile_creation_stats()
-    if stats['count'] > 0:
-        log.info(f"TILE CREATION STATS: {stats['count']} tiles created, "
-                f"avg time: {stats['avg_time_s']:.2f}s")
-        if stats['avg_time_by_mipmap']:
-            mm_str = ", ".join(f"MM{k}: {v:.2f}s" for k, v in sorted(stats['avg_time_by_mipmap'].items()))
-            log.info(f"  Per-mipmap averages: {mm_str}")
-        if stats['averages']:
-            recent_str = ", ".join(f"MM{k}: {v:.2f}s" for k, v in sorted(stats['averages'].items()) if v > 0)
-            if recent_str:
-                log.info(f"  Recent averages (last 50): {recent_str}")
 
 
 seasons_enabled = CFG.seasons.enabled
@@ -572,6 +379,24 @@ class TimeBudget:
         self._exhausted = False
         self._chunks_processed = 0
         self._chunks_skipped = 0
+        self._last_activity = time.monotonic()
+    
+    def reset(self):
+        """Reset the budget to start fresh. Called when reusing a stale budget."""
+        self.start_time = time.monotonic()
+        self._exhausted = False
+        self._chunks_processed = 0
+        self._chunks_skipped = 0
+        self._last_activity = time.monotonic()
+    
+    def touch(self):
+        """Mark activity on this budget."""
+        self._last_activity = time.monotonic()
+    
+    @property
+    def idle_seconds(self) -> float:
+        """Return seconds since last activity."""
+        return time.monotonic() - self._last_activity
     
     @property
     def remaining(self) -> float:
@@ -716,8 +541,7 @@ class Getter(object):
         global STATS
         self.localdata.idx = idx
         
-        # Create thread-local session with HTTP/2 support (if available)
-        # Uses httpx for HTTP/2 multiplexing, falls back to requests
+        # Create thread-local session with connection pooling
         try:
             pool_size = max(4, int(int(CFG.autoortho.fetch_threads) * 1.5))
             self.localdata.session = create_http_session(pool_size=pool_size)
@@ -742,22 +566,22 @@ class Getter(object):
                 obj.in_queue = False
                 obj.in_flight = True
                 
-                if not self.get(obj, *args, **kwargs):
-                    # Check if chunk is permanently failed before re-submitting
-                    if obj.permanent_failure:
-                        log.debug(f"Chunk {obj} permanently failed ({obj.failure_reason}), not re-submitting")
-                        continue
-                    log.warning(f"Failed getting: {obj} {args} {kwargs}, re-submit.")
-                    self.submit(obj, *args, **kwargs)
+                success = self.get(obj, *args, **kwargs)
             except Exception as err:
-                log.error(f"ERROR {err} getting: {obj} {args} {kwargs}, re-submit.")
-                # Don't re-submit if permanently failed
-                if obj.permanent_failure:
-                    log.debug(f"Chunk {obj} permanently failed during exception, not re-submitting")
-                    continue
-                self.submit(obj, *args, **kwargs)
+                log.error(f"ERROR {err} getting: {obj} {args} {kwargs}")
+                success = False
             finally:
+                # CRITICAL: Clear in_flight BEFORE re-submission check
+                # Otherwise submit() refuses to queue (sees in_flight=True)
                 obj.in_flight = False
+            
+            # Handle re-submission AFTER in_flight is cleared
+            if not success:
+                if obj.permanent_failure:
+                    log.debug(f"Chunk {obj} permanently failed ({obj.failure_reason}), not re-submitting")
+                    continue
+                log.warning(f"Failed getting: {obj} {args} {kwargs}, re-submit.")
+                self.submit(obj, *args, **kwargs)
 
     def get(obj, *args, **kwargs):
         raise NotImplementedError
@@ -1700,16 +1524,17 @@ class Chunk(object):
         if self.maptype.upper() == "EOX":
             log.debug("EOX DETECTED")
             header.update({'referer': 'https://s2maps.eu/'})
-       
-        time.sleep((self.attempt/10))
+        
         self.attempt += 1
 
         log.debug(f"Requesting {self.url} ..")
         
         resp = None
         try:
-
-            resp = session.get(self.url, headers=header, timeout=(5, 20))
+            # Timeout: (connect_timeout, read_timeout)
+            # - 5s connect: reasonable for establishing connection
+            # - 15s read: reduced from 20s to fail faster on stalled connections
+            resp = session.get(self.url, headers=header, timeout=(5, 15))
             status_code = resp.status_code
 
             if self.maptype.upper() == "APPLE" and status_code in (403, 410):
@@ -1719,7 +1544,7 @@ class Chunk(object):
                 self.url = MAPTYPES[self.maptype.upper()]
                 if resp is not None:
                     resp.close()
-                resp = session.get(self.url, headers=header, timeout=(5, 20))
+                resp = session.get(self.url, headers=header, timeout=(5, 15))
                 status_code = resp.status_code
 
             if status_code != 200:
@@ -1782,11 +1607,6 @@ class Chunk(object):
 
             bump('bytes_dl', len(self.data))
                 
-        except requests.exceptions.ConnectionError as err:
-            # Connection pool exhausted or network issue - don't spam logs, just track
-            bump('connection_pool_error')
-            log.debug(f"Connection error for chunk {self}: {err}")
-            return False
         except Exception as err:
             log.warning(f"Failed to get chunk {self} on server {server}. Err: {err} URL: {self.url}")
             return False
@@ -2259,10 +2079,18 @@ class Tile(object):
         
         if time_budget is not None:
             # Explicit budget provided (e.g., recursive pre-build calls) - use it
+            time_budget.touch()  # Mark activity
             log.debug(f"GET_IMG: Using provided budget (elapsed={time_budget.elapsed:.2f}s, remaining={time_budget.remaining:.2f}s)")
         elif self._tile_time_budget is not None:
-            # Budget already created for this tile - reuse it
+            # Budget already created for this tile - check if it's stale
             time_budget = self._tile_time_budget
+            # Reset stale budgets: if budget is exhausted AND has been idle for 30+ seconds,
+            # the original stall has cleared and we should try again with a fresh budget
+            if time_budget.exhausted and time_budget.idle_seconds > 30:
+                log.info(f"GET_IMG: Resetting stale budget (was idle {time_budget.idle_seconds:.1f}s)")
+                time_budget.reset()
+            else:
+                time_budget.touch()  # Mark activity
             log.debug(f"GET_IMG: Using existing tile budget (elapsed={time_budget.elapsed:.2f}s, remaining={time_budget.remaining:.2f}s)")
         else:
             # First get_img call for this tile - create the budget NOW (processing begins)
@@ -3414,35 +3242,9 @@ class Tile(object):
 
         # Record per-mipmap stats via counters for aggregation
         try:
-            bump_many({
-                f"mm_count:{mipmap}": 1,
-                f"mm_compress_time_ms:{mipmap}": int(compress_time * 1000),
-                f"tile_create_time_ms:{mipmap}": int(total_creation_time * 1000),
-            })
+            bump_many({f"mm_count:{mipmap}": 1})
         except Exception:
             pass
-        
-        # Only report tile completion stats when mipmap 0 is done (full tile delivered to X-Plane)
-        # This tracks the same time window as TimeBudget: from first request to tile release
-        if mipmap == 0 and not self._completion_reported:
-            self._completion_reported = True
-            # Calculate time from first X-Plane request to completion
-            if self.first_request_time is not None:
-                tile_completion_time = time.monotonic() - self.first_request_time
-            else:
-                # Fallback: use the mipmap creation time if first_request_time wasn't set
-                tile_completion_time = total_creation_time
-            
-            try:
-                bump_many({
-                    "tile_create_count": 1,
-                    "tile_create_time_total_ms": int(tile_completion_time * 1000),
-                })
-            except Exception:
-                pass
-            
-            log.debug(f"GET_MIPMAP: Tile {self} COMPLETED in {tile_completion_time:.2f}s "
-                     f"(mipmap 0 done, time from first request)")
         
         # Log per-mipmap creation time for visibility
         log.debug(f"GET_MIPMAP: Tile {self} mipmap {mipmap} created in {total_creation_time:.2f}s "
@@ -3596,16 +3398,25 @@ class TileCacher(object):
         # When "fixed" (default), uses the configured max_zoom value
         self.max_zoom_mode = str(CFG.autoortho.max_zoom_mode).lower()
         self.dynamic_zoom_manager = DynamicZoomManager()
+        # Track last logged zoom separately for normal and airport tiles to reduce spam
+        self._last_logged_zoom_normal = None
+        self._last_logged_zoom_airport = None
         if self.max_zoom_mode == "dynamic":
             self.dynamic_zoom_manager.load_from_config(
                 CFG.autoortho.dynamic_zoom_steps
             )
             step_count = len(self.dynamic_zoom_manager.get_steps())
-            log.info(f"Dynamic zoom enabled with {step_count} quality step(s)")
+            log.info("=" * 60)
+            log.info("DYNAMIC ZOOM MODE ACTIVATED")
+            log.info(f"  Quality steps configured: {step_count}")
             if step_count > 0:
-                log.info(f"Dynamic zoom steps: {self.dynamic_zoom_manager.get_summary()}")
+                log.info(f"  Steps: {self.dynamic_zoom_manager.get_summary()}")
+                log.info("  Zoom levels will be adjusted based on predicted altitude")
+            else:
+                log.warning("  No quality steps configured - using default zoom")
+            log.info("=" * 60)
         else:
-            log.info("Using fixed max zoom level")
+            log.info("Using fixed max zoom level (ZL%d)", self.target_zoom_level)
 
         self.clean_t = threading.Thread(target=self.clean, daemon=True)
         self.clean_t.start()
@@ -3643,10 +3454,13 @@ class TileCacher(object):
         simbrief_altitude_agl = self._get_simbrief_altitude_for_tile(tile_lat, tile_lon)
         if simbrief_altitude_agl is not None:
             # Use SimBrief flight plan AGL altitude for zoom calculation
-            log.debug(f"Using SimBrief AGL altitude {simbrief_altitude_agl}ft for tile at {tile_lat:.2f},{tile_lon:.2f}")
             if tile_zoom == 18 and not CFG.autoortho.using_custom_tiles:
-                return self.dynamic_zoom_manager.get_airport_zoom_for_altitude(simbrief_altitude_agl)
-            return self.dynamic_zoom_manager.get_zoom_for_altitude(simbrief_altitude_agl)
+                zoom = self.dynamic_zoom_manager.get_airport_zoom_for_altitude(simbrief_altitude_agl)
+                log.debug(f"Dynamic zoom (SimBrief): {simbrief_altitude_agl}ft AGL -> ZL{zoom} (airport tile)")
+                return zoom
+            zoom = self.dynamic_zoom_manager.get_zoom_for_altitude(simbrief_altitude_agl)
+            log.debug(f"Dynamic zoom (SimBrief): {simbrief_altitude_agl}ft AGL -> ZL{zoom}")
+            return zoom
         
         # Fall back to DataRef-based calculation
         return self._compute_dynamic_zoom_from_datarefs(row, col, tile_zoom, tile_lat, tile_lon)
@@ -3732,6 +3546,22 @@ class TileCacher(object):
         This is the fallback method when SimBrief data is not available or
         when the aircraft has deviated from the planned route.
         """
+        # Helper to select appropriate zoom based on tile type
+        is_airport_tile = (tile_zoom == 18 and not CFG.autoortho.using_custom_tiles)
+        
+        def get_zoom_for_alt(alt_ft: float) -> int:
+            """Get zoom for altitude, respecting airport tile setting."""
+            if is_airport_tile:
+                return self.dynamic_zoom_manager.get_airport_zoom_for_altitude(alt_ft)
+            return self.dynamic_zoom_manager.get_zoom_for_altitude(alt_ft)
+        
+        def get_fallback_zoom() -> int:
+            """Get fallback zoom when no altitude data available."""
+            base = self.dynamic_zoom_manager.get_base_step()
+            if base:
+                return base.zoom_level_airports if is_airport_tile else base.zoom_level
+            return self.target_zoom_level_near_airports if is_airport_tile else self.target_zoom_level
+        
         # Get flight averages for prediction
         averages = datareftracker.get_flight_averages()
 
@@ -3739,18 +3569,23 @@ class TileCacher(object):
         if averages is None:
             with datareftracker._lock:
                 if datareftracker.data_valid and datareftracker.alt_agl_ft > 0:
-                    return self.dynamic_zoom_manager.get_zoom_for_altitude(
-                        datareftracker.alt_agl_ft
-                    )
+                    zoom = get_zoom_for_alt(datareftracker.alt_agl_ft)
+                    tile_type = "airport tile" if is_airport_tile else "normal"
+                    log.debug(f"Dynamic zoom (current AGL): {datareftracker.alt_agl_ft:.0f}ft -> ZL{zoom} ({tile_type})")
+                    return zoom
             # Fall back to base step or fixed zoom
-            base = self.dynamic_zoom_manager.get_base_step()
-            return base.zoom_level if base else self.target_zoom_level
+            fallback_zoom = get_fallback_zoom()
+            tile_type = "airport tile" if is_airport_tile else "normal"
+            log.debug(f"Dynamic zoom: no flight data, using fallback ZL{fallback_zoom} ({tile_type})")
+            return fallback_zoom
 
         # Get current position (with lock for thread safety)
         with datareftracker._lock:
             if not datareftracker.data_valid:
-                base = self.dynamic_zoom_manager.get_base_step()
-                return base.zoom_level if base else self.target_zoom_level
+                fallback_zoom = get_fallback_zoom()
+                tile_type = "airport tile" if is_airport_tile else "normal"
+                log.debug(f"Dynamic zoom: no valid datarefs, using fallback ZL{fallback_zoom} ({tile_type})")
+                return fallback_zoom
 
             aircraft_lat = datareftracker.lat
             aircraft_lon = datareftracker.lon
@@ -3771,8 +3606,12 @@ class TileCacher(object):
         # Get zoom level for predicted altitude
         # Use airport zoom level when near airports (tile_zoom == 18)
         if tile_zoom == 18 and not CFG.autoortho.using_custom_tiles:
-            return self.dynamic_zoom_manager.get_airport_zoom_for_altitude(predicted_alt)
-        return self.dynamic_zoom_manager.get_zoom_for_altitude(predicted_alt)
+            zoom = self.dynamic_zoom_manager.get_airport_zoom_for_altitude(predicted_alt)
+            log.debug(f"Dynamic zoom (predicted): {predicted_alt:.0f}ft AGL -> ZL{zoom} (airport tile)")
+            return zoom
+        zoom = self.dynamic_zoom_manager.get_zoom_for_altitude(predicted_alt)
+        log.debug(f"Dynamic zoom (predicted): {predicted_alt:.0f}ft AGL -> ZL{zoom}")
+        return zoom
 
     def _get_target_zoom_level(self, default_zoom: int, row: int = None, col: int = None) -> int:
         """
@@ -3793,7 +3632,28 @@ class TileCacher(object):
         if self.max_zoom_mode == "dynamic" and row is not None and col is not None:
             dynamic_zoom = self._compute_dynamic_zoom(row, col, default_zoom)
             # Still cap to tile's max supported zoom (default + 1 is X-Plane's limit)
-            return min(default_zoom + 1, dynamic_zoom)
+            final_zoom = min(default_zoom + 1, dynamic_zoom)
+            
+            # Log when dynamic zoom changes the zoom level (reduce log spam)
+            # Track separately for normal tiles vs airport tiles
+            is_airport_tile = (default_zoom == 18 and not CFG.autoortho.using_custom_tiles)
+            if is_airport_tile:
+                fixed_zoom = self.target_zoom_level_near_airports
+                last_logged = self._last_logged_zoom_airport
+            else:
+                fixed_zoom = self.target_zoom_level
+                last_logged = self._last_logged_zoom_normal
+            
+            # Only log if this tile type's zoom actually changed
+            if final_zoom != last_logged and final_zoom != fixed_zoom:
+                tile_type = "airport" if is_airport_tile else "normal"
+                log.info(f"Dynamic zoom ({tile_type}): ZL{final_zoom} (was fixed ZL{fixed_zoom})")
+                if is_airport_tile:
+                    self._last_logged_zoom_airport = final_zoom
+                else:
+                    self._last_logged_zoom_normal = final_zoom
+            
+            return final_zoom
 
         # Fixed mode - existing behavior
         if CFG.autoortho.using_custom_tiles:

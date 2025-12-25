@@ -154,9 +154,6 @@ prefetch_lookahead = 10
 prefetch_interval = 2.0
 # Maximum chunks to prefetch per cycle (8-64)
 prefetch_max_chunks = 24
-# Use HTTP/2 multiplexing if httpx is installed (recommended for faster downloads)
-# HTTP/2 allows multiple requests over a single connection, reducing latency
-use_http2 = True
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False
