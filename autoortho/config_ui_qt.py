@@ -1244,6 +1244,8 @@ class ConfigUI(QMainWindow):
         self.simbrief_use_flight_data_check.setChecked(use_flight_data)
         self.simbrief_use_flight_data_check.setObjectName('simbrief_use_flight_data')
         self.simbrief_use_flight_data_check.hide()  # Hidden until flight data is loaded
+        # Connect for immediate effect - allows loading SimBrief data after pressing Run
+        self.simbrief_use_flight_data_check.stateChanged.connect(self._on_use_flight_data_changed)
         simbrief_info_layout.addWidget(self.simbrief_use_flight_data_check)
 
         self.simbrief_info_frame.hide()
@@ -1891,11 +1893,15 @@ class ConfigUI(QMainWindow):
             fb_extends_checked = bool(fb_extends_value)
         self.fallback_extends_budget_check.setChecked(fb_extends_checked)
         self.fallback_extends_budget_check.setToolTip(
-            "When enabled with 'Full' fallback level, network fallbacks will continue\n"
-            "even after the time budget is exhausted. This prioritizes image quality\n"
-            "over strict timing, which may cause longer load times on slow networks.\n\n"
-            "• Enabled: Better quality, may cause longer loading (quality priority)\n"
-            "• Disabled: Strict timing, may have some missing tiles (speed priority)"
+            "When enabled with 'Full' fallback level, adds EXTRA time after the main\n"
+            "budget expires to recover missing chunks using lower-detail fallbacks.\n\n"
+            "How it works:\n"
+            "  1. Main budget (e.g., 300s) is used for normal chunk downloads\n"
+            "  2. When main budget expires, a 'fallback sweep' phase begins\n"
+            "  3. All missing chunks are processed using lower-zoom alternatives\n"
+            "  4. Maximum total time = Main budget + Extended fallback timeout\n\n"
+            "• Enabled: Better quality, fewer missing tiles (quality priority)\n"
+            "• Disabled: Strict timing, may have gray patches (speed priority)"
         )
         self.fallback_extends_budget_check.stateChanged.connect(self._update_fallback_extends_control)
         fallback_extends_layout.addWidget(self.fallback_extends_budget_check)
@@ -1906,11 +1912,13 @@ class ConfigUI(QMainWindow):
         fallback_timeout_layout = QHBoxLayout()
         self.fallback_timeout_label = QLabel("Extended fallback timeout:")
         self.fallback_timeout_label.setToolTip(
-            "Timeout per mipmap level when using extended fallbacks.\n"
-            "When 'Allow fallbacks to extend time budget' is enabled,\n"
-            "each lower-detail level gets this much time to download.\n\n"
-            "Total extra time = this × number of levels (typically 3-4)\n"
-            "Example: 3.0s × 4 levels = 12 seconds max additional time"
+            "TOTAL extra time for the fallback sweep phase.\n"
+            "This time is added AFTER the main budget expires to recover\n"
+            "all missing chunks using lower-detail alternatives.\n\n"
+            "Maximum total tile time = Main budget + This value\n"
+            "Example: 300s main + 30s fallback = 330s maximum\n\n"
+            "Higher values = more time to recover missing chunks\n"
+            "Lower values = faster tile completion, may miss some chunks"
         )
         fallback_timeout_layout.addWidget(self.fallback_timeout_label)
         
@@ -1922,7 +1930,10 @@ class ConfigUI(QMainWindow):
         fallback_timeout_value = max(10, min(120, fallback_timeout_value))  # Clamp to valid range
         self.fallback_timeout_slider.setValue(fallback_timeout_value)
         self.fallback_timeout_slider.setObjectName('fallback_timeout')
-        self.fallback_timeout_slider.setToolTip("Drag to adjust fallback timeout (10-120 seconds)")
+        self.fallback_timeout_slider.setToolTip(
+            "Drag to adjust extra time for fallback sweep (10-120 seconds)\n"
+            "This is ADDED to the main tile budget when recovering missing chunks."
+        )
         self.fallback_timeout_value_label = QLabel(f"{fallback_timeout_value}s")
         self.fallback_timeout_slider.valueChanged.connect(
             lambda v: self.fallback_timeout_value_label.setText(f"{v}s")
@@ -3164,10 +3175,14 @@ class ConfigUI(QMainWindow):
         # Update tooltips to explain why controls are disabled
         if is_full_fallback:
             self.fallback_extends_budget_check.setToolTip(
-                "When enabled, network fallbacks will continue even after the time budget\n"
-                "is exhausted. This prioritizes image quality over strict timing.\n\n"
-                "• Enabled: Better quality, may cause longer loading (quality priority)\n"
-                "• Disabled: Strict timing, may have some missing tiles (speed priority)"
+                "When enabled, adds EXTRA time after the main budget expires\n"
+                "to recover missing chunks using lower-detail fallbacks.\n\n"
+                "How it works:\n"
+                "  • Main budget expires → 'Fallback Sweep' phase begins\n"
+                "  • All missing chunks are processed with lower-zoom alternatives\n"
+                "  • Maximum total time = Main budget + Extended fallback timeout\n\n"
+                "• Enabled: Better quality, fewer gray patches (recommended)\n"
+                "• Disabled: Strict timing, may have missing tiles"
             )
         else:
             self.fallback_extends_budget_check.setToolTip(
@@ -3177,10 +3192,13 @@ class ConfigUI(QMainWindow):
         
         if timeout_enabled:
             self.fallback_timeout_label.setToolTip(
-                "Timeout per mipmap level when using extended fallbacks.\n"
-                "Each lower-detail level gets this much time to download.\n\n"
-                "Total extra time = this × number of levels (typically 3-4)\n"
-                "Example: 3.0s × 4 levels = 12 seconds max additional time"
+                "TOTAL extra time for the fallback sweep phase.\n"
+                "This time is added AFTER the main budget expires to recover\n"
+                "all missing chunks using lower-detail alternatives.\n\n"
+                "Maximum total tile time = Main budget + This value\n"
+                "Example: 300s main + 30s fallback = 330s maximum\n\n"
+                "The fallback sweep efficiently processes ALL missing chunks\n"
+                "in batch, maximizing image quality within the extra time."
             )
         else:
             self.fallback_timeout_label.setToolTip(
@@ -3344,6 +3362,18 @@ class ConfigUI(QMainWindow):
         self.simbrief_use_flight_data_check.setChecked(False)
         
         log.info("SimBrief flight data unloaded")
+
+    def _on_use_flight_data_changed(self, state):
+        """
+        Immediately update config when the 'Use Flight Data' toggle changes.
+        
+        This allows users to load SimBrief data after pressing Run and have
+        it take effect immediately without needing to save config.
+        """
+        if hasattr(self.cfg, 'simbrief'):
+            # Qt.CheckState.Checked has value 2, Unchecked has value 0
+            self.cfg.simbrief.use_flight_data = (state == 2)
+            log.debug(f"SimBrief use_flight_data toggled: {self.cfg.simbrief.use_flight_data}")
 
     def _display_simbrief_flight_info(self, data):
         """Display SimBrief flight information in the UI"""

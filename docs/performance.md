@@ -550,6 +550,8 @@ AutoOrtho can integrate with SimBrief to enhance Dynamic Zoom and Prefetching us
 4. Click **Fetch Flight Data** after filing your flight plan in SimBrief
 5. Enable **Use Flight Data for Dynamic Zoom Level and Pre-fetching Calculations**
 
+> **Note:** You can load SimBrief flight data at any time — before or after pressing "Run". The toggle takes effect immediately, so you don't need to restart AutoOrtho or save the config when loading a flight plan mid-session.
+
 ### How It Works
 
 When SimBrief integration is enabled and flight data is loaded:
@@ -592,15 +594,26 @@ SimBrief integration gracefully falls back to DataRef-based calculations when:
 2. **Aircraft off-route**: If you deviate more than 40nm from the planned route, AutoOrtho assumes you're no longer following the plan and falls back to DataRef calculations
 3. **DataRefs unavailable**: If X-Plane isn't sending data yet, uses the base quality step (0ft AGL = maximum quality)
 
-### Example Workflow
+### Example Workflows
+
+#### Option A: Load flight plan before starting
 
 1. **File flight plan** in SimBrief (e.g., KJFK → KLAX)
 2. **Start AutoOrtho** and go to Settings → Setup
 3. **Enter SimBrief User ID** and click "Fetch Flight Data"
 4. **Verify flight info** displays correctly (route, cruise altitude, aircraft)
 5. **Enable toggle** "Use Flight Data for Dynamic Zoom..."
-6. **Start X-Plane** and load your flight
-7. **Fly your route** — AutoOrtho will prefetch tiles along your flight path at appropriate zoom levels
+6. **Press Run** — AutoOrtho starts and begins prefetching along your route
+7. **Start X-Plane** and fly your route
+
+#### Option B: Load flight plan after starting (mid-session)
+
+1. **Start AutoOrtho** and press Run (with your SimBrief User ID already saved)
+2. **Start X-Plane** and begin your flight
+3. **File flight plan** in SimBrief when ready
+4. **Go to Settings → Setup** and click "Fetch Flight Data"
+5. **Enable toggle** — takes effect immediately, no restart needed
+6. AutoOrtho will immediately start using your flight plan for prefetching and dynamic zoom
 
 ---
 
