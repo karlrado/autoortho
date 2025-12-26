@@ -1985,7 +1985,7 @@ class TestPerformanceConfig:
         tile_budget = float(cfg.autoortho.tile_time_budget)
         assert tile_budget > 0
         # Default should be 120.0
-        assert tile_budget == 120.0
+        assert tile_budget == 180.0
     
     def test_fallback_level_config_has_correct_default(self, tmpdir):
         """Test that fallback_level config option exists and has correct default."""

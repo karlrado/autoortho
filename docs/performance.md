@@ -320,25 +320,65 @@ How far ahead (in minutes of flight time) to prefetch tiles.
 
 ---
 
-### Legacy Settings
+### Per-Chunk Timeout Settings
 
-These settings are from the original timeout system and are still available for compatibility.
+These settings work **alongside** the tile time budget to control individual chunk download behavior.
 
-#### Max Wait (`maxwait`)
+#### Per-Chunk Max Wait (`maxwait`)
 - **Type:** Float (seconds)
-- **Default:** 1.5
-- **Config file:** `maxwait = 1.5`
+- **Default:** 5.0
+- **Range:** 0.1 - 10.0
+- **Config file:** `maxwait = 5.0`
+- **UI:** Settings → Advanced Settings → Per-chunk max wait
 
-The per-chunk timeout used when the time budget system is disabled. Each chunk waits up to this long before timing out.
+Maximum time to wait for a **single chunk** to download. This works in combination with the tile time budget:
 
-**Note:** When `use_time_budget = True`, this setting is largely superseded by `tile_time_budget`.
+- **Tile Time Budget:** Total time for the entire tile (all 256 chunks)
+- **Per-Chunk Max Wait:** Maximum time for each individual chunk download
 
-#### Suspend Max Wait at Startup (`suspend_maxwait`)
+A chunk will stop waiting when **either** limit is reached, whichever comes first. This prevents a single slow chunk from consuming the entire tile budget.
+
+**How it works:**
+```
+For each chunk:
+  wait_time = min(remaining_tile_budget, maxwait)
+  wait for chunk up to wait_time
+```
+
+**Recommended values:**
+| Network Speed | Recommended `maxwait` |
+|--------------|----------------------|
+| Fast (fiber) | 2.0 seconds |
+| Normal (cable/DSL) | 5.0 seconds (default) |
+| Slow/unreliable | 10.0 seconds |
+
+**When time budget is disabled:** This becomes the sole timeout mechanism — each chunk waits up to `maxwait` seconds independently, which can result in much longer total tile times (up to 256 × maxwait for a full tile).
+
+#### Extended Loading at Startup (`suspend_maxwait`)
 - **Type:** Boolean
 - **Default:** True
 - **Config file:** `suspend_maxwait = True`
+- **UI:** Settings → Advanced Settings → "Allow extra loading time during startup"
 
-When enabled, uses a much longer timeout during X-Plane startup to ensure initial tiles load completely before flight begins.
+When enabled, AutoOrtho uses significantly longer timeouts during X-Plane's initial scenery load (before the flight starts). This ensures tiles load at full quality before you begin flying.
+
+**Startup behavior when enabled:**
+
+| Setting | Normal Flight | During Startup |
+|---------|--------------|----------------|
+| Tile Time Budget | As configured | **10× the configured value** |
+| Per-Chunk Max Wait | As configured | **20 seconds** |
+
+**Example:** With `tile_time_budget = 180` and `maxwait = 5.0`:
+- During startup: 1800s tile budget, 20s per-chunk wait
+- During flight: 180s tile budget, 5s per-chunk wait
+
+**How startup is detected:** AutoOrtho considers you to be in "startup mode" until X-Plane's DataRef connection is established, which happens when the flight becomes active (after the "Reading new scenery files" splash screen).
+
+**Trade-offs:**
+- ✅ Better initial scenery quality (fewer blurry/missing tiles at flight start)
+- ✅ Reduces low-resolution and placeholder tiles
+- ⚠️ May increase initial scenery loading time
 
 ---
 
