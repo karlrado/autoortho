@@ -133,22 +133,6 @@ def get_tile_creation_stats():
     }
     
     try:
-        # Get counter-based stats (aggregate across all time)
-        from aostats import get_stat
-        count = get_stat('tile_create_count')
-        total_time_ms = get_stat('tile_create_time_total_ms')
-        
-        result['count'] = count
-        if count > 0:
-            result['avg_time_s'] = round(total_time_ms / count / 1000.0, 3)
-        
-        # Get per-mipmap averages from counters
-        for mm_level in range(5):
-            mm_count = get_stat(f'mm_count:{mm_level}')
-            mm_time = get_stat(f'tile_create_time_ms:{mm_level}')
-            if mm_count > 0:
-                result['avg_time_by_mipmap'][mm_level] = round(mm_time / mm_count / 1000.0, 3)
-        
         # Get rolling averages from StatTracker (recent samples)
         result['averages'] = dict(tile_creation_stats.averages)
         
@@ -3268,18 +3252,15 @@ class Tile(object):
         # Track FULL tile creation time (new stat for tuning tile_time_budget)
         tile_creation_stats.set(mipmap, total_creation_time)
 
-        # Record per-mipmap stats via counters for aggregation
+        # Record per-mipmap count via counters for aggregation
         try:
             bump_many({
                 f"mm_count:{mipmap}": 1,
-                f"mm_compress_time_ms:{mipmap}": int(compress_time * 1000),
-                f"tile_create_time_ms:{mipmap}": int(total_creation_time * 1000),
             })
         except Exception:
             pass
         
-        # Only report tile completion stats when mipmap 0 is done (full tile delivered to X-Plane)
-        # This tracks the same time window as TimeBudget: from first request to tile release
+        # Log tile completion when mipmap 0 is done (full tile delivered to X-Plane)
         if mipmap == 0 and not self._completion_reported:
             self._completion_reported = True
             # Calculate time from first X-Plane request to completion
@@ -3288,14 +3269,6 @@ class Tile(object):
             else:
                 # Fallback: use the mipmap creation time if first_request_time wasn't set
                 tile_completion_time = total_creation_time
-            
-            try:
-                bump_many({
-                    "tile_create_count": 1,
-                    "tile_create_time_total_ms": int(tile_completion_time * 1000),
-                })
-            except Exception:
-                pass
             
             log.debug(f"GET_MIPMAP: Tile {self} COMPLETED in {tile_completion_time:.2f}s "
                      f"(mipmap 0 done, time from first request)")

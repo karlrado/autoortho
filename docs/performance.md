@@ -388,55 +388,23 @@ prefetch_enabled = False
 AutoOrtho logs performance statistics that can help you tune your settings:
 
 ```
-STATS: {'tile_create_count': 45, 'tile_create_avg_s': 8.42, 'tile_create_avg_by_mm': {0: 12.5, 1: 3.2, 2: 1.1},
-        'mm_count:0': 12, 'mm_count:1': 26, 'chunk_budget_skipped': 8782, 'chunk_missing_count': 394}
+STATS: {'mm_count:0': 12, 'mm_count:1': 26, 'chunk_budget_skipped': 8782, 'chunk_missing_count': 394}
 ```
 
-### Tile Creation Time Statistics (Key for Tuning)
-
-These statistics help you determine the optimal `tile_time_budget`:
-
-| Statistic | Meaning |
-|-----------|---------|
-| `tile_create_count` | Total number of tiles created |
-| `tile_create_avg_s` | **Average tile creation time in seconds** (key metric!) |
-| `tile_create_avg_ms` | Average tile creation time in milliseconds |
-| `tile_create_avg_by_mm` | Average creation time by mipmap level |
-| `tile_create_time_ms:N` | Total time spent creating mipmap level N |
-
-**How to use these stats to tune `tile_time_budget`:**
-
-1. Run AutoOrtho with a high `tile_time_budget` (e.g., 60 seconds) to measure actual creation times
-2. Look at `tile_create_avg_s` to see how long tiles actually take
-3. Set your `tile_time_budget` slightly above this average for optimal performance
-
-**Example interpretation:**
-```
-tile_create_avg_s: 8.42
-tile_create_avg_by_mm: {0: 12.5, 1: 3.2, 2: 1.1}
-```
-- Average tile takes 8.42 seconds to create
-- Mipmap 0 (highest detail) averages 12.5 seconds
-- Setting `tile_time_budget = 15` would allow most tiles to complete fully
-- Setting `tile_time_budget = 8` would give faster loading but some incomplete tiles
-
-### Other Statistics
+### Key Statistics
 
 | Statistic | Meaning |
 |-----------|---------|
 | `mm_count:N` | Successful mipmap builds at level N (0=highest detail) |
-| `mm_compress_time_ms:N` | Time spent on DDS compression for mipmap level N |
 | `chunk_budget_skipped` | Chunks skipped because time budget ran out |
 | `chunk_missing_count` | Chunks that ended up with missing color (no fallback worked) |
 
 **Healthy indicators:**
-- `tile_create_avg_s` < `tile_time_budget` = tiles completing within budget
 - High `mm_count:0` values = high-detail tiles completing successfully
 - Low `chunk_missing_count` = fallbacks working well
 
 **Warning signs:**
-- `tile_create_avg_s` > `tile_time_budget` = budget too short, increase it
-- High `chunk_budget_skipped` = many chunks timing out, increase budget
+- High `chunk_budget_skipped` = many chunks timing out, increase `tile_time_budget`
 - High `chunk_missing_count` = fallbacks not covering gaps, enable more fallbacks
 
 ### Breaking Down Tile Creation Time
