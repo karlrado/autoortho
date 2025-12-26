@@ -593,6 +593,9 @@ class Getter(object):
                         log.debug(f"Chunk {obj} permanently failed ({obj.failure_reason}), not re-submitting")
                         continue
                     log.warning(f"Failed getting: {obj} {args} {kwargs}, re-submit.")
+                    # CRITICAL: Clear in_flight BEFORE re-submitting, otherwise submit()
+                    # will see in_flight=True and silently drop the chunk!
+                    obj.in_flight = False
                     self.submit(obj, *args, **kwargs)
             except Exception as err:
                 log.error(f"ERROR {err} getting: {obj} {args} {kwargs}, re-submit.")
@@ -600,6 +603,8 @@ class Getter(object):
                 if obj.permanent_failure:
                     log.debug(f"Chunk {obj} permanently failed during exception, not re-submitting")
                     continue
+                # CRITICAL: Clear in_flight BEFORE re-submitting
+                obj.in_flight = False
                 self.submit(obj, *args, **kwargs)
             finally:
                 obj.in_flight = False
@@ -3905,6 +3910,10 @@ class TileCacher(object):
                 # Only in this case would this cache have made a difference
                 self.hits += 1
                 bump('tile_mem_hits')
+                # Reset time budget when tile is re-opened from cache
+                # This ensures returning to an area gets a fresh budget, not the
+                # exhausted budget from a previous (possibly failed) request.
+                tile._tile_time_budget = None
 
             tile.refs += 1
         return tile
