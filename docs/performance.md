@@ -345,40 +345,44 @@ When enabled, uses a much longer timeout during X-Plane startup to ensure initia
 ### Stutter-Free Flying (Prioritize Performance)
 ```ini
 use_time_budget = True
-tile_time_budget = 5.0
+tile_time_budget = 120.0
 fallback_level = cache
 fallback_extends_budget = False
 prefetch_enabled = True
-prefetch_lookahead = 45
+prefetch_lookahead = 30
+max_zoom_level = 16
 ```
 
 ### Maximum Quality (Prioritize Imagery)
 ```ini
 use_time_budget = True
-tile_time_budget = 20.0
+tile_time_budget = 300
 fallback_level = full
 fallback_extends_budget = True
 prefetch_enabled = True
 prefetch_lookahead = 60
+max_zoom_level = 17
 ```
 
 ### Slow Internet Connection
 ```ini
 use_time_budget = True
-tile_time_budget = 15.0
+tile_time_budget = 180
 fallback_level = cache
 fallback_extends_budget = False
 prefetch_enabled = True
 prefetch_lookahead = 90
+max_zoom_level = 16
 ```
 
 ### Weak CPU / Limited System
 ```ini
 use_time_budget = True
-tile_time_budget = 3.0
+tile_time_budget = 180
 fallback_level = none
 fallback_extends_budget = False
 prefetch_enabled = False
+max_zoom_level = 15
 ```
 
 ---
