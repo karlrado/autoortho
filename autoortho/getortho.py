@@ -35,6 +35,9 @@ from utils.constants import (
     LOOKAHEAD_TIME_SEC,
 )
 from utils.apple_token_service import apple_token_service
+from utils.dynamic_zoom import DynamicZoomManager
+from utils.altitude_predictor import predict_altitude_at_closest_approach
+from utils.simbrief_flight import simbrief_flight_manager
 
 from datareftrack import dt as datareftracker
 
@@ -43,146 +46,12 @@ MEMTRACE = False
 log = logging.getLogger(__name__)
 
 
-# ============================================================================
-# HTTP/2 SUPPORT (OPTIONAL)
-# ============================================================================
-# Try to use httpx for HTTP/2 multiplexing. Falls back to requests if not available.
-# HTTP/2 allows multiple requests over a single connection, reducing latency.
-# ============================================================================
-_HTTPX_AVAILABLE = False
-_httpx = None
-try:
-    import httpx as _httpx
-    _HTTPX_AVAILABLE = True
-    # Silence httpx's verbose request logging (it logs every request at INFO level)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    log.info("httpx available - HTTP/2 support enabled")
-except ImportError:
-    log.debug("httpx not installed - using requests (HTTP/1.1). Install httpx for HTTP/2 support.")
-
-
-class HttpxSessionWrapper:
-    """
-    Wrapper around httpx.Client that provides requests-compatible API.
-    This allows seamless switching between requests and httpx.
-    """
-    
-    def __init__(self, http2=True, pool_size=10, timeout=25):
-        """
-        Initialize httpx client with HTTP/2 support.
-        
-        Args:
-            http2: Enable HTTP/2 (default True)
-            pool_size: Connection pool size
-            timeout: Request timeout in seconds
-        """
-        # httpx uses limits for connection pooling
-        limits = _httpx.Limits(
-            max_keepalive_connections=pool_size,
-            max_connections=pool_size * 2,
-            keepalive_expiry=30.0
-        )
-        
-        # Create httpx client with HTTP/2 enabled
-        self._client = _httpx.Client(
-            http2=http2,
-            limits=limits,
-            timeout=_httpx.Timeout(timeout, connect=5.0),
-            follow_redirects=True
-        )
-        self._http2 = http2
-        
-    def get(self, url, headers=None, timeout=None):
-        """
-        HTTP GET request - returns a requests-compatible response object.
-        
-        Args:
-            url: URL to fetch
-            headers: Optional request headers
-            timeout: Tuple of (connect_timeout, read_timeout) or single value
-        """
-        # Convert requests-style timeout tuple to httpx timeout
-        if isinstance(timeout, tuple):
-            connect_timeout, read_timeout = timeout
-            httpx_timeout = _httpx.Timeout(read_timeout, connect=connect_timeout)
-        elif timeout is not None:
-            httpx_timeout = _httpx.Timeout(timeout)
-        else:
-            httpx_timeout = None
-        
-        try:
-            response = self._client.get(url, headers=headers, timeout=httpx_timeout)
-            # Wrap in a compatible response object
-            return HttpxResponseWrapper(response)
-        except _httpx.TimeoutException as e:
-            raise requests.exceptions.Timeout(str(e))
-        except _httpx.RequestError as e:
-            raise requests.exceptions.RequestException(str(e))
-    
-    def close(self):
-        """Close the underlying httpx client."""
-        try:
-            self._client.close()
-        except Exception:
-            pass
-
-
-class HttpxResponseWrapper:
-    """
-    Wrapper that makes httpx.Response compatible with requests.Response API.
-    """
-    
-    def __init__(self, httpx_response):
-        self._response = httpx_response
-        
-    @property
-    def status_code(self):
-        return self._response.status_code
-    
-    @property
-    def content(self):
-        return self._response.content
-    
-    @property
-    def text(self):
-        return self._response.text
-    
-    @property
-    def headers(self):
-        return dict(self._response.headers)
-    
-    def close(self):
-        try:
-            self._response.close()
-        except Exception:
-            pass
-    
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, *args):
-        self.close()
-
-
 def create_http_session(pool_size=10):
     """
-    Factory function to create the best available HTTP session.
+    Factory function to create an HTTP session with connection pooling.
     
-    Returns httpx client with HTTP/2 if available, otherwise requests session.
-    Both have compatible APIs via the wrapper classes.
+    Returns a requests session configured with connection pooling.
     """
-    use_http2 = getattr(CFG.autoortho, 'use_http2', True)
-    
-    if _HTTPX_AVAILABLE and use_http2:
-        try:
-            session = HttpxSessionWrapper(http2=True, pool_size=pool_size)
-            log.debug(f"Created httpx session with HTTP/2 (pool_size={pool_size})")
-            return session
-        except Exception as e:
-            log.warning(f"Failed to create httpx session: {e}, falling back to requests")
-    
-    # Fall back to requests
     session = requests.Session()
     adapter = requests.adapters.HTTPAdapter(
         pool_connections=pool_size,
@@ -192,7 +61,7 @@ def create_http_session(pool_size=10):
     )
     session.mount('https://', adapter)
     session.mount('http://', adapter)
-    log.debug(f"Created requests session with HTTP/1.1 (pool_size={pool_size})")
+    log.debug(f"Created requests session (pool_size={pool_size})")
     return session
 
 
@@ -264,22 +133,6 @@ def get_tile_creation_stats():
     }
     
     try:
-        # Get counter-based stats (aggregate across all time)
-        from aostats import get_stat
-        count = get_stat('tile_create_count')
-        total_time_ms = get_stat('tile_create_time_total_ms')
-        
-        result['count'] = count
-        if count > 0:
-            result['avg_time_s'] = round(total_time_ms / count / 1000.0, 3)
-        
-        # Get per-mipmap averages from counters
-        for mm_level in range(5):
-            mm_count = get_stat(f'mm_count:{mm_level}')
-            mm_time = get_stat(f'tile_create_time_ms:{mm_level}')
-            if mm_count > 0:
-                result['avg_time_by_mipmap'][mm_level] = round(mm_time / mm_count / 1000.0, 3)
-        
         # Get rolling averages from StatTracker (recent samples)
         result['averages'] = dict(tile_creation_stats.averages)
         
@@ -709,8 +562,7 @@ class Getter(object):
         global STATS
         self.localdata.idx = idx
         
-        # Create thread-local session with HTTP/2 support (if available)
-        # Uses httpx for HTTP/2 multiplexing, falls back to requests
+        # Create thread-local session with connection pooling
         try:
             pool_size = max(4, int(int(CFG.autoortho.fetch_threads) * 1.5))
             self.localdata.session = create_http_session(pool_size=pool_size)
@@ -983,32 +835,279 @@ class SpatialPrefetcher:
             self._stop_event.wait(timeout=self.interval_sec)
     
     def _do_prefetch_cycle(self):
-        """Execute one prefetch cycle."""
-        # Only prefetch when connected to X-Plane and in active flight
-        if not datareftracker.data_valid or not datareftracker.connected:
-            return
-            
+        """
+        Execute one prefetch cycle.
+
+        If SimBrief flight data is loaded and enabled, prefetches along the
+        flight plan waypoints. Otherwise, uses velocity-based prediction.
+        
+        Falls back to velocity-based prefetching if aircraft deviates from route.
+        """
         # Check if tile_cacher is available
         if self._tile_cacher is None:
             return
-            
-        # Get current aircraft state
-        lat = datareftracker.lat
-        lon = datareftracker.lon
-        hdg = datareftracker.hdg
-        spd = datareftracker.spd
-        
-        # Validate data
-        if lat < -90 or lat > 90 or lon < -180 or lon > 180:
+
+        # Always use instantaneous position (that's where we actually are)
+        if not datareftracker.data_valid or not datareftracker.connected:
             return
             
+        lat = datareftracker.lat
+        lon = datareftracker.lon
+
+        # Validate position data
+        if lat < -90 or lat > 90 or lon < -180 or lon > 180:
+            return
+
+        # Check if SimBrief flight path prefetching should be used
+        if self._should_use_simbrief_prefetch(lat, lon):
+            chunks_submitted = self._prefetch_along_flight_plan(lat, lon)
+            if chunks_submitted > 0:
+                self._prefetch_count += chunks_submitted
+                log.debug(f"Prefetched {chunks_submitted} chunks along flight plan (total: {self._prefetch_count})")
+                bump('prefetch_chunk_count', chunks_submitted)
+            return
+        
+        # Fall back to velocity-based prefetching
+        self._do_velocity_prefetch_cycle(lat, lon)
+    
+    def _should_use_simbrief_prefetch(self, lat: float, lon: float) -> bool:
+        """
+        Check if SimBrief flight path prefetching should be used.
+        
+        Returns True if:
+        - SimBrief flight data is loaded
+        - use_flight_data toggle is enabled
+        - Aircraft is on-route (within deviation threshold)
+        """
+        # Check if SimBrief integration is enabled
+        if not hasattr(CFG, 'simbrief'):
+            return False
+        
+        use_flight_data = getattr(CFG.simbrief, 'use_flight_data', False)
+        if isinstance(use_flight_data, str):
+            use_flight_data = use_flight_data.lower() in ('true', '1', 'yes', 'on')
+        
+        if not use_flight_data:
+            return False
+        
+        # Check if flight data is loaded
+        if not simbrief_flight_manager.is_loaded:
+            return False
+        
+        # Get deviation threshold from config
+        deviation_threshold = float(getattr(CFG.simbrief, 'route_deviation_threshold_nm', 40))
+        
+        # Check if aircraft is on-route
+        return simbrief_flight_manager.is_on_route(lat, lon, deviation_threshold)
+    
+    def _prefetch_along_flight_plan(self, lat: float, lon: float) -> int:
+        """
+        Prefetch tiles along the SimBrief flight plan waypoints.
+        
+        Gets upcoming waypoints from current position and prefetches tiles
+        in a radius around each waypoint, working forward from current position.
+        
+        Uses the flight plan altitude at each waypoint to determine the
+        appropriate zoom level, matching what will actually be displayed.
+        
+        Returns number of chunks submitted.
+        """
+        chunks_submitted = 0
+        
+        # Get prefetch radius from config
+        prefetch_radius_nm = float(getattr(CFG.simbrief, 'route_prefetch_radius_nm', 40))
+        
+        # Get upcoming fixes (limited number to avoid overwhelming)
+        upcoming_fixes = simbrief_flight_manager.get_upcoming_fixes(lat, lon, count=15)
+        
+        if not upcoming_fixes:
+            return 0
+        
+        # Prefetch around each upcoming fix, stopping when we hit max chunks
+        for fix in upcoming_fixes:
+            if chunks_submitted >= self.max_chunks:
+                break
+            
+            # Determine zoom level based on the AGL altitude at this waypoint
+            # AGL (Above Ground Level) is used because it represents actual height
+            # above the terrain being viewed, which is more relevant for imagery quality
+            zoom_level = self._get_zoom_for_altitude(fix.altitude_agl_ft)
+            
+            log.debug(f"Prefetch fix {fix.ident}: MSL={fix.altitude_ft}ft, "
+                     f"GND={fix.ground_height_ft}ft, AGL={fix.altitude_agl_ft}ft -> ZL{zoom_level}")
+            
+            # Prefetch tiles around this waypoint at the appropriate zoom level
+            submitted = self._prefetch_waypoint_area(
+                fix.lat, fix.lon, prefetch_radius_nm, zoom_level
+            )
+            chunks_submitted += submitted
+        
+        return chunks_submitted
+    
+    def _prefetch_waypoint_area(self, waypoint_lat: float, waypoint_lon: float,
+                                  radius_nm: float, zoom: int) -> int:
+        """
+        Prefetch tiles within a radius around a waypoint.
+        
+        Returns number of chunks submitted.
+        """
+        chunks_submitted = 0
+        
+        # Convert radius to degrees (approximate)
+        # 1 nm ≈ 1/60 degree latitude
+        radius_deg_lat = radius_nm / 60.0
+        radius_deg_lon = radius_nm / (60.0 * math.cos(math.radians(waypoint_lat)))
+        
+        # Calculate tile coordinates
+        n = 2 ** zoom
+        
+        def latlon_to_tile(lat, lon):
+            """Convert lat/lon to tile coordinates."""
+            x = int((lon + 180) / 360 * n)
+            lat_clamped = max(-85.0511, min(85.0511, lat))
+            lat_rad = math.radians(lat_clamped)
+            y = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
+            return (x, y)
+        
+        # Get tile range for the area
+        col_center, row_center = latlon_to_tile(waypoint_lat, waypoint_lon)
+        col_min, row_min = latlon_to_tile(
+            waypoint_lat + radius_deg_lat,
+            waypoint_lon - radius_deg_lon
+        )
+        col_max, row_max = latlon_to_tile(
+            waypoint_lat - radius_deg_lat,
+            waypoint_lon + radius_deg_lon
+        )
+        
+        # Limit the area to prevent too many tiles
+        max_tiles_per_dim = 3
+        if row_max - row_min > max_tiles_per_dim:
+            row_min = row_center - max_tiles_per_dim // 2
+            row_max = row_center + max_tiles_per_dim // 2
+        if col_max - col_min > max_tiles_per_dim:
+            col_min = col_center - max_tiles_per_dim // 2
+            col_max = col_center + max_tiles_per_dim // 2
+        
+        # Prefetch tiles in the area
+        for row in range(row_min, row_max + 1):
+            for col in range(col_min, col_max + 1):
+                if chunks_submitted >= self.max_chunks:
+                    return chunks_submitted
+                
+                # Create unique key for this tile
+                tile_key = (row, col, zoom)
+                
+                # Skip if recently prefetched
+                if tile_key in self._recently_prefetched:
+                    continue
+                
+                # Add to recently prefetched
+                self._recently_prefetched.add(tile_key)
+                if len(self._recently_prefetched) > self._max_recent:
+                    try:
+                        self._recently_prefetched.pop()
+                    except KeyError:
+                        pass
+                
+                # Prefetch this tile
+                submitted = self._prefetch_tile(row, col, zoom)
+                chunks_submitted += submitted
+        
+        return chunks_submitted
+    
+    def _get_zoom_for_altitude(self, altitude_ft: int) -> int:
+        """
+        Get the appropriate zoom level for a given altitude.
+        
+        Uses the TileCacher's dynamic zoom manager if available and in dynamic mode.
+        Falls back to fixed max_zoom otherwise.
+        
+        Args:
+            altitude_ft: Altitude in feet
+            
+        Returns:
+            Appropriate zoom level for the altitude
+        """
+        # Check if we have access to the tile cacher and it's in dynamic mode
+        if self._tile_cacher is not None:
+            max_zoom_mode = getattr(CFG.autoortho, 'max_zoom_mode', 'fixed')
+            if max_zoom_mode == 'dynamic' and hasattr(self._tile_cacher, 'dynamic_zoom_manager'):
+                zoom = self._tile_cacher.dynamic_zoom_manager.get_zoom_for_altitude(altitude_ft)
+                log.debug(f"Dynamic zoom for altitude {altitude_ft}ft: ZL{zoom}")
+                return zoom
+        
+        # Fall back to fixed max_zoom
+        return int(getattr(CFG.autoortho, 'max_zoom', 16))
+    
+    def _get_predicted_altitude(self, lat: float, lon: float, 
+                                  hdg: float, spd: float, 
+                                  target_lat: float, target_lon: float) -> int:
+        """
+        Predict altitude at a target position based on current flight parameters.
+        
+        Uses vertical speed to estimate altitude change over the distance.
+        
+        Returns:
+            Predicted altitude in feet
+        """
+        # Get current altitude AGL and vertical speed
+        with datareftracker._lock:
+            if not datareftracker.data_valid:
+                return int(getattr(CFG.autoortho, 'max_zoom', 16))
+            current_alt = datareftracker.alt_agl_ft
+        
+        averages = datareftracker.get_flight_averages()
+        if averages is None:
+            return int(current_alt)
+        
+        vs_fpm = averages.get('vertical_speed_fpm', 0)
+        
+        # Calculate distance to target
+        delta_lat = target_lat - lat
+        delta_lon = target_lon - lon
+        cos_lat = math.cos(math.radians(lat))
+        distance_m = math.sqrt((delta_lat * 111320) ** 2 + (delta_lon * 111320 * cos_lat) ** 2)
+        
+        # Calculate time to reach target
+        if spd > 0:
+            time_sec = distance_m / spd
+        else:
+            time_sec = 0
+        
+        # Predict altitude change
+        alt_change = vs_fpm * (time_sec / 60)  # Convert seconds to minutes
+        predicted_alt = current_alt + alt_change
+        
+        # Clamp to reasonable values
+        return max(0, int(predicted_alt))
+    
+    def _do_velocity_prefetch_cycle(self, lat: float, lon: float):
+        """
+        Execute velocity-based prefetch cycle.
+        
+        Uses heading and speed to predict future position and prefetch tiles.
+        Uses predicted altitude to determine appropriate zoom level.
+        """
+        # Try to get 60-second averaged flight data for stable prediction
+        averages = datareftracker.get_flight_averages()
+
+        if averages is not None:
+            # Use averaged heading and speed for more stable predictions
+            hdg = averages['heading']
+            spd = averages['ground_speed_mps']
+        else:
+            # Fall back to instantaneous values if no averages available
+            hdg = datareftracker.hdg
+            spd = datareftracker.spd
+
         # Don't prefetch if moving slowly (taxiing, parked)
         if spd < self.MIN_SPEED_MPS:
             return
-            
-        # Calculate predicted position
+
+        # Calculate predicted position using (potentially averaged) heading/speed
         distance_m = spd * self.lookahead_sec
-        
+
         # Convert heading to radians
         hdg_rad = math.radians(hdg)
         
@@ -1025,29 +1124,39 @@ class SpatialPrefetcher:
         predicted_lat = lat + delta_lat
         predicted_lon = lon + delta_lon
         
-        # Get tiles along the flight path
+        # Calculate predicted altitude at destination for zoom level determination
+        predicted_alt = self._get_predicted_altitude(lat, lon, hdg, spd, predicted_lat, predicted_lon)
+        zoom_level = self._get_zoom_for_altitude(predicted_alt)
+        
+        # Get tiles along the flight path at the appropriate zoom level
         chunks_submitted = self._prefetch_along_path(
-            lat, lon, predicted_lat, predicted_lon
+            lat, lon, predicted_lat, predicted_lon, zoom_level
         )
         
         if chunks_submitted > 0:
             self._prefetch_count += chunks_submitted
-            log.debug(f"Prefetched {chunks_submitted} chunks (total: {self._prefetch_count})")
+            log.debug(f"Prefetched {chunks_submitted} chunks at ZL{zoom_level} (alt={predicted_alt}ft, total: {self._prefetch_count})")
             bump('prefetch_chunk_count', chunks_submitted)
     
-    def _prefetch_along_path(self, lat1, lon1, lat2, lon2):
+    def _prefetch_along_path(self, lat1, lon1, lat2, lon2, zoom_level: int = None):
         """
         Prefetch chunks for tiles along the flight path.
+        
+        Args:
+            lat1, lon1: Start position (current aircraft position)
+            lat2, lon2: End position (predicted position)
+            zoom_level: Zoom level to prefetch at. If None, uses config max_zoom.
         
         Returns number of chunks submitted for prefetch.
         """
         chunks_submitted = 0
         
-        # Get zoom level from config
-        max_zoom = int(getattr(CFG.autoortho, 'max_zoom', 16))
+        # Use provided zoom level or fall back to config
+        if zoom_level is None:
+            zoom_level = int(getattr(CFG.autoortho, 'max_zoom', 16))
         
         # Calculate tile coordinates using Web Mercator projection
-        n = 2 ** max_zoom
+        n = 2 ** zoom_level
         
         def latlon_to_tile(lat, lon):
             """Convert lat/lon to tile coordinates."""
@@ -1082,7 +1191,7 @@ class SpatialPrefetcher:
                     return chunks_submitted
                     
                 # Create unique key for this tile
-                tile_key = (row, col, max_zoom)
+                tile_key = (row, col, zoom_level)
                 
                 # Skip if recently prefetched
                 if tile_key in self._recently_prefetched:
@@ -1098,7 +1207,7 @@ class SpatialPrefetcher:
                         pass
                 
                 # Prefetch this tile's chunks
-                submitted = self._prefetch_tile(row, col, max_zoom)
+                submitted = self._prefetch_tile(row, col, zoom_level)
                 chunks_submitted += submitted
                 
         return chunks_submitted
@@ -2034,6 +2143,13 @@ class Tile(object):
         #   with much lower overhead since it only activates when needed.
         fallback_level = self.get_fallback_level()
         fallback_extends_budget = self.get_fallback_extends_budget()
+        
+        # === FALLBACK BUDGET ===
+        # When fallback_extends_budget is True, we create a SEPARATE budget for fallback operations.
+        # This caps the TOTAL extra time spent on fallbacks (not per-chunk like before).
+        # The fallback_budget is created lazily when the main budget exhausts.
+        fallback_timeout = float(getattr(CFG.autoortho, 'fallback_timeout', 30.0))
+        fallback_budget = None  # Created lazily when needed
 
         # Get effective zoom  
         zoom = min((self.max_zoom - mipmap), self.max_zoom)
@@ -2335,19 +2451,48 @@ class Tile(object):
             # Fallback 3: On-demand download of lower-detail chunks (enabled if fallback_level >= 2)
             # This is the expensive network fallback - only use when quality is prioritized
             if not chunk_img and needs_fallback and fallback_level >= 2:
-                # Determine whether to respect or ignore the exhausted budget:
-                # - If fallback_extends_budget is True: ignore exhausted budget (quality priority)
-                # - If fallback_extends_budget is False: respect budget strictly (speed priority)
+                # Budget strategy for cascading fallback:
+                # - Use main budget first (remaining time)
+                # - If fallback_extends_budget is True AND main budget exhausts during fallback,
+                #   switch to the extra fallback_budget
+                # - This ensures max total time is exactly: main_budget + fallback_timeout
+                nonlocal fallback_budget
+                
+                # Fallback budget is created lazily ONLY when main budget exhausts
+                # This ensures it truly extends the time rather than running in parallel
+                
                 if time_budget.exhausted and not fallback_extends_budget:
+                    # Main budget exhausted and no extension allowed - skip
                     log.debug(f"GET_IMG(process_chunk): Skipping Fallback 3 - budget exhausted and fallback_extends_budget=False")
+                elif time_budget.exhausted and fallback_extends_budget:
+                    # Main budget exhausted - create/use fallback budget
+                    # Created NOW so the timer starts when main exhausts (true extension)
+                    if fallback_budget is None:
+                        fallback_budget = TimeBudget(fallback_timeout)
+                        log.info(f"GET_IMG: Main budget exhausted, creating fallback budget {fallback_timeout:.1f}s")
+                    
+                    if fallback_budget.exhausted:
+                        log.debug(f"GET_IMG(process_chunk): Skipping Fallback 3 - both budgets exhausted")
+                    else:
+                        log.debug(f"GET_IMG(process_chunk): Fallback 3 - main exhausted, using fallback budget "
+                                 f"(remaining={fallback_budget.remaining:.2f}s)")
+                        chunk_img = self.get_or_build_lower_mipmap_chunk(
+                            mipmap, chunk.col, chunk.row, zoom,
+                            main_budget=None,  # Main already exhausted
+                            fallback_budget=fallback_budget
+                        )
                 else:
-                    log.debug(f"GET_IMG(process_chunk): Fallback 3 - cascading fallback "
-                             f"(budget_exhausted={time_budget.exhausted}, extends_budget={fallback_extends_budget}).")
-                    # When extends_budget is True and budget is exhausted, pass time_budget=None
-                    # so the cascading function uses its legacy fixed timeout instead of immediately giving up.
-                    cascade_budget = None if (time_budget.exhausted and fallback_extends_budget) else time_budget
-                    chunk_img = self.get_or_build_lower_mipmap_chunk(mipmap, chunk.col, chunk.row, zoom, 
-                                                                      time_budget=cascade_budget)
+                    # Main budget still has time - use it first, may switch to fallback if main exhausts
+                    log.debug(f"GET_IMG(process_chunk): Fallback 3 - using main budget "
+                             f"(remaining={time_budget.remaining:.2f}s)" +
+                             (f", fallback budget ready (remaining={fallback_budget.remaining:.2f}s)" 
+                              if fallback_budget else ""))
+                    chunk_img = self.get_or_build_lower_mipmap_chunk(
+                        mipmap, chunk.col, chunk.row, zoom,
+                        main_budget=time_budget,
+                        fallback_budget=fallback_budget,  # May be None, will be created lazily
+                        fallback_timeout=fallback_timeout if fallback_extends_budget else None
+                    )
 
             if not chunk_ready and not chunk_img and not is_permanent_failure:
                 # === FINAL RETRY (OPTIMIZED) ===
@@ -2414,6 +2559,7 @@ class Tile(object):
         completed = 0
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_pool_workers)
         active_futures = {}
+        chunks_with_images = set()  # Track which chunks have images for fallback sweep
         
         try:
             # Submit all chunks immediately (except permanently failed ones)
@@ -2451,6 +2597,7 @@ class Tile(object):
                         completed += 1
                         if chunk_img:
                             _safe_paste(new_im, chunk_img, start_x, start_y)
+                            chunks_with_images.add(id(chunk))  # Track for fallback sweep
                     except Exception as exc:
                         log.error(f"Chunk processing failed: {exc}")
                     finally:
@@ -2471,6 +2618,7 @@ class Tile(object):
                             chunk, chunk_img, start_x, start_y = future.result()
                             if chunk_img:
                                 _safe_paste(new_im, chunk_img, start_x, start_y)
+                                chunks_with_images.add(id(active_futures.get(future)))
                         except Exception as exc:
                             log.error(f"Chunk processing failed: {exc}")
                         finally:
@@ -2479,13 +2627,62 @@ class Tile(object):
                 except TimeoutError:
                     unfinished = len([f for f in remaining_futures if not f.done()])
                     log.debug(f"Timeout waiting for {unfinished} remaining chunks")
-                    bump('chunk_missing_count', unfinished)
                     # Cancel remaining futures to free resources
                     for future in remaining_futures:
                         if not future.done():
                             future.cancel()
                     # Clear remaining references
                     active_futures.clear()
+            
+            # === FALLBACK SWEEP PHASE ===
+            # After main budget expires, use fallback budget to fill in missing chunks
+            # This maximizes image quality by systematically processing all gaps
+            if fallback_extends_budget and time_budget.exhausted and fallback_level >= 2:
+                # Identify chunks without images
+                missing_chunks = [c for c in chunks if id(c) not in chunks_with_images 
+                                  and not c.permanent_failure]
+                
+                if missing_chunks:
+                    # Create fallback budget if not already created
+                    if fallback_budget is None:
+                        fallback_budget = TimeBudget(fallback_timeout)
+                        log.info(f"GET_IMG: Starting fallback sweep for {len(missing_chunks)} missing chunks "
+                                f"(budget={fallback_timeout:.1f}s)")
+                    elif not fallback_budget.exhausted:
+                        log.info(f"GET_IMG: Fallback sweep for {len(missing_chunks)} missing chunks "
+                                f"(remaining={fallback_budget.remaining:.2f}s)")
+                    
+                    # Process missing chunks with fallback budget
+                    sweep_recovered = 0
+                    for chunk in missing_chunks:
+                        if fallback_budget.exhausted:
+                            log.debug(f"Fallback sweep: budget exhausted after recovering {sweep_recovered} chunks")
+                            break
+                        
+                        # Calculate position for this chunk
+                        start_x = int(chunk.width * (chunk.col - col))
+                        start_y = int(chunk.height * (chunk.row - row))
+                        
+                        # Try cascading fallback for this chunk
+                        chunk_img = self.get_or_build_lower_mipmap_chunk(
+                            mipmap, chunk.col, chunk.row, zoom,
+                            main_budget=None,  # Main already exhausted
+                            fallback_budget=fallback_budget
+                        )
+                        
+                        if chunk_img:
+                            _safe_paste(new_im, chunk_img, start_x, start_y)
+                            chunks_with_images.add(id(chunk))
+                            sweep_recovered += 1
+                            bump('fallback_sweep_recovered')
+                    
+                    if sweep_recovered > 0:
+                        log.info(f"GET_IMG: Fallback sweep recovered {sweep_recovered}/{len(missing_chunks)} chunks")
+                    
+                    # Update missing count for chunks we couldn't recover
+                    still_missing = len(missing_chunks) - sweep_recovered
+                    if still_missing > 0:
+                        bump('chunk_missing_count', still_missing)
         finally:
             # Use wait=False to avoid blocking on cancelled/timed-out futures
             # The futures will complete in the background but we won't wait for them
@@ -2500,7 +2697,13 @@ class Tile(object):
             # Store image with metadata (col, row, zoom) for coordinate mapping in upscaling
             self.imgs[mipmap] = (new_im, col, row, zoom)
 
-        log.debug(f"GET_IMG: DONE!  IMG created {new_im}")
+        # Log budget summary including fallback budget if used
+        if fallback_budget is not None:
+            log.info(f"GET_IMG: DONE! Main budget: {time_budget.elapsed:.2f}s, "
+                    f"Fallback budget: {fallback_budget.elapsed:.2f}s/{fallback_timeout:.1f}s "
+                    f"(exhausted={fallback_budget.exhausted})")
+        else:
+            log.debug(f"GET_IMG: DONE!  IMG created {new_im}")
 
         # OPTIMIZATION: In-place desaturation when image isn't cached
         # Only copy when image was saved to cache AND needs desaturation
@@ -2624,7 +2827,10 @@ class Tile(object):
                 return chunk
             
             # Create new chunk and add to pool
-            chunk = Chunk(col, row, self.maptype, zoom, cache_dir=self.cache_dir)
+            # Use HIGH priority (low number) for fallback chunks since they're blocking
+            # tile completion. Regular mipmap 0 chunks have priority ~5-10, so we use
+            # priority 0 to ensure fallback chunks get processed urgently.
+            chunk = Chunk(col, row, self.maptype, zoom, priority=0, cache_dir=self.cache_dir)
             self._fallback_chunk_pool[key] = chunk
             bump('fallback_chunk_pool_miss')
             
@@ -2636,7 +2842,9 @@ class Tile(object):
             
             return chunk
 
-    def get_or_build_lower_mipmap_chunk(self, target_mipmap, col, row, zoom, time_budget=None):
+    def get_or_build_lower_mipmap_chunk(self, target_mipmap, col, row, zoom, 
+                                         main_budget=None, fallback_budget=None,
+                                         fallback_timeout=None):
         """
         Cascading fallback: Try to get/build progressively lower-detail mipmaps.
         Only downloads chunks on-demand when needed (lazy evaluation).
@@ -2644,24 +2852,57 @@ class Tile(object):
         OPTIMIZED: Uses shared chunk pool to prevent duplicate downloads.
         When multiple chunks fail and need the same parent, they share one download.
         
+        Budget strategy:
+        - Uses main_budget first (remaining time from tile's main budget)
+        - When main_budget exhausts, creates/switches to fallback_budget (extra time)
+        - This ensures max total time is: main_budget + fallback_timeout
+        
         Args:
             target_mipmap: The mipmap level we need (e.g., 0)
             col, row, zoom: Chunk coordinates at target zoom
-            time_budget: Optional TimeBudget to respect (for budget-aware network ops)
+            main_budget: Primary TimeBudget (tile's main budget)
+            fallback_budget: Extra TimeBudget for fallback extension (may be None, created lazily)
+            fallback_timeout: Seconds for fallback budget (used to create it lazily when main exhausts)
         
         Returns:
             Upscaled AoImage or None
         """
-        # Early exit if budget is already exhausted
-        if time_budget and time_budget.exhausted:
-            log.debug(f"Cascading fallback: skipping - time budget exhausted")
+        # Track the fallback budget - may be created lazily when main exhausts
+        _fallback_budget = fallback_budget
+        _using_fallback_budget = False
+        
+        def get_active_budget():
+            """Return the currently active budget, switching from main to fallback when needed."""
+            nonlocal _fallback_budget, _using_fallback_budget
+            if main_budget and not main_budget.exhausted:
+                return main_budget
+            # Main exhausted - try fallback budget
+            if _fallback_budget is None and fallback_timeout:
+                # Create fallback budget NOW (timer starts when main exhausts)
+                _fallback_budget = TimeBudget(fallback_timeout)
+                log.info(f"Cascading fallback: main budget exhausted, creating fallback budget {fallback_timeout:.1f}s")
+            if _fallback_budget and not _fallback_budget.exhausted:
+                if not _using_fallback_budget:
+                    log.debug(f"Cascading fallback: switching to fallback budget "
+                             f"(remaining={_fallback_budget.remaining:.2f}s)")
+                    _using_fallback_budget = True
+                return _fallback_budget
+            return None
+        
+        # Early exit if both budgets exhausted
+        active_budget = get_active_budget()
+        if main_budget is None and fallback_budget is None:
+            pass  # No budget constraints
+        elif active_budget is None:
+            log.debug(f"Cascading fallback: skipping - all budgets exhausted")
             return None
         
         # Try each progressively lower-detail mipmap
         for fallback_mipmap in range(target_mipmap + 1, self.max_mipmap + 1):
-            # Check budget at each iteration
-            if time_budget and time_budget.exhausted:
-                log.debug(f"Cascading fallback: stopping at mipmap {fallback_mipmap} - budget exhausted")
+            # Check budget at each iteration (may switch from main to fallback)
+            active_budget = get_active_budget()
+            if (main_budget is not None or fallback_budget is not None) and active_budget is None:
+                log.debug(f"Cascading fallback: stopping at mipmap {fallback_mipmap} - all budgets exhausted")
                 break
             
             log.debug(f"Cascading fallback: trying mipmap {fallback_mipmap} for failed mipmap {target_mipmap}")
@@ -2683,15 +2924,25 @@ class Tile(object):
                     chunk_getter.submit(fallback_chunk)
                 
                 # Wait for download with budget awareness
-                if time_budget:
-                    fallback_chunk_ready = time_budget.wait_with_budget(fallback_chunk.ready)
+                # Uses active_budget which may switch from main to fallback mid-wait
+                per_chunk_timeout = self.get_maxwait()
+                active_budget = get_active_budget()
+                if active_budget:
+                    fallback_chunk_ready = active_budget.wait_with_budget(
+                        fallback_chunk.ready, max_single_wait=per_chunk_timeout
+                    )
                 else:
-                    fallback_timeout = float(getattr(CFG.autoortho, 'fallback_timeout', 3.0))
-                    fallback_chunk_ready = fallback_chunk.ready.wait(timeout=fallback_timeout)
+                    # No budget constraints - use simple timeout
+                    fallback_chunk_ready = fallback_chunk.ready.wait(timeout=per_chunk_timeout)
                 
                 if not fallback_chunk_ready:
-                    log.debug(f"Cascading fallback: mipmap {fallback_mipmap} timed out "
-                             f"(budget_exhausted={time_budget.exhausted if time_budget else 'N/A'})")
+                    # Check if we can switch to fallback budget and continue
+                    active_budget = get_active_budget()
+                    if active_budget:
+                        log.debug(f"Cascading fallback: mipmap {fallback_mipmap} timed out, "
+                                 f"continuing with budget (remaining={active_budget.remaining:.2f}s)")
+                    else:
+                        log.debug(f"Cascading fallback: mipmap {fallback_mipmap} timed out, all budgets exhausted")
                     # Don't close - shared pool manages lifecycle
                     continue
             
@@ -3148,18 +3399,15 @@ class Tile(object):
         # Track FULL tile creation time (new stat for tuning tile_time_budget)
         tile_creation_stats.set(mipmap, total_creation_time)
 
-        # Record per-mipmap stats via counters for aggregation
+        # Record per-mipmap count via counters for aggregation
         try:
             bump_many({
                 f"mm_count:{mipmap}": 1,
-                f"mm_compress_time_ms:{mipmap}": int(compress_time * 1000),
-                f"tile_create_time_ms:{mipmap}": int(total_creation_time * 1000),
             })
         except Exception:
             pass
         
-        # Only report tile completion stats when mipmap 0 is done (full tile delivered to X-Plane)
-        # This tracks the same time window as TimeBudget: from first request to tile release
+        # Log tile completion when mipmap 0 is done (full tile delivered to X-Plane)
         if mipmap == 0 and not self._completion_reported:
             self._completion_reported = True
             # Calculate time from first X-Plane request to completion
@@ -3168,14 +3416,6 @@ class Tile(object):
             else:
                 # Fallback: use the mipmap creation time if first_request_time wasn't set
                 tile_completion_time = total_creation_time
-            
-            try:
-                bump_many({
-                    "tile_create_count": 1,
-                    "tile_create_time_total_ms": int(tile_completion_time * 1000),
-                })
-            except Exception:
-                pass
             
             log.debug(f"GET_MIPMAP: Tile {self} COMPLETED in {tile_completion_time:.2f}s "
                      f"(mipmap 0 done, time from first request)")
@@ -3327,6 +3567,29 @@ class TileCacher(object):
         self.target_zoom_level_near_airports = int(CFG.autoortho.max_zoom_near_airports)
         log.info(f"Target zoom level set to ZL{self.target_zoom_level}")
 
+        # Dynamic zoom configuration
+        # When "dynamic", zoom level is computed based on predicted altitude at tile
+        # When "fixed" (default), uses the configured max_zoom value
+        self.max_zoom_mode = str(CFG.autoortho.max_zoom_mode).lower()
+        self.dynamic_zoom_manager = DynamicZoomManager()
+        self._last_logged_dynamic_zoom = None  # Track last logged zoom to reduce spam
+        if self.max_zoom_mode == "dynamic":
+            self.dynamic_zoom_manager.load_from_config(
+                CFG.autoortho.dynamic_zoom_steps
+            )
+            step_count = len(self.dynamic_zoom_manager.get_steps())
+            log.info("=" * 60)
+            log.info("DYNAMIC ZOOM MODE ACTIVATED")
+            log.info(f"  Quality steps configured: {step_count}")
+            if step_count > 0:
+                log.info(f"  Steps: {self.dynamic_zoom_manager.get_summary()}")
+                log.info("  Zoom levels will be adjusted based on predicted altitude")
+            else:
+                log.warning("  No quality steps configured - using default zoom")
+            log.info("=" * 60)
+        else:
+            log.info("Using fixed max zoom level (ZL%d)", self.target_zoom_level)
+
         self.clean_t = threading.Thread(target=self.clean, daemon=True)
         self.clean_t.start()
 
@@ -3335,11 +3598,219 @@ class TileCacher(object):
             self.enable_cache = True
             self.cache_tile_lim = 50
     
-    def _get_target_zoom_level(self, default_zoom: int) -> int:
+    def _compute_dynamic_zoom(self, row: int, col: int, tile_zoom: int) -> int:
+        """
+        Compute dynamic zoom level based on predicted altitude at tile.
+
+        Uses the aircraft's averaged flight data (heading, speed, vertical speed)
+        to predict what altitude the aircraft will be at when it reaches the
+        closest point to this tile. Then returns the appropriate zoom level
+        from the configured quality steps.
+        
+        If SimBrief flight data is loaded and the "use_flight_data" toggle is enabled,
+        and the aircraft is on-route, uses the flight plan altitude for that position
+        instead of DataRef-based prediction.
+
+        Args:
+            row: Tile row coordinate
+            col: Tile column coordinate
+            tile_zoom: Default zoom level for this tile
+
+        Returns:
+            The computed max zoom level for this tile
+        """
+        # Get tile center coordinates (needed for both methods)
+        tile_lat, tile_lon = _chunk_to_latlon(row, col, tile_zoom)
+        
+        # Check if SimBrief flight data should be used
+        simbrief_altitude_agl = self._get_simbrief_altitude_for_tile(tile_lat, tile_lon)
+        if simbrief_altitude_agl is not None:
+            # Use SimBrief flight plan AGL altitude for zoom calculation
+            if tile_zoom == 18 and not CFG.autoortho.using_custom_tiles:
+                zoom = self.dynamic_zoom_manager.get_airport_zoom_for_altitude(simbrief_altitude_agl)
+                log.debug(f"Dynamic zoom (SimBrief): {simbrief_altitude_agl}ft AGL -> ZL{zoom} (airport tile)")
+                return zoom
+            zoom = self.dynamic_zoom_manager.get_zoom_for_altitude(simbrief_altitude_agl)
+            log.debug(f"Dynamic zoom (SimBrief): {simbrief_altitude_agl}ft AGL -> ZL{zoom}")
+            return zoom
+        
+        # Fall back to DataRef-based calculation
+        return self._compute_dynamic_zoom_from_datarefs(row, col, tile_zoom, tile_lat, tile_lon)
+    
+    def _get_simbrief_altitude_for_tile(self, tile_lat: float, tile_lon: float) -> Optional[int]:
+        """
+        Get conservative AGL altitude from SimBrief flight plan for a tile position.
+        
+        Returns the planned altitude Above Ground Level (AGL) if:
+        - SimBrief flight data is loaded
+        - The "use_flight_data" toggle is enabled
+        - The aircraft is currently on-route (within deviation threshold)
+        
+        When multiple waypoints are within the consideration radius:
+        - Uses the LOWEST flight altitude (MSL) - accounts for descent
+        - Uses the HIGHEST ground elevation - accounts for mountains
+        - Conservative AGL = lowest_MSL - highest_ground
+        
+        This ensures maximum detail when flying over areas with varied terrain
+        (e.g., descending over mountains).
+        
+        AGL Calculation:
+            AGL = MSL altitude - terrain elevation (ground_height from SimBrief)
+            
+            AGL is used because it represents the actual height above the terrain
+            being viewed. This is more relevant for imagery quality:
+            - 10,000 ft MSL over 5,000 ft mountains = 5,000 ft AGL (needs higher zoom)
+            - 10,000 ft MSL over the ocean = 10,000 ft AGL (can use lower zoom)
+        
+        Args:
+            tile_lat: Tile center latitude
+            tile_lon: Tile center longitude
+            
+        Returns:
+            Conservative AGL altitude in feet if SimBrief data should be used, None otherwise
+        """
+        # Check if SimBrief integration is enabled
+        if not hasattr(CFG, 'simbrief'):
+            return None
+        
+        use_flight_data = getattr(CFG.simbrief, 'use_flight_data', False)
+        if isinstance(use_flight_data, str):
+            use_flight_data = use_flight_data.lower() in ('true', '1', 'yes', 'on')
+        
+        if not use_flight_data:
+            return None
+        
+        # Check if flight data is loaded
+        if not simbrief_flight_manager.is_loaded:
+            return None
+        
+        # Get aircraft position to check if on-route
+        with datareftracker._lock:
+            if not datareftracker.data_valid:
+                return None
+            aircraft_lat = datareftracker.lat
+            aircraft_lon = datareftracker.lon
+        
+        # Get deviation threshold from config
+        deviation_threshold = float(getattr(CFG.simbrief, 'route_deviation_threshold_nm', 40))
+        
+        # Check if aircraft is on-route
+        if not simbrief_flight_manager.is_on_route(aircraft_lat, aircraft_lon, deviation_threshold):
+            log.debug(f"Aircraft deviated from route, using DataRef-based zoom calculation")
+            return None
+        
+        # Get consideration radius from config
+        consideration_radius = float(getattr(CFG.simbrief, 'route_consideration_radius_nm', 50))
+        
+        # Get AGL altitude at tile position (uses lowest AGL of fixes within radius)
+        # use_agl=True returns Above Ground Level altitude for better terrain awareness
+        altitude_agl = simbrief_flight_manager.get_altitude_at_position(
+            tile_lat, tile_lon, consideration_radius, use_agl=True
+        )
+        
+        return altitude_agl
+    
+    def _compute_dynamic_zoom_from_datarefs(self, row: int, col: int, tile_zoom: int,
+                                             tile_lat: float, tile_lon: float) -> int:
+        """
+        Compute dynamic zoom level using DataRef-based altitude prediction.
+        
+        This is the fallback method when SimBrief data is not available or
+        when the aircraft has deviated from the planned route.
+        """
+        # Get flight averages for prediction
+        averages = datareftracker.get_flight_averages()
+
+        # If no valid averages, try to use current altitude (AGL)
+        if averages is None:
+            with datareftracker._lock:
+                if datareftracker.data_valid and datareftracker.alt_agl_ft > 0:
+                    zoom = self.dynamic_zoom_manager.get_zoom_for_altitude(
+                        datareftracker.alt_agl_ft
+                    )
+                    log.debug(f"Dynamic zoom (current AGL): {datareftracker.alt_agl_ft:.0f}ft -> ZL{zoom}")
+                    return zoom
+            # Fall back to base step or fixed zoom
+            base = self.dynamic_zoom_manager.get_base_step()
+            fallback_zoom = base.zoom_level if base else self.target_zoom_level
+            log.debug(f"Dynamic zoom: no flight data, using fallback ZL{fallback_zoom}")
+            return fallback_zoom
+
+        # Get current position (with lock for thread safety)
+        with datareftracker._lock:
+            if not datareftracker.data_valid:
+                base = self.dynamic_zoom_manager.get_base_step()
+                fallback_zoom = base.zoom_level if base else self.target_zoom_level
+                log.debug(f"Dynamic zoom: no valid datarefs, using fallback ZL{fallback_zoom}")
+                return fallback_zoom
+
+            aircraft_lat = datareftracker.lat
+            aircraft_lon = datareftracker.lon
+            aircraft_alt_ft = datareftracker.alt_agl_ft
+
+        # Predict altitude at closest approach (using AGL for terrain-aware calculations)
+        predicted_alt, will_approach = predict_altitude_at_closest_approach(
+            aircraft_lat=aircraft_lat,
+            aircraft_lon=aircraft_lon,
+            aircraft_alt_ft=aircraft_alt_ft,
+            aircraft_hdg=averages['heading'],
+            aircraft_speed_mps=averages['ground_speed_mps'],
+            vertical_speed_fpm=averages['vertical_speed_fpm'],
+            tile_lat=tile_lat,
+            tile_lon=tile_lon
+        )
+
+        # Get zoom level for predicted altitude
+        # Use airport zoom level when near airports (tile_zoom == 18)
+        if tile_zoom == 18 and not CFG.autoortho.using_custom_tiles:
+            zoom = self.dynamic_zoom_manager.get_airport_zoom_for_altitude(predicted_alt)
+            log.debug(f"Dynamic zoom (predicted): {predicted_alt:.0f}ft AGL -> ZL{zoom} (airport tile)")
+            return zoom
+        zoom = self.dynamic_zoom_manager.get_zoom_for_altitude(predicted_alt)
+        log.debug(f"Dynamic zoom (predicted): {predicted_alt:.0f}ft AGL -> ZL{zoom}")
+        return zoom
+
+    def _get_target_zoom_level(self, default_zoom: int, row: int = None, col: int = None) -> int:
+        """
+        Get target zoom level for a tile.
+
+        In fixed mode: Uses the configured max_zoom (current behavior)
+        In dynamic mode: Computes zoom based on predicted altitude at tile
+
+        Args:
+            default_zoom: The default/base zoom level for this tile
+            row: Tile row coordinate (required for dynamic mode)
+            col: Tile column coordinate (required for dynamic mode)
+
+        Returns:
+            The target zoom level, capped to tile's max supported zoom
+        """
+        # Dynamic mode - compute based on altitude prediction
+        if self.max_zoom_mode == "dynamic" and row is not None and col is not None:
+            dynamic_zoom = self._compute_dynamic_zoom(row, col, default_zoom)
+            # Still cap to tile's max supported zoom (default + 1 is X-Plane's limit)
+            final_zoom = min(default_zoom + 1, dynamic_zoom)
+            
+            # Log when dynamic zoom changes the zoom level (reduce log spam)
+            if final_zoom != self._last_logged_dynamic_zoom:
+                fixed_zoom = self.target_zoom_level
+                if default_zoom == 18 and not CFG.autoortho.using_custom_tiles:
+                    fixed_zoom = self.target_zoom_level_near_airports
+                if final_zoom != fixed_zoom:
+                    log.info(f"Dynamic zoom: ZL{final_zoom} (was fixed ZL{fixed_zoom}) - altitude-based adjustment")
+                self._last_logged_dynamic_zoom = final_zoom
+            
+            return final_zoom
+
+        # Fixed mode - existing behavior
         if CFG.autoortho.using_custom_tiles:
             uncapped_target_zoom = self.target_zoom_level
         else:
-            uncapped_target_zoom = self.target_zoom_level_near_airports if default_zoom == 18 else self.target_zoom_level
+            uncapped_target_zoom = (
+                self.target_zoom_level_near_airports
+                if default_zoom == 18
+                else self.target_zoom_level
+            )
         return min(default_zoom + 1, uncapped_target_zoom)
 
     def _to_tile_id(self, row, col, map_type, zoom):
@@ -3563,12 +4034,13 @@ class TileCacher(object):
             if not tile:
                 self.misses += 1
                 bump('tile_mem_miss')
-                # Use target zoom level directly - much cleaner than offset calculations
+                # Use target zoom level - supports both fixed and dynamic modes
+                # Pass row/col for dynamic zoom computation based on predicted altitude
                 tile = Tile(
                     col, row, map_type, zoom, 
                     cache_dir=self.cache_dir,
                     min_zoom=self.min_zoom,
-                    max_zoom=self._get_target_zoom_level(zoom),
+                    max_zoom=self._get_target_zoom_level(zoom, row=row, col=col),
                 )
                 self.tiles[idx] = tile
                 # New tile becomes MRU

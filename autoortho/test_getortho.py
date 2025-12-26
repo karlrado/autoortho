@@ -1953,7 +1953,7 @@ class TestFallbackLevel:
         
         # Should return None immediately due to exhausted budget
         start = time.monotonic()
-        result = tile.get_or_build_lower_mipmap_chunk(0, 2176, 3232, 13, time_budget=budget)
+        result = tile.get_or_build_lower_mipmap_chunk(0, 2176, 3232, 13, main_budget=budget)
         elapsed = time.monotonic() - start
         
         # With exhausted budget, should return quickly (no network wait)

@@ -40,8 +40,34 @@ Key settings include:
 - **Tile Time Budget** - Maximum time to wait for a tile before returning results
 - **Fallback Level** - How aggressively to find replacement imagery for failed chunks
 - **Spatial Prefetching** - Proactively download tiles ahead of your aircraft
+- **Dynamic Zoom Levels** - Automatically adjust imagery quality based on altitude
 
 For detailed configuration options and recommended settings for different use cases, see the [Performance Tuning Guide](performance.md).
 
 For troubleshooting missing tiles or stuttering issues, see the [FAQ](faq.md#missing-color-tiles).
+
+## Dynamic Zoom Levels
+
+AutoOrtho can automatically adjust imagery zoom levels based on your altitude Above Ground Level (AGL). This provides:
+- Higher detail imagery when flying low
+- Lower detail (faster loading) imagery at high altitudes
+- Terrain-aware calculations — flying at 10,000ft MSL over 5,000ft mountains uses higher quality than 10,000ft over ocean
+
+Configure quality steps in **Settings** → **Imagery** → **Dynamic Zoom Mode**.
+
+See the [Performance Tuning Guide](performance.md#dynamic-zoom-levels) for detailed configuration.
+
+## SimBrief Integration
+
+AutoOrtho can integrate with your SimBrief account to use your flight plan data for:
+- **Dynamic Zoom**: Use planned altitudes at waypoints instead of velocity predictions
+- **Prefetching**: Download tiles along your actual flight path ahead of time
+
+To set up SimBrief integration:
+1. Go to **Settings** → **Setup** tab
+2. Enter your **SimBrief User ID**
+3. Click **Fetch Flight Data** after filing your flight plan
+4. Enable the toggle to use flight data for calculations
+
+See the [Performance Tuning Guide](performance.md#simbrief-integration) for detailed information and limitations.
 

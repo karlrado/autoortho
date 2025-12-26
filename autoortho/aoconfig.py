@@ -87,6 +87,16 @@ min_zoom = 12
 max_zoom = 16
 # Maximum zoom level to allow near airports. Zoom level around airports used by default is 18.
 max_zoom_near_airports = 18
+# Dynamic zoom mode: "fixed" (current behavior) or "dynamic" (altitude-based quality steps)
+# Fixed: Uses max_zoom slider value for all tiles
+# Dynamic: Uses altitude-based quality steps defined in dynamic_zoom_steps
+max_zoom_mode = fixed
+# Quality steps for dynamic zoom mode. List of altitude/zoom pairs.
+# Format: [{{"altitude_ft": <altitude>, "zoom_level": <zoom>}}, ...]
+# Example: [{{"altitude_ft": 0, "zoom_level": 17}}, {{"altitude_ft": 20000, "zoom_level": 15}}]
+# Altitude is "at or above" - tiles are rendered at the zoom level of the highest matching altitude.
+# The base step (altitude_ft: 0) cannot be removed and serves as the ground-level default.
+dynamic_zoom_steps = []
 # Per-chunk maximum wait time in seconds. This limits how long to wait for a SINGLE
 # chunk download before moving on. Works in combination with tile_time_budget:
 # - tile_time_budget: Total time for entire tile (all chunks combined)
@@ -144,9 +154,6 @@ prefetch_lookahead = 10
 prefetch_interval = 2.0
 # Maximum chunks to prefetch per cycle (8-64)
 prefetch_max_chunks = 24
-# Use HTTP/2 multiplexing if httpx is installed (recommended for faster downloads)
-# HTTP/2 allows multiple requests over a single connection, reducing latency
-use_http2 = True
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False
@@ -203,13 +210,26 @@ prefer_winfsp = True
 # AutoOrtho's scenery will be hidden and X-Plane will use its default scenery instead.
 enabled = False
 # Start time for exclusion in 24-hour format (HH:MM), e.g. "22:00" for 10 PM
-start_time = 22:00
+start_time = 23:00
 # End time for exclusion in 24-hour format (HH:MM), e.g. "06:00" for 6 AM
-end_time = 06:00
+end_time = 05:00
 # When enabled, assume exclusion is active until sim time is available.
 # Useful to ensure night flights start with default scenery from the beginning.
 # When disabled, AutoOrtho works normally until sim time confirms exclusion.
 default_to_exclusion = False
+
+[simbrief]
+# SimBrief user ID for flight plan integration
+userid = 
+# Use SimBrief flight data for dynamic zoom level and pre-fetching calculations
+use_flight_data = False
+# Radius in nautical miles to consider fixes when calculating altitude for a tile
+# All fixes within this radius are considered, and the lowest altitude is used
+route_consideration_radius_nm = 50
+# If the aircraft deviates more than this distance (nm) from the route, fall back to DataRef-based calculations
+route_deviation_threshold_nm = 40
+# Radius in nautical miles around waypoints to prefetch tiles
+route_prefetch_radius_nm = 40
 """
 
     def __init__(self, conf_file=None):
