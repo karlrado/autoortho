@@ -95,17 +95,17 @@ When enabled, AutoOrtho uses a wall-clock time limit for tile requests instead o
 
 #### Tile Time Budget (`tile_time_budget`)
 - **Type:** Float (seconds)
-- **Default:** 5.0
-- **Range:** 0.5 - 30.0 seconds
-- **Config file:** `tile_time_budget = 5.0`
+- **Default:** 180
+- **Range:** 60 - 600 seconds
+- **Config file:** `tile_time_budget = 180.0`
 
 The maximum wall-clock time for a **complete tile** (all mipmap levels combined). This budget measures **active processing time only** - queue wait time doesn't count. The budget starts when AutoOrtho actually begins processing the tile's chunks, not when the tile is first requested.
 
 | Value | Use Case | Effect |
 |-------|----------|--------|
-| 3.0 - 5.0s | Fast/smooth experience | Quicker loading, but more partial tiles |
-| 5.0 - 15.0s | Balanced | Good quality with reasonable loading times |
-| 15.0 - 30.0s | Maximum quality | Complete tiles, but longer loading times |
+| 60 - 120.0s | Fast/smooth experience | Quicker loading, but more partial tiles |
+| 120.0 - 300.0s | Balanced | Good quality with reasonable loading times |
+| 300 - 600.0s | Maximum quality | Complete tiles, but longer loading times |
 
 **How it works:**
 1. X-Plane requests a tile from AutoOrtho (tile enters processing queue)
@@ -117,6 +117,8 @@ The maximum wall-clock time for a **complete tile** (all mipmap levels combined)
 **Note:** Queue wait time (when other tiles are being processed first) does NOT count against the budget. This ensures fair time allocation even when many tiles are requested simultaneously.
 
 **Note:** Each tile covers a large geographic area (approximately 1 square degree of latitude/longitude at zoom 16). Higher budgets allow more time for all chunks to download and process.
+
+**Note:** The effectiveness of this setting will also depend on your configured max zoom level. Higher zoom levels with lower budget times will result in faster loading but lots of missing tiles.
 
 ---
 

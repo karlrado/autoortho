@@ -74,7 +74,7 @@ Each zoom level requires 4× more resources. Lowering your max zoom dramatically
 ```ini
 maptype_override_zoom = 16
 use_time_budget = True
-tile_time_budget = 20.0
+tile_time_budget = 300.0
 fallback_level = full
 fallback_extends_budget = True
 ```
