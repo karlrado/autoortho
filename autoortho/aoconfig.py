@@ -122,7 +122,7 @@ use_time_budget = True
 # Lower = faster loading, but may have more partial/blurry tiles
 # Higher = better quality, but longer initial load times
 # Recommended: 60.0 (fast), 120.0 (balanced), 300.0 (quality)
-tile_time_budget = 120.0
+tile_time_budget = 180.0
 # Fallback level when chunks fail to download in time:
 # none = Skip all fallbacks (fastest, may have missing tiles)
 # cache = Use disk cache and already-built mipmaps, no network (balanced)
@@ -148,8 +148,8 @@ prefetch_enabled = True
 # How far ahead to prefetch in minutes of flight time (1-60)
 # Higher = more tiles prefetched ahead, uses more bandwidth and memory
 # Lower = fewer tiles prefetched, less resource usage
-# Recommended: 5 (fast aircraft), 10 (balanced), 20 (slow internet)
-prefetch_lookahead = 10
+# Recommended: 15 (fast aircraft), 30 (balanced), 60 (slow internet or long haul)
+prefetch_lookahead = 30
 # How often to check for prefetch opportunities in seconds (1-10)
 prefetch_interval = 2.0
 # Maximum chunks to prefetch per cycle (8-64)
@@ -175,9 +175,9 @@ noclean = False
 [fuse]
 # Enable or disable multi-threading when using FUSE
 threading = {False if system_type == "darwin" else True}
-# Timeout in seconds for tile build operations. If a tile takes longer than this,
-# a placeholder will be shown instead of crashing X-Plane. Default: 60
-build_timeout = 60
+# NOTE: build_timeout (FUSE lock timeout) is calculated dynamically based on
+# tile_time_budget. Formula: tile_time_budget + fallback_timeout (if enabled) + 15s.
+# This ensures the lock timeout always exceeds the maximum possible tile build time.
 
 [flightdata]
 # Local port for map and stats

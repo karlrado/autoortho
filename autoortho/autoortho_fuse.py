@@ -334,6 +334,46 @@ class AutoOrtho(Operations):
     def _tile_key(self, row, col, maptype, zoom):
         return (row, col, maptype, zoom)
 
+    def _calculate_build_timeout(self):
+        """
+        Calculate dynamic build_timeout based on tile_time_budget settings.
+        
+        This ensures the FUSE lock timeout is always sufficient for tile building:
+        - Base: tile_time_budget (time allowed for chunk downloads)
+        - Extended: + fallback_timeout if fallback_extends_budget is enabled
+        - Buffer: + 15 seconds for DDS operations and overhead
+        
+        Returns timeout in seconds (int).
+        """
+        # Get tile_time_budget (default 120s)
+        tile_budget = getattr(CFG.autoortho, 'tile_time_budget', 120.0)
+        if isinstance(tile_budget, str):
+            try:
+                tile_budget = float(tile_budget)
+            except ValueError:
+                tile_budget = 120.0
+        
+        # Check if fallback extends the budget
+        fallback_extends = getattr(CFG.autoortho, 'fallback_extends_budget', False)
+        if isinstance(fallback_extends, str):
+            fallback_extends = fallback_extends.lower().strip() in ('true', '1', 'yes', 'on')
+        
+        # Get fallback_timeout if extended fallbacks are enabled (default 30s)
+        fallback_timeout = 0
+        if fallback_extends:
+            fallback_timeout = getattr(CFG.autoortho, 'fallback_timeout', 30)
+            if isinstance(fallback_timeout, str):
+                try:
+                    fallback_timeout = float(fallback_timeout)
+                except ValueError:
+                    fallback_timeout = 30
+        
+        # Calculate total: budget + extended fallback + 15s buffer
+        # The 15s buffer accounts for DDS read/write, processing overhead, and safety margin
+        build_timeout = int(tile_budget + fallback_timeout + 15)
+        
+        return build_timeout
+
     def _failfast(self, msg, exc=None):
         log.error(msg)
         if exc:
@@ -691,13 +731,15 @@ class AutoOrtho(Operations):
             key = self._tile_key(row, col, maptype, zoom)
             lock = self._tile_locks[key]
             
-            # Get configurable timeout, default 60 seconds
-            build_timeout = getattr(CFG.fuse, 'build_timeout', 60)
-            if isinstance(build_timeout, str):
-                try:
-                    build_timeout = int(build_timeout)
-                except ValueError:
-                    build_timeout = 60
+            # Calculate build_timeout dynamically based on tile_time_budget
+            # This ensures the FUSE lock timeout is always >= the tile build time
+            # Formula: tile_time_budget + fallback_timeout (if enabled) + 15s buffer
+            #
+            # The buffer accounts for:
+            # - DDS read/write operations after tile is built
+            # - Any processing overhead
+            # - Margin of safety to prevent premature lock timeout
+            build_timeout = self._calculate_build_timeout()
             
             if not lock.acquire(timeout=build_timeout):
                 # CRITICAL FIX: Instead of raising EIO (which causes CTD on Windows

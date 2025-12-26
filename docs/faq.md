@@ -100,19 +100,20 @@ If you're seeing many missing tiles with `fallback_level = full`, check these:
 Stuttering occurs when X-Plane waits for AutoOrtho to provide imagery. To minimize stutters:
 
 1. **Use Time Budget System:** Keep `use_time_budget = True` (default)
-2. **Use reasonable budget:** Set `tile_time_budget` to 5-10 seconds
+2. **Use reasonable budget:** Set `tile_time_budget` to 180-300 seconds
 3. **Use cache-only fallbacks:** Set `fallback_level = cache` to avoid network delays during fallbacks
 4. **Enable prefetching:** Keep `prefetch_enabled = True` to download tiles ahead of your aircraft
-5. **Increase prefetch lookahead:** Set `prefetch_lookahead = 60` or higher for faster aircraft
+5. **Increase prefetch lookahead:** Set `prefetch_lookahead = 30` or higher for faster aircraft
 
 **Recommended settings for stutter-free flying:**
 ```ini
 use_time_budget = True
-tile_time_budget = 5.0
+tile_time_budget = 180
 fallback_level = cache
 fallback_extends_budget = False
 prefetch_enabled = True
-prefetch_lookahead = 60
+prefetch_lookahead = 30
+max_zoom_level = 16
 ```
 
 **Trade-off:** You may see occasional blurry or missing tiles, but your flight will be smoother.
@@ -131,7 +132,7 @@ At startup, X-Plane requests the initial scenery tiles. Loading time depends on:
 
 **To speed up startup:**
 - **Lower your Max Zoom Level** - This has the biggest impact! ZL16→ZL15 is 4× faster
-- Use a lower `tile_time_budget` (5-10 seconds)
+- Use a lower `tile_time_budget` (180-300 seconds)
 - Enable `suspend_maxwait = True` to use extended timeouts only during startup
 - The second time you load the same area will be faster (cached data)
 
@@ -181,9 +182,9 @@ For detailed explanations, see the [Performance Tuning Guide](performance.md).
 - Worst case: 256 × 1.5s = 384 seconds (due to serial execution)
 - Actual time varies widely based on parallelism
 
-**Example:** With `tile_time_budget = 10s`:
-- Always completes in 10 seconds (predictable)
-- May have some missing chunks if network is slow
+**Example:** With `tile_time_budget = 180s`:
+- Always release a tile to X-Plane within 180 seconds (predictable)
+- May have some missing chunks if network is slow or zoom level is high
 
 **Recommendation:** Keep `use_time_budget = True` to use the new predictable system.
 
