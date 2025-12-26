@@ -68,6 +68,19 @@ To set up SimBrief integration:
 2. Enter your **SimBrief User ID**
 3. Click **Fetch Flight Data** after filing your flight plan
 4. Enable the toggle to use flight data for calculations
+5. Optionally adjust the **Route Calculation Settings** that appear below the toggle
+
+### Route Calculation Settings
+
+When flight data is loaded and the "Use Flight Data" toggle is enabled, additional settings become available:
+
+| Setting | Description |
+|---------|-------------|
+| **Route Consideration Radius** | How far (nm) to look for waypoints when calculating tile altitude. Larger values are more conservative. |
+| **Route Deviation Threshold** | Maximum distance (nm) off-route before falling back to DataRef-based calculations. |
+| **Route Prefetch Radius** | How far (nm) around waypoints to prefetch tiles. Larger values prefetch more tiles. |
+
+> **ℹ Real-time Changes:** These settings take effect immediately when modified — no restart required. Use **Save Config** to persist your values for future sessions.
 
 See the [Performance Tuning Guide](performance.md#simbrief-integration) for detailed information and limitations.
 

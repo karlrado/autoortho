@@ -580,11 +580,15 @@ Instead of prefetching based on velocity vector prediction, AutoOrtho follows yo
 
 ### Configuration Options
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `route_consideration_radius_nm` | 50 | Radius (NM) around a tile to consider fixes for altitude calculation |
-| `route_deviation_threshold_nm` | 40 | Distance (NM) off-route before falling back to DataRef calculations |
-| `route_prefetch_radius_nm` | 40 | Radius (NM) around waypoints for pre-fetching tiles |
+These settings are available in **Settings** → **Setup** → **SimBrief Integration** when flight data is loaded and the "Use Flight Data" toggle is enabled.
+
+| Setting | Default | Range | Description |
+|---------|---------|-------|-------------|
+| Route Consideration Radius | 50 nm | 10-200 nm | Radius around a tile to consider waypoints for altitude calculation. Uses the lowest altitude among nearby waypoints for conservative zoom level selection. |
+| Route Deviation Threshold | 40 nm | 5-100 nm | Maximum distance off-route before falling back to DataRef-based calculations. Accounts for ATC vectors or weather avoidance. |
+| Route Prefetch Radius | 40 nm | 10-150 nm | Radius around waypoints for pre-fetching tiles. Larger values prefetch more tiles but use more bandwidth. |
+
+> **ℹ Real-time Changes:** All route settings take effect immediately when modified — no restart required. However, use **Save Config** to persist your values for future AutoOrtho sessions.
 
 ### Fallback Behavior
 

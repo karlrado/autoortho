@@ -1248,6 +1248,147 @@ class ConfigUI(QMainWindow):
         self.simbrief_use_flight_data_check.stateChanged.connect(self._on_use_flight_data_changed)
         simbrief_info_layout.addWidget(self.simbrief_use_flight_data_check)
 
+        # Route settings container (visible when flight data is loaded and use_flight_data is checked)
+        self.simbrief_route_settings_frame = QFrame()
+        self.simbrief_route_settings_frame.setStyleSheet("""
+            QFrame {
+                background-color: #333333;
+                border: 1px solid #454545;
+                border-radius: 6px;
+                padding: 8px;
+                margin-top: 8px;
+            }
+        """)
+        route_settings_layout = QVBoxLayout()
+        route_settings_layout.setSpacing(10)
+        self.simbrief_route_settings_frame.setLayout(route_settings_layout)
+
+        route_settings_header = QLabel("Route Calculation Settings")
+        route_settings_header.setStyleSheet("""
+            QLabel {
+                font-size: 13px;
+                font-weight: bold;
+                color: #B0B0B0;
+                border: none;
+                padding: 0px;
+                margin-bottom: 4px;
+            }
+        """)
+        route_settings_layout.addWidget(route_settings_header)
+
+        # Route Consideration Radius
+        consideration_layout = QHBoxLayout()
+        consideration_label = QLabel("Route Consideration Radius:")
+        consideration_label.setToolTip(
+            "Radius in nautical miles to consider waypoints when calculating\n"
+            "the altitude for a tile.\n\n"
+            "When determining the zoom level for a tile, AutoOrtho looks at all\n"
+            "waypoints within this radius and uses the lowest altitude among them.\n"
+            "This ensures that when approaching lower altitude segments (like\n"
+            "descent or approach), tiles are fetched at an appropriate zoom level.\n\n"
+            "• Larger values: More conservative, fetches higher quality tiles earlier\n"
+            "• Smaller values: More accurate to current position, but may need to\n"
+            "  re-fetch tiles as you approach lower altitude segments\n\n"
+            "Default: 50 nm\n\n"
+            "ℹ Changes take effect immediately. Use 'Save Config' to persist\n"
+            "the value for future sessions."
+        )
+        consideration_layout.addWidget(consideration_label)
+        
+        self.simbrief_consideration_radius_spin = ModernSpinBox()
+        self.simbrief_consideration_radius_spin.setMinimum(10)
+        self.simbrief_consideration_radius_spin.setMaximum(200)
+        self.simbrief_consideration_radius_spin.setSuffix(" nm")
+        consideration_value = 50
+        if hasattr(self.cfg, 'simbrief'):
+            consideration_value = int(getattr(self.cfg.simbrief, 'route_consideration_radius_nm', 50))
+        self.simbrief_consideration_radius_spin.setValue(consideration_value)
+        self.simbrief_consideration_radius_spin.setToolTip(
+            "Radius (nm) to search for waypoints when calculating tile altitude"
+        )
+        self.simbrief_consideration_radius_spin.valueChanged.connect(
+            self._on_route_consideration_radius_changed
+        )
+        consideration_layout.addWidget(self.simbrief_consideration_radius_spin)
+        consideration_layout.addStretch()
+        route_settings_layout.addLayout(consideration_layout)
+
+        # Route Deviation Threshold
+        deviation_layout = QHBoxLayout()
+        deviation_label = QLabel("Route Deviation Threshold:")
+        deviation_label.setToolTip(
+            "Maximum distance in nautical miles the aircraft can deviate from\n"
+            "the flight plan before falling back to DataRef-based calculations.\n\n"
+            "When you fly off-route (e.g., ATC vectors, weather avoidance, or\n"
+            "free flight), the flight plan altitudes may no longer be accurate.\n"
+            "If you exceed this distance from the nearest route segment, AutoOrtho\n"
+            "will switch to using X-Plane's y_agl DataRef for altitude instead.\n\n"
+            "• Larger values: Trust flight plan longer when deviating\n"
+            "• Smaller values: Switch to DataRef sooner for accuracy\n\n"
+            "Default: 40 nm\n\n"
+            "ℹ Changes take effect immediately. Use 'Save Config' to persist\n"
+            "the value for future sessions."
+        )
+        deviation_layout.addWidget(deviation_label)
+        
+        self.simbrief_deviation_threshold_spin = ModernSpinBox()
+        self.simbrief_deviation_threshold_spin.setMinimum(5)
+        self.simbrief_deviation_threshold_spin.setMaximum(100)
+        self.simbrief_deviation_threshold_spin.setSuffix(" nm")
+        deviation_value = 40
+        if hasattr(self.cfg, 'simbrief'):
+            deviation_value = int(getattr(self.cfg.simbrief, 'route_deviation_threshold_nm', 40))
+        self.simbrief_deviation_threshold_spin.setValue(deviation_value)
+        self.simbrief_deviation_threshold_spin.setToolTip(
+            "Distance (nm) from route before falling back to DataRef altitude"
+        )
+        self.simbrief_deviation_threshold_spin.valueChanged.connect(
+            self._on_route_deviation_threshold_changed
+        )
+        deviation_layout.addWidget(self.simbrief_deviation_threshold_spin)
+        deviation_layout.addStretch()
+        route_settings_layout.addLayout(deviation_layout)
+
+        # Route Prefetch Radius
+        prefetch_layout = QHBoxLayout()
+        prefetch_label = QLabel("Route Prefetch Radius:")
+        prefetch_label.setToolTip(
+            "Radius in nautical miles around waypoints to prefetch tiles.\n\n"
+            "AutoOrtho can prefetch tiles along your flight route ahead of time.\n"
+            "This radius determines how far around each waypoint tiles will be\n"
+            "downloaded in advance, ensuring smooth scenery during your flight.\n\n"
+            "• Larger values: More tiles prefetched, better coverage but more\n"
+            "  bandwidth and cache usage\n"
+            "• Smaller values: Fewer tiles prefetched, lighter on resources\n\n"
+            "This works with the spatial prefetcher to download tiles around\n"
+            "waypoints you're approaching.\n\n"
+            "Default: 40 nm\n\n"
+            "ℹ Changes take effect immediately. Use 'Save Config' to persist\n"
+            "the value for future sessions."
+        )
+        prefetch_layout.addWidget(prefetch_label)
+        
+        self.simbrief_prefetch_radius_spin = ModernSpinBox()
+        self.simbrief_prefetch_radius_spin.setMinimum(10)
+        self.simbrief_prefetch_radius_spin.setMaximum(150)
+        self.simbrief_prefetch_radius_spin.setSuffix(" nm")
+        prefetch_value = 40
+        if hasattr(self.cfg, 'simbrief'):
+            prefetch_value = int(getattr(self.cfg.simbrief, 'route_prefetch_radius_nm', 40))
+        self.simbrief_prefetch_radius_spin.setValue(prefetch_value)
+        self.simbrief_prefetch_radius_spin.setToolTip(
+            "Radius (nm) around waypoints to prefetch tiles"
+        )
+        self.simbrief_prefetch_radius_spin.valueChanged.connect(
+            self._on_route_prefetch_radius_changed
+        )
+        prefetch_layout.addWidget(self.simbrief_prefetch_radius_spin)
+        prefetch_layout.addStretch()
+        route_settings_layout.addLayout(prefetch_layout)
+
+        self.simbrief_route_settings_frame.hide()  # Hidden until use_flight_data is checked
+        simbrief_info_layout.addWidget(self.simbrief_route_settings_frame)
+
         self.simbrief_info_frame.hide()
         simbrief_layout.addWidget(self.simbrief_info_frame)
 
@@ -3278,6 +3419,7 @@ class ConfigUI(QMainWindow):
         if not has_userid:
             self.simbrief_info_frame.hide()
             self.simbrief_use_flight_data_check.hide()
+            self.simbrief_route_settings_frame.hide()
             self.simbrief_unload_btn.hide()
             self.simbrief_flight_data = None
             
@@ -3329,6 +3471,7 @@ class ConfigUI(QMainWindow):
         self.simbrief_route_label.setText("")
         self.simbrief_details_label.setText("")
         self.simbrief_use_flight_data_check.hide()  # Hide toggle on error
+        self.simbrief_route_settings_frame.hide()  # Hide route settings on error
         self.simbrief_unload_btn.hide()  # Hide unload button on error
         self.simbrief_flight_data = None
         
@@ -3355,6 +3498,7 @@ class ConfigUI(QMainWindow):
         # Hide flight info UI
         self.simbrief_info_frame.hide()
         self.simbrief_use_flight_data_check.hide()
+        self.simbrief_route_settings_frame.hide()
         self.simbrief_unload_btn.hide()
         self.simbrief_error_label.hide()
         
@@ -3370,10 +3514,32 @@ class ConfigUI(QMainWindow):
         This allows users to load SimBrief data after pressing Run and have
         it take effect immediately without needing to save config.
         """
+        is_checked = (state == 2)  # Qt.CheckState.Checked has value 2
+        
+        # Show/hide route settings based on checkbox state
+        self.simbrief_route_settings_frame.setVisible(is_checked)
+        
         if hasattr(self.cfg, 'simbrief'):
-            # Qt.CheckState.Checked has value 2, Unchecked has value 0
-            self.cfg.simbrief.use_flight_data = (state == 2)
+            self.cfg.simbrief.use_flight_data = is_checked
             log.debug(f"SimBrief use_flight_data toggled: {self.cfg.simbrief.use_flight_data}")
+
+    def _on_route_consideration_radius_changed(self, value):
+        """Handle route consideration radius spinbox change"""
+        if hasattr(self.cfg, 'simbrief'):
+            self.cfg.simbrief.route_consideration_radius_nm = value
+            log.debug(f"SimBrief route_consideration_radius_nm changed: {value}")
+
+    def _on_route_deviation_threshold_changed(self, value):
+        """Handle route deviation threshold spinbox change"""
+        if hasattr(self.cfg, 'simbrief'):
+            self.cfg.simbrief.route_deviation_threshold_nm = value
+            log.debug(f"SimBrief route_deviation_threshold_nm changed: {value}")
+
+    def _on_route_prefetch_radius_changed(self, value):
+        """Handle route prefetch radius spinbox change"""
+        if hasattr(self.cfg, 'simbrief'):
+            self.cfg.simbrief.route_prefetch_radius_nm = value
+            log.debug(f"SimBrief route_prefetch_radius_nm changed: {value}")
 
     def _display_simbrief_flight_info(self, data):
         """Display SimBrief flight information in the UI"""
