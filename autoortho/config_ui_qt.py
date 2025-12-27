@@ -1638,7 +1638,7 @@ class ConfigUI(QMainWindow):
                 old_level = logging.getLevelName(root_logger.level)
                 root_logger.setLevel(min_level)
                 level_name = logging.getLevelName(min_level)
-                log.info(f"Root logger adjusted: {old_level} → {level_name} (handlers: {', '.join(handler_levels)})")
+                log.info(f"Root logger adjusted: {old_level} -> {level_name} (handlers: {', '.join(handler_levels)})")
         except Exception as e:
             log.error(f"Failed to update root logger level: {e}")
 
