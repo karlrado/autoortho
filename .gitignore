@@ -15,3 +15,4 @@ release/
 *.bin
 .version
 dist/
+docs/internal/

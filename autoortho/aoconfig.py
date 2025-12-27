@@ -154,6 +154,21 @@ prefetch_lookahead = 30
 prefetch_interval = 2.0
 # Maximum chunks to prefetch per cycle (8-64)
 prefetch_max_chunks = 24
+# Predictive DDS generation - pre-build DDS textures in background after prefetch
+# When enabled, tiles are compressed to DDS in the background, eliminating stutters
+# when X-Plane loads new scenery areas. Falls back gracefully on cache miss.
+predictive_dds_enabled = True
+# Maximum memory for pre-built DDS cache in MB (128-2048)
+# Higher = more tiles cached, fewer stutters, more RAM used
+# Lower = fewer tiles cached, more potential stutters, less RAM used
+# Recommended: 256 (low RAM), 512 (balanced), 1024 (high RAM)
+predictive_dds_cache_mb = 512
+# Minimum interval between DDS builds in milliseconds (100-2000)
+# Rate limits background builds to prevent CPU spikes during flight
+# Lower = faster building, higher CPU usage
+# Higher = slower building, lower CPU usage
+# Recommended: 250 (fast CPU), 500 (balanced), 1000 (low-end CPU)
+predictive_dds_build_interval_ms = 500
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False

@@ -2134,6 +2134,157 @@ class ConfigUI(QMainWindow):
         lookahead_layout.addWidget(self.prefetch_lookahead_value)
         autoortho_layout.addLayout(lookahead_layout)
         
+        # Prefetch interval slider (NEW)
+        interval_layout = QHBoxLayout()
+        self.prefetch_interval_label = QLabel("Check interval:")
+        self.prefetch_interval_label.setToolTip(
+            "How often (in seconds) to check for prefetch opportunities.\n"
+            "Lower = more responsive prefetching, slightly higher CPU\n"
+            "Higher = less frequent checks, lower CPU\n\n"
+            "Recommended: 2.0 sec (balanced)"
+        )
+        interval_layout.addWidget(self.prefetch_interval_label)
+        
+        self.prefetch_interval_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.prefetch_interval_slider.setRange(10, 100)  # 1.0-10.0 seconds (x10)
+        self.prefetch_interval_slider.setValue(
+            int(float(getattr(self.cfg.autoortho, 'prefetch_interval', 2.0)) * 10)
+        )
+        self.prefetch_interval_slider.setObjectName('prefetch_interval')
+        self.prefetch_interval_value = QLabel(
+            f"{self.prefetch_interval_slider.value() / 10:.1f} sec"
+        )
+        self.prefetch_interval_slider.valueChanged.connect(
+            lambda v: self.prefetch_interval_value.setText(f"{v / 10:.1f} sec")
+        )
+        interval_layout.addWidget(self.prefetch_interval_slider)
+        interval_layout.addWidget(self.prefetch_interval_value)
+        autoortho_layout.addLayout(interval_layout)
+        
+        # Prefetch max chunks slider (NEW)
+        max_chunks_layout = QHBoxLayout()
+        self.prefetch_max_chunks_label = QLabel("Max chunks/cycle:")
+        self.prefetch_max_chunks_label.setToolTip(
+            "Maximum number of chunks to submit per prefetch cycle.\n"
+            "Higher = more aggressive prefetching, more bandwidth\n"
+            "Lower = gentler prefetching, less bandwidth\n\n"
+            "Recommended: 24 (balanced), 48 (fast internet), 12 (slow internet)"
+        )
+        max_chunks_layout.addWidget(self.prefetch_max_chunks_label)
+        
+        self.prefetch_max_chunks_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.prefetch_max_chunks_slider.setRange(8, 64)
+        self.prefetch_max_chunks_slider.setValue(
+            int(getattr(self.cfg.autoortho, 'prefetch_max_chunks', 24))
+        )
+        self.prefetch_max_chunks_slider.setObjectName('prefetch_max_chunks')
+        self.prefetch_max_chunks_value = QLabel(
+            f"{self.prefetch_max_chunks_slider.value()}"
+        )
+        self.prefetch_max_chunks_slider.valueChanged.connect(
+            lambda v: self.prefetch_max_chunks_value.setText(f"{v}")
+        )
+        max_chunks_layout.addWidget(self.prefetch_max_chunks_slider)
+        max_chunks_layout.addWidget(self.prefetch_max_chunks_value)
+        autoortho_layout.addLayout(max_chunks_layout)
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # PREDICTIVE DDS SECTION (NEW)
+        # ═══════════════════════════════════════════════════════════════════
+        autoortho_layout.addSpacing(10)
+        predictive_dds_header = QLabel("Predictive DDS Generation")
+        predictive_dds_header.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        autoortho_layout.addWidget(predictive_dds_header)
+        
+        # Enable checkbox
+        predictive_enable_layout = QHBoxLayout()
+        self.predictive_dds_enabled_check = QCheckBox("Enable predictive DDS building")
+        self.predictive_dds_enabled_check.setChecked(
+            getattr(self.cfg.autoortho, 'predictive_dds_enabled', True)
+        )
+        self.predictive_dds_enabled_check.setToolTip(
+            "Pre-build DDS textures in the background after tiles are prefetched.\n\n"
+            "When enabled:\n"
+            "  • Downloaded tiles are compressed to DDS in the background\n"
+            "  • X-Plane reads are served from cache (near-instant)\n"
+            "  • Dramatically reduces stutters when entering new areas\n\n"
+            "When disabled:\n"
+            "  • Tiles are only downloaded, not pre-compressed\n"
+            "  • DDS compression happens when X-Plane reads (can stutter)"
+        )
+        self.predictive_dds_enabled_check.stateChanged.connect(
+            self._update_predictive_dds_controls
+        )
+        predictive_enable_layout.addWidget(self.predictive_dds_enabled_check)
+        predictive_enable_layout.addStretch()
+        autoortho_layout.addLayout(predictive_enable_layout)
+        
+        # Cache size slider
+        cache_layout = QHBoxLayout()
+        self.predictive_cache_label = QLabel("Cache size:")
+        self.predictive_cache_label.setToolTip(
+            "Maximum memory for pre-built DDS tiles.\n"
+            "Higher = more tiles cached, fewer stutters, more RAM used\n"
+            "Lower = fewer tiles cached, more potential stutters\n\n"
+            "Recommended:\n"
+            "  • 256 MB - Low RAM systems\n"
+            "  • 512 MB - Balanced (default)\n"
+            "  • 1024 MB - High RAM, long flights\n"
+            "  • 2048 MB - Maximum caching"
+        )
+        cache_layout.addWidget(self.predictive_cache_label)
+        
+        self.predictive_cache_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.predictive_cache_slider.setRange(128, 2048)
+        self.predictive_cache_slider.setSingleStep(64)
+        self.predictive_cache_slider.setValue(
+            int(getattr(self.cfg.autoortho, 'predictive_dds_cache_mb', 512))
+        )
+        self.predictive_cache_slider.setObjectName('predictive_dds_cache_mb')
+        self.predictive_cache_value = QLabel(
+            f"{self.predictive_cache_slider.value()} MB"
+        )
+        self.predictive_cache_slider.valueChanged.connect(
+            lambda v: self.predictive_cache_value.setText(f"{v} MB")
+        )
+        cache_layout.addWidget(self.predictive_cache_slider)
+        cache_layout.addWidget(self.predictive_cache_value)
+        autoortho_layout.addLayout(cache_layout)
+        
+        # Build interval slider
+        build_interval_layout = QHBoxLayout()
+        self.predictive_interval_label = QLabel("Build interval:")
+        self.predictive_interval_label.setToolTip(
+            "Minimum time between DDS builds (rate limiting).\n"
+            "Higher = less CPU usage, slower pre-building\n"
+            "Lower = faster pre-building, more CPU usage\n\n"
+            "Recommended:\n"
+            "  • 250 ms - Fast CPU, aggressive building\n"
+            "  • 500 ms - Balanced (default)\n"
+            "  • 1000 ms - Low-end CPU, minimal impact"
+        )
+        build_interval_layout.addWidget(self.predictive_interval_label)
+        
+        self.predictive_interval_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.predictive_interval_slider.setRange(100, 2000)
+        self.predictive_interval_slider.setSingleStep(50)
+        self.predictive_interval_slider.setValue(
+            int(getattr(self.cfg.autoortho, 'predictive_dds_build_interval_ms', 500))
+        )
+        self.predictive_interval_slider.setObjectName('predictive_dds_build_interval_ms')
+        self.predictive_interval_value = QLabel(
+            f"{self.predictive_interval_slider.value()} ms"
+        )
+        self.predictive_interval_slider.valueChanged.connect(
+            lambda v: self.predictive_interval_value.setText(f"{v} ms")
+        )
+        build_interval_layout.addWidget(self.predictive_interval_slider)
+        build_interval_layout.addWidget(self.predictive_interval_value)
+        autoortho_layout.addLayout(build_interval_layout)
+        
+        autoortho_layout.addSpacing(10)
+        # ═══════════════════════════════════════════════════════════════════
+        
         # Initialize prefetch control states
         self._update_prefetch_controls()
 
@@ -3213,9 +3364,39 @@ class ConfigUI(QMainWindow):
         """Update enabled state of prefetch controls based on enable checkbox."""
         enabled = self.prefetch_enabled_check.isChecked()
         
+        # Existing controls
         self.prefetch_lookahead_slider.setEnabled(enabled)
         self.prefetch_lookahead_label.setEnabled(enabled)
         self.prefetch_lookahead_value.setEnabled(enabled)
+        
+        # New prefetch controls
+        self.prefetch_interval_slider.setEnabled(enabled)
+        self.prefetch_interval_label.setEnabled(enabled)
+        self.prefetch_interval_value.setEnabled(enabled)
+        
+        self.prefetch_max_chunks_slider.setEnabled(enabled)
+        self.prefetch_max_chunks_label.setEnabled(enabled)
+        self.prefetch_max_chunks_value.setEnabled(enabled)
+        
+        # Predictive DDS controls depend on prefetch being enabled
+        self.predictive_dds_enabled_check.setEnabled(enabled)
+        self._update_predictive_dds_controls()
+    
+    def _update_predictive_dds_controls(self):
+        """Update enabled state of predictive DDS controls."""
+        # Predictive DDS requires prefetch to be enabled
+        prefetch_enabled = self.prefetch_enabled_check.isChecked()
+        predictive_enabled = self.predictive_dds_enabled_check.isChecked()
+        
+        enabled = prefetch_enabled and predictive_enabled
+        
+        self.predictive_cache_slider.setEnabled(enabled)
+        self.predictive_cache_label.setEnabled(enabled)
+        self.predictive_cache_value.setEnabled(enabled)
+        
+        self.predictive_interval_slider.setEnabled(enabled)
+        self.predictive_interval_label.setEnabled(enabled)
+        self.predictive_interval_value.setEnabled(enabled)
 
     def _init_dynamic_zoom_manager(self):
         """Initialize the dynamic zoom manager from config."""
@@ -4220,6 +4401,21 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.prefetch_enabled = self.prefetch_enabled_check.isChecked()
             self.cfg.autoortho.prefetch_lookahead = str(
                 self.prefetch_lookahead_slider.value()
+            )
+            self.cfg.autoortho.prefetch_interval = str(
+                self.prefetch_interval_slider.value() / 10.0
+            )
+            self.cfg.autoortho.prefetch_max_chunks = str(
+                self.prefetch_max_chunks_slider.value()
+            )
+            
+            # Predictive DDS settings
+            self.cfg.autoortho.predictive_dds_enabled = self.predictive_dds_enabled_check.isChecked()
+            self.cfg.autoortho.predictive_dds_cache_mb = str(
+                self.predictive_cache_slider.value()
+            )
+            self.cfg.autoortho.predictive_dds_build_interval_ms = str(
+                self.predictive_interval_slider.value()
             )
             
             self.cfg.autoortho.fetch_threads = str(

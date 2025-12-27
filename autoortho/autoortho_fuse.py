@@ -248,8 +248,18 @@ class AutoOrtho(Operations):
 
         self.tc = getortho.TileCacher(cache_dir)
         
+        # Register terrain index for this scenery
+        # This indexes .ter files to discover actual tile zoom levels
+        # Critical for predictive DDS: ensures we prefetch the exact tiles X-Plane will request
+        terrain_folder = os.path.join(self.root, "terrain")
+        scenery_name = os.path.basename(self.root)
+        getortho.register_terrain_index(terrain_folder, scenery_name)
+        
         # Start spatial prefetcher for proactive tile loading
         getortho.start_prefetcher(self.tc)
+        
+        # Start predictive DDS generation (pre-builds DDS in background)
+        getortho.start_predictive_dds(self.tc)
     
         #self.path_condition = threading.Condition()
         #self.read_lock = threading.Lock()
@@ -696,6 +706,12 @@ class AutoOrtho(Operations):
             row = int(row)
             col = int(col)
             zoom = int(zoom)
+            
+            # Register non-BI maptypes for terrain lookup (custom Ortho4XP tiles)
+            # This allows the prefetcher to also check for custom tile maptypes
+            if maptype != "BI":
+                getortho.register_discovered_maptype(maptype)
+            
             t = self.tc._open_tile(row, col, maptype, zoom)
             try:
                 self._size_cache[(row, col, maptype, zoom)] = t.dds.total_size
