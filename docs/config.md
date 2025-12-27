@@ -61,7 +61,7 @@ See the [Performance Tuning Guide](performance.md#dynamic-zoom-levels) for detai
 
 AutoOrtho can integrate with your SimBrief account to use your flight plan data for:
 - **Dynamic Zoom**: Use planned altitudes at waypoints instead of velocity predictions
-- **Prefetching**: Download tiles along your actual flight path ahead of time
+- **Prefetching**: Download tiles along your actual flight path, prioritized by time-to-encounter using SimBrief's calculated flight times
 
 To set up SimBrief integration:
 1. Go to **Settings** → **Setup** tab
@@ -78,7 +78,7 @@ When flight data is loaded and the "Use Flight Data" toggle is enabled, addition
 |---------|-------------|
 | **Route Consideration Radius** | How far (nm) to look for waypoints when calculating tile altitude. Larger values are more conservative. |
 | **Route Deviation Threshold** | Maximum distance (nm) off-route before falling back to DataRef-based calculations. |
-| **Route Prefetch Radius** | How far (nm) around waypoints to prefetch tiles. Larger values prefetch more tiles. |
+| **Route Prefetch Radius** | How far (nm) perpendicular to your route to prefetch tiles. The path is sampled uniformly along the route; this controls the width of coverage. |
 
 > **ℹ Real-time Changes:** These settings take effect immediately when modified — no restart required. Use **Save Config** to persist your values for future sessions.
 
