@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QHeaderView
 )
 from PySide6.QtCore import (
-    Qt, QThread, Signal, QTimer, QSize, QPoint, QObject
+    Qt, QThread, Signal, QTimer, QSize, QPoint, QObject, QEvent
 )
 from PySide6.QtGui import (
     QPixmap, QIcon, QColor, QWheelEvent, QCursor
@@ -397,6 +397,11 @@ class ModernSpinBox(QSpinBox):
                 height: 12px;
             }
         """)
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
 
 
 class QualityStepsDialog(QDialog):
@@ -925,6 +930,21 @@ class ConfigUI(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready")
 
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if (
+            obj is self.maptype_combo
+            or obj is self.max_zoom_mode_combo
+            or obj is self.fallback_level_combo
+            or obj is self.compressor_combo
+            or obj is self.format_combo
+            or obj is self.console_log_level_combo
+            or obj is self.file_log_level_combo
+        ) and event.type() == QEvent.Type.Wheel:
+            if not obj.hasFocus():
+                event.ignore()
+                return True
+        return super().eventFilter(obj, event)
+
     def create_setup_tab(self):
         """Create the setup configuration tab"""
         setup_widget = QWidget()
@@ -1078,6 +1098,8 @@ class ConfigUI(QMainWindow):
         )
         maptype_layout.addWidget(maptype_label)
         self.maptype_combo = QComboBox()
+        self.maptype_combo.installEventFilter(self)
+        self.maptype_combo.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
         self.maptype_combo.addItems(MAPTYPES)
         self.maptype_combo.setCurrentText(self.cfg.autoortho.maptype_override)
         self.maptype_combo.setObjectName('maptype_override')
@@ -1296,6 +1318,7 @@ class ConfigUI(QMainWindow):
         consideration_layout.addWidget(consideration_label)
         
         self.simbrief_consideration_radius_spin = ModernSpinBox()
+        self.simbrief_consideration_radius_spin.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
         self.simbrief_consideration_radius_spin.setMinimum(10)
         self.simbrief_consideration_radius_spin.setMaximum(200)
         self.simbrief_consideration_radius_spin.setSuffix(" nm")
@@ -1332,6 +1355,7 @@ class ConfigUI(QMainWindow):
         deviation_layout.addWidget(deviation_label)
         
         self.simbrief_deviation_threshold_spin = ModernSpinBox()
+        self.simbrief_deviation_threshold_spin.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
         self.simbrief_deviation_threshold_spin.setMinimum(5)
         self.simbrief_deviation_threshold_spin.setMaximum(100)
         self.simbrief_deviation_threshold_spin.setSuffix(" nm")
@@ -1369,6 +1393,7 @@ class ConfigUI(QMainWindow):
         prefetch_layout.addWidget(prefetch_label)
         
         self.simbrief_prefetch_radius_spin = ModernSpinBox()
+        self.simbrief_prefetch_radius_spin.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
         self.simbrief_prefetch_radius_spin.setMinimum(10)
         self.simbrief_prefetch_radius_spin.setMaximum(150)
         self.simbrief_prefetch_radius_spin.setSuffix(" nm")
@@ -1613,7 +1638,7 @@ class ConfigUI(QMainWindow):
                 old_level = logging.getLevelName(root_logger.level)
                 root_logger.setLevel(min_level)
                 level_name = logging.getLevelName(min_level)
-                log.info(f"Root logger adjusted: {old_level} → {level_name} (handlers: {', '.join(handler_levels)})")
+                log.info(f"Root logger adjusted: {old_level} -> {level_name} (handlers: {', '.join(handler_levels)})")
         except Exception as e:
             log.error(f"Failed to update root logger level: {e}")
 
@@ -1756,6 +1781,8 @@ class ConfigUI(QMainWindow):
         max_zoom_mode_layout.addWidget(max_zoom_mode_label)
         
         self.max_zoom_mode_combo = QComboBox()
+        self.max_zoom_mode_combo.installEventFilter(self)
+        self.max_zoom_mode_combo.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
         self.max_zoom_mode_combo.addItems(["Fixed", "Dynamic"])
         current_mode = str(getattr(self.cfg.autoortho, 'max_zoom_mode', 'fixed')).lower()
         self.max_zoom_mode_combo.setCurrentText("Dynamic" if current_mode == "dynamic" else "Fixed")
@@ -2006,6 +2033,8 @@ class ConfigUI(QMainWindow):
         )
         fallback_layout.addWidget(fallback_label)
         self.fallback_level_combo = QComboBox()
+        self.fallback_level_combo.installEventFilter(self)
+        self.fallback_level_combo.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
         self.fallback_level_combo.addItems([
             "None (Fastest)",
             "Cache Only (Balanced)",
@@ -2152,6 +2181,7 @@ class ConfigUI(QMainWindow):
         )
         threads_layout.addWidget(threads_label)
         self.fetch_threads_spinbox = ModernSpinBox()
+        self.fetch_threads_spinbox.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
 
         max_threads = 1000
         self.fetch_threads_spinbox.setRange(1, max_threads)
@@ -2359,6 +2389,8 @@ class ConfigUI(QMainWindow):
             )
             compressor_layout.addWidget(compressor_label)
             self.compressor_combo = QComboBox()
+            self.compressor_combo.installEventFilter(self)
+            self.compressor_combo.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
             self.compressor_combo.addItems(supported_compressors)
             self.compressor_combo.setCurrentText(self.cfg.pydds.compressor)
             self.compressor_combo.setObjectName('compressor')
@@ -2387,6 +2419,8 @@ class ConfigUI(QMainWindow):
         )
         format_layout.addWidget(format_label)
         self.format_combo = QComboBox()
+        self.format_combo.installEventFilter(self)
+        self.format_combo.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
         self.format_combo.addItems(['BC1', 'BC3'])
         self.format_combo.setCurrentText(self.cfg.pydds.format)
         self.format_combo.setObjectName('format')
@@ -2442,6 +2476,8 @@ class ConfigUI(QMainWindow):
         )
         console_log_level_layout.addWidget(console_log_level_label)
         self.console_log_level_combo = QComboBox()
+        self.console_log_level_combo.installEventFilter(self)
+        self.console_log_level_combo.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
         self.console_log_level_combo.addItems(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
         console_level = getattr(self.cfg.general, 'console_log_level', 'INFO').upper()
         self.console_log_level_combo.setCurrentText(console_level)
@@ -2471,6 +2507,8 @@ class ConfigUI(QMainWindow):
         )
         file_log_level_layout.addWidget(file_log_level_label)
         self.file_log_level_combo = QComboBox()
+        self.file_log_level_combo.installEventFilter(self)
+        self.file_log_level_combo.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
         self.file_log_level_combo.addItems(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
         file_level = getattr(self.cfg.general, 'file_log_level', 'DEBUG').upper()
         self.file_log_level_combo.setCurrentText(file_level)
