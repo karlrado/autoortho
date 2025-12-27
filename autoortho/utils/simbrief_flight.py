@@ -52,6 +52,35 @@ EARTH_RADIUS_NM = 3440.065
 
 
 @dataclass
+class PathPoint:
+    """
+    A point along the flight path with time-to-encounter information.
+    
+    Used for prefetching prioritization - points the aircraft will reach
+    sooner should be prefetched first.
+    
+    Attributes:
+        lat: Latitude in degrees
+        lon: Longitude in degrees
+        time_to_reach_sec: Estimated time to reach this point in seconds
+        altitude_ft: Planned altitude at this point in feet (MSL)
+        ground_height_ft: Terrain elevation at this point in feet
+        distance_from_start_nm: Distance from current position along the path
+    """
+    lat: float
+    lon: float
+    time_to_reach_sec: float
+    altitude_ft: int
+    ground_height_ft: int
+    distance_from_start_nm: float
+    
+    @property
+    def altitude_agl_ft(self) -> int:
+        """Calculate altitude Above Ground Level (AGL)."""
+        return max(0, self.altitude_ft - self.ground_height_ft)
+
+
+@dataclass
 class FlightFix:
     """
     A waypoint/fix from the SimBrief flight plan.
@@ -65,6 +94,9 @@ class FlightFix:
         altitude_ft: Planned altitude at this fix in feet (MSL)
         ground_height_ft: Terrain elevation at this fix in feet (MSL)
         index: Position in the route (0 = departure, -1 = arrival)
+        time_total_sec: Cumulative time from departure to this fix in seconds
+        time_leg_sec: Time for this leg only in seconds
+        groundspeed_kts: Planned ground speed at this fix in knots
         is_toc: True if this is Top of Climb
         is_tod: True if this is Top of Descent
         
@@ -79,6 +111,9 @@ class FlightFix:
     altitude_ft: int
     ground_height_ft: int
     index: int
+    time_total_sec: int = 0
+    time_leg_sec: int = 0
+    groundspeed_kts: int = 0
     is_toc: bool = False
     is_tod: bool = False
     
@@ -222,6 +257,14 @@ class SimBriefFlightManager:
             # Get ground height (terrain elevation) - defaults to 0 if not available
             ground_height_ft = int(fix_data.get('ground_height', 0))
             
+            # Get timing information from SimBrief
+            # time_total: cumulative seconds from departure
+            # time_leg: seconds for this leg only
+            # groundspeed: planned ground speed at this fix in knots
+            time_total_sec = int(fix_data.get('time_total', 0))
+            time_leg_sec = int(fix_data.get('time_leg', 0))
+            groundspeed_kts = int(fix_data.get('groundspeed', 0))
+            
             # Check for TOC/TOD
             is_toc = ident.upper() == 'TOC' or 'TOP OF CLIMB' in name.upper()
             is_tod = ident.upper() == 'TOD' or 'TOP OF DESCENT' in name.upper()
@@ -235,6 +278,9 @@ class SimBriefFlightManager:
                 altitude_ft=altitude_ft,
                 ground_height_ft=ground_height_ft,
                 index=index,
+                time_total_sec=time_total_sec,
+                time_leg_sec=time_leg_sec,
+                groundspeed_kts=groundspeed_kts,
                 is_toc=is_toc,
                 is_tod=is_tod
             )
@@ -565,6 +611,260 @@ class SimBriefFlightManager:
         """Get all fixes in the flight plan."""
         with self._lock:
             return list(self._fixes)
+    
+    def get_path_points_with_time(self, aircraft_lat: float, aircraft_lon: float,
+                                   lookahead_sec: float,
+                                   spacing_nm: float = 20.0) -> List[PathPoint]:
+        """
+        Get interpolated points along the flight path with time-to-encounter.
+        
+        Uses SimBrief's pre-calculated time_total for each fix to determine
+        time-to-encounter. This is more accurate than calculating from current
+        ground speed because SimBrief accounts for winds, climb/descent speeds, etc.
+        
+        The method:
+        1. Finds the aircraft's position on the route
+        2. Calculates the aircraft's "current time" based on position
+        3. Walks forward through fixes, interpolating points at regular intervals
+        4. Calculates time_to_reach = point_time - aircraft_current_time
+        5. Stops when lookahead time is exceeded
+        
+        Args:
+            aircraft_lat: Current aircraft latitude
+            aircraft_lon: Current aircraft longitude
+            lookahead_sec: Maximum time ahead to generate points (seconds)
+            spacing_nm: Distance between interpolated points (nautical miles)
+            
+        Returns:
+            List of PathPoint objects sorted by time_to_reach_sec (closest first)
+        """
+        with self._lock:
+            if not self._fixes or len(self._fixes) < 2:
+                return []
+            
+            # Find the closest segment and projection point
+            closest_segment_idx, projection_lat, projection_lon, dist_along_segment = \
+                self._find_closest_segment_projection(aircraft_lat, aircraft_lon)
+            
+            if closest_segment_idx < 0:
+                return []
+            
+            # Calculate the aircraft's "current time" on the route
+            # by interpolating between the fix times based on position
+            fix1 = self._fixes[closest_segment_idx]
+            fix2 = self._fixes[closest_segment_idx + 1]
+            segment_length = self._haversine_distance(fix1.lat, fix1.lon, fix2.lat, fix2.lon)
+            
+            if segment_length > 0:
+                segment_fraction = dist_along_segment / segment_length
+            else:
+                segment_fraction = 0.0
+            
+            # Interpolate current time based on position between fixes
+            # fix1.time_total_sec is time to reach fix1, fix2.time_total_sec is time to reach fix2
+            aircraft_current_time_sec = fix1.time_total_sec + segment_fraction * (fix2.time_total_sec - fix1.time_total_sec)
+            
+            path_points = []
+            cumulative_distance_nm = 0.0
+            
+            # Start from the projection point and work forward along the route
+            current_lat = projection_lat
+            current_lon = projection_lon
+            current_segment_idx = closest_segment_idx
+            remaining_in_segment = self._haversine_distance(
+                current_lat, current_lon,
+                self._fixes[current_segment_idx + 1].lat,
+                self._fixes[current_segment_idx + 1].lon
+            )
+            
+            while current_segment_idx < len(self._fixes) - 1:
+                fix1 = self._fixes[current_segment_idx]
+                fix2 = self._fixes[current_segment_idx + 1]
+                segment_length = self._haversine_distance(fix1.lat, fix1.lon, fix2.lat, fix2.lon)
+                
+                # Generate points along this segment at spacing intervals
+                distance_to_next_point = spacing_nm
+                
+                while remaining_in_segment >= distance_to_next_point:
+                    # Calculate how far we've moved into this segment
+                    distance_into_segment = segment_length - remaining_in_segment + distance_to_next_point
+                    seg_fraction = distance_into_segment / segment_length if segment_length > 0 else 0
+                    seg_fraction = max(0.0, min(1.0, seg_fraction))
+                    
+                    # Calculate interpolated position
+                    point_lat, point_lon = self._interpolate_position(
+                        fix1.lat, fix1.lon,
+                        fix2.lat, fix2.lon,
+                        seg_fraction
+                    )
+                    
+                    # Interpolate time using SimBrief's fix times
+                    point_time_sec = fix1.time_total_sec + seg_fraction * (fix2.time_total_sec - fix1.time_total_sec)
+                    time_to_reach = point_time_sec - aircraft_current_time_sec
+                    
+                    # Check if we've exceeded lookahead
+                    if time_to_reach > lookahead_sec:
+                        return path_points
+                    
+                    # Skip points behind us (negative time)
+                    if time_to_reach < 0:
+                        remaining_in_segment -= distance_to_next_point
+                        cumulative_distance_nm += distance_to_next_point
+                        continue
+                    
+                    # Interpolate altitude and ground height
+                    altitude_ft = int(fix1.altitude_ft + seg_fraction * (fix2.altitude_ft - fix1.altitude_ft))
+                    ground_height_ft = int(fix1.ground_height_ft + seg_fraction * (fix2.ground_height_ft - fix1.ground_height_ft))
+                    
+                    cumulative_distance_nm += distance_to_next_point
+                    
+                    path_points.append(PathPoint(
+                        lat=point_lat,
+                        lon=point_lon,
+                        time_to_reach_sec=time_to_reach,
+                        altitude_ft=altitude_ft,
+                        ground_height_ft=ground_height_ft,
+                        distance_from_start_nm=cumulative_distance_nm
+                    ))
+                    
+                    # Update remaining distance in segment
+                    remaining_in_segment -= distance_to_next_point
+                
+                # Move to next segment
+                if current_segment_idx < len(self._fixes) - 2:
+                    cumulative_distance_nm += remaining_in_segment
+                    current_segment_idx += 1
+                    remaining_in_segment = self._haversine_distance(
+                        self._fixes[current_segment_idx].lat,
+                        self._fixes[current_segment_idx].lon,
+                        self._fixes[current_segment_idx + 1].lat,
+                        self._fixes[current_segment_idx + 1].lon
+                    )
+                else:
+                    break
+            
+            return path_points
+    
+    def _find_closest_segment_projection(self, lat: float, lon: float) -> Tuple[int, float, float, float]:
+        """
+        Find the route segment closest to the given position and the projection point.
+        
+        Returns:
+            Tuple of (segment_index, projection_lat, projection_lon, distance_along_segment)
+            Returns (-1, 0, 0, 0) if no valid segment found.
+        """
+        if len(self._fixes) < 2:
+            return (-1, 0.0, 0.0, 0.0)
+        
+        best_segment_idx = -1
+        best_distance = float('inf')
+        best_projection = (0.0, 0.0)
+        best_along_track = 0.0
+        
+        for i in range(len(self._fixes) - 1):
+            fix1 = self._fixes[i]
+            fix2 = self._fixes[i + 1]
+            
+            # Calculate projection onto this segment
+            proj_lat, proj_lon, along_track = self._project_onto_segment(
+                lat, lon, fix1.lat, fix1.lon, fix2.lat, fix2.lon
+            )
+            
+            # Distance from aircraft to projection
+            distance = self._haversine_distance(lat, lon, proj_lat, proj_lon)
+            
+            if distance < best_distance:
+                best_distance = distance
+                best_segment_idx = i
+                best_projection = (proj_lat, proj_lon)
+                best_along_track = along_track
+        
+        return (best_segment_idx, best_projection[0], best_projection[1], best_along_track)
+    
+    def _project_onto_segment(self, lat: float, lon: float,
+                               lat1: float, lon1: float,
+                               lat2: float, lon2: float) -> Tuple[float, float, float]:
+        """
+        Project a point onto a line segment.
+        
+        Returns:
+            Tuple of (projection_lat, projection_lon, distance_along_segment_nm)
+        """
+        # Calculate distances
+        d1 = self._haversine_distance(lat1, lon1, lat, lon)
+        d2 = self._haversine_distance(lat2, lon2, lat, lon)
+        segment_length = self._haversine_distance(lat1, lon1, lat2, lon2)
+        
+        if segment_length < 0.1:  # Very short segment
+            return (lat1, lon1, 0.0)
+        
+        # Use bearing-based projection
+        bearing_1_to_point = self._initial_bearing(lat1, lon1, lat, lon)
+        bearing_1_to_2 = self._initial_bearing(lat1, lon1, lat2, lon2)
+        
+        angle_diff = abs(self._normalize_angle(bearing_1_to_point - bearing_1_to_2))
+        
+        if angle_diff > 90:
+            # Point is behind segment start
+            return (lat1, lon1, 0.0)
+        
+        bearing_2_to_point = self._initial_bearing(lat2, lon2, lat, lon)
+        bearing_2_to_1 = self._initial_bearing(lat2, lon2, lat1, lon1)
+        
+        angle_diff_2 = abs(self._normalize_angle(bearing_2_to_point - bearing_2_to_1))
+        
+        if angle_diff_2 > 90:
+            # Point is past segment end
+            return (lat2, lon2, segment_length)
+        
+        # Calculate along-track distance
+        along_track = d1 * math.cos(math.radians(angle_diff))
+        
+        # Clamp to segment
+        along_track = max(0, min(segment_length, along_track))
+        
+        # Calculate projection point
+        fraction = along_track / segment_length if segment_length > 0 else 0
+        proj_lat = lat1 + fraction * (lat2 - lat1)
+        proj_lon = lon1 + fraction * (lon2 - lon1)
+        
+        return (proj_lat, proj_lon, along_track)
+    
+    def _interpolate_position(self, lat1: float, lon1: float,
+                               lat2: float, lon2: float,
+                               fraction: float) -> Tuple[float, float]:
+        """
+        Interpolate between two positions.
+        
+        Uses simple linear interpolation (acceptable for short distances).
+        
+        Args:
+            lat1, lon1: Start position
+            lat2, lon2: End position
+            fraction: Interpolation fraction (0 = start, 1 = end)
+            
+        Returns:
+            Tuple of (interpolated_lat, interpolated_lon)
+        """
+        fraction = max(0.0, min(1.0, fraction))
+        lat = lat1 + fraction * (lat2 - lat1)
+        lon = lon1 + fraction * (lon2 - lon1)
+        return (lat, lon)
+    
+    def _get_segment_fraction(self, lat: float, lon: float,
+                               fix1: FlightFix, fix2: FlightFix) -> float:
+        """
+        Calculate the fraction along a segment where a point lies.
+        
+        Returns a value between 0 (at fix1) and 1 (at fix2).
+        """
+        d_to_fix1 = self._haversine_distance(lat, lon, fix1.lat, fix1.lon)
+        segment_length = self._haversine_distance(fix1.lat, fix1.lon, fix2.lat, fix2.lon)
+        
+        if segment_length < 0.1:
+            return 0.0
+        
+        return min(1.0, d_to_fix1 / segment_length)
     
     def get_route_info(self) -> Dict:
         """

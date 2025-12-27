@@ -277,10 +277,17 @@ The prefetching system proactively downloads tiles ahead of your aircraft to red
 When enabled, AutoOrtho monitors your aircraft's position, heading, and speed to predict which tiles you'll need next and downloads them in advance.
 
 **How it works:**
+
+*With SimBrief flight data loaded:*
+1. AutoOrtho follows your actual flight plan, interpolating between waypoints
+2. Uses SimBrief's calculated times (accounting for winds and climb/descent)
+3. Prioritizes tiles by time-to-encounter (closest tiles first)
+4. Downloads tiles uniformly along your entire route
+
+*Without SimBrief (velocity-based):*
 1. AutoOrtho tracks your aircraft's heading and ground speed
-2. It calculates which tiles are in your flight path
+2. It calculates which tiles are in your flight path ahead
 3. It downloads those tiles in the background before you reach them
-4. When X-Plane requests those tiles, they're already cached
 
 **Prefetching with Dynamic Zoom:**
 
@@ -617,12 +624,19 @@ Instead of predicting altitude based on current vertical speed, AutoOrtho uses y
 
 #### Prefetching with SimBrief
 
-Instead of prefetching based on velocity vector prediction, AutoOrtho follows your actual flight path:
+Instead of prefetching based on velocity vector prediction, AutoOrtho follows your actual flight path with time-based prioritization:
 
-1. Gets upcoming waypoints from your SimBrief flight plan
-2. For each waypoint, calculates the appropriate zoom level based on planned AGL altitude
-3. Prefetches tiles around each waypoint at the correct zoom level
-4. Only prefetches when the download queue is not busy (priority tiles come first)
+1. **Projects your position onto the route** — finds exactly where you are on the flight plan
+2. **Calculates your "current time"** — interpolates between waypoint times based on position
+3. **Walks forward along the entire path** — interpolating between waypoints at regular intervals (not just around waypoints)
+4. **Uses SimBrief's planned times** — accounts for winds, climb/descent speeds, and holds
+5. **Calculates time-to-encounter** for each point along the path
+6. **Prioritizes tiles by time** — tiles you'll reach sooner are prefetched first
+7. **Stops at the configured lookahead time** — doesn't waste bandwidth on distant tiles
+
+**Key advantage:** The path is uniformly sampled between waypoints, so even long oceanic legs or direct routes with distant waypoints get full coverage. Tiles are downloaded in the order you'll actually encounter them.
+
+**Example:** If your next waypoint is 200nm away but you'll pass near a tile in 5 minutes, that tile is prefetched before tiles near the waypoint itself.
 
 ### Configuration Options
 
@@ -632,7 +646,7 @@ These settings are available in **Settings** → **Setup** → **SimBrief Integr
 |---------|---------|-------|-------------|
 | Route Consideration Radius | 50 nm | 10-200 nm | Radius around a tile to consider waypoints for altitude calculation. Uses the lowest altitude among nearby waypoints for conservative zoom level selection. |
 | Route Deviation Threshold | 40 nm | 5-100 nm | Maximum distance off-route before falling back to DataRef-based calculations. Accounts for ATC vectors or weather avoidance. |
-| Route Prefetch Radius | 40 nm | 10-150 nm | Radius around waypoints for pre-fetching tiles. Larger values prefetch more tiles but use more bandwidth. |
+| Route Prefetch Radius | 40 nm | 10-150 nm | Radius around path points for pre-fetching tiles. Larger values prefetch more tiles perpendicular to your route. |
 
 > **ℹ Real-time Changes:** All route settings take effect immediately when modified — no restart required. However, use **Save Config** to persist your values for future AutoOrtho sessions.
 

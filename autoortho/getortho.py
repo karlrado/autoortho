@@ -8,7 +8,7 @@ import concurrent.futures
 import uuid
 import math
 import tracemalloc
-from typing import Optional
+from typing import Optional, Dict, Tuple, List
 
 from io import BytesIO
 from urllib.request import urlopen, Request
@@ -37,7 +37,7 @@ from utils.constants import (
 from utils.apple_token_service import apple_token_service
 from utils.dynamic_zoom import DynamicZoomManager
 from utils.altitude_predictor import predict_altitude_at_closest_approach
-from utils.simbrief_flight import simbrief_flight_manager
+from utils.simbrief_flight import simbrief_flight_manager, PathPoint
 
 from datareftrack import dt as datareftracker
 
@@ -902,13 +902,103 @@ class SpatialPrefetcher:
     
     def _prefetch_along_flight_plan(self, lat: float, lon: float) -> int:
         """
-        Prefetch tiles along the SimBrief flight plan waypoints.
+        Prefetch tiles along the SimBrief flight plan path with time-based priority.
         
-        Gets upcoming waypoints from current position and prefetches tiles
-        in a radius around each waypoint, working forward from current position.
+        This method interpolates points along the entire flight path (not just at
+        waypoints) and prioritizes tiles by time-to-encounter. Tiles the aircraft
+        will reach sooner are prefetched first.
         
-        Uses the flight plan altitude at each waypoint to determine the
+        The path is interpolated at regular intervals to ensure uniform coverage
+        even when waypoints are far apart.
+        
+        Uses the flight plan altitude at each position to determine the
         appropriate zoom level, matching what will actually be displayed.
+        
+        Returns number of chunks submitted.
+        """
+        chunks_submitted = 0
+        
+        # Get prefetch radius from config
+        prefetch_radius_nm = float(getattr(CFG.simbrief, 'route_prefetch_radius_nm', 40))
+        
+        # Get interpolated path points with time-to-encounter
+        # Uses SimBrief's pre-calculated times (accounts for winds, climb/descent, etc.)
+        # Spacing determines how frequently we sample the path
+        # Smaller spacing = more uniform coverage, but more computation
+        spacing_nm = min(prefetch_radius_nm / 2, 15.0)  # Sample at half the radius or 15nm
+        
+        path_points = simbrief_flight_manager.get_path_points_with_time(
+            aircraft_lat=lat,
+            aircraft_lon=lon,
+            lookahead_sec=self.lookahead_sec,
+            spacing_nm=spacing_nm
+        )
+        
+        if not path_points:
+            # Fall back to waypoint-based prefetching if path generation fails
+            return self._prefetch_along_flight_plan_waypoints(lat, lon)
+        
+        # Collect tiles along the path with their time-to-encounter
+        # Use a dict to track earliest time for each tile (key = (row, col, zoom))
+        tile_times: Dict[Tuple[int, int, int], Tuple[float, int]] = {}  # key -> (time, altitude_agl)
+        
+        for point in path_points:
+            # Get zoom level for this point's altitude
+            zoom_level = self._get_zoom_for_altitude(point.altitude_agl_ft)
+            
+            # Get tiles within radius of this path point
+            tiles = self._get_tiles_in_radius(
+                point.lat, point.lon, prefetch_radius_nm, zoom_level
+            )
+            
+            # Track each tile with its earliest encounter time
+            for (row, col) in tiles:
+                tile_key = (row, col, zoom_level)
+                
+                # Skip if already in recently prefetched
+                if tile_key in self._recently_prefetched:
+                    continue
+                
+                # Keep the earliest time for each tile
+                if tile_key not in tile_times:
+                    tile_times[tile_key] = (point.time_to_reach_sec, point.altitude_agl_ft)
+                elif point.time_to_reach_sec < tile_times[tile_key][0]:
+                    tile_times[tile_key] = (point.time_to_reach_sec, point.altitude_agl_ft)
+        
+        # Sort tiles by time-to-encounter (earliest first)
+        sorted_tiles = sorted(tile_times.items(), key=lambda x: x[1][0])
+        
+        log.debug(f"Path prefetch: {len(path_points)} path points, {len(sorted_tiles)} unique tiles to prefetch")
+        
+        # Prefetch tiles in order of encounter time
+        for (row, col, zoom), (time_sec, alt_agl) in sorted_tiles:
+            if chunks_submitted >= self.max_chunks:
+                break
+            
+            tile_key = (row, col, zoom)
+            
+            # Add to recently prefetched
+            self._recently_prefetched.add(tile_key)
+            if len(self._recently_prefetched) > self._max_recent:
+                try:
+                    self._recently_prefetched.pop()
+                except KeyError:
+                    pass
+            
+            # Prefetch this tile
+            submitted = self._prefetch_tile(row, col, zoom)
+            chunks_submitted += submitted
+            
+            if submitted > 0:
+                log.debug(f"Prefetch tile ({row},{col}) ZL{zoom}: ETA={time_sec/60:.1f}min, alt={alt_agl}ft AGL")
+        
+        return chunks_submitted
+    
+    def _prefetch_along_flight_plan_waypoints(self, lat: float, lon: float) -> int:
+        """
+        Fallback: Prefetch tiles around waypoints only (legacy behavior).
+        
+        Used when path interpolation fails or for compatibility.
         
         Returns number of chunks submitted.
         """
@@ -929,8 +1019,6 @@ class SpatialPrefetcher:
                 break
             
             # Determine zoom level based on the AGL altitude at this waypoint
-            # AGL (Above Ground Level) is used because it represents actual height
-            # above the terrain being viewed, which is more relevant for imagery quality
             zoom_level = self._get_zoom_for_altitude(fix.altitude_agl_ft)
             
             log.debug(f"Prefetch fix {fix.ident}: MSL={fix.altitude_ft}ft, "
@@ -943,6 +1031,64 @@ class SpatialPrefetcher:
             chunks_submitted += submitted
         
         return chunks_submitted
+    
+    def _get_tiles_in_radius(self, center_lat: float, center_lon: float,
+                              radius_nm: float, zoom: int) -> List[Tuple[int, int]]:
+        """
+        Get all tile coordinates (row, col) within a radius of a center point.
+        
+        Args:
+            center_lat, center_lon: Center point coordinates
+            radius_nm: Radius in nautical miles
+            zoom: Zoom level for tile coordinates
+            
+        Returns:
+            List of (row, col) tuples for tiles within the radius
+        """
+        tiles = []
+        
+        # Convert radius to degrees (approximate)
+        # 1 nm ≈ 1/60 degree latitude
+        radius_deg_lat = radius_nm / 60.0
+        radius_deg_lon = radius_nm / (60.0 * max(0.1, math.cos(math.radians(center_lat))))
+        
+        # Calculate tile coordinates
+        n = 2 ** zoom
+        
+        def latlon_to_tile(lat, lon):
+            """Convert lat/lon to tile coordinates."""
+            x = int((lon + 180) / 360 * n)
+            lat_clamped = max(-85.0511, min(85.0511, lat))
+            lat_rad = math.radians(lat_clamped)
+            y = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
+            return (x, y)
+        
+        # Get tile range for the area
+        col_center, row_center = latlon_to_tile(center_lat, center_lon)
+        col_min, row_min = latlon_to_tile(
+            center_lat + radius_deg_lat,
+            center_lon - radius_deg_lon
+        )
+        col_max, row_max = latlon_to_tile(
+            center_lat - radius_deg_lat,
+            center_lon + radius_deg_lon
+        )
+        
+        # Limit the area to prevent too many tiles
+        max_tiles_per_dim = 5
+        if row_max - row_min > max_tiles_per_dim:
+            row_min = row_center - max_tiles_per_dim // 2
+            row_max = row_center + max_tiles_per_dim // 2
+        if col_max - col_min > max_tiles_per_dim:
+            col_min = col_center - max_tiles_per_dim // 2
+            col_max = col_center + max_tiles_per_dim // 2
+        
+        # Collect tiles in the area
+        for row in range(row_min, row_max + 1):
+            for col in range(col_min, col_max + 1):
+                tiles.append((row, col))
+        
+        return tiles
     
     def _prefetch_waypoint_area(self, waypoint_lat: float, waypoint_lon: float,
                                   radius_nm: float, zoom: int) -> int:
