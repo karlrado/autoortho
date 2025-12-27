@@ -2282,6 +2282,27 @@ class ConfigUI(QMainWindow):
         build_interval_layout.addWidget(self.predictive_interval_value)
         autoortho_layout.addLayout(build_interval_layout)
         
+        # Use fallbacks checkbox
+        fallbacks_layout = QHBoxLayout()
+        self.predictive_use_fallbacks_check = QCheckBox("Apply fallbacks to prebuilt DDS")
+        self.predictive_use_fallbacks_check.setChecked(
+            getattr(self.cfg.autoortho, 'predictive_dds_use_fallbacks', True)
+        )
+        self.predictive_use_fallbacks_check.setToolTip(
+            "How to handle failed chunks when pre-building DDS.\n\n"
+            "When enabled (default):\n"
+            "  • Apply same fallback chain as live requests\n"
+            "  • Search disk cache, use lower zoom data if available\n"
+            "  • Best quality but may do extra disk/network I/O\n\n"
+            "When disabled:\n"
+            "  • Use missing color for failed chunks (fastest)\n"
+            "  • No extra I/O, minimal CPU overhead\n"
+            "  • Failed areas show configured missing color"
+        )
+        fallbacks_layout.addWidget(self.predictive_use_fallbacks_check)
+        fallbacks_layout.addStretch()
+        autoortho_layout.addLayout(fallbacks_layout)
+        
         autoortho_layout.addSpacing(10)
         # ═══════════════════════════════════════════════════════════════════
         
@@ -3397,6 +3418,8 @@ class ConfigUI(QMainWindow):
         self.predictive_interval_slider.setEnabled(enabled)
         self.predictive_interval_label.setEnabled(enabled)
         self.predictive_interval_value.setEnabled(enabled)
+        
+        self.predictive_use_fallbacks_check.setEnabled(enabled)
 
     def _init_dynamic_zoom_manager(self):
         """Initialize the dynamic zoom manager from config."""
@@ -4417,6 +4440,7 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.predictive_dds_build_interval_ms = str(
                 self.predictive_interval_slider.value()
             )
+            self.cfg.autoortho.predictive_dds_use_fallbacks = self.predictive_use_fallbacks_check.isChecked()
             
             self.cfg.autoortho.fetch_threads = str(
                 self.fetch_threads_spinbox.value()

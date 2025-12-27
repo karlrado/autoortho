@@ -169,6 +169,14 @@ predictive_dds_cache_mb = 512
 # Higher = slower building, lower CPU usage
 # Recommended: 250 (fast CPU), 500 (balanced), 1000 (low-end CPU)
 predictive_dds_build_interval_ms = 500
+# Apply fallbacks when pre-building DDS (True/False)
+# True (default): Apply same fallback logic as live requests (cache search, lower zoom, etc.)
+#   - Pro: Prebuilt tiles have best possible quality with fallbacks for failed chunks
+#   - Con: Prebuilds may do extra disk/network I/O to find fallback data
+# False: Use missing color for failed chunks (no fallbacks, fastest)
+#   - Pro: Faster prebuilds, no extra I/O
+#   - Con: Failed chunks show missing color instead of fallback data
+predictive_dds_use_fallbacks = True
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False

@@ -913,23 +913,39 @@ class TerrainTileLookup:
         """Check if a specific tile exists."""
         return self._tile_exists(row, col, maptype, zoom)
     
+    # Tile grid alignment: .ter files are placed every 16 slippy coordinates
+    # because each tile covers a 16×16 chunk grid
+    TILE_GRID_STEP = 16
+    
     @staticmethod
     def _latlon_to_tile(lat: float, lon: float, zoom: int) -> Tuple[int, int]:
         """
         Convert lat/lon to tile coordinates at a specific zoom level.
         
-        Uses Web Mercator (Slippy Map) convention.
+        Uses Web Mercator (Slippy Map) convention, then aligns to tile grid.
+        
+        IMPORTANT: .ter files are placed every 16 slippy coordinates because
+        each tile covers a 16×16 chunk grid. Example:
+        - 144224_260256_BI18.ter covers slippy coords 260256-260271
+        - 144224_260272_BI18.ter covers slippy coords 260272-260287
+        
+        So we round DOWN to the nearest multiple of 16 to get the .ter filename.
         
         Returns:
-            (row, col) tuple - NOTE: row is Y, col is X
+            (row, col) tuple aligned to 16-tile grid - NOTE: row is Y, col is X
         """
         n = 2 ** zoom
-        col = int((lon + 180) / 360 * n)
+        raw_col = int((lon + 180) / 360 * n)
         
         # Clamp latitude to valid Mercator range
         lat_clamped = max(-85.0511, min(85.0511, lat))
         lat_rad = math.radians(lat_clamped)
-        row = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
+        raw_row = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
+        
+        # Align to tile grid (every 16 slippy coordinates)
+        step = TerrainTileLookup.TILE_GRID_STEP
+        row = (raw_row // step) * step
+        col = (raw_col // step) * step
         
         return (row, col)
     
@@ -1319,10 +1335,16 @@ class SpatialPrefetcher:
         
         return chunks_submitted
     
+    # Tile grid alignment: .ter files are placed every 16 slippy coordinates
+    TILE_GRID_STEP = 16
+    
     def _get_tiles_in_radius(self, center_lat: float, center_lon: float,
                               radius_nm: float, zoom: int) -> List[Tuple[int, int]]:
         """
         Get all tile coordinates (row, col) within a radius of a center point.
+        
+        IMPORTANT: Tiles are aligned to a 16-coordinate grid (each .ter covers
+        16×16 slippy tiles). We step through the grid in increments of 16.
         
         Args:
             center_lat, center_lon: Center point coordinates
@@ -1330,9 +1352,10 @@ class SpatialPrefetcher:
             zoom: Zoom level for tile coordinates
             
         Returns:
-            List of (row, col) tuples for tiles within the radius
+            List of (row, col) tuples for tiles within the radius (grid-aligned)
         """
         tiles = []
+        step = self.TILE_GRID_STEP
         
         # Convert radius to degrees (approximate)
         # 1 nm ≈ 1/60 degree latitude
@@ -1343,14 +1366,15 @@ class SpatialPrefetcher:
         n = 2 ** zoom
         
         def latlon_to_tile(lat, lon):
-            """Convert lat/lon to tile coordinates."""
-            x = int((lon + 180) / 360 * n)
+            """Convert lat/lon to grid-aligned tile coordinates."""
+            raw_x = int((lon + 180) / 360 * n)
             lat_clamped = max(-85.0511, min(85.0511, lat))
             lat_rad = math.radians(lat_clamped)
-            y = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
-            return (x, y)
+            raw_y = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
+            # Align to tile grid (every 16 slippy coordinates)
+            return ((raw_x // step) * step, (raw_y // step) * step)
         
-        # Get tile range for the area
+        # Get tile range for the area (already grid-aligned)
         col_center, row_center = latlon_to_tile(center_lat, center_lon)
         col_min, row_min = latlon_to_tile(
             center_lat + radius_deg_lat,
@@ -1362,17 +1386,23 @@ class SpatialPrefetcher:
         )
         
         # Limit the area to prevent too many tiles
+        # Note: max_tiles_per_dim now counts actual tiles (each covers 16×16 area)
         max_tiles_per_dim = 5
-        if row_max - row_min > max_tiles_per_dim:
-            row_min = row_center - max_tiles_per_dim // 2
-            row_max = row_center + max_tiles_per_dim // 2
-        if col_max - col_min > max_tiles_per_dim:
-            col_min = col_center - max_tiles_per_dim // 2
-            col_max = col_center + max_tiles_per_dim // 2
+        tiles_in_row = (row_max - row_min) // step + 1
+        tiles_in_col = (col_max - col_min) // step + 1
         
-        # Collect tiles in the area
-        for row in range(row_min, row_max + 1):
-            for col in range(col_min, col_max + 1):
+        if tiles_in_row > max_tiles_per_dim:
+            half_tiles = (max_tiles_per_dim // 2) * step
+            row_min = row_center - half_tiles
+            row_max = row_center + half_tiles
+        if tiles_in_col > max_tiles_per_dim:
+            half_tiles = (max_tiles_per_dim // 2) * step
+            col_min = col_center - half_tiles
+            col_max = col_center + half_tiles
+        
+        # Collect tiles in the area, stepping by 16 (tile grid)
+        for row in range(row_min, row_max + 1, step):
+            for col in range(col_min, col_max + 1, step):
                 tiles.append((row, col))
         
         return tiles
@@ -2261,18 +2291,49 @@ class BackgroundDDSBuilder:
                 log.debug(f"BackgroundDDSBuilder: {tile_id} - no chunks for zoom {zoom}")
                 return
             
-            # Step 3: Verify all chunks are ready
+            # Step 3: Verify chunks have been processed (ready means download attempted)
+            # Note: Some chunks may have failed (empty data) - that's OK!
+            # get_img() will apply fallbacks for failed chunks.
+            # We count chunks that are "resolved" (either succeeded with data, or failed permanently)
             chunks = tile.chunks[zoom]
-            chunks_ready = sum(1 for c in chunks if c.ready.is_set() and c.data)
-            if chunks_ready < len(chunks):
-                log.debug(f"BackgroundDDSBuilder: {tile_id} - only {chunks_ready}/{len(chunks)} chunks ready")
+            chunks_resolved = sum(1 for c in chunks if c.ready.is_set())
+            chunks_with_data = sum(1 for c in chunks if c.ready.is_set() and c.data)
+            
+            if chunks_resolved < len(chunks):
+                # Some chunks are still downloading - not ready for prebuild yet
+                log.debug(f"BackgroundDDSBuilder: {tile_id} - only {chunks_resolved}/{len(chunks)} chunks resolved")
                 return
+            
+            if chunks_with_data == 0:
+                # ALL chunks failed - nothing to build from
+                log.debug(f"BackgroundDDSBuilder: {tile_id} - all chunks failed, skipping")
+                return
+            
+            # Log if some chunks failed
+            failed_count = len(chunks) - chunks_with_data
+            
+            # Determine fallback behavior for prebuilds
+            # If predictive_dds_use_fallbacks=True (default): Use user's configured fallback_level
+            # If predictive_dds_use_fallbacks=False: Force fallback_level=0 (missing color only)
+            use_fallbacks = getattr(CFG.autoortho, 'predictive_dds_use_fallbacks', True)
+            if isinstance(use_fallbacks, str):
+                use_fallbacks = use_fallbacks.lower() in ('true', '1', 'yes', 'on')
+            
+            fallback_override = None if use_fallbacks else 0
+            
+            if failed_count > 0:
+                if use_fallbacks:
+                    log.debug(f"BackgroundDDSBuilder: {tile_id} - {failed_count}/{len(chunks)} chunks failed, "
+                             f"will apply fallbacks")
+                else:
+                    log.debug(f"BackgroundDDSBuilder: {tile_id} - {failed_count}/{len(chunks)} chunks failed, "
+                             f"will use missing color (fallbacks disabled)")
             
             # Step 4: Get the assembled image for mipmap 0
             # Use a generous maxwait since we're not time-pressured
-            # Pass skip_download_wait=True conceptually - chunks are already ready
             mipmap = 0
-            img = tile.get_img(mipmap, startrow=0, endrow=None, maxwait=30)
+            img = tile.get_img(mipmap, startrow=0, endrow=None, maxwait=30,
+                              fallback_level_override=fallback_override)
             
             if img is None:
                 log.debug(f"BackgroundDDSBuilder: {tile_id} - get_img returned None")
@@ -2707,6 +2768,14 @@ class Chunk(object):
                     self.data = b''  # Empty data
                     self.ready.set()  # Mark as ready (with no data) to unblock waiters
                     bump(f'chunk_permanent_fail_{status_code}')
+                    # Notify tile completion tracker even on failure
+                    # This allows DDS prebuild to proceed with available chunks
+                    # (fallbacks will be applied during build for failed chunks)
+                    try:
+                        if tile_completion_tracker is not None and self.tile_id:
+                            tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
+                    except Exception:
+                        pass
                     return True  # Return True to stop worker retries
                 
                 # Check if transient failure has exceeded max retries
@@ -2720,6 +2789,12 @@ class Chunk(object):
                         self.data = b''
                         self.ready.set()
                         bump(f'chunk_transient_fail_{status_code}_exhausted')
+                        # Notify tile completion tracker even on exhausted retries
+                        try:
+                            if tile_completion_tracker is not None and self.tile_id:
+                                tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
+                        except Exception:
+                            pass
                         return True
                     # Increase backoff for rate limiting
                     if status_code == 429:
@@ -3285,9 +3360,15 @@ class Tile(object):
         return outfile
 
     @locked
-    def get_img(self, mipmap, startrow=0, endrow=None, maxwait=5, min_zoom=None, time_budget=None):
+    def get_img(self, mipmap, startrow=0, endrow=None, maxwait=5, min_zoom=None, time_budget=None,
+                fallback_level_override=None):
         #
         # Get an image for a particular mipmap
+        #
+        # Args:
+        #   fallback_level_override: If provided, overrides the config fallback_level.
+        #       Used by BackgroundDDSBuilder when predictive_dds_use_fallbacks=False
+        #       to force fallback_level=0 (missing color only, no extra I/O).
         #
         
         # === TIME BUDGET INITIALIZATION ===
@@ -3338,7 +3419,13 @@ class Tile(object):
         # - Benefit: Only helped when mipmap 0 chunks fail (<5% of cases)
         # - Alternative: Fallback 3 (Cascading Download) handles failures on-demand
         #   with much lower overhead since it only activates when needed.
-        fallback_level = self.get_fallback_level()
+        #
+        # fallback_level_override allows callers (e.g., BackgroundDDSBuilder) to
+        # force a specific fallback behavior, bypassing user config.
+        if fallback_level_override is not None:
+            fallback_level = fallback_level_override
+        else:
+            fallback_level = self.get_fallback_level()
         fallback_extends_budget = self.get_fallback_extends_budget()
         
         # === FALLBACK BUDGET ===
