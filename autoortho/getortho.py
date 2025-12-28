@@ -2,6 +2,7 @@
 import logging
 import atexit
 import os
+import re
 import time
 import threading
 import concurrent.futures
@@ -12,7 +13,7 @@ from typing import Optional, Dict, Tuple, List
 
 from io import BytesIO
 from urllib.request import urlopen, Request
-from queue import Queue, PriorityQueue, Empty
+from queue import Queue, PriorityQueue, Empty, Full
 from functools import wraps, lru_cache
 from pathlib import Path
 from collections import OrderedDict
@@ -728,6 +729,308 @@ def flush_cache_writer(timeout=30.0):
 
 
 # ============================================================================
+# TERRAIN TILE LOOKUP
+# ============================================================================
+# Provides on-demand lookup of .ter files to discover actual zoom levels.
+# Uses lazy file existence checks instead of pre-indexing to handle
+# sceneries with millions of .ter files efficiently.
+#
+# Critical for predictive DDS generation: Without this, the prefetcher might
+# guess ZL16 based on altitude, but if the .ter file says ZL18 (airport tile),
+# the prefetched DDS would be at the wrong zoom level - a complete miss!
+#
+# Design for scale:
+# - NO pre-indexing (avoids 600MB+ RAM for 5M tiles)
+# - NO startup delay (avoids 30-60s scan)
+# - Lazy os.path.exists() checks (~0.1ms each, only when needed)
+#
+# Maptype handling:
+# - .ter files are always "BI" in standard AutoOrtho sceneries
+# - Custom Ortho4XP tiles may use other maptypes (EOX, Arc, etc.)
+# - We default to checking only "BI" for efficiency
+# - When X-Plane requests a DDS with a different maptype, we add it to
+#   the known maptypes set and check it in future lookups
+# ============================================================================
+
+# Module-level set of discovered maptypes from actual X-Plane requests
+# Starts with just "BI", grows if custom tiles use other providers
+_discovered_maptypes: set = {"BI"}
+_discovered_maptypes_lock = threading.Lock()
+
+
+def register_discovered_maptype(maptype: str) -> None:
+    """
+    Register a maptype discovered from an actual X-Plane DDS request.
+    
+    Called from FUSE layer when X-Plane requests a DDS with a maptype
+    other than "BI". This adapts the terrain lookup to also check
+    for custom tile maptypes.
+    """
+    global _discovered_maptypes
+    with _discovered_maptypes_lock:
+        if maptype not in _discovered_maptypes:
+            _discovered_maptypes.add(maptype)
+            log.info(f"TerrainTileLookup: Discovered custom maptype '{maptype}', "
+                    f"will now check for it in terrain lookups")
+
+
+def get_discovered_maptypes() -> set:
+    """Get the current set of discovered maptypes."""
+    with _discovered_maptypes_lock:
+        return _discovered_maptypes.copy()
+
+
+class TerrainTileLookup:
+    """
+    Lazy lookup of .ter files in scenery terrain folders.
+    
+    Instead of pre-indexing millions of files (which would use 600MB+ RAM
+    and take 30-60s at startup), this class performs on-demand file
+    existence checks when tiles are needed.
+    
+    Maptype strategy:
+    - Default: Check only "BI" (standard for AutoOrtho sceneries)
+    - Adaptive: When X-Plane requests a DDS with a different maptype,
+      it gets registered and future lookups will also check for it
+    - This handles custom Ortho4XP tiles without upfront I/O penalty
+    
+    Cost per prefetch cycle:
+    - 1 maptype × 6 zooms × os.path.exists() = ~0.6ms (uncached)
+    - Additional maptypes only added when evidence of custom tiles
+    
+    File format checked:
+    - {row}_{col}_{maptype}{zoom}.ter
+    
+    Example: 10880_10432_BI16.ter → row=10880, col=10432, maptype=BI, zoom=16
+    """
+    
+    def __init__(self, terrain_folder: str, scenery_name: str):
+        """
+        Args:
+            terrain_folder: Path to the terrain folder (e.g., .../z_ao_na/terrain)
+            scenery_name: Human-readable name for logging (e.g., "z_ao_na")
+        """
+        self._terrain_folder = terrain_folder
+        self._scenery_name = scenery_name
+        self._folder_exists = os.path.isdir(terrain_folder)
+        
+        # Simple LRU cache for recent lookups to avoid repeated fs checks
+        # Key: (row, col, maptype, zoom) → Value: bool (exists)
+        self._cache: Dict[Tuple[int, int, str, int], bool] = {}
+        self._cache_max_size = 10000  # ~1MB max
+        self._cache_lock = threading.Lock()
+        
+        # Stats
+        self._lookups = 0
+        self._cache_hits = 0
+        self._files_found = 0
+        
+        if self._folder_exists:
+            log.info(f"TerrainTileLookup: Ready for {scenery_name} at {terrain_folder}")
+        else:
+            log.warning(f"TerrainTileLookup: Folder not found: {terrain_folder}")
+    
+    def get_tiles_for_position(self, lat: float, lon: float,
+                               maptype_filter: Optional[str] = None,
+                               zoom_range: Tuple[int, int] = (14, 19)
+                               ) -> List[Tuple[int, int, str, int]]:
+        """
+        Find all .ter files that exist at a geographic position.
+        
+        Performs lazy file existence checks for each zoom level.
+        
+        Args:
+            lat: Latitude in degrees
+            lon: Longitude in degrees
+            maptype_filter: Maptype to check (e.g., "BI"). If None, checks common types.
+            zoom_range: (min_zoom, max_zoom) to check (default 14-19 for perf)
+        
+        Returns:
+            List of (row, col, maptype, zoom) tuples for tiles that exist.
+        """
+        if not self._folder_exists:
+            return []
+        
+        results = []
+        
+        # Get maptypes to check:
+        # 1. If specific maptype requested, use only that
+        # 2. Otherwise, use all discovered maptypes (starts with just "BI",
+        #    grows if X-Plane requests DDS files with other maptypes)
+        if maptype_filter:
+            maptypes_to_check = [maptype_filter]
+        else:
+            maptypes_to_check = list(get_discovered_maptypes())
+        
+        for zoom in range(zoom_range[0], zoom_range[1] + 1):
+            # Convert lat/lon to tile coords at this zoom
+            row, col = self._latlon_to_tile(lat, lon, zoom)
+            
+            for maptype in maptypes_to_check:
+                if self._tile_exists(row, col, maptype, zoom):
+                    results.append((row, col, maptype, zoom))
+                    # Found a tile at this zoom, no need to check other maptypes
+                    break
+        
+        return results
+    
+    def _tile_exists(self, row: int, col: int, maptype: str, zoom: int) -> bool:
+        """
+        Check if a specific .ter file exists.
+        
+        Uses a small cache to avoid repeated filesystem checks for the same tile.
+        """
+        cache_key = (row, col, maptype, zoom)
+        self._lookups += 1
+        
+        # Check cache first
+        with self._cache_lock:
+            if cache_key in self._cache:
+                self._cache_hits += 1
+                return self._cache[cache_key]
+        
+        # Build path and check filesystem
+        ter_filename = f"{row}_{col}_{maptype}{zoom}.ter"
+        ter_path = os.path.join(self._terrain_folder, ter_filename)
+        exists = os.path.exists(ter_path)
+        
+        if exists:
+            self._files_found += 1
+        
+        # Cache the result
+        with self._cache_lock:
+            # Simple eviction: clear half when full
+            if len(self._cache) >= self._cache_max_size:
+                # Keep most recent half (arbitrary, but simple)
+                keys_to_remove = list(self._cache.keys())[:self._cache_max_size // 2]
+                for key in keys_to_remove:
+                    del self._cache[key]
+            self._cache[cache_key] = exists
+        
+        return exists
+    
+    def has_tile(self, row: int, col: int, maptype: str, zoom: int) -> bool:
+        """Check if a specific tile exists."""
+        return self._tile_exists(row, col, maptype, zoom)
+    
+    # Tile grid alignment: .ter files are placed every 16 slippy coordinates
+    # because each tile covers a 16×16 chunk grid
+    TILE_GRID_STEP = 16
+    
+    @staticmethod
+    def _latlon_to_tile(lat: float, lon: float, zoom: int) -> Tuple[int, int]:
+        """
+        Convert lat/lon to tile coordinates at a specific zoom level.
+        
+        Uses Web Mercator (Slippy Map) convention, then aligns to tile grid.
+        
+        IMPORTANT: .ter files are placed every 16 slippy coordinates because
+        each tile covers a 16×16 chunk grid. Example:
+        - 144224_260256_BI18.ter covers slippy coords 260256-260271
+        - 144224_260272_BI18.ter covers slippy coords 260272-260287
+        
+        So we round DOWN to the nearest multiple of 16 to get the .ter filename.
+        
+        Returns:
+            (row, col) tuple aligned to 16-tile grid - NOTE: row is Y, col is X
+        """
+        n = 2 ** zoom
+        raw_col = int((lon + 180) / 360 * n)
+        
+        # Clamp latitude to valid Mercator range
+        lat_clamped = max(-85.0511, min(85.0511, lat))
+        lat_rad = math.radians(lat_clamped)
+        raw_row = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
+        
+        # Align to tile grid (every 16 slippy coordinates)
+        step = TerrainTileLookup.TILE_GRID_STEP
+        row = (raw_row // step) * step
+        col = (raw_col // step) * step
+        
+        return (row, col)
+    
+    def clear_cache(self) -> None:
+        """Clear the lookup cache."""
+        with self._cache_lock:
+            self._cache.clear()
+    
+    @property
+    def is_ready(self) -> bool:
+        """Always ready (no async indexing needed)."""
+        return self._folder_exists
+    
+    @property
+    def stats(self) -> dict:
+        """Return lookup statistics."""
+        hit_rate = (self._cache_hits / self._lookups * 100) if self._lookups > 0 else 0
+        return {
+            'scenery': self._scenery_name,
+            'lookups': self._lookups,
+            'cache_hits': self._cache_hits,
+            'hit_rate_pct': hit_rate,
+            'files_found': self._files_found,
+            'cache_size': len(self._cache),
+            'folder_exists': self._folder_exists,
+        }
+
+
+# Module-level terrain lookup management
+_terrain_lookups: List[TerrainTileLookup] = []
+_terrain_lookups_lock = threading.Lock()
+
+
+def register_terrain_index(terrain_folder: str, scenery_name: str) -> None:
+    """
+    Register a terrain lookup for a scenery.
+    
+    Called from autoortho_fuse.py when mounting a scenery.
+    No async indexing needed - lookups are lazy.
+    """
+    global _terrain_lookups
+    with _terrain_lookups_lock:
+        lookup = TerrainTileLookup(terrain_folder, scenery_name)
+        _terrain_lookups.append(lookup)
+        log.info(f"Registered terrain lookup for {scenery_name}")
+
+
+def get_all_tiles_for_position(lat: float, lon: float,
+                               maptype_filter: Optional[str] = None) -> List[Tuple[int, int, str, int]]:
+    """
+    Query all terrain lookups for tiles at a position.
+    
+    Args:
+        lat: Latitude in degrees
+        lon: Longitude in degrees
+        maptype_filter: Optional maptype to filter by
+        
+    Returns:
+        List of (row, col, maptype, zoom) tuples from all sceneries
+    """
+    results = []
+    with _terrain_lookups_lock:
+        for lookup in _terrain_lookups:
+            results.extend(lookup.get_tiles_for_position(lat, lon, maptype_filter))
+    return results
+
+
+def clear_terrain_indices() -> None:
+    """Clear all terrain lookups (for shutdown)."""
+    global _terrain_lookups
+    with _terrain_lookups_lock:
+        for lookup in _terrain_lookups:
+            lookup.clear_cache()
+        count = len(_terrain_lookups)
+        _terrain_lookups.clear()
+        log.info(f"Cleared {count} terrain lookups")
+
+
+def get_terrain_index_stats() -> List[dict]:
+    """Get statistics from all terrain lookups."""
+    with _terrain_lookups_lock:
+        return [lookup.stats for lookup in _terrain_lookups]
+
+
+# ============================================================================
 # SPATIAL PREFETCHER
 # ============================================================================
 # Proactively downloads tile chunks ahead of the aircraft based on position
@@ -776,15 +1079,27 @@ class SpatialPrefetcher:
         """Load prefetch configuration from aoconfig."""
         self.enabled = getattr(CFG.autoortho, 'prefetch_enabled', True)
         # Lookahead is now configured in MINUTES, convert to seconds
+        # 0 = Unlimited (use very large lookahead, effectively infinite)
         lookahead_min = float(getattr(CFG.autoortho, 'prefetch_lookahead', 10))
-        self.lookahead_sec = lookahead_min * 60  # Convert minutes to seconds
+        self.lookahead_unlimited = (lookahead_min <= 0)
+        if self.lookahead_unlimited:
+            # Use 24 hours as "unlimited" - effectively infinite for flight purposes
+            self.lookahead_sec = 24 * 60 * 60  # 86400 seconds
+        else:
+            self.lookahead_sec = lookahead_min * 60  # Convert minutes to seconds
+            # Clamp to reasonable range (1-60 minutes = 60-3600 seconds)
+            self.lookahead_sec = max(60, min(3600, self.lookahead_sec))
+        
         self.interval_sec = float(getattr(CFG.autoortho, 'prefetch_interval', 2.0))
         self.max_chunks = int(getattr(CFG.autoortho, 'prefetch_max_chunks', 24))
         
-        # Clamp to reasonable ranges (1-60 minutes = 60-3600 seconds)
-        self.lookahead_sec = max(60, min(3600, self.lookahead_sec))
+        # Unified prefetch radius (used by both velocity and SimBrief methods)
+        # This replaces the old simbrief-specific route_prefetch_radius_nm
+        self.prefetch_radius_nm = float(getattr(CFG.autoortho, 'prefetch_radius_nm', 40))
+        self.prefetch_radius_nm = max(10, min(150, self.prefetch_radius_nm))
+        
         self.interval_sec = max(1.0, min(10.0, self.interval_sec))
-        self.max_chunks = max(8, min(64, self.max_chunks))
+        self.max_chunks = max(8, min(512, self.max_chunks))
         
     def set_tile_cacher(self, tile_cacher):
         """Set the tile cacher reference for accessing tiles."""
@@ -807,7 +1122,8 @@ class SpatialPrefetcher:
             daemon=True
         )
         self._thread.start()
-        log.info(f"Spatial prefetcher started (lookahead={self.lookahead_sec/60:.0f}min, "
+        lookahead_str = "Unlimited" if self.lookahead_unlimited else f"{self.lookahead_sec/60:.0f}min"
+        log.info(f"Spatial prefetcher started (lookahead={lookahead_str}, "
                 f"interval={self.interval_sec}s, max_chunks={self.max_chunks})")
         
     def stop(self):
@@ -877,7 +1193,8 @@ class SpatialPrefetcher:
         Returns True if:
         - SimBrief flight data is loaded
         - use_flight_data toggle is enabled
-        - Aircraft is on-route (within deviation threshold)
+        - Aircraft is on-route (within deviation threshold) OR
+        - prefetch_while_parked is enabled AND aircraft is near origin airport
         """
         # Check if SimBrief integration is enabled
         if not hasattr(CFG, 'simbrief'):
@@ -898,7 +1215,24 @@ class SpatialPrefetcher:
         deviation_threshold = float(getattr(CFG.simbrief, 'route_deviation_threshold_nm', 40))
         
         # Check if aircraft is on-route
-        return simbrief_flight_manager.is_on_route(lat, lon, deviation_threshold)
+        if simbrief_flight_manager.is_on_route(lat, lon, deviation_threshold):
+            return True
+        
+        # If prefetch_while_parked is enabled, allow prefetching when near origin
+        # This lets us start prefetching the route even before takeoff
+        prefetch_while_parked = getattr(CFG.simbrief, 'prefetch_while_parked', True)
+        if isinstance(prefetch_while_parked, str):
+            prefetch_while_parked = prefetch_while_parked.lower() in ('true', '1', 'yes', 'on')
+        
+        if prefetch_while_parked:
+            # Check if aircraft is near the origin airport (within 50nm)
+            # This allows prefetching to start while parked at the gate
+            origin_distance = simbrief_flight_manager.get_distance_from_origin(lat, lon)
+            if origin_distance is not None and origin_distance < 50:
+                log.debug(f"SimBrief prefetch: Aircraft near origin ({origin_distance:.1f}nm), enabling parked prefetch")
+                return True
+        
+        return False
     
     def _prefetch_along_flight_plan(self, lat: float, lon: float) -> int:
         """
@@ -914,12 +1248,14 @@ class SpatialPrefetcher:
         Uses the flight plan altitude at each position to determine the
         appropriate zoom level, matching what will actually be displayed.
         
+        Skips tiles that are already opened by X-Plane (on-demand logic handles those).
+        
         Returns number of chunks submitted.
         """
         chunks_submitted = 0
         
-        # Get prefetch radius from config
-        prefetch_radius_nm = float(getattr(CFG.simbrief, 'route_prefetch_radius_nm', 40))
+        # Use unified prefetch radius from config
+        prefetch_radius_nm = self.prefetch_radius_nm
         
         # Get interpolated path points with time-to-encounter
         # Uses SimBrief's pre-calculated times (accounts for winds, climb/descent, etc.)
@@ -937,6 +1273,10 @@ class SpatialPrefetcher:
         if not path_points:
             # Fall back to waypoint-based prefetching if path generation fails
             return self._prefetch_along_flight_plan_waypoints(lat, lon)
+        
+        # Get maptype for checking if tiles are opened
+        maptype_filter = self._get_maptype_filter()
+        default_maptype = maptype_filter or "EOX"
         
         # Collect tiles along the path with their time-to-encounter
         # Use a dict to track earliest time for each tile (key = (row, col, zoom))
@@ -965,10 +1305,12 @@ class SpatialPrefetcher:
                 elif point.time_to_reach_sec < tile_times[tile_key][0]:
                     tile_times[tile_key] = (point.time_to_reach_sec, point.altitude_agl_ft)
         
-        # Sort tiles by time-to-encounter (earliest first)
+        # Sort tiles by time-to-encounter (earliest first = nearest in time)
         sorted_tiles = sorted(tile_times.items(), key=lambda x: x[1][0])
         
         log.debug(f"Path prefetch: {len(path_points)} path points, {len(sorted_tiles)} unique tiles to prefetch")
+        
+        tiles_prefetched = 0
         
         # Prefetch tiles in order of encounter time
         for (row, col, zoom), (time_sec, alt_agl) in sorted_tiles:
@@ -976,6 +1318,11 @@ class SpatialPrefetcher:
                 break
             
             tile_key = (row, col, zoom)
+            
+            # Skip if tile is already opened by X-Plane (on-demand logic handles it)
+            if self._tile_cacher and self._tile_cacher.is_tile_opened_by_xplane(row, col, default_maptype, zoom):
+                log.debug(f"Skipping prefetch for {row},{col}@ZL{zoom} - already opened by X-Plane")
+                continue
             
             # Add to recently prefetched
             self._recently_prefetched.add(tile_key)
@@ -990,6 +1337,7 @@ class SpatialPrefetcher:
             chunks_submitted += submitted
             
             if submitted > 0:
+                tiles_prefetched += 1
                 log.debug(f"Prefetch tile ({row},{col}) ZL{zoom}: ETA={time_sec/60:.1f}min, alt={alt_agl}ft AGL")
         
         return chunks_submitted
@@ -999,13 +1347,14 @@ class SpatialPrefetcher:
         Fallback: Prefetch tiles around waypoints only (legacy behavior).
         
         Used when path interpolation fails or for compatibility.
+        Skips tiles already opened by X-Plane.
         
         Returns number of chunks submitted.
         """
         chunks_submitted = 0
         
-        # Get prefetch radius from config
-        prefetch_radius_nm = float(getattr(CFG.simbrief, 'route_prefetch_radius_nm', 40))
+        # Use unified prefetch radius from config
+        prefetch_radius_nm = self.prefetch_radius_nm
         
         # Get upcoming fixes (limited number to avoid overwhelming)
         upcoming_fixes = simbrief_flight_manager.get_upcoming_fixes(lat, lon, count=15)
@@ -1032,10 +1381,16 @@ class SpatialPrefetcher:
         
         return chunks_submitted
     
+    # Tile grid alignment: .ter files are placed every 16 slippy coordinates
+    TILE_GRID_STEP = 16
+    
     def _get_tiles_in_radius(self, center_lat: float, center_lon: float,
                               radius_nm: float, zoom: int) -> List[Tuple[int, int]]:
         """
         Get all tile coordinates (row, col) within a radius of a center point.
+        
+        IMPORTANT: Tiles are aligned to a 16-coordinate grid (each .ter covers
+        16×16 slippy tiles). We step through the grid in increments of 16.
         
         Args:
             center_lat, center_lon: Center point coordinates
@@ -1043,9 +1398,10 @@ class SpatialPrefetcher:
             zoom: Zoom level for tile coordinates
             
         Returns:
-            List of (row, col) tuples for tiles within the radius
+            List of (row, col) tuples for tiles within the radius (grid-aligned)
         """
         tiles = []
+        step = self.TILE_GRID_STEP
         
         # Convert radius to degrees (approximate)
         # 1 nm ≈ 1/60 degree latitude
@@ -1056,14 +1412,15 @@ class SpatialPrefetcher:
         n = 2 ** zoom
         
         def latlon_to_tile(lat, lon):
-            """Convert lat/lon to tile coordinates."""
-            x = int((lon + 180) / 360 * n)
+            """Convert lat/lon to grid-aligned tile coordinates."""
+            raw_x = int((lon + 180) / 360 * n)
             lat_clamped = max(-85.0511, min(85.0511, lat))
             lat_rad = math.radians(lat_clamped)
-            y = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
-            return (x, y)
+            raw_y = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
+            # Align to tile grid (every 16 slippy coordinates)
+            return ((raw_x // step) * step, (raw_y // step) * step)
         
-        # Get tile range for the area
+        # Get tile range for the area (already grid-aligned)
         col_center, row_center = latlon_to_tile(center_lat, center_lon)
         col_min, row_min = latlon_to_tile(
             center_lat + radius_deg_lat,
@@ -1075,17 +1432,23 @@ class SpatialPrefetcher:
         )
         
         # Limit the area to prevent too many tiles
+        # Note: max_tiles_per_dim now counts actual tiles (each covers 16×16 area)
         max_tiles_per_dim = 5
-        if row_max - row_min > max_tiles_per_dim:
-            row_min = row_center - max_tiles_per_dim // 2
-            row_max = row_center + max_tiles_per_dim // 2
-        if col_max - col_min > max_tiles_per_dim:
-            col_min = col_center - max_tiles_per_dim // 2
-            col_max = col_center + max_tiles_per_dim // 2
+        tiles_in_row = (row_max - row_min) // step + 1
+        tiles_in_col = (col_max - col_min) // step + 1
         
-        # Collect tiles in the area
-        for row in range(row_min, row_max + 1):
-            for col in range(col_min, col_max + 1):
+        if tiles_in_row > max_tiles_per_dim:
+            half_tiles = (max_tiles_per_dim // 2) * step
+            row_min = row_center - half_tiles
+            row_max = row_center + half_tiles
+        if tiles_in_col > max_tiles_per_dim:
+            half_tiles = (max_tiles_per_dim // 2) * step
+            col_min = col_center - half_tiles
+            col_max = col_center + half_tiles
+        
+        # Collect tiles in the area, stepping by 16 (tile grid)
+        for row in range(row_min, row_max + 1, step):
+            for col in range(col_min, col_max + 1, step):
                 tiles.append((row, col))
         
         return tiles
@@ -1094,10 +1457,15 @@ class SpatialPrefetcher:
                                   radius_nm: float, zoom: int) -> int:
         """
         Prefetch tiles within a radius around a waypoint.
+        Skips tiles already opened by X-Plane.
         
         Returns number of chunks submitted.
         """
         chunks_submitted = 0
+        
+        # Get maptype for checking if tiles are opened
+        maptype_filter = self._get_maptype_filter()
+        default_maptype = maptype_filter or "EOX"
         
         # Convert radius to degrees (approximate)
         # 1 nm ≈ 1/60 degree latitude
@@ -1146,6 +1514,11 @@ class SpatialPrefetcher:
                 
                 # Skip if recently prefetched
                 if tile_key in self._recently_prefetched:
+                    continue
+                
+                # Skip if tile is already opened by X-Plane
+                if self._tile_cacher and self._tile_cacher.is_tile_opened_by_xplane(row, col, default_maptype, zoom):
+                    log.debug(f"Skipping prefetch for {row},{col}@ZL{zoom} - already opened by X-Plane")
                     continue
                 
                 # Add to recently prefetched
@@ -1230,20 +1603,25 @@ class SpatialPrefetcher:
     
     def _do_velocity_prefetch_cycle(self, lat: float, lon: float):
         """
-        Execute velocity-based prefetch cycle.
+        Execute velocity-based prefetch cycle using radius-based sampling.
         
-        Uses heading and speed to predict future position and prefetch tiles.
-        Uses predicted altitude to determine appropriate zoom level.
+        Samples points along the predicted flight path at regular intervals,
+        then collects tiles within the prefetch radius at each sample point.
+        Tiles are prioritized by distance from the aircraft (nearest first).
+        
+        ZOOM LEVEL DETERMINATION:
+        1. PRIMARY: Query TerrainZoomIndex to find actual .ter files at each position
+           - This ensures we prefetch the exact tiles X-Plane will request
+           - Critical for airport tiles (ZL18) which would be missed by altitude guessing
+        2. FALLBACK: Use altitude-based zoom guessing if no terrain index available
         """
         # Try to get 60-second averaged flight data for stable prediction
         averages = datareftracker.get_flight_averages()
 
         if averages is not None:
-            # Use averaged heading and speed for more stable predictions
             hdg = averages['heading']
             spd = averages['ground_speed_mps']
         else:
-            # Fall back to instantaneous values if no averages available
             hdg = datareftracker.hdg
             spd = datareftracker.spd
 
@@ -1251,166 +1629,235 @@ class SpatialPrefetcher:
         if spd < self.MIN_SPEED_MPS:
             return
 
-        # Calculate predicted position using (potentially averaged) heading/speed
-        distance_m = spd * self.lookahead_sec
-
-        # Convert heading to radians
+        # Calculate max distance based on lookahead time
+        max_distance_m = spd * self.lookahead_sec
+        
+        # Sample spacing: half the radius or 15nm max (like SimBrief approach)
+        spacing_nm = min(self.prefetch_radius_nm / 2, 15.0)
+        spacing_m = spacing_nm * 1852  # Convert nm to meters
+        
+        # Generate sample points along the flight path (nearest to farthest)
+        sample_points = []
+        distance_m = 0
         hdg_rad = math.radians(hdg)
         
-        # Calculate offset in degrees
-        # 1 degree latitude ≈ 111,320m
-        # 1 degree longitude ≈ 111,320m * cos(latitude)
-        delta_lat = (distance_m * math.cos(hdg_rad)) / 111320
-        cos_lat = math.cos(math.radians(lat))
-        if cos_lat > 0.01:  # Avoid division issues near poles
-            delta_lon = (distance_m * math.sin(hdg_rad)) / (111320 * cos_lat)
-        else:
-            delta_lon = 0
+        while distance_m <= max_distance_m:
+            # Calculate position at this distance
+            delta_lat = (distance_m * math.cos(hdg_rad)) / 111320
+            cos_lat = math.cos(math.radians(lat))
+            if cos_lat > 0.01:
+                delta_lon = (distance_m * math.sin(hdg_rad)) / (111320 * cos_lat)
+            else:
+                delta_lon = 0
+            
+            sample_lat = lat + delta_lat
+            sample_lon = lon + delta_lon
+            
+            # Estimate altitude at this position
+            predicted_alt = self._get_predicted_altitude(
+                lat, lon, hdg, spd, sample_lat, sample_lon
+            )
+            
+            sample_points.append((sample_lat, sample_lon, distance_m, predicted_alt))
+            distance_m += spacing_m
         
-        predicted_lat = lat + delta_lat
-        predicted_lon = lon + delta_lon
+        if not sample_points:
+            return
         
-        # Calculate predicted altitude at destination for zoom level determination
-        predicted_alt = self._get_predicted_altitude(lat, lon, hdg, spd, predicted_lat, predicted_lon)
-        zoom_level = self._get_zoom_for_altitude(predicted_alt)
+        # Collect tiles from all sample points, tracking distance for prioritization
+        # Key: (row, col, maptype, zoom), Value: distance_m (nearest wins)
+        tile_distances: Dict[Tuple[int, int, str, int], float] = {}
         
-        # Get tiles along the flight path at the appropriate zoom level
-        chunks_submitted = self._prefetch_along_path(
-            lat, lon, predicted_lat, predicted_lon, zoom_level
-        )
+        maptype_filter = self._get_maptype_filter()
+        
+        for sample_lat, sample_lon, distance_m, predicted_alt in sample_points:
+            # PRIMARY: Query TerrainZoomIndex for actual tiles
+            tiles_from_index = get_all_tiles_for_position(
+                sample_lat, sample_lon, maptype_filter=maptype_filter
+            )
+            
+            if tiles_from_index:
+                # Use indexed tiles - get all within radius of this sample point
+                for row, col, maptype, zoom in tiles_from_index:
+                    tile_key = (row, col, maptype, zoom)
+                    # Keep the nearest distance for each tile
+                    if tile_key not in tile_distances or distance_m < tile_distances[tile_key]:
+                        tile_distances[tile_key] = distance_m
+            else:
+                # FALLBACK: Use altitude-based zoom guessing with radius
+                zoom_level = self._get_zoom_for_altitude(predicted_alt)
+                fallback_maptype = maptype_filter or "EOX"
+                
+                tiles_in_radius = self._get_tiles_in_radius(
+                    sample_lat, sample_lon, self.prefetch_radius_nm, zoom_level
+                )
+                
+                for row, col in tiles_in_radius:
+                    tile_key = (row, col, fallback_maptype, zoom_level)
+                    if tile_key not in tile_distances or distance_m < tile_distances[tile_key]:
+                        tile_distances[tile_key] = distance_m
+        
+        # Sort tiles by distance (nearest first - gradient from player outward)
+        sorted_tiles = sorted(tile_distances.items(), key=lambda x: x[1])
+        
+        # Prefetch tiles in order of proximity
+        chunks_submitted = 0
+        tiles_prefetched = 0
+        
+        for (row, col, maptype, zoom), distance in sorted_tiles:
+            if chunks_submitted >= self.max_chunks:
+                break
+            
+            tile_key = (row, col, maptype, zoom)
+            
+            # Skip if recently prefetched
+            if tile_key in self._recently_prefetched:
+                continue
+            
+            # Skip if tile is already opened by X-Plane (on-demand logic handles it)
+            if self._tile_cacher and self._tile_cacher.is_tile_opened_by_xplane(row, col, maptype, zoom):
+                log.debug(f"Skipping prefetch for {row},{col}@ZL{zoom} - already opened by X-Plane")
+                continue
+            
+            # Add to recently prefetched
+            self._recently_prefetched.add(tile_key)
+            if len(self._recently_prefetched) > self._max_recent:
+                try:
+                    self._recently_prefetched.pop()
+                except KeyError:
+                    pass
+            
+            submitted = self._prefetch_tile(row, col, zoom, maptype)
+            chunks_submitted += submitted
+            if submitted > 0:
+                tiles_prefetched += 1
         
         if chunks_submitted > 0:
             self._prefetch_count += chunks_submitted
-            log.debug(f"Prefetched {chunks_submitted} chunks at ZL{zoom_level} (alt={predicted_alt}ft, total: {self._prefetch_count})")
+            log.debug(f"Velocity prefetch: {chunks_submitted} chunks from {tiles_prefetched} tiles "
+                     f"(radius={self.prefetch_radius_nm}nm, total: {self._prefetch_count})")
             bump('prefetch_chunk_count', chunks_submitted)
     
-    def _prefetch_along_path(self, lat1, lon1, lat2, lon2, zoom_level: int = None):
+    def _get_maptype_filter(self) -> Optional[str]:
         """
-        Prefetch chunks for tiles along the flight path.
+        Get the maptype to filter by when querying terrain index.
+        
+        Returns:
+            Maptype string (e.g., "BI", "EOX") if override is set, None otherwise.
+            When None, all maptypes are accepted from the terrain index.
+        """
+        if self._tile_cacher is not None:
+            override = getattr(self._tile_cacher, 'maptype_override', None)
+            if override and override != "Use tile default":
+                return override
+        return None  # Accept any maptype from terrain index
+    
+    # Maximum chunks to submit per tile per prefetch cycle
+    # With 5 mipmaps (0-4), a ZL16 tile has 256+64+16+4+1 = 341 chunks total
+    # We limit per-tile to avoid one tile dominating the queue
+    MAX_CHUNKS_PER_TILE = 32
+    
+    def _prefetch_tile(self, row, col, zoom, maptype: Optional[str] = None):
+        """
+        Submit prefetch requests for a tile's chunks at ALL mipmap levels.
         
         Args:
-            lat1, lon1: Start position (current aircraft position)
-            lat2, lon2: End position (predicted position)
-            zoom_level: Zoom level to prefetch at. If None, uses config max_zoom.
-        
-        Returns number of chunks submitted for prefetch.
-        """
-        chunks_submitted = 0
-        
-        # Use provided zoom level or fall back to config
-        if zoom_level is None:
-            zoom_level = int(getattr(CFG.autoortho, 'max_zoom', 16))
-        
-        # Calculate tile coordinates using Web Mercator projection
-        n = 2 ** zoom_level
-        
-        def latlon_to_tile(lat, lon):
-            """Convert lat/lon to tile coordinates."""
-            x = int((lon + 180) / 360 * n)
-            # Clamp latitude to valid Mercator range
-            lat_clamped = max(-85.0511, min(85.0511, lat))
-            lat_rad = math.radians(lat_clamped)
-            y = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
-            return (x, y)
-        
-        # Get tile coordinates for start and end of path
-        col1, row1 = latlon_to_tile(lat1, lon1)
-        col2, row2 = latlon_to_tile(lat2, lon2)
-        
-        # Get tiles in the bounding box (prioritize destination end)
-        row_min, row_max = min(row1, row2), max(row1, row2)
-        col_min, col_max = min(col1, col2), max(col1, col2)
-        
-        # Limit the search area to avoid excessive prefetching
-        max_tiles = 4  # Max tiles per dimension
-        if row_max - row_min > max_tiles:
-            row_min = row2 - max_tiles // 2
-            row_max = row2 + max_tiles // 2
-        if col_max - col_min > max_tiles:
-            col_min = col2 - max_tiles // 2
-            col_max = col2 + max_tiles // 2
-        
-        # Iterate from destination back to current position
-        for row in range(row_max, row_min - 1, -1):
-            for col in range(col_min, col_max + 1):
-                if chunks_submitted >= self.max_chunks:
-                    return chunks_submitted
-                    
-                # Create unique key for this tile
-                tile_key = (row, col, zoom_level)
-                
-                # Skip if recently prefetched
-                if tile_key in self._recently_prefetched:
-                    continue
-                    
-                # Add to recently prefetched (with size limit)
-                self._recently_prefetched.add(tile_key)
-                if len(self._recently_prefetched) > self._max_recent:
-                    # Remove oldest (arbitrary since set, but prevents unbounded growth)
-                    try:
-                        self._recently_prefetched.pop()
-                    except KeyError:
-                        pass
-                
-                # Prefetch this tile's chunks
-                submitted = self._prefetch_tile(row, col, zoom_level)
-                chunks_submitted += submitted
-                
-        return chunks_submitted
-    
-    def _prefetch_tile(self, row, col, zoom):
-        """
-        Submit prefetch requests for a tile's chunks.
+            row: Tile row coordinate
+            col: Tile column coordinate  
+            zoom: Zoom level (max zoom for this tile)
+            maptype: Optional maptype (e.g., "BI", "EOX"). If None, uses config.
         
         Returns number of chunks submitted.
         
+        Downloads chunks for all mipmap levels (ZL16, ZL15, ZL14, etc.) to ensure
+        the prebuilt DDS matches on-demand behavior where X-Plane may request
+        any mipmap level first and get native-resolution chunks.
+        
         IMPORTANT: Uses _open_tile()/_close_tile() pair to properly manage refs.
         This ensures prefetched tiles can be evicted when no longer needed.
+        
+        If X-Plane has also opened this tile (refs > 1 after our open), we drop
+        it and let the on-demand tile build logic handle it instead.
         """
-        # Get maptype from config
-        maptype = getattr(CFG.autoortho, 'maptype_override', None)
-        if not maptype or maptype == "Use tile default":
-            maptype = "EOX"
+        # Get maptype from parameter or config
+        if maptype is None:
+            maptype = getattr(CFG.autoortho, 'maptype_override', None)
+            if not maptype or maptype == "Use tile default":
+                maptype = "EOX"
         
         tile = None
         try:
             # Use _open_tile() to properly increment refs (balanced with _close_tile below)
             # This ensures prefetched tiles don't accumulate refs and block eviction.
-            # Previous bug: _get_tile() incremented refs for new tiles but we never
-            # called _close_tile(), causing refs to stay elevated and preventing eviction.
             tile = self._tile_cacher._open_tile(row, col, maptype, zoom)
             if not tile:
                 return 0
-                
-            # Get chunks for highest detail mipmap
-            if not tile.chunks or zoom not in tile.chunks:
-                # Trigger chunk creation by requesting a mipmap
-                # But don't actually wait - just ensure chunks exist
+            
+            # If tile has refs > 1, X-Plane has also opened it - drop and let on-demand handle
+            # Our _open_tile incremented refs to 1 (new) or +1 (existing). If refs > 1 now,
+            # it means X-Plane is actively using this tile.
+            if tile.refs > 1:
+                log.debug(f"Tile {row},{col}@ZL{zoom} has refs={tile.refs}, X-Plane is using it - dropping prefetch")
                 return 0
-                
-            chunks = tile.chunks.get(zoom, [])
+            
             submitted = 0
             
-            for chunk in chunks:
-                # Skip if already ready, in flight, or failed
-                if chunk.ready.is_set():
-                    continue
-                if chunk.in_queue or chunk.in_flight:
-                    continue
-                if chunk.permanent_failure:
-                    continue
-                    
-                # Set low priority (higher number = lower priority)
-                chunk.priority = self.PREFETCH_PRIORITY_OFFSET
+            # =========================================================================
+            # Download chunks for ALL mipmap levels (not just mipmap 0)
+            # This ensures prebuilt DDS matches on-demand behavior where X-Plane
+            # may request any mipmap first and get native-resolution chunks.
+            #
+            # Mipmap levels and their zoom:
+            #   mipmap 0 → max_zoom (ZL16) → 256 chunks (highest detail)
+            #   mipmap 1 → max_zoom-1 (ZL15) → 64 chunks
+            #   mipmap 2 → max_zoom-2 (ZL14) → 16 chunks
+            #   mipmap 3 → max_zoom-3 (ZL13) → 4 chunks
+            #   mipmap 4 → max_zoom-4 (ZL12) → 1 chunk (lowest detail)
+            # =========================================================================
+            
+            for mipmap in range(tile.max_mipmap + 1):
+                mipmap_zoom = tile.max_zoom - mipmap
                 
-                # Submit to chunk getter
-                chunk_getter.submit(chunk)
-                submitted += 1
-                
-                # Stop if we've submitted enough from this tile
-                if submitted >= 4:  # Max 4 chunks per tile per cycle
+                # Don't go below minimum zoom
+                if mipmap_zoom < tile.min_zoom:
                     break
+                
+                # Create chunks for this zoom level if they don't exist
+                tile._create_chunks(mipmap_zoom)
+                
+                mipmap_chunks = tile.chunks.get(mipmap_zoom, [])
+                if not mipmap_chunks:
+                    continue
+                
+                for chunk in mipmap_chunks:
+                    # Skip if already ready, in flight, or failed
+                    if chunk.ready.is_set():
+                        continue
+                    if chunk.in_queue or chunk.in_flight:
+                        continue
+                    if chunk.permanent_failure:
+                        continue
                     
+                    # Priority: mipmap 0 = most important, higher mipmaps = less important
+                    # Lower priority number = more urgent
+                    chunk.priority = self.PREFETCH_PRIORITY_OFFSET + mipmap
+                    
+                    # Submit to chunk getter
+                    chunk_getter.submit(chunk)
+                    submitted += 1
+                    
+                    # Limit chunks per tile to avoid flooding queue with one tile
+                    if submitted >= self.MAX_CHUNKS_PER_TILE:
+                        break
+                
+                if submitted >= self.MAX_CHUNKS_PER_TILE:
+                    break
+            
+            # Register tile with completion tracker for predictive DDS generation
+            # This must happen AFTER creating all chunks so the tracker can count them
+            if tile_completion_tracker is not None and submitted > 0:
+                tile_completion_tracker.start_tracking(tile, zoom)
+            
             return submitted
             
         except Exception as e:
@@ -1440,6 +1887,700 @@ def start_prefetcher(tile_cacher):
 def stop_prefetcher():
     """Stop the spatial prefetcher."""
     spatial_prefetcher.stop()
+
+
+# ============================================================================
+# PREDICTIVE DDS GENERATION
+# ============================================================================
+# Pre-builds DDS textures in the background after tiles are prefetched.
+# This eliminates the decode+compress stutter when X-Plane reads new tiles.
+#
+# Components:
+# 1. TileCompletionTracker - Monitors chunk downloads, detects when all ready
+# 2. PrebuiltDDSCache - Stores pre-built DDS for instant serving
+# 3. BackgroundDDSBuilder - Builds DDS from completed tiles in background
+# ============================================================================
+
+class _TrackedTile:
+    """Internal tracking state for a tile being prefetched."""
+    __slots__ = ('tile', 'zoom', 'expected_chunks', 'completed_chunks', 
+                 'start_time', 'completed_chunk_ids')
+    
+    def __init__(self, tile, zoom: int, expected_chunks: int):
+        self.tile = tile
+        self.zoom = zoom
+        self.expected_chunks = expected_chunks
+        self.completed_chunks = 0
+        self.start_time = time.monotonic()
+        self.completed_chunk_ids = set()  # Track which chunks reported complete
+
+
+class TileCompletionTracker:
+    """
+    Tracks chunk downloads and notifies when all chunks for a tile are ready.
+    
+    Thread-safe: chunks complete on ChunkGetter threads, notifications are
+    processed to avoid blocking download threads.
+    
+    Memory-bounded: Only tracks tiles that are actively being prefetched.
+    Tiles are removed from tracking once build is triggered or on timeout.
+    """
+    
+    def __init__(self, on_tile_complete=None):
+        """
+        Args:
+            on_tile_complete: Callback when all chunks are ready.
+                             Called with (tile_id, tile) from notification thread.
+                             If None, no callback is made.
+        """
+        self._lock = threading.Lock()
+        self._tracked_tiles: Dict[str, _TrackedTile] = {}
+        self._on_tile_complete = on_tile_complete
+        self._max_tracked = 200  # Limit memory usage
+        self._timeout_sec = 600  # Stop tracking after 10 minutes
+        self._last_cleanup = time.monotonic()
+        self._cleanup_interval = 60  # Cleanup every 60 seconds
+    
+    def start_tracking(self, tile, zoom: int) -> None:
+        """
+        Begin tracking a tile's chunk completion for ALL mipmap levels.
+        
+        Called by SpatialPrefetcher when it starts prefetching a tile.
+        If tile is already being tracked, this is a no-op.
+        
+        Counts chunks across all mipmap levels (not just mipmap 0) to ensure
+        we wait for all native-resolution chunks before building the DDS.
+        
+        Args:
+            tile: Tile object to track
+            zoom: Max zoom level for this tile (tile.max_zoom)
+        """
+        if tile is None:
+            return
+        
+        tile_id = tile.id
+        
+        with self._lock:
+            # Already tracking this tile
+            if tile_id in self._tracked_tiles:
+                return
+            
+            # Calculate expected chunk count across ALL mipmap levels
+            # Each mipmap has chunks at its corresponding zoom level:
+            #   mipmap 0 → max_zoom (256 chunks typically)
+            #   mipmap 1 → max_zoom-1 (64 chunks)
+            #   mipmap 2 → max_zoom-2 (16 chunks)
+            #   mipmap 3 → max_zoom-3 (4 chunks)
+            #   mipmap 4 → max_zoom-4 (1 chunk)
+            total_expected = 0
+            
+            for mipmap in range(tile.max_mipmap + 1):
+                mipmap_zoom = tile.max_zoom - mipmap
+                
+                # Don't go below minimum zoom
+                if mipmap_zoom < tile.min_zoom:
+                    break
+                
+                chunks = tile.chunks.get(mipmap_zoom, [])
+                if chunks:
+                    total_expected += len(chunks)
+                else:
+                    # Chunks not created yet - estimate from tile dimensions
+                    # Chunk count follows 4^mipmap pattern relative to mipmap 0
+                    zoom_diff = tile.tilename_zoom - mipmap_zoom
+                    if zoom_diff >= 0:
+                        chunks_per_row = tile.width >> zoom_diff
+                        chunks_per_col = tile.height >> zoom_diff
+                    else:
+                        chunks_per_row = tile.width << (-zoom_diff)
+                        chunks_per_col = tile.height << (-zoom_diff)
+                    total_expected += max(1, chunks_per_row) * max(1, chunks_per_col)
+            
+            # Enforce max tracked limit (evict oldest if needed)
+            if len(self._tracked_tiles) >= self._max_tracked:
+                self._evict_oldest_unlocked()
+            
+            self._tracked_tiles[tile_id] = _TrackedTile(tile, zoom, total_expected)
+            log.debug(f"TileCompletionTracker: Started tracking {tile_id} "
+                     f"(expecting {total_expected} chunks across all mipmaps)")
+            
+            # Periodic cleanup of stale entries
+            self._maybe_cleanup_unlocked()
+    
+    def notify_chunk_ready(self, tile_id: str, chunk) -> None:
+        """
+        Called when a chunk download completes.
+        
+        Thread-safe: may be called from any ChunkGetter thread.
+        Non-blocking: uses fire-and-forget pattern.
+        
+        Args:
+            tile_id: ID of the parent tile
+            chunk: The chunk that just completed
+        """
+        if not tile_id:
+            return
+        
+        tile_to_callback = None
+        
+        with self._lock:
+            tracked = self._tracked_tiles.get(tile_id)
+            if tracked is None:
+                # Not tracking this tile (not prefetched, or already completed)
+                return
+            
+            # Avoid double-counting the same chunk
+            chunk_key = chunk.chunk_id if chunk else None
+            if chunk_key and chunk_key in tracked.completed_chunk_ids:
+                return
+            
+            if chunk_key:
+                tracked.completed_chunk_ids.add(chunk_key)
+            tracked.completed_chunks += 1
+            
+            log.debug(f"TileCompletionTracker: {tile_id} chunk complete "
+                     f"({tracked.completed_chunks}/{tracked.expected_chunks})")
+            
+            # Check if tile is complete
+            if tracked.completed_chunks >= tracked.expected_chunks:
+                tile_to_callback = tracked.tile
+                # Remove from tracking (build will be triggered)
+                del self._tracked_tiles[tile_id]
+                log.debug(f"TileCompletionTracker: {tile_id} COMPLETE - all chunks ready")
+        
+        # Call callback OUTSIDE the lock to avoid deadlocks
+        if tile_to_callback is not None and self._on_tile_complete is not None:
+            try:
+                self._on_tile_complete(tile_id, tile_to_callback)
+            except Exception as e:
+                log.warning(f"TileCompletionTracker: Callback error for {tile_id}: {e}")
+    
+    def stop_tracking(self, tile_id: str) -> None:
+        """Stop tracking a tile (e.g., tile was evicted from cache)."""
+        with self._lock:
+            self._tracked_tiles.pop(tile_id, None)
+    
+    def _evict_oldest_unlocked(self) -> None:
+        """Evict the oldest tracked tile. Must hold _lock."""
+        if not self._tracked_tiles:
+            return
+        
+        oldest_id = None
+        oldest_time = float('inf')
+        
+        for tid, tracked in self._tracked_tiles.items():
+            if tracked.start_time < oldest_time:
+                oldest_time = tracked.start_time
+                oldest_id = tid
+        
+        if oldest_id:
+            del self._tracked_tiles[oldest_id]
+            log.debug(f"TileCompletionTracker: Evicted oldest tile {oldest_id}")
+    
+    def _maybe_cleanup_unlocked(self) -> None:
+        """Cleanup stale entries if enough time has passed. Must hold _lock."""
+        now = time.monotonic()
+        if now - self._last_cleanup < self._cleanup_interval:
+            return
+        
+        self._last_cleanup = now
+        cutoff = now - self._timeout_sec
+        
+        stale = [tid for tid, tracked in self._tracked_tiles.items()
+                 if tracked.start_time < cutoff]
+        
+        for tid in stale:
+            del self._tracked_tiles[tid]
+            log.debug(f"TileCompletionTracker: Cleaned up stale tile {tid}")
+    
+    @property
+    def tracked_count(self) -> int:
+        """Number of tiles currently being tracked."""
+        with self._lock:
+            return len(self._tracked_tiles)
+
+
+class PrebuiltDDSCache:
+    """
+    Cache for pre-built DDS byte buffers.
+    
+    Stores completed DDS textures built by BackgroundDDSBuilder.
+    These are served directly to X-Plane on cache hit, avoiding
+    the decode+compress overhead.
+    
+    Memory Management:
+    - Has its own memory limit (separate from tile cache)
+    - Uses LRU eviction when limit is reached
+    - Prebuilt tiles are evicted BEFORE active tiles
+    
+    Thread Safety:
+    - Reads and writes are protected by RLock
+    - Multiple FUSE threads may read concurrently
+    - Single builder thread writes
+    """
+    
+    def __init__(self, max_memory_bytes: int = 512 * 1024 * 1024):
+        """
+        Args:
+            max_memory_bytes: Maximum memory for prebuilt DDS (default 512MB)
+        """
+        self._lock = threading.RLock()
+        self._cache: OrderedDict = OrderedDict()
+        self._memory_used = 0
+        self._max_memory = max_memory_bytes
+        self._hits = 0
+        self._misses = 0
+    
+    def get(self, tile_id: str) -> Optional[bytes]:
+        """
+        Retrieve pre-built DDS bytes for a tile.
+        
+        Returns None if not in cache (cache miss).
+        Updates LRU order on hit.
+        
+        Thread-safe: may be called from multiple FUSE threads.
+        """
+        with self._lock:
+            if tile_id not in self._cache:
+                self._misses += 1
+                return None
+            
+            # Move to end (most recently used)
+            self._cache.move_to_end(tile_id)
+            self._hits += 1
+            return self._cache[tile_id]
+    
+    def store(self, tile_id: str, dds_bytes: bytes) -> None:
+        """
+        Store pre-built DDS bytes.
+        
+        Evicts oldest entries if memory limit exceeded.
+        
+        Thread-safe: called from builder thread.
+        """
+        if not dds_bytes:
+            return
+        
+        size = len(dds_bytes)
+        
+        with self._lock:
+            # Remove existing entry if present
+            if tile_id in self._cache:
+                old_size = len(self._cache[tile_id])
+                del self._cache[tile_id]
+                self._memory_used -= old_size
+            
+            # Evict until we have room
+            while self._memory_used + size > self._max_memory and self._cache:
+                oldest_id, oldest_bytes = self._cache.popitem(last=False)
+                self._memory_used -= len(oldest_bytes)
+                log.debug(f"PrebuiltDDSCache: Evicted {oldest_id} to make room")
+            
+            # Store new entry
+            self._cache[tile_id] = dds_bytes
+            self._memory_used += size
+            log.debug(f"PrebuiltDDSCache: Stored {tile_id} ({size} bytes, "
+                     f"total: {self._memory_used / (1024*1024):.1f}MB)")
+    
+    def remove(self, tile_id: str) -> None:
+        """Remove a tile from the cache (e.g., when tile is evicted from main cache)."""
+        with self._lock:
+            if tile_id in self._cache:
+                size = len(self._cache[tile_id])
+                del self._cache[tile_id]
+                self._memory_used -= size
+    
+    def clear(self) -> None:
+        """Clear all cached entries."""
+        with self._lock:
+            self._cache.clear()
+            self._memory_used = 0
+    
+    def contains(self, tile_id: str) -> bool:
+        """Check if tile is in cache without updating LRU."""
+        with self._lock:
+            return tile_id in self._cache
+    
+    @property
+    def stats(self) -> dict:
+        """Return cache statistics."""
+        with self._lock:
+            total = self._hits + self._misses
+            hit_rate = (self._hits / total * 100) if total > 0 else 0
+            return {
+                'entries': len(self._cache),
+                'memory_mb': self._memory_used / (1024 * 1024),
+                'max_memory_mb': self._max_memory / (1024 * 1024),
+                'hits': self._hits,
+                'misses': self._misses,
+                'hit_rate': hit_rate
+            }
+
+
+class BackgroundDDSBuilder:
+    """
+    Builds DDS textures from fully-downloaded tiles in the background.
+    
+    Design principles:
+    1. Single-threaded: Avoids CPU contention, predictable load
+    2. Rate-limited: Minimum interval between builds to prevent micro-stutters
+    3. Priority queue: Build tiles in submission order (FIFO for fairness)
+    4. Interruptible: Can pause/stop cleanly during shutdown
+    """
+    
+    # Maximum queue depth (prevents unbounded memory growth)
+    MAX_QUEUE_SIZE = 100
+    
+    def __init__(self, prebuilt_cache: PrebuiltDDSCache, 
+                 build_interval_sec: float = 0.5):
+        """
+        Args:
+            prebuilt_cache: Cache to store completed DDS buffers
+            build_interval_sec: Minimum time between builds (rate limiting)
+        """
+        self._queue = Queue(maxsize=self.MAX_QUEUE_SIZE)
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._prebuilt_cache = prebuilt_cache
+        self._build_interval = build_interval_sec
+        self._builds_completed = 0
+        self._builds_failed = 0
+        self._last_build_time = 0.0
+    
+    def start(self) -> None:
+        """Start the background builder thread."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._build_loop,
+            name="BackgroundDDSBuilder",
+            daemon=True
+        )
+        self._thread.start()
+        log.info(f"BackgroundDDSBuilder started (interval={self._build_interval*1000:.0f}ms)")
+    
+    def stop(self) -> None:
+        """Stop the background builder thread."""
+        self._stop_event.set()
+        
+        if self._thread is not None:
+            # Put a sentinel to unblock the queue.get()
+            try:
+                self._queue.put_nowait(None)
+            except Full:
+                pass
+            
+            self._thread.join(timeout=5.0)
+            self._thread = None
+        
+        log.info(f"BackgroundDDSBuilder stopped "
+                f"(built={self._builds_completed}, failed={self._builds_failed})")
+    
+    def submit(self, tile, priority: float = 0) -> bool:
+        """
+        Submit a tile for background DDS building.
+        
+        Args:
+            tile: Tile with all chunks downloaded
+            priority: Not used currently (FIFO order), reserved for future
+            
+        Returns:
+            True if queued, False if queue is full or tile already cached
+        """
+        if tile is None:
+            return False
+        
+        # Skip if already in prebuilt cache
+        if self._prebuilt_cache.contains(tile.id):
+            log.debug(f"BackgroundDDSBuilder: Skipping {tile.id} - already cached")
+            return False
+        
+        try:
+            self._queue.put_nowait((priority, tile))
+            log.debug(f"BackgroundDDSBuilder: Queued {tile.id} "
+                     f"(queue size: {self._queue.qsize()})")
+            return True
+        except Full:
+            log.debug(f"BackgroundDDSBuilder: Queue full, skipping {tile.id}")
+            return False
+    
+    def _build_loop(self) -> None:
+        """Main build loop - runs in background thread."""
+        while not self._stop_event.is_set():
+            try:
+                # Non-blocking get with timeout for clean shutdown
+                item = self._queue.get(timeout=1.0)
+            except Empty:
+                continue
+            
+            # Sentinel value signals shutdown
+            if item is None:
+                continue
+            
+            priority, tile = item
+            
+            # Rate limiting: ensure minimum interval between builds
+            elapsed = time.monotonic() - self._last_build_time
+            if elapsed < self._build_interval:
+                sleep_time = self._build_interval - elapsed
+                # Use stop_event.wait() for interruptible sleep
+                if self._stop_event.wait(timeout=sleep_time):
+                    # Stop requested during sleep
+                    continue
+            
+            # Build the DDS
+            self._build_tile_dds(tile)
+            self._last_build_time = time.monotonic()
+    
+    def _build_tile_dds(self, tile) -> None:
+        """
+        Build DDS for a single tile and store in prebuilt cache.
+        
+        Builds EACH mipmap from native-resolution chunks to match on-demand
+        behavior. This ensures prebuilt tiles are visually identical to tiles
+        that X-Plane requests directly.
+        
+        Uses the tile's existing infrastructure to get the composed image
+        for each mipmap level, then compresses each into the DDS.
+        """
+        tile_id = tile.id
+        build_start = time.monotonic()
+        mipmap_images = []  # Track images for cleanup
+        
+        try:
+            # Verify tile is still valid
+            if tile.dds is None:
+                log.debug(f"BackgroundDDSBuilder: {tile_id} - tile.dds is None, skipping")
+                return
+            
+            # Skip if already in cache (race condition check)
+            if self._prebuilt_cache.contains(tile_id):
+                log.debug(f"BackgroundDDSBuilder: {tile_id} - already in cache, skipping")
+                return
+            
+            # Step 1: Verify chunks are ready for ALL mipmap levels
+            # We need native chunks at each zoom level for proper mipmap building
+            total_chunks = 0
+            total_resolved = 0
+            total_with_data = 0
+            
+            for mipmap in range(tile.max_mipmap + 1):
+                mipmap_zoom = tile.max_zoom - mipmap
+                if mipmap_zoom < tile.min_zoom:
+                    break
+                
+                chunks = tile.chunks.get(mipmap_zoom, [])
+                if not chunks:
+                    # Chunks not created for this mipmap - can't build natively
+                    log.debug(f"BackgroundDDSBuilder: {tile_id} - no chunks for mipmap {mipmap} (zoom {mipmap_zoom})")
+                    continue
+                
+                total_chunks += len(chunks)
+                resolved = sum(1 for c in chunks if c.ready.is_set())
+                with_data = sum(1 for c in chunks if c.ready.is_set() and c.data)
+                total_resolved += resolved
+                total_with_data += with_data
+            
+            if total_resolved < total_chunks:
+                # Some chunks still downloading - not ready for prebuild yet
+                log.debug(f"BackgroundDDSBuilder: {tile_id} - only {total_resolved}/{total_chunks} chunks resolved")
+                return
+            
+            if total_with_data == 0:
+                # ALL chunks failed - nothing to build from
+                log.debug(f"BackgroundDDSBuilder: {tile_id} - all chunks failed, skipping")
+                return
+            
+            # Determine fallback behavior for prebuilds
+            use_fallbacks = getattr(CFG.autoortho, 'predictive_dds_use_fallbacks', True)
+            if isinstance(use_fallbacks, str):
+                use_fallbacks = use_fallbacks.lower() in ('true', '1', 'yes', 'on')
+            
+            fallback_override = None if use_fallbacks else 0
+            
+            failed_count = total_chunks - total_with_data
+            if failed_count > 0:
+                if use_fallbacks:
+                    log.debug(f"BackgroundDDSBuilder: {tile_id} - {failed_count}/{total_chunks} chunks failed, "
+                             f"will apply fallbacks")
+                else:
+                    log.debug(f"BackgroundDDSBuilder: {tile_id} - {failed_count}/{total_chunks} chunks failed, "
+                             f"will use missing color (fallbacks disabled)")
+            
+            # Step 2: Get mipmap 0 image to determine DDS dimensions
+            img0 = tile.get_img(0, startrow=0, endrow=None, maxwait=30,
+                               fallback_level_override=fallback_override)
+            
+            if img0 is None:
+                log.debug(f"BackgroundDDSBuilder: {tile_id} - mipmap 0 get_img returned None")
+                self._builds_failed += 1
+                return
+            
+            mipmap_images.append(img0)
+            width, height = img0.size
+            
+            # Step 3: Create DDS and compress mipmap 0
+            use_ispc = CFG.pydds.compressor.upper() == "ISPC"
+            dxt_format = CFG.pydds.format
+            
+            temp_dds = pydds.DDS(width, height, ispc=use_ispc, dxt_format=dxt_format)
+            
+            # Compress mipmap 0 only (not generating lower mipmaps from it)
+            temp_dds.gen_mipmaps(img0, startmipmap=0, maxmipmaps=1)
+            
+            # Step 4: Build each subsequent mipmap from its native chunks
+            # This matches on-demand behavior where X-Plane might request
+            # any mipmap first and get native-resolution chunks
+            for mipmap in range(1, tile.max_mipmap + 1):
+                mipmap_zoom = tile.max_zoom - mipmap
+                if mipmap_zoom < tile.min_zoom:
+                    break
+                
+                # Get native image for this mipmap level
+                img = tile.get_img(mipmap, startrow=0, endrow=None, maxwait=30,
+                                  fallback_level_override=fallback_override)
+                
+                if img is None:
+                    # Fall back to generating remaining mipmaps by downscaling
+                    log.debug(f"BackgroundDDSBuilder: {tile_id} - mipmap {mipmap} get_img failed, "
+                             f"will generate by downscaling")
+                    # Generate remaining mipmaps from what we have
+                    temp_dds.gen_mipmaps(img0, startmipmap=mipmap, maxmipmaps=99)
+                    break
+                
+                mipmap_images.append(img)
+                
+                # Compress just this mipmap from native image
+                temp_dds.gen_mipmaps(img, startmipmap=mipmap, maxmipmaps=1)
+            
+            # Step 5: Read out the complete DDS as bytes
+            dds_bytes = temp_dds.read(temp_dds.total_size)
+            
+            if not dds_bytes or len(dds_bytes) < 128:
+                log.debug(f"BackgroundDDSBuilder: {tile_id} - DDS read failed")
+                self._builds_failed += 1
+                return
+            
+            # Step 6: Store in prebuilt cache
+            self._prebuilt_cache.store(tile_id, dds_bytes)
+            
+            build_time = (time.monotonic() - build_start) * 1000
+            self._builds_completed += 1
+            
+            log.debug(f"BackgroundDDSBuilder: Built {tile_id} in {build_time:.0f}ms "
+                     f"({len(dds_bytes)} bytes, {len(mipmap_images)} native mipmaps)")
+            bump('prebuilt_dds_builds')
+            
+        except Exception as e:
+            log.warning(f"BackgroundDDSBuilder: Failed to build {tile_id}: {e}")
+            self._builds_failed += 1
+        finally:
+            # Clean up all mipmap images
+            for img in mipmap_images:
+                try:
+                    img.close()
+                except Exception:
+                    pass
+    
+    @property
+    def queue_size(self) -> int:
+        """Current number of tiles waiting to be built."""
+        return self._queue.qsize()
+    
+    @property
+    def stats(self) -> dict:
+        """Return builder statistics."""
+        return {
+            'queue_size': self._queue.qsize(),
+            'builds_completed': self._builds_completed,
+            'builds_failed': self._builds_failed,
+            'interval_ms': self._build_interval * 1000
+        }
+
+
+# Global instances for predictive DDS generation (initialized in start_predictive_dds)
+prebuilt_dds_cache: Optional[PrebuiltDDSCache] = None
+background_dds_builder: Optional[BackgroundDDSBuilder] = None
+tile_completion_tracker: Optional[TileCompletionTracker] = None
+
+
+def _on_tile_complete_callback(tile_id: str, tile) -> None:
+    """
+    Callback invoked when all chunks for a tile have been downloaded.
+    Submits the tile to the background DDS builder.
+    """
+    if background_dds_builder is not None:
+        background_dds_builder.submit(tile)
+
+
+def start_predictive_dds(tile_cacher=None) -> None:
+    """
+    Initialize and start the predictive DDS generation system.
+    
+    Should be called after start_prefetcher().
+    
+    Args:
+        tile_cacher: TileCacher instance (for future use)
+    """
+    global prebuilt_dds_cache, background_dds_builder, tile_completion_tracker
+    
+    # Check if enabled
+    enabled = getattr(CFG.autoortho, 'predictive_dds_enabled', True)
+    if isinstance(enabled, str):
+        enabled = enabled.lower() in ('true', '1', 'yes', 'on')
+    
+    if not enabled:
+        log.info("Predictive DDS generation disabled by configuration")
+        return
+    
+    # Get configuration
+    cache_mb = int(getattr(CFG.autoortho, 'predictive_dds_cache_mb', 512))
+    cache_mb = max(128, min(2048, cache_mb))  # Clamp to valid range
+    
+    build_interval_ms = int(getattr(CFG.autoortho, 'predictive_dds_build_interval_ms', 500))
+    build_interval_ms = max(100, min(2000, build_interval_ms))
+    build_interval_sec = build_interval_ms / 1000.0
+    
+    # Initialize components
+    prebuilt_dds_cache = PrebuiltDDSCache(max_memory_bytes=cache_mb * 1024 * 1024)
+    
+    background_dds_builder = BackgroundDDSBuilder(
+        prebuilt_cache=prebuilt_dds_cache,
+        build_interval_sec=build_interval_sec
+    )
+    
+    tile_completion_tracker = TileCompletionTracker(
+        on_tile_complete=_on_tile_complete_callback
+    )
+    
+    # Start the builder thread
+    background_dds_builder.start()
+    
+    log.info(f"Predictive DDS generation started "
+            f"(cache={cache_mb}MB, interval={build_interval_ms}ms)")
+
+
+def stop_predictive_dds() -> None:
+    """Stop the predictive DDS generation system."""
+    global background_dds_builder, tile_completion_tracker, prebuilt_dds_cache
+    
+    if background_dds_builder is not None:
+        stats = background_dds_builder.stats
+        background_dds_builder.stop()
+        log.info(f"BackgroundDDSBuilder: {stats['builds_completed']} tiles built, "
+                f"{stats['builds_failed']} failed")
+    
+    if prebuilt_dds_cache is not None:
+        stats = prebuilt_dds_cache.stats
+        log.info(f"PrebuiltDDSCache: {stats['hits']} hits, {stats['misses']} misses, "
+                f"{stats['hit_rate']:.1f}% hit rate, {stats['memory_mb']:.1f}MB used")
+    
+    # Clear references
+    background_dds_builder = None
+    tile_completion_tracker = None
+    prebuilt_dds_cache = None
 
 
 # HTTP status codes that indicate permanent failure (no retry)
@@ -1478,15 +2619,19 @@ class Chunk(object):
     data = None
     img = None
     url = None
+    
+    # Parent tile ID for completion tracking (predictive DDS generation)
+    tile_id = None
 
     serverlist=['a','b','c','d']
 
-    def __init__(self, col, row, maptype, zoom, priority=0, cache_dir='.cache'):
+    def __init__(self, col, row, maptype, zoom, priority=0, cache_dir='.cache', tile_id=None):
         self.col = col
         self.row = row
         self.zoom = zoom
         self.maptype = maptype
         self.cache_dir = cache_dir
+        self.tile_id = tile_id  # Parent tile ID for completion tracking
         
         # Hack override maptype
         #self.maptype = "BI"
@@ -1730,6 +2875,14 @@ class Chunk(object):
                     self.data = b''  # Empty data
                     self.ready.set()  # Mark as ready (with no data) to unblock waiters
                     bump(f'chunk_permanent_fail_{status_code}')
+                    # Notify tile completion tracker even on failure
+                    # This allows DDS prebuild to proceed with available chunks
+                    # (fallbacks will be applied during build for failed chunks)
+                    try:
+                        if tile_completion_tracker is not None and self.tile_id:
+                            tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
+                    except Exception:
+                        pass
                     return True  # Return True to stop worker retries
                 
                 # Check if transient failure has exceeded max retries
@@ -1743,6 +2896,12 @@ class Chunk(object):
                         self.data = b''
                         self.ready.set()
                         bump(f'chunk_transient_fail_{status_code}_exhausted')
+                        # Notify tile completion tracker even on exhausted retries
+                        try:
+                            if tile_completion_tracker is not None and self.tile_id:
+                                tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
+                        except Exception:
+                            pass
                         return True
                     # Increase backoff for rate limiting
                     if status_code == 429:
@@ -1791,6 +2950,14 @@ class Chunk(object):
         # The chunk data is already in memory (self.data), so we can mark it
         # as ready immediately. Cache writes are for future requests only.
         self.ready.set()
+        
+        # Notify tile completion tracker (for predictive DDS generation)
+        # Fire-and-forget: never block download on notification failure
+        try:
+            if tile_completion_tracker is not None and self.tile_id:
+                tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
+        except Exception:
+            pass  # Never block downloads
         
         # Submit cache write asynchronously - fire and forget
         # This prevents disk I/O from blocking the download worker thread
@@ -1961,7 +3128,8 @@ class Tile(object):
             for r in range(row, row+height):
                 for c in range(col, col+width):
                     # FIXED: Create chunk and let it check cache during initialization
-                    chunk = Chunk(c, r, self.maptype, zoom, cache_dir=self.cache_dir)
+                    # Pass tile_id for completion tracking (predictive DDS generation)
+                    chunk = Chunk(c, r, self.maptype, zoom, cache_dir=self.cache_dir, tile_id=self.id)
                     self.chunks[zoom].append(chunk)
         else:
             log.debug(f"Reusing existing {len(self.chunks[zoom])} chunks for zoom {zoom}")
@@ -2041,6 +3209,51 @@ class Tile(object):
                 log.error("Failed to get chunk.")
 
         return True
+    
+    def _populate_dds_from_prebuilt(self, prebuilt_bytes: bytes) -> bool:
+        """
+        Populate DDS mipmap buffers from prebuilt byte buffer.
+        
+        This copies the prebuilt DDS data into the tile's DDS structure
+        so that subsequent reads work correctly without re-checking the cache.
+        
+        Args:
+            prebuilt_bytes: Complete DDS file as bytes (including 128-byte header)
+            
+        Returns:
+            True if successful, False if DDS structure is invalid
+        """
+        if self.dds is None:
+            return False
+        
+        if not prebuilt_bytes or len(prebuilt_bytes) < 128:
+            return False
+        
+        try:
+            # The prebuilt bytes include the 128-byte DDS header followed by mipmap data
+            # We need to populate each mipmap's databuffer
+            for mm in self.dds.mipmap_list:
+                if mm.startpos >= len(prebuilt_bytes):
+                    # Prebuilt data doesn't include this mipmap - leave it for on-demand build
+                    break
+                
+                # Extract this mipmap's data from the prebuilt buffer
+                mm_end = min(mm.endpos, len(prebuilt_bytes))
+                if mm_end <= mm.startpos:
+                    break
+                    
+                mm_data = prebuilt_bytes[mm.startpos:mm_end]
+                
+                # Store in the mipmap's databuffer
+                mm.databuffer = BytesIO(initial_bytes=mm_data)
+                mm.retrieved = True
+            
+            log.debug(f"Populated DDS from prebuilt cache for {self}")
+            return True
+            
+        except Exception as e:
+            log.warning(f"Failed to populate DDS from prebuilt: {e}")
+            return False
    
     def find_mipmap_pos(self, offset):
         for m in self.dds.mipmap_list:
@@ -2054,6 +3267,26 @@ class Tile(object):
         if self.dds is None:
             log.debug(f"GET_BYTES: DDS is None for {self}, likely closing; skipping")
             return True
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # PREDICTIVE DDS: Check prebuilt cache first
+        # ═══════════════════════════════════════════════════════════════════
+        # If we have a prebuilt DDS for this tile, populate the DDS structure
+        # from it and skip all the chunk download/decode/compress work.
+        if prebuilt_dds_cache is not None:
+            prebuilt_bytes = prebuilt_dds_cache.get(self.id)
+            if prebuilt_bytes is not None:
+                if self._populate_dds_from_prebuilt(prebuilt_bytes):
+                    log.debug(f"GET_BYTES: Prebuilt cache HIT for {self.id}")
+                    bump('prebuilt_cache_hit')
+                    return True
+                else:
+                    # Population failed - fall through to normal path
+                    log.debug(f"GET_BYTES: Prebuilt cache hit but populate failed for {self.id}")
+                    bump('prebuilt_cache_populate_fail')
+            else:
+                bump('prebuilt_cache_miss')
+        # ═══════════════════════════════════════════════════════════════════
 
         mipmap = self.find_mipmap_pos(offset)
         log.debug(f"Get_bytes for mipmap {mipmap} ...")
@@ -2234,9 +3467,15 @@ class Tile(object):
         return outfile
 
     @locked
-    def get_img(self, mipmap, startrow=0, endrow=None, maxwait=5, min_zoom=None, time_budget=None):
+    def get_img(self, mipmap, startrow=0, endrow=None, maxwait=5, min_zoom=None, time_budget=None,
+                fallback_level_override=None):
         #
         # Get an image for a particular mipmap
+        #
+        # Args:
+        #   fallback_level_override: If provided, overrides the config fallback_level.
+        #       Used by BackgroundDDSBuilder when predictive_dds_use_fallbacks=False
+        #       to force fallback_level=0 (missing color only, no extra I/O).
         #
         
         # === TIME BUDGET INITIALIZATION ===
@@ -2287,7 +3526,13 @@ class Tile(object):
         # - Benefit: Only helped when mipmap 0 chunks fail (<5% of cases)
         # - Alternative: Fallback 3 (Cascading Download) handles failures on-demand
         #   with much lower overhead since it only activates when needed.
-        fallback_level = self.get_fallback_level()
+        #
+        # fallback_level_override allows callers (e.g., BackgroundDDSBuilder) to
+        # force a specific fallback behavior, bypassing user config.
+        if fallback_level_override is not None:
+            fallback_level = fallback_level_override
+        else:
+            fallback_level = self.get_fallback_level()
         fallback_extends_budget = self.get_fallback_extends_budget()
         
         # === FALLBACK BUDGET ===
@@ -2976,7 +4221,8 @@ class Tile(object):
             # Use HIGH priority (low number) for fallback chunks since they're blocking
             # tile completion. Regular mipmap 0 chunks have priority ~5-10, so we use
             # priority 0 to ensure fallback chunks get processed urgently.
-            chunk = Chunk(col, row, self.maptype, zoom, priority=0, cache_dir=self.cache_dir)
+            # Pass tile_id for completion tracking (predictive DDS generation)
+            chunk = Chunk(col, row, self.maptype, zoom, priority=0, cache_dir=self.cache_dir, tile_id=self.id)
             self._fallback_chunk_pool[key] = chunk
             bump('fallback_chunk_pool_miss')
             
@@ -4231,6 +5477,24 @@ class TileCacher(object):
                 log.debug(f"Still have {t.refs} refs for {tile_id}")
 
         return True
+    
+    def is_tile_opened_by_xplane(self, row: int, col: int, map_type: str, zoom: int) -> bool:
+        """
+        Check if a tile is currently opened by X-Plane (has refs > 0).
+        
+        This is used by the prefetcher to skip tiles that X-Plane is already
+        loading - the on-demand tile build logic will handle those.
+        
+        Returns:
+            True if tile exists and has refs > 0 (being used by X-Plane)
+            False if tile doesn't exist or has refs <= 0
+        """
+        tile_id = self._to_tile_id(row, col, map_type, zoom)
+        with self.tc_lock:
+            t = self.tiles.get(tile_id)
+            if t and t.refs > 0:
+                return True
+        return False
 
 # ============================================================
 # Module-level cleanup helpers

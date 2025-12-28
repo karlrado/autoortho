@@ -470,6 +470,27 @@ class SimBriefFlightManager:
             
             return False
     
+    def get_distance_from_origin(self, lat: float, lon: float) -> Optional[float]:
+        """
+        Calculate distance from a position to the origin airport.
+        
+        Uses the first fix in the flight plan as the origin reference point.
+        This allows prefetching to start while parked at the departure airport.
+        
+        Args:
+            lat: Aircraft latitude
+            lon: Aircraft longitude
+            
+        Returns:
+            Distance in nautical miles, or None if no flight plan is loaded
+        """
+        with self._lock:
+            if not self._fixes:
+                return None
+            
+            origin_fix = self._fixes[0]
+            return self._haversine_distance(lat, lon, origin_fix.lat, origin_fix.lon)
+    
     def _distance_to_segment(self, lat: float, lon: float,
                               lat1: float, lon1: float,
                               lat2: float, lon2: float) -> float:

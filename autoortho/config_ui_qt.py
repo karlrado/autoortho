@@ -1373,43 +1373,51 @@ class ConfigUI(QMainWindow):
         deviation_layout.addStretch()
         route_settings_layout.addLayout(deviation_layout)
 
-        # Route Prefetch Radius
-        prefetch_layout = QHBoxLayout()
-        prefetch_label = QLabel("Route Prefetch Radius:")
-        prefetch_label.setToolTip(
-            "Radius in nautical miles around waypoints to prefetch tiles.\n\n"
-            "AutoOrtho can prefetch tiles along your flight route ahead of time.\n"
-            "This radius determines how far around each waypoint tiles will be\n"
-            "downloaded in advance, ensuring smooth scenery during your flight.\n\n"
-            "• Larger values: More tiles prefetched, better coverage but more\n"
-            "  bandwidth and cache usage\n"
-            "• Smaller values: Fewer tiles prefetched, lighter on resources\n\n"
-            "This works with the spatial prefetcher to download tiles around\n"
-            "waypoints you're approaching.\n\n"
-            "Default: 40 nm\n\n"
-            "ℹ Changes take effect immediately. Use 'Save Config' to persist\n"
-            "the value for future sessions."
-        )
-        prefetch_layout.addWidget(prefetch_label)
-        
-        self.simbrief_prefetch_radius_spin = ModernSpinBox()
-        self.simbrief_prefetch_radius_spin.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
-        self.simbrief_prefetch_radius_spin.setMinimum(10)
-        self.simbrief_prefetch_radius_spin.setMaximum(150)
-        self.simbrief_prefetch_radius_spin.setSuffix(" nm")
-        prefetch_value = 40
+        # Prefetch while parked checkbox
+        prefetch_parked_layout = QHBoxLayout()
+        self.simbrief_prefetch_parked_check = QCheckBox("Prefetch while parked")
+        prefetch_parked_value = True
         if hasattr(self.cfg, 'simbrief'):
-            prefetch_value = int(getattr(self.cfg.simbrief, 'route_prefetch_radius_nm', 40))
-        self.simbrief_prefetch_radius_spin.setValue(prefetch_value)
-        self.simbrief_prefetch_radius_spin.setToolTip(
-            "Radius (nm) around waypoints to prefetch tiles"
+            val = getattr(self.cfg.simbrief, 'prefetch_while_parked', True)
+            if isinstance(val, str):
+                prefetch_parked_value = val.lower() in ('true', '1', 'yes', 'on')
+            else:
+                prefetch_parked_value = bool(val)
+        self.simbrief_prefetch_parked_check.setChecked(prefetch_parked_value)
+        self.simbrief_prefetch_parked_check.setToolTip(
+            "Start prefetching the route immediately when flight plan is loaded.\n\n"
+            "When enabled:\n"
+            "  • Prefetching starts while parked at the gate\n"
+            "  • Uses known route to fetch tiles ahead of time\n"
+            "  • Great for loading flight plans before departure\n\n"
+            "When disabled:\n"
+            "  • Prefetching only starts once airborne and on-route\n"
+            "  • Matches velocity-based prefetch behavior"
         )
-        self.simbrief_prefetch_radius_spin.valueChanged.connect(
-            self._on_route_prefetch_radius_changed
+        self.simbrief_prefetch_parked_check.stateChanged.connect(
+            self._on_prefetch_while_parked_changed
         )
-        prefetch_layout.addWidget(self.simbrief_prefetch_radius_spin)
-        prefetch_layout.addStretch()
-        route_settings_layout.addLayout(prefetch_layout)
+        prefetch_parked_layout.addWidget(self.simbrief_prefetch_parked_check)
+        prefetch_parked_layout.addStretch()
+        route_settings_layout.addLayout(prefetch_parked_layout)
+        
+        # Route Prefetch Radius note (moved to unified setting in Advanced)
+        prefetch_note_layout = QHBoxLayout()
+        prefetch_note_label = QLabel(
+            "ℹ Prefetch radius is now in Advanced Settings → Prefetching"
+        )
+        prefetch_note_label.setStyleSheet("color: #8ab4f8; font-style: italic;")
+        prefetch_note_label.setToolTip(
+            "The prefetch radius setting has been unified for both SimBrief\n"
+            "and velocity-based prefetching.\n\n"
+            "Go to: Advanced Settings → AutoOrtho → Prefetching → Prefetch radius\n\n"
+            "This single setting controls how wide a corridor of tiles is\n"
+            "prefetched around your flight path, regardless of whether you're\n"
+            "using SimBrief flight plans or simple heading-based prediction."
+        )
+        prefetch_note_layout.addWidget(prefetch_note_label)
+        prefetch_note_layout.addStretch()
+        route_settings_layout.addLayout(prefetch_note_layout)
 
         self.simbrief_route_settings_frame.hide()  # Hidden until use_flight_data is checked
         simbrief_info_layout.addWidget(self.simbrief_route_settings_frame)
@@ -2135,7 +2143,7 @@ class ConfigUI(QMainWindow):
         prefetch_enable_layout.addStretch()
         autoortho_layout.addLayout(prefetch_enable_layout)
         
-        # Prefetch lookahead slider (in minutes)
+        # Prefetch lookahead slider (in minutes, 0 = Unlimited)
         lookahead_layout = QHBoxLayout()
         self.prefetch_lookahead_label = QLabel("Lookahead time:")
         self.prefetch_lookahead_label.setToolTip(
@@ -2145,23 +2153,246 @@ class ConfigUI(QMainWindow):
             "Example at 300 knots:\n"
             "  • 5 min = ~25nm ahead\n"
             "  • 10 min = ~50nm ahead\n"
-            "  • 30 min = ~150nm ahead"
+            "  • 30 min = ~150nm ahead\n"
+            "  • Unlimited = continues until max chunks/cycle or other limits"
         )
         lookahead_layout.addWidget(self.prefetch_lookahead_label)
         
         self.prefetch_lookahead_slider = ModernSlider(Qt.Orientation.Horizontal)
-        self.prefetch_lookahead_slider.setRange(1, 60)  # 1-60 minutes
-        self.prefetch_lookahead_slider.setValue(
-            int(float(getattr(self.cfg.autoortho, 'prefetch_lookahead', 10)))
-        )
+        self.prefetch_lookahead_slider.setRange(1, 61)  # 1-60 minutes, 61 = Unlimited
+        # Load config: 0 means unlimited -> slider value 61
+        lookahead_config = int(float(getattr(self.cfg.autoortho, 'prefetch_lookahead', 10)))
+        if lookahead_config <= 0:
+            self.prefetch_lookahead_slider.setValue(61)  # Unlimited
+        else:
+            self.prefetch_lookahead_slider.setValue(min(lookahead_config, 60))
         self.prefetch_lookahead_slider.setObjectName('prefetch_lookahead')
-        self.prefetch_lookahead_value = QLabel(f"{self.prefetch_lookahead_slider.value()} min")
+        self.prefetch_lookahead_value = QLabel(
+            "Unlimited" if self.prefetch_lookahead_slider.value() == 61 
+            else f"{self.prefetch_lookahead_slider.value()} min"
+        )
         self.prefetch_lookahead_slider.valueChanged.connect(
-            lambda v: self.prefetch_lookahead_value.setText(f"{v} min")
+            lambda v: self.prefetch_lookahead_value.setText(
+                "Unlimited" if v == 61 else f"{v} min"
+            )
         )
         lookahead_layout.addWidget(self.prefetch_lookahead_slider)
         lookahead_layout.addWidget(self.prefetch_lookahead_value)
         autoortho_layout.addLayout(lookahead_layout)
+        
+        # Prefetch interval slider (NEW)
+        interval_layout = QHBoxLayout()
+        self.prefetch_interval_label = QLabel("Check interval:")
+        self.prefetch_interval_label.setToolTip(
+            "How often (in seconds) to check for prefetch opportunities.\n"
+            "Lower = more responsive prefetching, slightly higher CPU\n"
+            "Higher = less frequent checks, lower CPU\n\n"
+            "Recommended: 2.0 sec (balanced)"
+        )
+        interval_layout.addWidget(self.prefetch_interval_label)
+        
+        self.prefetch_interval_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.prefetch_interval_slider.setRange(10, 100)  # 1.0-10.0 seconds (x10)
+        self.prefetch_interval_slider.setValue(
+            int(float(getattr(self.cfg.autoortho, 'prefetch_interval', 2.0)) * 10)
+        )
+        self.prefetch_interval_slider.setObjectName('prefetch_interval')
+        self.prefetch_interval_value = QLabel(
+            f"{self.prefetch_interval_slider.value() / 10:.1f} sec"
+        )
+        self.prefetch_interval_slider.valueChanged.connect(
+            lambda v: self.prefetch_interval_value.setText(f"{v / 10:.1f} sec")
+        )
+        interval_layout.addWidget(self.prefetch_interval_slider)
+        interval_layout.addWidget(self.prefetch_interval_value)
+        autoortho_layout.addLayout(interval_layout)
+        
+        # Prefetch max chunks slider (NEW)
+        max_chunks_layout = QHBoxLayout()
+        self.prefetch_max_chunks_label = QLabel("Max chunks/cycle:")
+        self.prefetch_max_chunks_label.setToolTip(
+            "Maximum number of chunks to submit per prefetch cycle.\n"
+            "Higher = more aggressive prefetching, more bandwidth\n"
+            "Lower = gentler prefetching, less bandwidth\n\n"
+            "Recommended: 32 (balanced), 64-128 (fast internet), 16 (slow internet)\n"
+            "Values above 128 are for very fast connections only."
+        )
+        max_chunks_layout.addWidget(self.prefetch_max_chunks_label)
+        
+        self.prefetch_max_chunks_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.prefetch_max_chunks_slider.setRange(8, 512)
+        self.prefetch_max_chunks_slider.setValue(
+            int(getattr(self.cfg.autoortho, 'prefetch_max_chunks', 32))
+        )
+        self.prefetch_max_chunks_slider.setObjectName('prefetch_max_chunks')
+        self.prefetch_max_chunks_value = QLabel(
+            f"{self.prefetch_max_chunks_slider.value()}"
+        )
+        self.prefetch_max_chunks_slider.valueChanged.connect(
+            lambda v: self.prefetch_max_chunks_value.setText(f"{v}")
+        )
+        max_chunks_layout.addWidget(self.prefetch_max_chunks_slider)
+        max_chunks_layout.addWidget(self.prefetch_max_chunks_value)
+        autoortho_layout.addLayout(max_chunks_layout)
+        
+        # Prefetch radius slider (unified for both velocity and SimBrief methods)
+        radius_layout = QHBoxLayout()
+        self.prefetch_radius_label = QLabel("Prefetch radius:")
+        self.prefetch_radius_label.setToolTip(
+            "Radius (in nautical miles) around the flight path to prefetch tiles.\n\n"
+            "Tiles within this radius of each sample point along the route are prefetched.\n"
+            "Used by both velocity-based and SimBrief flight plan prefetching.\n\n"
+            "Higher = wider coverage, more tiles prefetched, higher bandwidth\n"
+            "Lower = narrower corridor, fewer tiles, less bandwidth\n\n"
+            "Recommended:\n"
+            "  • 20 nm - Conservative (slow internet)\n"
+            "  • 40 nm - Balanced (default)\n"
+            "  • 60+ nm - Aggressive (fast internet, wide turns)"
+        )
+        radius_layout.addWidget(self.prefetch_radius_label)
+        
+        self.prefetch_radius_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.prefetch_radius_slider.setRange(10, 150)  # 10-150 nm
+        self.prefetch_radius_slider.setValue(
+            int(float(getattr(self.cfg.autoortho, 'prefetch_radius_nm', 40)))
+        )
+        self.prefetch_radius_slider.setObjectName('prefetch_radius_nm')
+        self.prefetch_radius_value = QLabel(
+            f"{self.prefetch_radius_slider.value()} nm"
+        )
+        self.prefetch_radius_slider.valueChanged.connect(
+            lambda v: self.prefetch_radius_value.setText(f"{v} nm")
+        )
+        radius_layout.addWidget(self.prefetch_radius_slider)
+        radius_layout.addWidget(self.prefetch_radius_value)
+        autoortho_layout.addLayout(radius_layout)
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # PREDICTIVE DDS SECTION (NEW)
+        # ═══════════════════════════════════════════════════════════════════
+        autoortho_layout.addSpacing(10)
+        predictive_dds_header = QLabel("Predictive DDS Generation")
+        predictive_dds_header.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        autoortho_layout.addWidget(predictive_dds_header)
+        
+        # Enable checkbox
+        predictive_enable_layout = QHBoxLayout()
+        self.predictive_dds_enabled_check = QCheckBox("Enable predictive DDS building")
+        self.predictive_dds_enabled_check.setChecked(
+            getattr(self.cfg.autoortho, 'predictive_dds_enabled', True)
+        )
+        self.predictive_dds_enabled_check.setToolTip(
+            "Pre-build DDS textures in the background after tiles are prefetched.\n\n"
+            "When enabled:\n"
+            "  • Downloaded tiles are compressed to DDS in the background\n"
+            "  • X-Plane reads are served from cache (near-instant)\n"
+            "  • Dramatically reduces stutters when entering new areas\n\n"
+            "When disabled:\n"
+            "  • Tiles are only downloaded, not pre-compressed\n"
+            "  • DDS compression happens when X-Plane reads (can stutter)"
+        )
+        self.predictive_dds_enabled_check.stateChanged.connect(
+            self._update_predictive_dds_controls
+        )
+        predictive_enable_layout.addWidget(self.predictive_dds_enabled_check)
+        predictive_enable_layout.addStretch()
+        autoortho_layout.addLayout(predictive_enable_layout)
+        
+        # Cache size slider
+        cache_layout = QHBoxLayout()
+        self.predictive_cache_label = QLabel("Cache size:")
+        self.predictive_cache_label.setToolTip(
+            "Maximum memory for pre-built DDS tiles.\n"
+            "Higher = more tiles cached, fewer stutters, more RAM used\n"
+            "Lower = fewer tiles cached, more potential stutters\n\n"
+            "Recommended:\n"
+            "  • 256 MB - Low RAM systems\n"
+            "  • 512 MB - Balanced (default)\n"
+            "  • 1024 MB - High RAM, long flights\n"
+            "  • 2048 MB - Maximum caching"
+        )
+        cache_layout.addWidget(self.predictive_cache_label)
+        
+        self.predictive_cache_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.predictive_cache_slider.setRange(128, 2048)
+        self.predictive_cache_slider.setSingleStep(64)
+        self.predictive_cache_slider.setValue(
+            int(getattr(self.cfg.autoortho, 'predictive_dds_cache_mb', 512))
+        )
+        self.predictive_cache_slider.setObjectName('predictive_dds_cache_mb')
+        self.predictive_cache_value = QLabel(
+            f"{self.predictive_cache_slider.value()} MB"
+        )
+        self.predictive_cache_slider.valueChanged.connect(
+            lambda v: self.predictive_cache_value.setText(f"{v} MB")
+        )
+        cache_layout.addWidget(self.predictive_cache_slider)
+        cache_layout.addWidget(self.predictive_cache_value)
+        autoortho_layout.addLayout(cache_layout)
+        
+        # Build interval slider
+        build_interval_layout = QHBoxLayout()
+        self.predictive_interval_label = QLabel("Build interval:")
+        self.predictive_interval_label.setToolTip(
+            "Minimum time between DDS builds (rate limiting).\n"
+            "Higher = less CPU usage, slower pre-building\n"
+            "Lower = faster pre-building, more CPU usage\n\n"
+            "Recommended:\n"
+            "  • 250 ms - Fast CPU, aggressive building\n"
+            "  • 500 ms - Balanced (default)\n"
+            "  • 1000 ms - Low-end CPU, minimal impact"
+        )
+        build_interval_layout.addWidget(self.predictive_interval_label)
+        
+        self.predictive_interval_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.predictive_interval_slider.setRange(100, 2000)
+        self.predictive_interval_slider.setSingleStep(50)
+        self.predictive_interval_slider.setPageStep(100)
+        self.predictive_interval_slider.setTickInterval(50)
+        # Snap to nearest 50ms step
+        raw_value = int(getattr(self.cfg.autoortho, 'predictive_dds_build_interval_ms', 500))
+        snapped_value = ((raw_value + 25) // 50) * 50  # Round to nearest 50
+        snapped_value = max(100, min(2000, snapped_value))  # Clamp to range
+        self.predictive_interval_slider.setValue(snapped_value)
+        self.predictive_interval_slider.setObjectName('predictive_dds_build_interval_ms')
+        self.predictive_interval_value = QLabel(
+            f"{self.predictive_interval_slider.value()} ms"
+        )
+        # Snap value to 50ms increments and update label
+        def on_interval_changed(v):
+            snapped = ((v + 25) // 50) * 50
+            snapped = max(100, min(2000, snapped))
+            if snapped != v:
+                self.predictive_interval_slider.setValue(snapped)
+            self.predictive_interval_value.setText(f"{snapped} ms")
+        self.predictive_interval_slider.valueChanged.connect(on_interval_changed)
+        build_interval_layout.addWidget(self.predictive_interval_slider)
+        build_interval_layout.addWidget(self.predictive_interval_value)
+        autoortho_layout.addLayout(build_interval_layout)
+        
+        # Use fallbacks checkbox
+        fallbacks_layout = QHBoxLayout()
+        self.predictive_use_fallbacks_check = QCheckBox("Apply fallbacks to prebuilt DDS")
+        self.predictive_use_fallbacks_check.setChecked(
+            getattr(self.cfg.autoortho, 'predictive_dds_use_fallbacks', True)
+        )
+        self.predictive_use_fallbacks_check.setToolTip(
+            "How to handle failed chunks when pre-building DDS.\n\n"
+            "When enabled (default):\n"
+            "  • Apply same fallback chain as live requests\n"
+            "  • Search disk cache, use lower zoom data if available\n"
+            "  • Best quality but may do extra disk/network I/O\n\n"
+            "When disabled:\n"
+            "  • Use missing color for failed chunks (fastest)\n"
+            "  • No extra I/O, minimal CPU overhead\n"
+            "  • Failed areas show configured missing color"
+        )
+        fallbacks_layout.addWidget(self.predictive_use_fallbacks_check)
+        fallbacks_layout.addStretch()
+        autoortho_layout.addLayout(fallbacks_layout)
+        
+        autoortho_layout.addSpacing(10)
+        # ═══════════════════════════════════════════════════════════════════
         
         # Initialize prefetch control states
         self._update_prefetch_controls()
@@ -3251,9 +3482,46 @@ class ConfigUI(QMainWindow):
         """Update enabled state of prefetch controls based on enable checkbox."""
         enabled = self.prefetch_enabled_check.isChecked()
         
+        # Existing controls
         self.prefetch_lookahead_slider.setEnabled(enabled)
         self.prefetch_lookahead_label.setEnabled(enabled)
         self.prefetch_lookahead_value.setEnabled(enabled)
+        
+        # New prefetch controls
+        self.prefetch_interval_slider.setEnabled(enabled)
+        self.prefetch_interval_label.setEnabled(enabled)
+        self.prefetch_interval_value.setEnabled(enabled)
+        
+        self.prefetch_max_chunks_slider.setEnabled(enabled)
+        self.prefetch_max_chunks_label.setEnabled(enabled)
+        self.prefetch_max_chunks_value.setEnabled(enabled)
+        
+        # Prefetch radius (unified setting for both methods)
+        self.prefetch_radius_slider.setEnabled(enabled)
+        self.prefetch_radius_label.setEnabled(enabled)
+        self.prefetch_radius_value.setEnabled(enabled)
+        
+        # Predictive DDS controls depend on prefetch being enabled
+        self.predictive_dds_enabled_check.setEnabled(enabled)
+        self._update_predictive_dds_controls()
+    
+    def _update_predictive_dds_controls(self):
+        """Update enabled state of predictive DDS controls."""
+        # Predictive DDS requires prefetch to be enabled
+        prefetch_enabled = self.prefetch_enabled_check.isChecked()
+        predictive_enabled = self.predictive_dds_enabled_check.isChecked()
+        
+        enabled = prefetch_enabled and predictive_enabled
+        
+        self.predictive_cache_slider.setEnabled(enabled)
+        self.predictive_cache_label.setEnabled(enabled)
+        self.predictive_cache_value.setEnabled(enabled)
+        
+        self.predictive_interval_slider.setEnabled(enabled)
+        self.predictive_interval_label.setEnabled(enabled)
+        self.predictive_interval_value.setEnabled(enabled)
+        
+        self.predictive_use_fallbacks_check.setEnabled(enabled)
 
     def _init_dynamic_zoom_manager(self):
         """Initialize the dynamic zoom manager from config."""
@@ -3572,12 +3840,13 @@ class ConfigUI(QMainWindow):
         if hasattr(self.cfg, 'simbrief'):
             self.cfg.simbrief.route_deviation_threshold_nm = value
             log.debug(f"SimBrief route_deviation_threshold_nm changed: {value}")
-
-    def _on_route_prefetch_radius_changed(self, value):
-        """Handle route prefetch radius spinbox change"""
+    
+    def _on_prefetch_while_parked_changed(self, state):
+        """Handle prefetch while parked checkbox change"""
+        is_checked = (state == 2)  # Qt.CheckState.Checked has value 2
         if hasattr(self.cfg, 'simbrief'):
-            self.cfg.simbrief.route_prefetch_radius_nm = value
-            log.debug(f"SimBrief route_prefetch_radius_nm changed: {value}")
+            self.cfg.simbrief.prefetch_while_parked = is_checked
+            log.debug(f"SimBrief prefetch_while_parked changed: {is_checked}")
 
     def _display_simbrief_flight_info(self, data):
         """Display SimBrief flight information in the UI"""
@@ -4256,9 +4525,30 @@ class ConfigUI(QMainWindow):
             
             # Prefetch settings
             self.cfg.autoortho.prefetch_enabled = self.prefetch_enabled_check.isChecked()
+            # Slider value 61 = Unlimited, save as 0 to config
+            lookahead_val = self.prefetch_lookahead_slider.value()
             self.cfg.autoortho.prefetch_lookahead = str(
-                self.prefetch_lookahead_slider.value()
+                0 if lookahead_val == 61 else lookahead_val
             )
+            self.cfg.autoortho.prefetch_interval = str(
+                self.prefetch_interval_slider.value() / 10.0
+            )
+            self.cfg.autoortho.prefetch_max_chunks = str(
+                self.prefetch_max_chunks_slider.value()
+            )
+            self.cfg.autoortho.prefetch_radius_nm = str(
+                self.prefetch_radius_slider.value()
+            )
+            
+            # Predictive DDS settings
+            self.cfg.autoortho.predictive_dds_enabled = self.predictive_dds_enabled_check.isChecked()
+            self.cfg.autoortho.predictive_dds_cache_mb = str(
+                self.predictive_cache_slider.value()
+            )
+            self.cfg.autoortho.predictive_dds_build_interval_ms = str(
+                self.predictive_interval_slider.value()
+            )
+            self.cfg.autoortho.predictive_dds_use_fallbacks = self.predictive_use_fallbacks_check.isChecked()
             
             self.cfg.autoortho.fetch_threads = str(
                 self.fetch_threads_spinbox.value()

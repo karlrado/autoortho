@@ -701,12 +701,14 @@ class AOMount:
         log.info("Unmounting ...")
         self.mounts_running = False
         
-        # Stop spatial prefetcher
+        # Stop spatial prefetcher, predictive DDS, and clear terrain indices
         try:
             import getortho
+            getortho.stop_predictive_dds()
             getortho.stop_prefetcher()
+            getortho.clear_terrain_indices()
         except Exception as e:
-            log.debug(f"Error stopping prefetcher: {e}")
+            log.debug(f"Error stopping prefetcher/predictive_dds/terrain_indices: {e}")
         
         for scenery in self.cfg.scenery_mounts:
             self.unmount(scenery.get('mount'), force)

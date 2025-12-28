@@ -149,11 +149,39 @@ prefetch_enabled = True
 # Higher = more tiles prefetched ahead, uses more bandwidth and memory
 # Lower = fewer tiles prefetched, less resource usage
 # Recommended: 15 (fast aircraft), 30 (balanced), 60 (slow internet or long haul)
+# Set to 0 for Unlimited lookahead (continues until max_chunks or other limits)
 prefetch_lookahead = 30
 # How often to check for prefetch opportunities in seconds (1-10)
 prefetch_interval = 2.0
-# Maximum chunks to prefetch per cycle (8-64)
-prefetch_max_chunks = 24
+# Maximum chunks to prefetch per cycle (8-512)
+prefetch_max_chunks = 32
+# Prefetch radius in nautical miles (10-150)
+# Tiles within this radius of the flight path are prefetched
+# Used by both velocity-based and SimBrief prefetching
+prefetch_radius_nm = 40
+# Predictive DDS generation - pre-build DDS textures in background after prefetch
+# When enabled, tiles are compressed to DDS in the background, eliminating stutters
+# when X-Plane loads new scenery areas. Falls back gracefully on cache miss.
+predictive_dds_enabled = True
+# Maximum memory for pre-built DDS cache in MB (128-2048)
+# Higher = more tiles cached, fewer stutters, more RAM used
+# Lower = fewer tiles cached, more potential stutters, less RAM used
+# Recommended: 256 (low RAM), 512 (balanced), 1024 (high RAM)
+predictive_dds_cache_mb = 512
+# Minimum interval between DDS builds in milliseconds (100-2000)
+# Rate limits background builds to prevent CPU spikes during flight
+# Lower = faster building, higher CPU usage
+# Higher = slower building, lower CPU usage
+# Recommended: 250 (fast CPU), 500 (balanced), 1000 (low-end CPU)
+predictive_dds_build_interval_ms = 500
+# Apply fallbacks when pre-building DDS (True/False)
+# True (default): Apply same fallback logic as live requests (cache search, lower zoom, etc.)
+#   - Pro: Prebuilt tiles have best possible quality with fallbacks for failed chunks
+#   - Con: Prebuilds may do extra disk/network I/O to find fallback data
+# False: Use missing color for failed chunks (no fallbacks, fastest)
+#   - Pro: Faster prebuilds, no extra I/O
+#   - Con: Failed chunks show missing color instead of fallback data
+predictive_dds_use_fallbacks = True
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False
@@ -228,7 +256,10 @@ use_flight_data = False
 route_consideration_radius_nm = 50
 # If the aircraft deviates more than this distance (nm) from the route, fall back to DataRef-based calculations
 route_deviation_threshold_nm = 40
-# Radius in nautical miles around waypoints to prefetch tiles
+# Allow prefetching while parked when SimBrief flight plan is loaded
+# With a known route, we don't need to wait for aircraft movement to start prefetching
+prefetch_while_parked = True
+# Radius in nautical miles around waypoints to prefetch tiles (now in Advanced Settings)
 route_prefetch_radius_nm = 40
 """
 
