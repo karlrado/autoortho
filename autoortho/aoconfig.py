@@ -149,11 +149,16 @@ prefetch_enabled = True
 # Higher = more tiles prefetched ahead, uses more bandwidth and memory
 # Lower = fewer tiles prefetched, less resource usage
 # Recommended: 15 (fast aircraft), 30 (balanced), 60 (slow internet or long haul)
+# Set to 0 for Unlimited lookahead (continues until max_chunks or other limits)
 prefetch_lookahead = 30
 # How often to check for prefetch opportunities in seconds (1-10)
 prefetch_interval = 2.0
-# Maximum chunks to prefetch per cycle (8-64)
-prefetch_max_chunks = 24
+# Maximum chunks to prefetch per cycle (8-128)
+prefetch_max_chunks = 32
+# Prefetch radius in nautical miles (10-150)
+# Tiles within this radius of the flight path are prefetched
+# Used by both velocity-based and SimBrief prefetching
+prefetch_radius_nm = 40
 # Predictive DDS generation - pre-build DDS textures in background after prefetch
 # When enabled, tiles are compressed to DDS in the background, eliminating stutters
 # when X-Plane loads new scenery areas. Falls back gracefully on cache miss.
