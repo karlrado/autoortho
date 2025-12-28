@@ -935,7 +935,7 @@ class ConfigUI(QMainWindow):
             obj is self.maptype_combo
             or obj is self.max_zoom_mode_combo
             or obj is self.fallback_level_combo
-            or obj is self.compressor_combo
+            or (not self.system == "darwin" and obj is self.compressor_combo)
             or obj is self.format_combo
             or obj is self.console_log_level_combo
             or obj is self.file_log_level_combo
