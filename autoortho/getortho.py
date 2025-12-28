@@ -13,7 +13,7 @@ from typing import Optional, Dict, Tuple, List
 
 from io import BytesIO
 from urllib.request import urlopen, Request
-from queue import Queue, PriorityQueue, Empty
+from queue import Queue, PriorityQueue, Empty, Full
 from functools import wraps, lru_cache
 from pathlib import Path
 from collections import OrderedDict
@@ -1099,7 +1099,7 @@ class SpatialPrefetcher:
         self.prefetch_radius_nm = max(10, min(150, self.prefetch_radius_nm))
         
         self.interval_sec = max(1.0, min(10.0, self.interval_sec))
-        self.max_chunks = max(8, min(128, self.max_chunks))
+        self.max_chunks = max(8, min(512, self.max_chunks))
         
     def set_tile_cacher(self, tile_cacher):
         """Set the tile cacher reference for accessing tiles."""
@@ -1193,7 +1193,8 @@ class SpatialPrefetcher:
         Returns True if:
         - SimBrief flight data is loaded
         - use_flight_data toggle is enabled
-        - Aircraft is on-route (within deviation threshold)
+        - Aircraft is on-route (within deviation threshold) OR
+        - prefetch_while_parked is enabled AND aircraft is near origin airport
         """
         # Check if SimBrief integration is enabled
         if not hasattr(CFG, 'simbrief'):
@@ -1214,7 +1215,24 @@ class SpatialPrefetcher:
         deviation_threshold = float(getattr(CFG.simbrief, 'route_deviation_threshold_nm', 40))
         
         # Check if aircraft is on-route
-        return simbrief_flight_manager.is_on_route(lat, lon, deviation_threshold)
+        if simbrief_flight_manager.is_on_route(lat, lon, deviation_threshold):
+            return True
+        
+        # If prefetch_while_parked is enabled, allow prefetching when near origin
+        # This lets us start prefetching the route even before takeoff
+        prefetch_while_parked = getattr(CFG.simbrief, 'prefetch_while_parked', True)
+        if isinstance(prefetch_while_parked, str):
+            prefetch_while_parked = prefetch_while_parked.lower() in ('true', '1', 'yes', 'on')
+        
+        if prefetch_while_parked:
+            # Check if aircraft is near the origin airport (within 50nm)
+            # This allows prefetching to start while parked at the gate
+            origin_distance = simbrief_flight_manager.get_distance_from_origin(lat, lon)
+            if origin_distance is not None and origin_distance < 50:
+                log.debug(f"SimBrief prefetch: Aircraft near origin ({origin_distance:.1f}nm), enabling parked prefetch")
+                return True
+        
+        return False
     
     def _prefetch_along_flight_plan(self, lat: float, lon: float) -> int:
         """
@@ -2220,7 +2238,7 @@ class BackgroundDDSBuilder:
             prebuilt_cache: Cache to store completed DDS buffers
             build_interval_sec: Minimum time between builds (rate limiting)
         """
-        self._queue = queue.Queue(maxsize=self.MAX_QUEUE_SIZE)
+        self._queue = Queue(maxsize=self.MAX_QUEUE_SIZE)
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._prebuilt_cache = prebuilt_cache
@@ -2251,7 +2269,7 @@ class BackgroundDDSBuilder:
             # Put a sentinel to unblock the queue.get()
             try:
                 self._queue.put_nowait(None)
-            except queue.Full:
+            except Full:
                 pass
             
             self._thread.join(timeout=5.0)
@@ -2284,7 +2302,7 @@ class BackgroundDDSBuilder:
             log.debug(f"BackgroundDDSBuilder: Queued {tile.id} "
                      f"(queue size: {self._queue.qsize()})")
             return True
-        except queue.Full:
+        except Full:
             log.debug(f"BackgroundDDSBuilder: Queue full, skipping {tile.id}")
             return False
     
@@ -2294,7 +2312,7 @@ class BackgroundDDSBuilder:
             try:
                 # Non-blocking get with timeout for clean shutdown
                 item = self._queue.get(timeout=1.0)
-            except queue.Empty:
+            except Empty:
                 continue
             
             # Sentinel value signals shutdown

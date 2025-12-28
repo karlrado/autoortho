@@ -153,7 +153,7 @@ prefetch_enabled = True
 prefetch_lookahead = 30
 # How often to check for prefetch opportunities in seconds (1-10)
 prefetch_interval = 2.0
-# Maximum chunks to prefetch per cycle (8-128)
+# Maximum chunks to prefetch per cycle (8-512)
 prefetch_max_chunks = 32
 # Prefetch radius in nautical miles (10-150)
 # Tiles within this radius of the flight path are prefetched
@@ -256,7 +256,10 @@ use_flight_data = False
 route_consideration_radius_nm = 50
 # If the aircraft deviates more than this distance (nm) from the route, fall back to DataRef-based calculations
 route_deviation_threshold_nm = 40
-# Radius in nautical miles around waypoints to prefetch tiles
+# Allow prefetching while parked when SimBrief flight plan is loaded
+# With a known route, we don't need to wait for aircraft movement to start prefetching
+prefetch_while_parked = True
+# Radius in nautical miles around waypoints to prefetch tiles (now in Advanced Settings)
 route_prefetch_radius_nm = 40
 """
 

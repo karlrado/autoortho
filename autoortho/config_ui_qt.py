@@ -1349,6 +1349,34 @@ class ConfigUI(QMainWindow):
         deviation_layout.addStretch()
         route_settings_layout.addLayout(deviation_layout)
 
+        # Prefetch while parked checkbox
+        prefetch_parked_layout = QHBoxLayout()
+        self.simbrief_prefetch_parked_check = QCheckBox("Prefetch while parked")
+        prefetch_parked_value = True
+        if hasattr(self.cfg, 'simbrief'):
+            val = getattr(self.cfg.simbrief, 'prefetch_while_parked', True)
+            if isinstance(val, str):
+                prefetch_parked_value = val.lower() in ('true', '1', 'yes', 'on')
+            else:
+                prefetch_parked_value = bool(val)
+        self.simbrief_prefetch_parked_check.setChecked(prefetch_parked_value)
+        self.simbrief_prefetch_parked_check.setToolTip(
+            "Start prefetching the route immediately when flight plan is loaded.\n\n"
+            "When enabled:\n"
+            "  • Prefetching starts while parked at the gate\n"
+            "  • Uses known route to fetch tiles ahead of time\n"
+            "  • Great for loading flight plans before departure\n\n"
+            "When disabled:\n"
+            "  • Prefetching only starts once airborne and on-route\n"
+            "  • Matches velocity-based prefetch behavior"
+        )
+        self.simbrief_prefetch_parked_check.stateChanged.connect(
+            self._on_prefetch_while_parked_changed
+        )
+        prefetch_parked_layout.addWidget(self.simbrief_prefetch_parked_check)
+        prefetch_parked_layout.addStretch()
+        route_settings_layout.addLayout(prefetch_parked_layout)
+        
         # Route Prefetch Radius note (moved to unified setting in Advanced)
         prefetch_note_layout = QHBoxLayout()
         prefetch_note_label = QLabel(
@@ -2158,12 +2186,13 @@ class ConfigUI(QMainWindow):
             "Maximum number of chunks to submit per prefetch cycle.\n"
             "Higher = more aggressive prefetching, more bandwidth\n"
             "Lower = gentler prefetching, less bandwidth\n\n"
-            "Recommended: 32 (balanced), 64 (fast internet), 16 (slow internet)"
+            "Recommended: 32 (balanced), 64-128 (fast internet), 16 (slow internet)\n"
+            "Values above 128 are for very fast connections only."
         )
         max_chunks_layout.addWidget(self.prefetch_max_chunks_label)
         
         self.prefetch_max_chunks_slider = ModernSlider(Qt.Orientation.Horizontal)
-        self.prefetch_max_chunks_slider.setRange(8, 128)
+        self.prefetch_max_chunks_slider.setRange(8, 512)
         self.prefetch_max_chunks_slider.setValue(
             int(getattr(self.cfg.autoortho, 'prefetch_max_chunks', 32))
         )
@@ -2290,16 +2319,25 @@ class ConfigUI(QMainWindow):
         self.predictive_interval_slider = ModernSlider(Qt.Orientation.Horizontal)
         self.predictive_interval_slider.setRange(100, 2000)
         self.predictive_interval_slider.setSingleStep(50)
-        self.predictive_interval_slider.setValue(
-            int(getattr(self.cfg.autoortho, 'predictive_dds_build_interval_ms', 500))
-        )
+        self.predictive_interval_slider.setPageStep(100)
+        self.predictive_interval_slider.setTickInterval(50)
+        # Snap to nearest 50ms step
+        raw_value = int(getattr(self.cfg.autoortho, 'predictive_dds_build_interval_ms', 500))
+        snapped_value = ((raw_value + 25) // 50) * 50  # Round to nearest 50
+        snapped_value = max(100, min(2000, snapped_value))  # Clamp to range
+        self.predictive_interval_slider.setValue(snapped_value)
         self.predictive_interval_slider.setObjectName('predictive_dds_build_interval_ms')
         self.predictive_interval_value = QLabel(
             f"{self.predictive_interval_slider.value()} ms"
         )
-        self.predictive_interval_slider.valueChanged.connect(
-            lambda v: self.predictive_interval_value.setText(f"{v} ms")
-        )
+        # Snap value to 50ms increments and update label
+        def on_interval_changed(v):
+            snapped = ((v + 25) // 50) * 50
+            snapped = max(100, min(2000, snapped))
+            if snapped != v:
+                self.predictive_interval_slider.setValue(snapped)
+            self.predictive_interval_value.setText(f"{snapped} ms")
+        self.predictive_interval_slider.valueChanged.connect(on_interval_changed)
         build_interval_layout.addWidget(self.predictive_interval_slider)
         build_interval_layout.addWidget(self.predictive_interval_value)
         autoortho_layout.addLayout(build_interval_layout)
@@ -3765,6 +3803,13 @@ class ConfigUI(QMainWindow):
         if hasattr(self.cfg, 'simbrief'):
             self.cfg.simbrief.route_deviation_threshold_nm = value
             log.debug(f"SimBrief route_deviation_threshold_nm changed: {value}")
+    
+    def _on_prefetch_while_parked_changed(self, state):
+        """Handle prefetch while parked checkbox change"""
+        is_checked = (state == 2)  # Qt.CheckState.Checked has value 2
+        if hasattr(self.cfg, 'simbrief'):
+            self.cfg.simbrief.prefetch_while_parked = is_checked
+            log.debug(f"SimBrief prefetch_while_parked changed: {is_checked}")
 
     def _display_simbrief_flight_info(self, data):
         """Display SimBrief flight information in the UI"""
