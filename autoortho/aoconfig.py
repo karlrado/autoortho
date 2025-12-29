@@ -137,8 +137,8 @@ fallback_level = cache
 fallback_extends_budget = False
 # Timeout per mipmap level when using extended fallbacks (in seconds)
 # When fallback_extends_budget is True, each lower-detail mipmap level
-# gets this much time to download. Total extra time = this × number of levels tried.
-# Example: 10 seconds × 4 levels = 40 seconds max additional time
+# gets this much time to download. Total extra time = this * number of levels tried.
+# Example: 10 seconds * 4 levels = 40 seconds max additional time
 # Range: 10 - 120 seconds
 # Recommended: 3.0 (balanced), 5.0 (quality), 1.5 (fast)
 fallback_timeout = 30.0
