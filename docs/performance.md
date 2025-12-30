@@ -387,6 +387,9 @@ When enabled, AutoOrtho uses significantly longer timeouts during X-Plane's init
 - ✅ Reduces low-resolution and placeholder tiles
 - ⚠️ May increase initial scenery loading time
 
+> **⚠️ Tip: Long X-Plane Loading Times?**  
+> If you're experiencing significantly longer X-Plane loading times, try setting **"Allow extra loading time during startup"** to **Off**. This option can dramatically increase scenery loading times, especially when combined with higher zoom levels or slower internet connections. Disabling it will use the normal time budgets during startup, resulting in faster loads at the cost of potentially lower initial scenery quality.
+
 ---
 
 ## Recommended Configurations
@@ -738,6 +741,20 @@ When not using SimBrief (or when off-route), altitude prediction uses X-Plane Da
 ---
 
 ## Troubleshooting
+
+### Long X-Plane Loading Times
+
+If X-Plane takes significantly longer to load scenery with AutoOrtho enabled, the most common cause is the **"Allow extra loading time during startup"** setting (`suspend_maxwait`). This option extends timeout values by 10× during initial scenery loading, which can add substantial time to X-Plane's startup.
+
+**To reduce loading times:**
+
+1. Go to **Settings** → **Advanced Settings**
+2. Set **"Allow extra loading time during startup"** to **Off**
+3. This will use normal time budgets during startup, resulting in faster loads
+
+**Note:** Disabling this may result in some tiles loading at lower quality initially, but they will reload at full quality as you fly.
+
+### Other Common Issues
 
 See the [FAQ](faq.md#missing-color-tiles) for common issues related to:
 - Missing color (green) tiles
