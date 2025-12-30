@@ -5,7 +5,18 @@ DatarefTracker: Thread-safe X-Plane dataref collection via UDP.
 
 This module provides a singleton DatarefTracker instance that connects
 to X-Plane via UDP to receive real-time flight data (position, heading,
-speed, altitude).
+speed, altitude AGL).
+
+Altitude Handling:
+    Uses AGL (Above Ground Level) altitude from X-Plane's y_agl dataref
+    instead of MSL (Mean Sea Level) pressure altitude. This provides
+    more accurate terrain-aware calculations for:
+    - Dynamic zoom level decisions
+    - Predictive tile loading
+    - Spatial prefetching
+    
+    AGL represents actual height above the terrain being viewed, which
+    is more relevant for imagery quality decisions.
 
 Connection State:
     The tracker automatically connects when X-Plane is running a flight
@@ -14,15 +25,242 @@ Connection State:
 """
 
 import binascii
+import math
 import time
 import struct
 import socket
 import threading
+from collections import deque
+from dataclasses import dataclass
+from typing import Optional
+
 from aoconfig import CFG
 import logging
 
 log = logging.getLogger(__name__)
 UDP_IP = "127.0.0.1"
+
+
+# =============================================================================
+# Flight Data Averaging
+# =============================================================================
+# Maintains a rolling 60-second window of flight samples for computing
+# smoothed/averaged values used in predictive tile loading calculations.
+# This reduces jitter from instantaneous readings and provides better
+# estimates for vertical speed and heading trends.
+# =============================================================================
+
+
+@dataclass
+class FlightSample:
+    """
+    A single flight data sample with timestamp.
+    
+    Used by FlightDataAverager to maintain a history of recent
+    flight data for computing rolling averages.
+    """
+    timestamp: float    # Time when sample was recorded (time.time())
+    lat: float          # Latitude in degrees
+    lon: float          # Longitude in degrees
+    alt_agl_ft: float   # Altitude Above Ground Level (AGL) in feet
+    hdg: float          # Heading in degrees (0-360)
+    spd: float          # Ground speed in m/s
+
+
+class FlightDataAverager:
+    """
+    Maintains a 60-second rolling window of flight samples
+    and computes averaged values for predictive calculations.
+    
+    The averager provides smoothed values for:
+    - Vertical speed (computed from AGL altitude change over time)
+    - Heading (circular average to handle 359->1 wraparound)
+    - Ground speed (simple arithmetic average)
+    
+    Note: Uses AGL (Above Ground Level) altitude instead of MSL for
+    more accurate terrain-aware calculations. This provides better
+    imagery quality decisions when flying over varied terrain.
+    
+    Thread Safety:
+        All public methods are thread-safe. The averager uses its own
+        lock separate from DatarefTracker to minimize contention.
+    
+    Usage:
+        averager = FlightDataAverager()
+        averager.add_sample(lat, lon, alt_agl_ft, hdg, spd)
+        averages = averager.get_averages()
+        if averages:
+            vs = averages['vertical_speed_fpm']
+    """
+    
+    # Configuration constants
+    WINDOW_SEC = 60.0       # Rolling window duration in seconds
+    MIN_SAMPLES = 3         # Minimum samples needed for valid average
+    MAX_SAMPLES = 600       # Maximum samples to store (~10 samples/sec max)
+    MIN_TIME_DELTA = 0.01   # Minimum time delta in minutes (~0.6 seconds)
+    
+    def __init__(self):
+        """Initialize with empty sample buffer."""
+        self._samples: deque = deque(maxlen=self.MAX_SAMPLES)
+        self._lock = threading.Lock()
+        
+        # Cached averages (updated on each add_sample call)
+        self._avg_vertical_speed_fpm = 0.0  # feet per minute
+        self._avg_heading = 0.0             # degrees (0-360)
+        self._avg_ground_speed_mps = 0.0    # m/s
+        self._is_valid = False
+    
+    def add_sample(self, lat: float, lon: float, alt_agl_ft: float,
+                   hdg: float, spd: float) -> None:
+        """
+        Add a new flight data sample and update cached averages.
+        
+        This method is called from the UDP listener thread each time
+        valid flight data is received from X-Plane. Samples older than
+        WINDOW_SEC are automatically pruned.
+        
+        Args:
+            lat: Latitude in degrees
+            lon: Longitude in degrees
+            alt_agl_ft: Altitude Above Ground Level (AGL) in feet
+            hdg: Heading in degrees (0-360)
+            spd: Ground speed in m/s
+        """
+        now = time.time()
+        sample = FlightSample(
+            timestamp=now,
+            lat=lat,
+            lon=lon,
+            alt_agl_ft=alt_agl_ft,
+            hdg=hdg,
+            spd=spd
+        )
+        
+        with self._lock:
+            self._samples.append(sample)
+            self._prune_old_samples(now)
+            self._update_averages()
+    
+    def _prune_old_samples(self, now: float) -> None:
+        """
+        Remove samples older than the window.
+        
+        Called internally while holding the lock.
+        
+        Args:
+            now: Current timestamp for comparison
+        """
+        cutoff = now - self.WINDOW_SEC
+        while self._samples and self._samples[0].timestamp < cutoff:
+            self._samples.popleft()
+    
+    def _update_averages(self) -> None:
+        """
+        Compute rolling averages from current samples.
+        
+        Called internally while holding the lock after each sample
+        is added. Updates the cached average values.
+        """
+        if len(self._samples) < self.MIN_SAMPLES:
+            self._is_valid = False
+            return
+        
+        samples = list(self._samples)
+        
+        # --- Vertical Speed ---
+        # Computed as (last_alt - first_alt) / time_delta
+        # This gives average climb/descent rate over the window
+        # Uses AGL altitude for terrain-aware calculations
+        first, last = samples[0], samples[-1]
+        time_delta_min = (last.timestamp - first.timestamp) / 60.0
+        
+        if time_delta_min > self.MIN_TIME_DELTA:
+            alt_delta_ft = last.alt_agl_ft - first.alt_agl_ft
+            self._avg_vertical_speed_fpm = alt_delta_ft / time_delta_min
+        else:
+            self._avg_vertical_speed_fpm = 0.0
+        
+        # --- Ground Speed ---
+        # Simple arithmetic average of all samples
+        self._avg_ground_speed_mps = sum(s.spd for s in samples) / len(samples)
+        
+        # --- Heading ---
+        # Circular average to handle wraparound (e.g., 359° -> 1°)
+        # Uses vector addition: average of unit vectors in heading direction
+        sin_sum = sum(math.sin(math.radians(s.hdg)) for s in samples)
+        cos_sum = sum(math.cos(math.radians(s.hdg)) for s in samples)
+        self._avg_heading = math.degrees(math.atan2(sin_sum, cos_sum)) % 360
+        
+        self._is_valid = True
+    
+    def get_averages(self) -> Optional[dict]:
+        """
+        Get current averaged values.
+        
+        Returns:
+            dict with keys:
+                - 'vertical_speed_fpm': Average climb/descent rate (ft/min)
+                - 'heading': Average heading (degrees, 0-360)
+                - 'ground_speed_mps': Average ground speed (m/s)
+            Returns None if not enough samples are available.
+        """
+        with self._lock:
+            if not self._is_valid:
+                return None
+            return {
+                'vertical_speed_fpm': self._avg_vertical_speed_fpm,
+                'heading': self._avg_heading,
+                'ground_speed_mps': self._avg_ground_speed_mps,
+            }
+    
+    def get_vertical_speed_fpm(self) -> Optional[float]:
+        """
+        Get the averaged vertical speed.
+        
+        Returns:
+            Vertical speed in feet per minute, or None if not valid.
+            Positive = climbing, Negative = descending
+        """
+        with self._lock:
+            if not self._is_valid:
+                return None
+            return self._avg_vertical_speed_fpm
+    
+    def clear(self) -> None:
+        """
+        Clear all samples and reset state.
+        
+        Called when connection to X-Plane is lost to ensure stale
+        data isn't used when connection is re-established.
+        """
+        with self._lock:
+            self._samples.clear()
+            self._avg_vertical_speed_fpm = 0.0
+            self._avg_heading = 0.0
+            self._avg_ground_speed_mps = 0.0
+            self._is_valid = False
+    
+    def is_valid(self) -> bool:
+        """Check if averages are currently valid."""
+        with self._lock:
+            return self._is_valid
+    
+    def sample_count(self) -> int:
+        """Get the current number of samples in the buffer."""
+        with self._lock:
+            return len(self._samples)
+    
+    def get_window_duration(self) -> float:
+        """
+        Get the actual time span covered by current samples.
+        
+        Returns:
+            Duration in seconds, or 0 if fewer than 2 samples.
+        """
+        with self._lock:
+            if len(self._samples) < 2:
+                return 0.0
+            return self._samples[-1].timestamp - self._samples[0].timestamp
 
 
 class DatarefTracker(object):
@@ -50,11 +288,13 @@ class DatarefTracker(object):
         ("sim/flightmodel/position/longitude", "°E",
          "The longitude of the aircraft", 6),
         ("sim/flightmodel/position/y_agl", "m",
-         "AGL", 0),
+         "Altitude Above Ground Level (AGL) in meters", 0),
         ("sim/flightmodel/position/mag_psi", "°",
          "The real magnetic heading of the aircraft", 0),
         ("sim/flightmodel/position/groundspeed", "m/s",
          "The ground speed of the aircraft", 0),
+        ("sim/time/local_time_sec", "s",
+         "Local time (seconds since midnight)", 0),
     ]
     # fmt:on
 
@@ -70,15 +310,21 @@ class DatarefTracker(object):
         # Flight data (protected by _lock)
         self.lat = -1.0
         self.lon = -1.0
-        self.alt = -1.0
+        self.alt_agl_m = -1.0      # Altitude AGL in meters (raw from X-Plane)
+        self.alt_agl_ft = -1.0     # Altitude AGL in feet (converted)
         self.hdg = -1.0
         self.spd = -1.0
+        self.local_time_sec = -1.0  # Local time (seconds since midnight)
         self.connected = False
         self.data_valid = False
 
         # Thread management
         self.t = None
         self.running = False
+
+        # Flight data averaging for predictive calculations
+        # Maintains a 60-second rolling window of samples
+        self.flight_averager = FlightDataAverager()
 
         # Socket
         self.sock = socket.socket(
@@ -129,8 +375,8 @@ class DatarefTracker(object):
         Thread-safe getter for all flight data.
 
         Returns:
-            dict: Flight data with keys 'lat', 'lon', 'alt', 'hdg',
-                  'spd', 'connected', 'data_valid', 'timestamp'.
+            dict: Flight data with keys 'lat', 'lon', 'alt_agl_ft', 'hdg',
+                  'spd', 'local_time_sec', 'connected', 'data_valid', 'timestamp'.
                   Returns None if not connected or data is invalid.
         """
         with self._lock:
@@ -139,13 +385,38 @@ class DatarefTracker(object):
             return {
                 'lat': self.lat,
                 'lon': self.lon,
-                'alt': self.alt,
+                'alt_agl_ft': self.alt_agl_ft,
                 'hdg': self.hdg,
                 'spd': self.spd,
+                'local_time_sec': self.local_time_sec,
                 'connected': self.connected,
                 'data_valid': self.data_valid,
                 'timestamp': time.time()
             }
+
+    def get_local_time_sec(self):
+        """
+        Thread-safe getter for local sim time.
+
+        Returns:
+            float: Seconds since midnight in sim time, or -1 if not available.
+        """
+        with self._lock:
+            if not self.connected or not self.data_valid:
+                return -1.0
+            return self.local_time_sec
+
+    def get_alt_agl_ft(self):
+        """
+        Thread-safe getter for altitude Above Ground Level (AGL).
+
+        Returns:
+            float: Altitude AGL in feet, or -1 if not available.
+        """
+        with self._lock:
+            if not self.connected or not self.data_valid:
+                return -1.0
+            return self.alt_agl_ft
 
     def start(self):
         """Start the UDP listening thread."""
@@ -266,6 +537,10 @@ class DatarefTracker(object):
                     self.connected = False
                     self.data_valid = False
 
+                # Clear flight averager when connection is lost
+                # This ensures stale data isn't used when reconnecting
+                self.flight_averager.clear()
+
                 # Check if we're shutting down before recreating socket
                 if self._shutdown_flag.is_set():
                     break
@@ -302,24 +577,48 @@ class DatarefTracker(object):
                     log.info("Flight is starting.")
                     self.connected = True
 
-                if len(values) == 5:
+                # Accept 5 or 6 values
+                # Datarefs: lat, lon, y_agl (m), hdg, spd, local_time_sec
+                if len(values) >= 5:
                     lat = values[0]
                     lon = values[1]
-                    alt = values[2]
+                    alt_agl_m = values[2]  # y_agl in meters
                     hdg = values[3]
                     spd = values[4]
+                    # local_time is optional (6th value)
+                    local_time = values[5] if len(values) >= 6 else None
+
+                    # Convert AGL from meters to feet (1 meter = 3.28084 feet)
+                    alt_agl_ft = alt_agl_m * 3.28084
 
                     # Validate position data
-                    if self._validate_position(lat, lon, alt):
+                    if self._validate_position(lat, lon, alt_agl_m):
                         self.lat = lat
                         self.lon = lon
-                        self.alt = alt
+                        self.alt_agl_m = alt_agl_m
+                        self.alt_agl_ft = alt_agl_ft
                         self.hdg = hdg
                         self.spd = spd
+                        # Only update local_time_sec if we received it
+                        if local_time is not None:
+                            self.local_time_sec = local_time
                         self.data_valid = True
+
+                        # Feed sample to flight averager for predictive calculations
+                        # Uses AGL altitude for terrain-aware calculations
+                        if self.alt_agl_ft > 0:
+                            self.flight_averager.add_sample(
+                                lat=self.lat,
+                                lon=self.lon,
+                                alt_agl_ft=self.alt_agl_ft,
+                                hdg=self.hdg,
+                                spd=self.spd
+                            )
                     else:
                         self.data_valid = False
                 else:
+                    # Not enough values - log and mark invalid
+                    log.debug(f"Incomplete packet: got {len(values)}, need 5+")
                     self.data_valid = False
 
             # Debug logging (uncomment if needed)
@@ -439,6 +738,25 @@ class DatarefTracker(object):
                     self.datarefs[idx][0]
                 )
         return retvalues
+
+    def get_flight_averages(self) -> Optional[dict]:
+        """
+        Get 60-second averaged flight data for predictive calculations.
+
+        This provides smoothed values suitable for predicting future
+        aircraft position and altitude. Used by the dynamic zoom system
+        to determine appropriate zoom levels based on predicted altitude
+        at closest approach to tiles.
+
+        Returns:
+            dict with keys:
+                - 'vertical_speed_fpm': Average climb/descent rate (ft/min)
+                - 'heading': Average heading (degrees, 0-360)
+                - 'ground_speed_mps': Average ground speed (m/s)
+            Returns None if not enough samples are available or if
+            not connected to X-Plane.
+        """
+        return self.flight_averager.get_averages()
 
 
 dt = DatarefTracker()

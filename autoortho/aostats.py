@@ -300,20 +300,40 @@ class StatsBatcher:
             self._flush_unlocked()
 
     def stop(self):
-        self._stop.set()
+        # Flush BEFORE setting stop flag, otherwise _flush_unlocked() will
+        # detect the stop flag and discard the buffer instead of flushing
         self.flush()
+        self._stop.set()
 
     def _flush_unlocked(self):
         if not self._buf:
             return
+        # If stopping, don't bother flushing - manager may already be gone
+        if self._stop.is_set():
+            self._buf = {}
+            return
         payload, self._buf = self._buf, {}
         try:
             inc_many(payload)
+        except (ConnectionResetError, BrokenPipeError, EOFError, OSError):
+            # Manager already shut down - discard stats silently
+            pass
         except Exception:
             # As a safety net, fall back to single increments.
+            # But check if we're stopping to avoid cascade errors
+            if self._stop.is_set():
+                return
             for k, v in payload.items():
-                inc_stat(k, v)
+                try:
+                    inc_stat(k, v)
+                except (ConnectionResetError, BrokenPipeError, EOFError, OSError):
+                    # Manager shut down mid-fallback - stop trying
+                    break
 
     def _loop(self):
         while not self._stop.wait(self._flush_interval):
-            self.flush()
+            try:
+                self.flush()
+            except (ConnectionResetError, BrokenPipeError, EOFError, OSError):
+                # Manager shut down - exit loop silently
+                break

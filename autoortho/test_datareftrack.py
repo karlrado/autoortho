@@ -17,7 +17,8 @@ class TestDatarefTrackerInit:
         # Check flight data initialized correctly
         assert dt.lat == -1.0
         assert dt.lon == -1.0
-        assert dt.alt == -1.0
+        assert dt.alt_agl_m == -1.0  # AGL altitude in meters
+        assert dt.alt_agl_ft == -1.0  # AGL altitude in feet
         assert dt.hdg == -1.0
         assert dt.spd == -1.0
         assert dt.connected is False
@@ -129,7 +130,8 @@ class TestDatarefTrackerThreadSafety:
         with dt._lock:
             dt.lat = 47.5
             dt.lon = -122.3
-            dt.alt = 1000.0
+            dt.alt_agl_ft = 1000.0  # AGL altitude in feet
+            dt.alt_agl_m = 1000.0 / 3.28084  # AGL altitude in meters
             dt.hdg = 180.0
             dt.spd = 50.0
             dt.connected = True
@@ -141,7 +143,7 @@ class TestDatarefTrackerThreadSafety:
         assert data is not None
         assert data['lat'] == 47.5
         assert data['lon'] == -122.3
-        assert data['alt'] == 1000.0
+        assert data['alt_agl_ft'] == 1000.0  # Now uses AGL altitude
         assert data['hdg'] == 180.0
         assert data['spd'] == 50.0
         assert data['connected'] is True
@@ -178,7 +180,8 @@ class TestDatarefTrackerThreadSafety:
         with dt._lock:
             dt.lat = 47.5
             dt.lon = -122.3
-            dt.alt = 1000.0
+            dt.alt_agl_ft = 1000.0  # AGL altitude in feet
+            dt.alt_agl_m = 1000.0 / 3.28084  # AGL altitude in meters
             dt.hdg = 180.0
             dt.spd = 50.0
             dt.connected = True
@@ -562,9 +565,11 @@ class TestDatarefTrackerIntegration:
                 data, addr = server_sock.recvfrom(1024)
 
                 # Send back a response packet with flight data
+                # Values: lat, lon, y_agl (meters), hdg, spd
+                # Note: y_agl is in meters and will be converted to feet
                 header = b"RREF\x00"
                 values = []
-                test_data = [47.5, -122.3, 1000.0, 180.0, 50.0]
+                test_data = [47.5, -122.3, 304.8, 180.0, 50.0]  # 304.8m = 1000ft AGL
                 for i, val in enumerate(test_data):
                     values.append(struct.pack("<if", i, val))
                 response = header + b"".join(values)
@@ -603,7 +608,8 @@ class TestDatarefTrackerIntegration:
             if data is not None:
                 assert data['lat'] == 47.5
                 assert data['lon'] == -122.3
-                assert data['alt'] == 1000.0
+                # alt_agl_ft is 304.8m * 3.28084 ≈ 1000ft (allow small float error)
+                assert abs(data['alt_agl_ft'] - 1000.0) < 1.0
                 assert data['connected'] is True
                 assert data['data_valid'] is True
 

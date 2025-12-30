@@ -87,14 +87,101 @@ min_zoom = 12
 max_zoom = 16
 # Maximum zoom level to allow near airports. Zoom level around airports used by default is 18.
 max_zoom_near_airports = 18
-# Max time to wait for images.  Higher numbers mean better quality, but more
-# stutters.  Lower numbers will be more responsive at the expense of
-# ocassional low quality tiles.
-maxwait = 0.5
+# Dynamic zoom mode: "fixed" (current behavior) or "dynamic" (altitude-based quality steps)
+# Fixed: Uses max_zoom slider value for all tiles
+# Dynamic: Uses altitude-based quality steps defined in dynamic_zoom_steps
+max_zoom_mode = fixed
+# Quality steps for dynamic zoom mode. List of altitude/zoom pairs.
+# Format: [{{"altitude_ft": <altitude>, "zoom_level": <zoom>}}, ...]
+# Example: [{{"altitude_ft": 0, "zoom_level": 17}}, {{"altitude_ft": 20000, "zoom_level": 15}}]
+# Altitude is "at or above" - tiles are rendered at the zoom level of the highest matching altitude.
+# The base step (altitude_ft: 0) cannot be removed and serves as the ground-level default.
+dynamic_zoom_steps = []
+# Per-chunk maximum wait time in seconds. This limits how long to wait for a SINGLE
+# chunk download before moving on. Works in combination with tile_time_budget:
+# - tile_time_budget: Total time for entire tile (all chunks combined)
+# - maxwait: Maximum time per individual chunk download
+# A chunk download will end when EITHER limit is reached, whichever comes first.
+# This prevents a single slow chunk from consuming the entire tile budget.
+# Recommended: 2.0 (fast networks), 5.0 (normal), 10.0 (slow networks)
+maxwait = 5.0
 # Temporarily increase maxwait to an effectively infinite value while X-Plane is
 # loading scenery data prior to starting the flight.  This allows more downloads to
 # succeed and reduce the use of backup chunks and missing chunks at the start of flight.
 suspend_maxwait = True
+# Use time budget system for tile requests. When enabled, the tile_time_budget
+# value represents the total wall-clock time for an ENTIRE tile (all mipmaps),
+# providing more predictable loading times. When disabled, falls back to legacy
+# per-chunk maxwait timing.
+use_time_budget = True
+# Maximum wall-clock time in seconds for a COMPLETE tile (all 5 mipmap levels).
+# IMPORTANT: This measures ACTIVE PROCESSING time only - queue wait time doesn't count.
+# The budget starts when chunks actually begin downloading, not when the tile is first requested.
+# This ensures fair time allocation when many tiles are requested simultaneously.
+# After this time, the tile is built with whatever has been downloaded.
+# Lower = faster loading, but may have more partial/blurry tiles
+# Higher = better quality, but longer initial load times
+# Recommended: 60.0 (fast), 120.0 (balanced), 300.0 (quality)
+tile_time_budget = 180.0
+# Fallback level when chunks fail to download in time:
+# none = Skip all fallbacks (fastest, may have missing tiles)
+# cache = Use disk cache and already-built mipmaps, no network (balanced)
+# full = All fallbacks including on-demand network downloads (best quality, slowest)
+# Recommended: cache for most users, full if you have fast internet and CPU
+fallback_level = cache
+# When enabled with fallback_level=full, network fallbacks will continue even after
+# the tile time budget is exhausted. This prioritizes quality over strict timing.
+# True = Better quality, may cause longer load times when network is slow
+# False = Strict timing, fallbacks respect budget (may have more missing tiles)
+# Recommended: False for stutter-free experience, True for maximum quality
+fallback_extends_budget = False
+# Timeout per mipmap level when using extended fallbacks (in seconds)
+# When fallback_extends_budget is True, each lower-detail mipmap level
+# gets this much time to download. Total extra time = this * number of levels tried.
+# Example: 10 seconds * 4 levels = 40 seconds max additional time
+# Range: 10 - 120 seconds
+# Recommended: 3.0 (balanced), 5.0 (quality), 1.5 (fast)
+fallback_timeout = 30.0
+# Spatial prefetching - proactively downloads tiles ahead of aircraft
+# Enable/disable prefetching (True/False)
+prefetch_enabled = True
+# How far ahead to prefetch in minutes of flight time (1-60)
+# Higher = more tiles prefetched ahead, uses more bandwidth and memory
+# Lower = fewer tiles prefetched, less resource usage
+# Recommended: 15 (fast aircraft), 30 (balanced), 60 (slow internet or long haul)
+# Set to 0 for Unlimited lookahead (continues until max_chunks or other limits)
+prefetch_lookahead = 30
+# How often to check for prefetch opportunities in seconds (1-10)
+prefetch_interval = 2.0
+# Maximum chunks to prefetch per cycle (8-512)
+prefetch_max_chunks = 32
+# Prefetch radius in nautical miles (10-150)
+# Tiles within this radius of the flight path are prefetched
+# Used by both velocity-based and SimBrief prefetching
+prefetch_radius_nm = 40
+# Predictive DDS generation - pre-build DDS textures in background after prefetch
+# When enabled, tiles are compressed to DDS in the background, eliminating stutters
+# when X-Plane loads new scenery areas. Falls back gracefully on cache miss.
+predictive_dds_enabled = True
+# Maximum memory for pre-built DDS cache in MB (128-2048)
+# Higher = more tiles cached, fewer stutters, more RAM used
+# Lower = fewer tiles cached, more potential stutters, less RAM used
+# Recommended: 256 (low RAM), 512 (balanced), 1024 (high RAM)
+predictive_dds_cache_mb = 512
+# Minimum interval between DDS builds in milliseconds (100-2000)
+# Rate limits background builds to prevent CPU spikes during flight
+# Lower = faster building, higher CPU usage
+# Higher = slower building, lower CPU usage
+# Recommended: 250 (fast CPU), 500 (balanced), 1000 (low-end CPU)
+predictive_dds_build_interval_ms = 500
+# Apply fallbacks when pre-building DDS (True/False)
+# True (default): Apply same fallback logic as live requests (cache search, lower zoom, etc.)
+#   - Pro: Prebuilt tiles have best possible quality with fallbacks for failed chunks
+#   - Con: Prebuilds may do extra disk/network I/O to find fallback data
+# False: Use missing color for failed chunks (no fallbacks, fastest)
+#   - Pro: Faster prebuilds, no extra I/O
+#   - Con: Failed chunks show missing color instead of fallback data
+predictive_dds_use_fallbacks = True
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False
@@ -116,9 +203,9 @@ noclean = False
 [fuse]
 # Enable or disable multi-threading when using FUSE
 threading = {False if system_type == "darwin" else True}
-# Timeout in seconds for tile build operations. If a tile takes longer than this,
-# a placeholder will be shown instead of crashing X-Plane. Default: 60
-build_timeout = 60
+# NOTE: build_timeout (FUSE lock timeout) is calculated dynamically based on
+# tile_time_budget. Formula: tile_time_budget + fallback_timeout (if enabled) + 15s.
+# This ensures the lock timeout always exceeds the maximum possible tile build time.
 
 [flightdata]
 # Local port for map and stats
@@ -145,6 +232,35 @@ compress_dsf = True
 
 [windows]
 prefer_winfsp = True
+
+[time_exclusion]
+# Enable time-based AutoOrtho exclusion. When active during the specified time range,
+# AutoOrtho's scenery will be hidden and X-Plane will use its default scenery instead.
+enabled = False
+# Start time for exclusion in 24-hour format (HH:MM), e.g. "22:00" for 10 PM
+start_time = 23:00
+# End time for exclusion in 24-hour format (HH:MM), e.g. "06:00" for 6 AM
+end_time = 05:00
+# When enabled, assume exclusion is active until sim time is available.
+# Useful to ensure night flights start with default scenery from the beginning.
+# When disabled, AutoOrtho works normally until sim time confirms exclusion.
+default_to_exclusion = False
+
+[simbrief]
+# SimBrief user ID for flight plan integration
+userid = 
+# Use SimBrief flight data for dynamic zoom level and pre-fetching calculations
+use_flight_data = False
+# Radius in nautical miles to consider fixes when calculating altitude for a tile
+# All fixes within this radius are considered, and the lowest altitude is used
+route_consideration_radius_nm = 50
+# If the aircraft deviates more than this distance (nm) from the route, fall back to DataRef-based calculations
+route_deviation_threshold_nm = 40
+# Allow prefetching while parked when SimBrief flight plan is loaded
+# With a known route, we don't need to wait for aircraft movement to start prefetching
+prefetch_while_parked = True
+# Radius in nautical miles around waypoints to prefetch tiles (now in Advanced Settings)
+route_prefetch_radius_nm = 40
 """
 
     def __init__(self, conf_file=None):

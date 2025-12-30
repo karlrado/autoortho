@@ -18,16 +18,19 @@ from utils.constants import MAPTYPES, system_type
 from utils.mappers import map_kubilus_region_to_simheaven_region
 from utils.dsf_utils import DsfUtils, dsf_utils
 from utils.mount_utils import cleanup_mountpoint, safe_ismount
+from utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QPushButton, QLabel, QLineEdit, QCheckBox, QComboBox,
     QSlider, QTextEdit, QFileDialog, QMessageBox, QScrollArea,
     QSplashScreen, QGroupBox, QProgressBar, QStatusBar, QFrame, QSpinBox,
-    QColorDialog, QRadioButton, QMenu, QStyle
+    QColorDialog, QRadioButton, QMenu, QStyle,
+    QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QInputDialog,
+    QHeaderView
 )
 from PySide6.QtCore import (
-    Qt, QThread, Signal, QTimer, QSize, QPoint, QObject
+    Qt, QThread, Signal, QTimer, QSize, QPoint, QObject, QEvent
 )
 from PySide6.QtGui import (
     QPixmap, QIcon, QColor, QWheelEvent, QCursor
@@ -224,6 +227,47 @@ class RestoreDefaultDsfsWorker(QThread):
             self.error.emit(self.region_id, str(err))
             log.error(tb)
 
+
+class SimBriefFetchWorker(QThread):
+    """Worker thread for fetching SimBrief flight plan data"""
+    success = Signal(dict)  # flight data
+    error = Signal(str)  # error message
+    
+    SIMBRIEF_API_URL = "https://www.simbrief.com/api/xml.fetcher.php"
+    
+    def __init__(self, userid):
+        super().__init__()
+        self.userid = userid
+    
+    def run(self):
+        try:
+            url = f"{self.SIMBRIEF_API_URL}?userid={self.userid}&json=1"
+            response = requests.get(url, timeout=15)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            # Check for API-level errors
+            fetch_info = data.get('fetch', {})
+            status = fetch_info.get('status', '')
+            if status.lower().startswith('error'):
+                self.error.emit(status)
+                return
+            
+            self.success.emit(data)
+            
+        except requests.exceptions.Timeout:
+            self.error.emit("Request timed out. Please check your internet connection.")
+        except requests.exceptions.ConnectionError:
+            self.error.emit("Connection error. Please check your internet connection.")
+        except requests.exceptions.HTTPError as e:
+            self.error.emit(f"HTTP error: {e.response.status_code}")
+        except ValueError as e:
+            self.error.emit(f"Invalid response from SimBrief: {str(e)}")
+        except Exception as e:
+            self.error.emit(f"Unexpected error: {str(e)}")
+
+
 class StyledButton(QPushButton):
     """Custom styled button with hover effects"""
     def __init__(self, text, primary=False):
@@ -353,6 +397,287 @@ class ModernSpinBox(QSpinBox):
                 height: 12px;
             }
         """)
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class QualityStepsDialog(QDialog):
+    """
+    Dialog for managing dynamic zoom quality steps.
+    
+    Allows users to define altitude-based zoom level thresholds.
+    Each step specifies a max zoom level for altitudes at or above
+    a threshold. The base step (0 ft AGL) cannot be removed.
+    """
+    
+    def __init__(self, parent=None, manager=None, current_max_zoom=16):
+        """
+        Initialize the quality steps dialog.
+        
+        Args:
+            parent: Parent widget
+            manager: DynamicZoomManager instance (creates new if None)
+            current_max_zoom: Current fixed max zoom (for initializing base step)
+        """
+        super().__init__(parent)
+        self.manager = manager if manager is not None else DynamicZoomManager()
+        self.current_max_zoom = current_max_zoom
+        self.setWindowTitle("Dynamic Zoom - Quality Steps")
+        self.setMinimumSize(550, 450)
+        self._setup_ui()
+        
+    def _setup_ui(self):
+        """Set up the dialog UI."""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+        
+        # Info label
+        info = QLabel(
+            "Define maximum zoom levels for different altitude ranges.\n"
+            "Cruising at higher altitudes doesn't need as much detail - saves VRAM and speeds up loading.\n"
+            "'Near Airports' uses higher zoom when approaching airports.\n"
+            "The base level (0 ft AGL) is the default for ground level and cannot be removed."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #aaa; padding: 10px; background: #333; border-radius: 5px;")
+        layout.addWidget(info)
+        
+        # Steps table
+        self.steps_table = QTableWidget()
+        self.steps_table.setColumnCount(4)
+        self.steps_table.setHorizontalHeaderLabels([
+            "Altitude (ft)", "Max Zoom Level", "Near Airports", "Actions"
+        ])
+        self.steps_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.steps_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.steps_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.steps_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.steps_table.setColumnWidth(3, 100)
+        self.steps_table.verticalHeader().setDefaultSectionSize(36)  # Ensure enough row height
+        self.steps_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #2d2d2d;
+                border: 1px solid #444;
+                border-radius: 5px;
+            }
+            QTableWidget::item {
+                padding: 5px;
+            }
+            QHeaderView::section {
+                background-color: #3d3d3d;
+                padding: 8px;
+                border: none;
+                border-bottom: 1px solid #555;
+            }
+            QSpinBox {
+                background-color: #3d3d3d;
+                border: 1px solid #555;
+                border-radius: 3px;
+                padding: 4px;
+                color: white;
+                min-height: 24px;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                width: 16px;
+            }
+        """)
+        layout.addWidget(self.steps_table)
+        
+        # Add step button
+        add_btn = StyledButton("Add Quality Step")
+        add_btn.clicked.connect(self._add_step)
+        layout.addWidget(add_btn)
+        
+        # Dialog buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | 
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        
+        self._refresh_table()
+    
+    def _refresh_table(self):
+        """Refresh the steps table from manager."""
+        steps = self.manager.get_steps()
+        self.steps_table.setRowCount(len(steps))
+        
+        for i, step in enumerate(steps):
+            # Altitude (editable except for base)
+            alt_item = QTableWidgetItem(str(step.altitude_ft))
+            if step.altitude_ft == BASE_ALTITUDE_FT:
+                alt_item.setFlags(alt_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                alt_item.setToolTip("Base altitude cannot be changed")
+                alt_item.setBackground(QColor(60, 60, 60))
+            self.steps_table.setItem(i, 0, alt_item)
+            
+            # Zoom level - use QSpinBox for proper validation (12-17 range)
+            zoom_spinbox = QSpinBox()
+            zoom_spinbox.setMinimum(12)
+            zoom_spinbox.setMaximum(17)
+            zoom_spinbox.setValue(min(17, max(12, step.zoom_level)))  # Clamp to valid range
+            zoom_spinbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            zoom_spinbox.setProperty("altitude_ft", step.altitude_ft)
+            zoom_spinbox.setProperty("row", i)
+            self.steps_table.setCellWidget(i, 1, zoom_spinbox)
+            
+            # Airport zoom level - use QSpinBox for proper validation (12-18 range)
+            airport_zoom_spinbox = QSpinBox()
+            airport_zoom_spinbox.setMinimum(12)
+            airport_zoom_spinbox.setMaximum(18)
+            airport_zoom_spinbox.setValue(min(18, max(12, step.zoom_level_airports)))
+            airport_zoom_spinbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            airport_zoom_spinbox.setProperty("altitude_ft", step.altitude_ft)
+            airport_zoom_spinbox.setProperty("row", i)
+            self.steps_table.setCellWidget(i, 2, airport_zoom_spinbox)
+            
+            # Connect validation: airport zoom must be >= regular zoom
+            zoom_spinbox.valueChanged.connect(
+                lambda val, row=i: self._validate_zoom_pair(row, "zoom")
+            )
+            airport_zoom_spinbox.valueChanged.connect(
+                lambda val, row=i: self._validate_zoom_pair(row, "airport")
+            )
+            
+            # Delete button (not for base)
+            if step.altitude_ft != BASE_ALTITUDE_FT:
+                del_btn = QPushButton("Remove")
+                del_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #8b3030;
+                        color: white;
+                        border: none;
+                        padding: 3px 8px;
+                        border-radius: 3px;
+                    }
+                    QPushButton:hover {
+                        background-color: #a04040;
+                    }
+                """)
+                # Capture altitude value in lambda closure
+                del_btn.clicked.connect(
+                    lambda checked, alt=step.altitude_ft: self._remove_step(alt)
+                )
+                self.steps_table.setCellWidget(i, 3, del_btn)
+            else:
+                # Empty cell for base step
+                self.steps_table.setCellWidget(i, 3, QLabel(""))
+    
+    def _add_step(self):
+        """Add a new quality step."""
+        # Show dialog to enter altitude
+        altitude, ok = QInputDialog.getInt(
+            self, "Add Quality Step", 
+            "Altitude (ft) - step applies at and above this altitude:",
+            10000, 0, 60000, 1000
+        )
+        if not ok:
+            return
+            
+        # Show dialog to enter zoom level
+        zoom, ok = QInputDialog.getInt(
+            self, "Add Quality Step", 
+            "Maximum Zoom Level (12-17):",
+            15, 12, 17, 1
+        )
+        if not ok:
+            return
+        
+        # Show dialog to enter airport zoom level
+        airport_zoom, ok = QInputDialog.getInt(
+            self, "Add Quality Step", 
+            "Maximum Zoom Level Near Airports (12-18):",
+            min(18, zoom + 1), 12, 18, 1  # Default to one level higher than normal
+        )
+        if not ok:
+            return
+        
+        # Validate: airport zoom must be >= regular zoom
+        if airport_zoom < zoom:
+            QMessageBox.warning(
+                self, "Invalid Zoom Settings",
+                f"Airport zoom level ({airport_zoom}) cannot be lower than regular zoom level ({zoom}).\n"
+                "Setting airport zoom to match regular zoom."
+            )
+            airport_zoom = zoom
+            
+        if not self.manager.add_step(altitude, zoom, airport_zoom):
+            QMessageBox.warning(
+                self, "Duplicate Altitude", 
+                f"A quality step at {altitude} ft already exists.\n"
+                "Please choose a different altitude or edit the existing step."
+            )
+            return
+            
+        self._refresh_table()
+    
+    def _remove_step(self, altitude: int):
+        """Remove a quality step."""
+        self.manager.remove_step(altitude)
+        self._refresh_table()
+    
+    def _validate_zoom_pair(self, row: int, changed: str):
+        """
+        Validate that airport zoom >= regular zoom for a row.
+        
+        Args:
+            row: The table row to validate
+            changed: Which spinbox changed ("zoom" or "airport")
+        """
+        zoom_spinbox = self.steps_table.cellWidget(row, 1)
+        airport_spinbox = self.steps_table.cellWidget(row, 2)
+        
+        if not zoom_spinbox or not airport_spinbox:
+            return
+        
+        zoom_val = zoom_spinbox.value()
+        airport_val = airport_spinbox.value()
+        
+        if airport_val < zoom_val:
+            # Block signals to prevent recursion
+            if changed == "zoom":
+                # User increased zoom, bump airport to match
+                airport_spinbox.blockSignals(True)
+                airport_spinbox.setValue(zoom_val)
+                airport_spinbox.blockSignals(False)
+            else:
+                # User decreased airport zoom below zoom, bump it back up
+                airport_spinbox.blockSignals(True)
+                airport_spinbox.setValue(zoom_val)
+                airport_spinbox.blockSignals(False)
+    
+    def _on_accept(self):
+        """Handle dialog acceptance - apply table edits to manager."""
+        # Apply any table edits to manager
+        for i in range(self.steps_table.rowCount()):
+            alt_item = self.steps_table.item(i, 0)
+            zoom_spinbox = self.steps_table.cellWidget(i, 1)
+            airport_zoom_spinbox = self.steps_table.cellWidget(i, 2)
+            if alt_item and zoom_spinbox and isinstance(zoom_spinbox, QSpinBox):
+                try:
+                    alt = int(alt_item.text())
+                    zoom = zoom_spinbox.value()  # Already validated by spinbox
+                    airport_zoom = None
+                    if airport_zoom_spinbox and isinstance(airport_zoom_spinbox, QSpinBox):
+                        airport_zoom = airport_zoom_spinbox.value()
+                    self.manager.update_step(alt, zoom, airport_zoom)
+                except ValueError:
+                    pass
+        self.accept()
+    
+    def get_manager(self) -> DynamicZoomManager:
+        """
+        Get the configured manager after dialog closes.
+        
+        Returns:
+            The DynamicZoomManager with any changes applied
+        """
+        return self.manager
 
 
 class ConfigUI(QMainWindow):
@@ -605,6 +930,21 @@ class ConfigUI(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready")
 
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if (
+            obj is self.maptype_combo
+            or obj is self.max_zoom_mode_combo
+            or obj is self.fallback_level_combo
+            or (not self.system == "darwin" and obj is self.compressor_combo)
+            or obj is self.format_combo
+            or obj is self.console_log_level_combo
+            or obj is self.file_log_level_combo
+        ) and event.type() == QEvent.Type.Wheel:
+            if not obj.hasFocus():
+                event.ignore()
+                return True
+        return super().eventFilter(obj, event)
+
     def create_setup_tab(self):
         """Create the setup configuration tab"""
         setup_widget = QWidget()
@@ -758,6 +1098,8 @@ class ConfigUI(QMainWindow):
         )
         maptype_layout.addWidget(maptype_label)
         self.maptype_combo = QComboBox()
+        self.maptype_combo.installEventFilter(self)
+        self.maptype_combo.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
         self.maptype_combo.addItems(MAPTYPES)
         self.maptype_combo.setCurrentText(self.cfg.autoortho.maptype_override)
         self.maptype_combo.setObjectName('maptype_override')
@@ -798,6 +1140,299 @@ class ConfigUI(QMainWindow):
 
 
         layout.addWidget(options_group)
+
+        # SimBrief Integration group
+        simbrief_group = QGroupBox("SimBrief Integration")
+        simbrief_layout = QVBoxLayout()
+        simbrief_group.setLayout(simbrief_layout)
+
+        # User ID row
+        userid_layout = QHBoxLayout()
+        userid_label = QLabel("SimBrief User ID:")
+        userid_label.setToolTip(
+            "Your SimBrief Pilot ID.\n"
+            "Find it at: SimBrief → Account Settings → Pilot ID"
+        )
+        userid_layout.addWidget(userid_label)
+        
+        self.simbrief_userid_edit = QLineEdit(
+            getattr(self.cfg.simbrief, 'userid', '') if hasattr(self.cfg, 'simbrief') else ''
+        )
+        self.simbrief_userid_edit.setObjectName('simbrief_userid')
+        self.simbrief_userid_edit.setPlaceholderText("Enter your SimBrief Pilot ID")
+        self.simbrief_userid_edit.setToolTip("Your SimBrief Pilot ID (numeric)")
+        self.simbrief_userid_edit.textChanged.connect(self._on_simbrief_userid_changed)
+        userid_layout.addWidget(self.simbrief_userid_edit)
+        
+        simbrief_layout.addLayout(userid_layout)
+
+        # Button row for Fetch and Unload
+        simbrief_btn_layout = QHBoxLayout()
+        simbrief_btn_layout.setSpacing(10)
+        
+        # Fetch button (only visible when userid is set)
+        self.simbrief_fetch_btn = StyledButton("Fetch Flight Data")
+        self.simbrief_fetch_btn.setToolTip("Fetch the latest flight plan from SimBrief")
+        self.simbrief_fetch_btn.clicked.connect(self._on_simbrief_fetch)
+        simbrief_btn_layout.addWidget(self.simbrief_fetch_btn)
+        
+        # Unload button (only visible when flight data is loaded)
+        self.simbrief_unload_btn = StyledButton("Unload Flight")
+        self.simbrief_unload_btn.setToolTip("Clear the loaded flight plan data")
+        self.simbrief_unload_btn.clicked.connect(self._on_simbrief_unload)
+        self.simbrief_unload_btn.hide()  # Hidden until flight is loaded
+        simbrief_btn_layout.addWidget(self.simbrief_unload_btn)
+        
+        simbrief_btn_layout.addStretch()
+        simbrief_layout.addLayout(simbrief_btn_layout)
+
+        # Flight info display area (hidden initially)
+        self.simbrief_info_frame = QFrame()
+        self.simbrief_info_frame.setStyleSheet("""
+            QFrame {
+                background-color: #2A2A2A;
+                border: 1px solid #3A3A3A;
+                border-radius: 6px;
+                padding: 10px;
+            }
+        """)
+        simbrief_info_layout = QVBoxLayout()
+        simbrief_info_layout.setSpacing(8)
+        self.simbrief_info_frame.setLayout(simbrief_info_layout)
+
+        # Flight route header
+        self.simbrief_route_label = QLabel("")
+        self.simbrief_route_label.setStyleSheet("""
+            QLabel {
+                font-size: 16px;
+                font-weight: bold;
+                color: #6da4e3;
+            }
+        """)
+        simbrief_info_layout.addWidget(self.simbrief_route_label)
+
+        # Flight details grid
+        self.simbrief_details_label = QLabel("")
+        self.simbrief_details_label.setStyleSheet("""
+            QLabel {
+                color: #E0E0E0;
+                font-size: 13px;
+            }
+        """)
+        self.simbrief_details_label.setWordWrap(True)
+        simbrief_info_layout.addWidget(self.simbrief_details_label)
+
+        # Error label (hidden initially)
+        self.simbrief_error_label = QLabel("")
+        self.simbrief_error_label.setStyleSheet("""
+            QLabel {
+                color: #ff6b6b;
+                font-size: 13px;
+                padding: 8px;
+                background-color: #3a2a2a;
+                border-radius: 4px;
+            }
+        """)
+        self.simbrief_error_label.setWordWrap(True)
+        self.simbrief_error_label.hide()
+        simbrief_info_layout.addWidget(self.simbrief_error_label)
+
+        # Toggle for using flight data (only visible when flight data is loaded)
+        self.simbrief_use_flight_data_check = QCheckBox(
+            "Use Flight Data for Dynamic Zoom Level and Pre-fetching Calculations"
+        )
+        self.simbrief_use_flight_data_check.setToolTip(
+            "When enabled, AutoOrtho uses the SimBrief flight plan to:\n\n"
+            "• Dynamic Zoom: Uses conservative AGL (Above Ground Level) altitude\n"
+            "  to determine the appropriate zoom level for tiles.\n\n"
+            "• Pre-fetching: Downloads tiles along your flight path ahead of time,\n"
+            "  at the appropriate zoom level for each waypoint's AGL altitude.\n\n"
+            "Conservative AGL calculation (when multiple waypoints are nearby):\n"
+            "  • Uses LOWEST flight altitude (MSL) - accounts for descent\n"
+            "  • Uses HIGHEST ground elevation - accounts for mountains\n"
+            "  • AGL = lowest_MSL - highest_ground = most conservative result\n\n"
+            "Why AGL? It represents actual height above terrain:\n"
+            "  • 10,000ft MSL over 5,000ft mountains = 5,000ft AGL (higher zoom)\n"
+            "  • 10,000ft MSL over ocean = 10,000ft AGL (lower zoom)\n\n"
+            "If you deviate more than 40nm from the route, AutoOrtho falls back\n"
+            "to DataRef-based AGL calculations using X-Plane's y_agl dataref."
+        )
+        # Load saved value from config
+        use_flight_data = False
+        if hasattr(self.cfg, 'simbrief'):
+            use_flight_data = getattr(self.cfg.simbrief, 'use_flight_data', False)
+            if isinstance(use_flight_data, str):
+                use_flight_data = use_flight_data.lower() in ('true', '1', 'yes', 'on')
+        self.simbrief_use_flight_data_check.setChecked(use_flight_data)
+        self.simbrief_use_flight_data_check.setObjectName('simbrief_use_flight_data')
+        self.simbrief_use_flight_data_check.hide()  # Hidden until flight data is loaded
+        # Connect for immediate effect - allows loading SimBrief data after pressing Run
+        self.simbrief_use_flight_data_check.stateChanged.connect(self._on_use_flight_data_changed)
+        simbrief_info_layout.addWidget(self.simbrief_use_flight_data_check)
+
+        # Route settings container (visible when flight data is loaded and use_flight_data is checked)
+        self.simbrief_route_settings_frame = QFrame()
+        self.simbrief_route_settings_frame.setStyleSheet("""
+            QFrame {
+                background-color: #333333;
+                border: 1px solid #454545;
+                border-radius: 6px;
+                padding: 8px;
+                margin-top: 8px;
+            }
+        """)
+        route_settings_layout = QVBoxLayout()
+        route_settings_layout.setSpacing(10)
+        self.simbrief_route_settings_frame.setLayout(route_settings_layout)
+
+        route_settings_header = QLabel("Route Calculation Settings")
+        route_settings_header.setStyleSheet("""
+            QLabel {
+                font-size: 13px;
+                font-weight: bold;
+                color: #B0B0B0;
+                border: none;
+                padding: 0px;
+                margin-bottom: 4px;
+            }
+        """)
+        route_settings_layout.addWidget(route_settings_header)
+
+        # Route Consideration Radius
+        consideration_layout = QHBoxLayout()
+        consideration_label = QLabel("Route Consideration Radius:")
+        consideration_label.setToolTip(
+            "Radius in nautical miles to consider waypoints when calculating\n"
+            "the altitude for a tile.\n\n"
+            "When determining the zoom level for a tile, AutoOrtho looks at all\n"
+            "waypoints within this radius and uses the lowest altitude among them.\n"
+            "This ensures that when approaching lower altitude segments (like\n"
+            "descent or approach), tiles are fetched at an appropriate zoom level.\n\n"
+            "• Larger values: More conservative, fetches higher quality tiles earlier\n"
+            "• Smaller values: More accurate to current position, but may need to\n"
+            "  re-fetch tiles as you approach lower altitude segments\n\n"
+            "Default: 50 nm\n\n"
+            "ℹ Changes take effect immediately. Use 'Save Config' to persist\n"
+            "the value for future sessions."
+        )
+        consideration_layout.addWidget(consideration_label)
+        
+        self.simbrief_consideration_radius_spin = ModernSpinBox()
+        self.simbrief_consideration_radius_spin.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
+        self.simbrief_consideration_radius_spin.setMinimum(10)
+        self.simbrief_consideration_radius_spin.setMaximum(200)
+        self.simbrief_consideration_radius_spin.setSuffix(" nm")
+        consideration_value = 50
+        if hasattr(self.cfg, 'simbrief'):
+            consideration_value = int(getattr(self.cfg.simbrief, 'route_consideration_radius_nm', 50))
+        self.simbrief_consideration_radius_spin.setValue(consideration_value)
+        self.simbrief_consideration_radius_spin.setToolTip(
+            "Radius (nm) to search for waypoints when calculating tile altitude"
+        )
+        self.simbrief_consideration_radius_spin.valueChanged.connect(
+            self._on_route_consideration_radius_changed
+        )
+        consideration_layout.addWidget(self.simbrief_consideration_radius_spin)
+        consideration_layout.addStretch()
+        route_settings_layout.addLayout(consideration_layout)
+
+        # Route Deviation Threshold
+        deviation_layout = QHBoxLayout()
+        deviation_label = QLabel("Route Deviation Threshold:")
+        deviation_label.setToolTip(
+            "Maximum distance in nautical miles the aircraft can deviate from\n"
+            "the flight plan before falling back to DataRef-based calculations.\n\n"
+            "When you fly off-route (e.g., ATC vectors, weather avoidance, or\n"
+            "free flight), the flight plan altitudes may no longer be accurate.\n"
+            "If you exceed this distance from the nearest route segment, AutoOrtho\n"
+            "will switch to using X-Plane's y_agl DataRef for altitude instead.\n\n"
+            "• Larger values: Trust flight plan longer when deviating\n"
+            "• Smaller values: Switch to DataRef sooner for accuracy\n\n"
+            "Default: 40 nm\n\n"
+            "ℹ Changes take effect immediately. Use 'Save Config' to persist\n"
+            "the value for future sessions."
+        )
+        deviation_layout.addWidget(deviation_label)
+        
+        self.simbrief_deviation_threshold_spin = ModernSpinBox()
+        self.simbrief_deviation_threshold_spin.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
+        self.simbrief_deviation_threshold_spin.setMinimum(5)
+        self.simbrief_deviation_threshold_spin.setMaximum(100)
+        self.simbrief_deviation_threshold_spin.setSuffix(" nm")
+        deviation_value = 40
+        if hasattr(self.cfg, 'simbrief'):
+            deviation_value = int(getattr(self.cfg.simbrief, 'route_deviation_threshold_nm', 40))
+        self.simbrief_deviation_threshold_spin.setValue(deviation_value)
+        self.simbrief_deviation_threshold_spin.setToolTip(
+            "Distance (nm) from route before falling back to DataRef altitude"
+        )
+        self.simbrief_deviation_threshold_spin.valueChanged.connect(
+            self._on_route_deviation_threshold_changed
+        )
+        deviation_layout.addWidget(self.simbrief_deviation_threshold_spin)
+        deviation_layout.addStretch()
+        route_settings_layout.addLayout(deviation_layout)
+
+        # Prefetch while parked checkbox
+        prefetch_parked_layout = QHBoxLayout()
+        self.simbrief_prefetch_parked_check = QCheckBox("Prefetch while parked")
+        prefetch_parked_value = True
+        if hasattr(self.cfg, 'simbrief'):
+            val = getattr(self.cfg.simbrief, 'prefetch_while_parked', True)
+            if isinstance(val, str):
+                prefetch_parked_value = val.lower() in ('true', '1', 'yes', 'on')
+            else:
+                prefetch_parked_value = bool(val)
+        self.simbrief_prefetch_parked_check.setChecked(prefetch_parked_value)
+        self.simbrief_prefetch_parked_check.setToolTip(
+            "Start prefetching the route immediately when flight plan is loaded.\n\n"
+            "When enabled:\n"
+            "  • Prefetching starts while parked at the gate\n"
+            "  • Uses known route to fetch tiles ahead of time\n"
+            "  • Great for loading flight plans before departure\n\n"
+            "When disabled:\n"
+            "  • Prefetching only starts once airborne and on-route\n"
+            "  • Matches velocity-based prefetch behavior"
+        )
+        self.simbrief_prefetch_parked_check.stateChanged.connect(
+            self._on_prefetch_while_parked_changed
+        )
+        prefetch_parked_layout.addWidget(self.simbrief_prefetch_parked_check)
+        prefetch_parked_layout.addStretch()
+        route_settings_layout.addLayout(prefetch_parked_layout)
+        
+        # Route Prefetch Radius note (moved to unified setting in Advanced)
+        prefetch_note_layout = QHBoxLayout()
+        prefetch_note_label = QLabel(
+            "ℹ Prefetch radius is now in Advanced Settings → Prefetching"
+        )
+        prefetch_note_label.setStyleSheet("color: #8ab4f8; font-style: italic;")
+        prefetch_note_label.setToolTip(
+            "The prefetch radius setting has been unified for both SimBrief\n"
+            "and velocity-based prefetching.\n\n"
+            "Go to: Advanced Settings → AutoOrtho → Prefetching → Prefetch radius\n\n"
+            "This single setting controls how wide a corridor of tiles is\n"
+            "prefetched around your flight path, regardless of whether you're\n"
+            "using SimBrief flight plans or simple heading-based prediction."
+        )
+        prefetch_note_layout.addWidget(prefetch_note_label)
+        prefetch_note_layout.addStretch()
+        route_settings_layout.addLayout(prefetch_note_layout)
+
+        self.simbrief_route_settings_frame.hide()  # Hidden until use_flight_data is checked
+        simbrief_info_layout.addWidget(self.simbrief_route_settings_frame)
+
+        self.simbrief_info_frame.hide()
+        simbrief_layout.addWidget(self.simbrief_info_frame)
+
+        # Store the current flight data
+        self.simbrief_flight_data = None
+        self.simbrief_fetch_worker = None
+
+        # Update initial visibility
+        self._update_simbrief_ui_state()
+
+        layout.addWidget(simbrief_group)
     
         # Set the content widget to the scroll area
         scroll_area.setWidget(setup_content)
@@ -1011,7 +1646,7 @@ class ConfigUI(QMainWindow):
                 old_level = logging.getLevelName(root_logger.level)
                 root_logger.setLevel(min_level)
                 level_name = logging.getLevelName(min_level)
-                log.info(f"Root logger adjusted: {old_level} → {level_name} (handlers: {', '.join(handler_levels)})")
+                log.info(f"Root logger adjusted: {old_level} -> {level_name} (handlers: {', '.join(handler_levels)})")
         except Exception as e:
             log.error(f"Failed to update root logger level: {e}")
 
@@ -1143,6 +1778,36 @@ class ConfigUI(QMainWindow):
         min_zoom_layout.addWidget(self.min_zoom_label)
         autoortho_layout.addLayout(min_zoom_layout)
 
+        # === Max Zoom Mode Toggle ===
+        # Allows switching between Fixed (single value) and Dynamic (altitude-based)
+        max_zoom_mode_layout = QHBoxLayout()
+        max_zoom_mode_label = QLabel("Max Zoom Mode:")
+        max_zoom_mode_label.setToolTip(
+            "Fixed: Use a single max zoom level for all tiles.\n"
+            "Dynamic: Use different zoom levels based on aircraft altitude."
+        )
+        max_zoom_mode_layout.addWidget(max_zoom_mode_label)
+        
+        self.max_zoom_mode_combo = QComboBox()
+        self.max_zoom_mode_combo.installEventFilter(self)
+        self.max_zoom_mode_combo.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
+        self.max_zoom_mode_combo.addItems(["Fixed", "Dynamic"])
+        current_mode = str(getattr(self.cfg.autoortho, 'max_zoom_mode', 'fixed')).lower()
+        self.max_zoom_mode_combo.setCurrentText("Dynamic" if current_mode == "dynamic" else "Fixed")
+        self.max_zoom_mode_combo.setToolTip(
+            "Fixed: Single max zoom for all tiles (simpler)\n"
+            "Dynamic: Altitude-based zoom levels (saves VRAM at altitude)"
+        )
+        self.max_zoom_mode_combo.currentTextChanged.connect(self._on_zoom_mode_changed)
+        max_zoom_mode_layout.addWidget(self.max_zoom_mode_combo)
+        max_zoom_mode_layout.addStretch()
+        autoortho_layout.addLayout(max_zoom_mode_layout)
+
+        # === Fixed Mode Controls (wrapped in widget for show/hide) ===
+        self.fixed_zoom_widget = QWidget()
+        fixed_zoom_layout = QVBoxLayout(self.fixed_zoom_widget)
+        fixed_zoom_layout.setContentsMargins(0, 0, 0, 0)
+        
         max_zoom_tooltip = (
             "Maximum zoom level for imagery downloads.\n"
             "Higher values = more detail but larger downloads and more VRAM usage.\n"
@@ -1152,12 +1817,12 @@ class ConfigUI(QMainWindow):
             max_zoom_tooltip += "IMPORTANT: You are using custom tiles, you can set this to 19 if your tiles are built for higher ZL it.\n"
             "But be aware that in-game zoom level will be capped to tile default zoom level + 1 (only X-Plane 12)."
 
-        max_zoom_layout = QHBoxLayout()
+        fixed_max_zoom_row = QHBoxLayout()
         max_zoom_label = QLabel("Maximum zoom level:")
         max_zoom_label.setToolTip(max_zoom_tooltip)
-        max_zoom_layout.addWidget(max_zoom_label)
+        fixed_max_zoom_row.addWidget(max_zoom_label)
         self.max_zoom_slider = ModernSlider()
-        self.max_zoom_slider.setRange(12, 17 if not self.cfg.autoortho.using_custom_tiles else 19) # Max X-Plane allows is tile zoom + 1 , 17 accounts for kubilus mesh
+        self.max_zoom_slider.setRange(12, 17 if not self.cfg.autoortho.using_custom_tiles else 19)
         self.max_zoom_slider.setValue(int(self.cfg.autoortho.max_zoom))
         self.max_zoom_slider.setObjectName('max_zoom')
         self.max_zoom_slider.setToolTip(
@@ -1169,12 +1834,45 @@ class ConfigUI(QMainWindow):
                 self.validate_min_and_max_zoom("max")
             )
         )
-        max_zoom_layout.addWidget(self.max_zoom_slider)
-        max_zoom_layout.addWidget(self.max_zoom_label)
-        autoortho_layout.addLayout(max_zoom_layout)
+        fixed_max_zoom_row.addWidget(self.max_zoom_slider)
+        fixed_max_zoom_row.addWidget(self.max_zoom_label)
+        fixed_zoom_layout.addLayout(fixed_max_zoom_row)
+        
+        autoortho_layout.addWidget(self.fixed_zoom_widget)
 
-        # Max zoom near airports
-        max_zoom_near_airports_layout = QHBoxLayout()
+        # === Dynamic Mode Controls (wrapped in widget for show/hide) ===
+        self.dynamic_zoom_widget = QWidget()
+        dynamic_zoom_layout = QVBoxLayout(self.dynamic_zoom_widget)
+        dynamic_zoom_layout.setContentsMargins(0, 0, 0, 0)
+        
+        dynamic_info = QLabel(
+            "Dynamic zoom adjusts detail based on altitude. "
+            "Higher = less detail (saves VRAM and makes scenery loading faster at cruise)."
+        )
+        dynamic_info.setStyleSheet("color: #888; font-size: 11px;")
+        dynamic_info.setWordWrap(True)
+        dynamic_zoom_layout.addWidget(dynamic_info)
+        
+        dynamic_btn_row = QHBoxLayout()
+        self.dynamic_zoom_btn = StyledButton("Configure Quality Steps...")
+        self.dynamic_zoom_btn.clicked.connect(self._open_quality_steps_dialog)
+        dynamic_btn_row.addWidget(self.dynamic_zoom_btn)
+        dynamic_btn_row.addStretch()
+        dynamic_zoom_layout.addLayout(dynamic_btn_row)
+        
+        self.dynamic_zoom_summary = QLabel("No steps configured")
+        self.dynamic_zoom_summary.setStyleSheet("color: #6da4e3; padding-left: 5px;")
+        dynamic_zoom_layout.addWidget(self.dynamic_zoom_summary)
+        
+        autoortho_layout.addWidget(self.dynamic_zoom_widget)
+        
+        # Initialize dynamic zoom manager (visibility updated after all widgets created)
+        self._init_dynamic_zoom_manager()
+
+        # Max zoom near airports (wrapped in widget for show/hide with fixed mode)
+        self.max_zoom_near_airports_widget = QWidget()
+        max_zoom_near_airports_layout = QHBoxLayout(self.max_zoom_near_airports_widget)
+        max_zoom_near_airports_layout.setContentsMargins(0, 0, 0, 0)
         max_zoom_near_airports_label = QLabel("Max zoom near airports:")
         max_zoom_near_airports_label.setToolTip(
             "Maximum zoom level to allow near airports. Zoom level around airports used by default is 18."
@@ -1198,51 +1896,509 @@ class ConfigUI(QMainWindow):
         max_zoom_near_airports_layout.addWidget(self.max_zoom_near_airports_label)
 
         if not self.cfg.autoortho.using_custom_tiles:
-            autoortho_layout.addLayout(max_zoom_near_airports_layout)
+            autoortho_layout.addWidget(self.max_zoom_near_airports_widget)
 
-        # Max wait time
-        maxwait_layout = QHBoxLayout()
-        maxwait_label = QLabel("Max wait time (seconds):")
-        maxwait_label.setToolTip(
-            "Maximum time to wait for single imagery downloads before timing out.\n"
-            "Lower values = faster response but may have green or blank tiles\n"
-            "Higher values = better change at getting tiles but stutters and missing tiles while they load\n"
-            "Default: 0.5 seconds\n"
-            "Optimal: 2 seconds is a good compromise.\n"
-            "Increase this if you are using higher zoom levels and/or have a slow internet connection."
+        # Now update visibility after all zoom widgets are created
+        self._update_zoom_mode_visibility()
+
+        # Performance Tuning Section
+        # Separator line for visual grouping
+        perf_separator = QFrame()
+        perf_separator.setFrameShape(QFrame.Shape.HLine)
+        perf_separator.setFrameShadow(QFrame.Shadow.Sunken)
+        perf_separator.setStyleSheet("background-color: #555; margin: 10px 0;")
+        autoortho_layout.addWidget(perf_separator)
+
+        perf_header = QLabel("Performance Tuning")
+        perf_header.setStyleSheet("font-weight: bold; font-size: 14px; color: #6da4e3; margin-bottom: 5px;")
+        autoortho_layout.addWidget(perf_header)
+
+        # Use Time Budget checkbox
+        time_budget_layout = QHBoxLayout()
+        self.use_time_budget_check = QCheckBox("Use time budget system (recommended)")
+        self.use_time_budget_check.setChecked(self.cfg.autoortho.use_time_budget)
+        self.use_time_budget_check.setObjectName('use_time_budget')
+        self.use_time_budget_check.setToolTip(
+            "When enabled, enforces a strict wall-clock time limit for tile requests.\n"
+            "This provides more predictable performance and reduces stuttering.\n\n"
+            "When disabled, falls back to legacy per-chunk maxwait behavior,\n"
+            "which can result in longer cumulative wait times.\n\n"
+            "Recommended: Enabled for most users."
         )
-        maxwait_layout.addWidget(maxwait_label)
+        self.use_time_budget_check.stateChanged.connect(self._update_time_budget_controls)
+        time_budget_layout.addWidget(self.use_time_budget_check)
+        autoortho_layout.addLayout(time_budget_layout)
+
+        # Tile time budget slider
+        tile_budget_layout = QHBoxLayout()
+        self.tile_budget_label_title = QLabel("Tile time budget (seconds):")
+        self.tile_budget_label_title.setToolTip(
+            "Maximum wall-clock time for a COMPLETE tile (all mipmaps combined).\n"
+            "When this time is reached, the tile is built with whatever has been downloaded.\n\n"
+            "This measures ACTIVE PROCESSING TIME only - queue wait time doesn't count.\n"
+            "The budget starts when chunks actually begin downloading, not when the\n"
+            "tile is first requested. This ensures fair time allocation.\n\n"
+            "Lower values = faster loading, but may have more missing/blurry areas\n"
+            "Higher values = better quality, but longer initial load times\n\n"
+            "Recommended values:\n"
+            "  • 60.0 - Fast (quicker loading, more partial tiles, do not use along high zoom levels)\n"
+            "  • 120.0 - Balanced (good for most users)\n"
+            "  • 300.0 - Quality (for fast networks, slower loading, use along high zoom levels, but beware of stuttering and loading times)"
+        )
+        tile_budget_layout.addWidget(self.tile_budget_label_title)
+        self.tile_budget_slider = ModernSlider()
+        # Range: 1 to 300 seconds, with 1 second precision
+        # Each tile has 256 chunks (16x16), so adequate time is needed for full quality
+        self.tile_budget_slider.setRange(60, 600)  # 60 to 600 seconds in 1 second increments
+        self.tile_budget_slider.setSingleStep(1)
+        tile_budget_value = int(float(self.cfg.autoortho.tile_time_budget))
+        tile_budget_value = max(60, min(600, tile_budget_value))  # Clamp to valid range
+        self.tile_budget_slider.setValue(tile_budget_value)
+        self.tile_budget_slider.setObjectName('tile_time_budget')
+        self.tile_budget_slider.setToolTip(
+            "Drag to adjust tile time budget (60-600.0 seconds)"
+        )
+        self.tile_budget_value_label = QLabel(f"{float(self.cfg.autoortho.tile_time_budget):.1f}")
+        self.tile_budget_slider.valueChanged.connect(
+            lambda v: self.tile_budget_value_label.setText(f"{v:.1f}")
+        )
+        tile_budget_layout.addWidget(self.tile_budget_slider)
+        tile_budget_layout.addWidget(self.tile_budget_value_label)
+        autoortho_layout.addLayout(tile_budget_layout)
+
+        # Per-chunk max wait time (moved from general settings to performance)
+        maxwait_layout = QHBoxLayout()
+        self.maxwait_label_title = QLabel("Per-chunk max wait (seconds):")
+        self.maxwait_label_title.setToolTip(
+            "Maximum time to wait for a SINGLE chunk to download.\n\n"
+            "This is separate from the tile time budget:\n"
+            "  • Tile Budget: Total time for the entire tile (all chunks)\n"
+            "  • Per-chunk Max Wait: Timeout for each individual chunk download\n\n"
+            "A chunk will stop waiting when EITHER limit is reached.\n"
+            "This prevents a single slow chunk from consuming the entire tile budget.\n\n"
+            "Lower values = faster timeout per chunk, more fallback usage\n"
+            "Higher values = more patience per chunk, better for slow networks\n\n"
+            "Recommended values:\n"
+            "  • 2.0 - Fast networks\n"
+            "  • 5.0 - Normal networks (default)\n"
+            "  • 10.0 - Slow/unreliable networks"
+        )
+        maxwait_layout.addWidget(self.maxwait_label_title)
         self.maxwait_slider = ModernSlider()
-        self.maxwait_slider.setRange(1, 100)
+        self.maxwait_slider.setRange(1, 100)  # 0.1 to 10.0 seconds
         self.maxwait_slider.setSingleStep(1)
         # Convert maxwait to int for slider (multiply by 10 for 0.1 precision)
         maxwait_value = int(float(self.cfg.autoortho.maxwait) * 10)
+        maxwait_value = max(1, min(100, maxwait_value))
         self.maxwait_slider.setValue(maxwait_value)
         self.maxwait_slider.setObjectName('maxwait')
         self.maxwait_slider.setToolTip(
-            "Drag to adjust maximum wait time in seconds"
+            "Drag to adjust per-chunk max wait time (0.1-10.0 seconds)"
         )
-        self.maxwait_label = QLabel(f"{self.cfg.autoortho.maxwait}")
+        self.maxwait_value_label = QLabel(f"{float(self.cfg.autoortho.maxwait):.1f}")
         self.maxwait_slider.valueChanged.connect(
-            lambda v: self.maxwait_label.setText(f"{v/10:.1f}")
+            lambda v: self.maxwait_value_label.setText(f"{v/10:.1f}")
         )
         maxwait_layout.addWidget(self.maxwait_slider)
-        maxwait_layout.addWidget(self.maxwait_label)
+        maxwait_layout.addWidget(self.maxwait_value_label)
         autoortho_layout.addLayout(maxwait_layout)
 
-        suspend_maxwait_layout = QHBoxLayout()
-        self.suspend_maxwait_check = QCheckBox("Suspend max wait during startup")
+        # Extended loading time during startup
+        startup_loading_layout = QHBoxLayout()
+        self.suspend_maxwait_check = QCheckBox("Allow extra loading time during startup")
         self.suspend_maxwait_check.setChecked(self.cfg.autoortho.suspend_maxwait)
         self.suspend_maxwait_check.setObjectName('suspend_maxwait')
         self.suspend_maxwait_check.setToolTip(
-            "Suspend the effect of max wait (by temporarily increasing it to a large\n"
-            "value) while loading scenery before the start of the flight.\n"
-            "This reduces backup (low res) textures and missing (grey) textures.\n"
-            "The specified max wait time is used after the flight starts.\n"
-            "This may increase the scenery load time before the start of the flight."
+            "Allow more time for tiles to load while X-Plane is loading scenery\n"
+            "before the flight starts.\n\n"
+            "When enabled:\n"
+            "  • With Time Budget: Uses 10x the tile time budget during startup\n"
+            "  • With Max Wait: Uses 20 seconds per chunk during startup\n\n"
+            "Benefits:\n"
+            "  • Reduces low-resolution and missing tiles at flight start\n"
+            "  • Better initial scenery quality\n\n"
+            "Trade-off:\n"
+            "  • May increase initial scenery loading time\n\n"
+            "Recommended: Enabled for best startup quality."
         )
-        suspend_maxwait_layout.addWidget(self.suspend_maxwait_check)
-        autoortho_layout.addLayout(suspend_maxwait_layout)
+        startup_loading_layout.addWidget(self.suspend_maxwait_check)
+        autoortho_layout.addLayout(startup_loading_layout)
+
+        # Fallback level dropdown
+        fallback_layout = QHBoxLayout()
+        fallback_label = QLabel("Fallback behavior:")
+        fallback_label.setToolTip(
+            "Controls what happens when image chunks fail to load in time.\n\n"
+            "None (Fastest):\n"
+            "  Skip all fallbacks. Fastest, but may have missing (gray) tiles.\n\n"
+            "Cache Only (Balanced):\n"
+            "  Use cached data and pre-built lower mipmaps only.\n"
+            "  Good balance of speed and quality. No extra network requests.\n\n"
+            "Full (Best Quality):\n"
+            "  All fallbacks including on-demand network downloads.\n"
+            "  Best quality but slowest. May cause extra stuttering.\n\n"
+            "Recommended: Cache Only for most users."
+        )
+        fallback_layout.addWidget(fallback_label)
+        self.fallback_level_combo = QComboBox()
+        self.fallback_level_combo.installEventFilter(self)
+        self.fallback_level_combo.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
+        self.fallback_level_combo.addItems([
+            "None (Fastest)",
+            "Cache Only (Balanced)",
+            "Full (Best Quality)"
+        ])
+        # Convert string fallback_level to index
+        fb_value = getattr(self.cfg.autoortho, 'fallback_level', 'cache')
+        current_fallback = self._fallback_str_to_index(fb_value)
+        self.fallback_level_combo.setCurrentIndex(current_fallback)
+        self.fallback_level_combo.setObjectName('fallback_level')
+        self.fallback_level_combo.setToolTip(
+            "Select fallback behavior when chunks timeout"
+        )
+        self.fallback_level_combo.currentIndexChanged.connect(self._update_fallback_extends_control)
+        fallback_layout.addWidget(self.fallback_level_combo)
+        fallback_layout.addStretch()
+        autoortho_layout.addLayout(fallback_layout)
+        
+        # Fallback extends budget checkbox (only relevant when fallback_level is 'full')
+        fallback_extends_layout = QHBoxLayout()
+        self.fallback_extends_budget_check = QCheckBox("Allow fallbacks to extend time budget")
+        fb_extends_value = getattr(self.cfg.autoortho, 'fallback_extends_budget', False)
+        if isinstance(fb_extends_value, str):
+            fb_extends_checked = fb_extends_value.lower().strip() in ('true', '1', 'yes', 'on')
+        else:
+            fb_extends_checked = bool(fb_extends_value)
+        self.fallback_extends_budget_check.setChecked(fb_extends_checked)
+        self.fallback_extends_budget_check.setToolTip(
+            "When enabled with 'Full' fallback level, adds EXTRA time after the main\n"
+            "budget expires to recover missing chunks using lower-detail fallbacks.\n\n"
+            "How it works:\n"
+            "  1. Main budget (e.g., 300s) is used for normal chunk downloads\n"
+            "  2. When main budget expires, a 'fallback sweep' phase begins\n"
+            "  3. All missing chunks are processed using lower-zoom alternatives\n"
+            "  4. Maximum total time = Main budget + Extended fallback timeout\n\n"
+            "• Enabled: Better quality, fewer missing tiles (quality priority)\n"
+            "• Disabled: Strict timing, may have gray patches (speed priority)"
+        )
+        self.fallback_extends_budget_check.stateChanged.connect(self._update_fallback_extends_control)
+        fallback_extends_layout.addWidget(self.fallback_extends_budget_check)
+        fallback_extends_layout.addStretch()
+        autoortho_layout.addLayout(fallback_extends_layout)
+        
+        # Fallback timeout slider (per-level timeout when extends_budget is enabled)
+        fallback_timeout_layout = QHBoxLayout()
+        self.fallback_timeout_label = QLabel("Extended fallback timeout:")
+        self.fallback_timeout_label.setToolTip(
+            "TOTAL extra time for the fallback sweep phase.\n"
+            "This time is added AFTER the main budget expires to recover\n"
+            "all missing chunks using lower-detail alternatives.\n\n"
+            "Maximum total tile time = Main budget + This value\n"
+            "Example: 300s main + 30s fallback = 330s maximum\n\n"
+            "Higher values = more time to recover missing chunks\n"
+            "Lower values = faster tile completion, may miss some chunks"
+        )
+        fallback_timeout_layout.addWidget(self.fallback_timeout_label)
+        
+        self.fallback_timeout_slider = ModernSlider(Qt.Orientation.Horizontal)
+        # Range: 1 to 30 seconds, with 1 second precision
+        self.fallback_timeout_slider.setRange(10, 120)  # 10 to 120 seconds in 1 second increments
+        self.fallback_timeout_slider.setSingleStep(1)
+        fallback_timeout_value = int(float(getattr(self.cfg.autoortho, 'fallback_timeout', 3.0)))
+        fallback_timeout_value = max(10, min(120, fallback_timeout_value))  # Clamp to valid range
+        self.fallback_timeout_slider.setValue(fallback_timeout_value)
+        self.fallback_timeout_slider.setObjectName('fallback_timeout')
+        self.fallback_timeout_slider.setToolTip(
+            "Drag to adjust extra time for fallback sweep (10-120 seconds)\n"
+            "This is ADDED to the main tile budget when recovering missing chunks."
+        )
+        self.fallback_timeout_value_label = QLabel(f"{fallback_timeout_value}s")
+        self.fallback_timeout_slider.valueChanged.connect(
+            lambda v: self.fallback_timeout_value_label.setText(f"{v}s")
+        )
+        fallback_timeout_layout.addWidget(self.fallback_timeout_slider)
+        fallback_timeout_layout.addWidget(self.fallback_timeout_value_label)
+        autoortho_layout.addLayout(fallback_timeout_layout)
+        
+        # Initially update the enabled state
+        self._update_fallback_extends_control()
+
+        # Prefetch Settings Sub-section
+        prefetch_header = QLabel("Prefetching")
+        prefetch_header.setStyleSheet("font-weight: bold; font-size: 12px; color: #8ab4f8; margin-top: 10px;")
+        autoortho_layout.addWidget(prefetch_header)
+        
+        # Prefetch enable checkbox
+        prefetch_enable_layout = QHBoxLayout()
+        self.prefetch_enabled_check = QCheckBox("Enable spatial prefetching")
+        self.prefetch_enabled_check.setChecked(
+            getattr(self.cfg.autoortho, 'prefetch_enabled', True)
+        )
+        self.prefetch_enabled_check.setToolTip(
+            "Proactively download tiles ahead of the aircraft to reduce stutters.\n"
+            "Uses aircraft heading and speed to predict which tiles will be needed."
+        )
+        self.prefetch_enabled_check.stateChanged.connect(self._update_prefetch_controls)
+        prefetch_enable_layout.addWidget(self.prefetch_enabled_check)
+        prefetch_enable_layout.addStretch()
+        autoortho_layout.addLayout(prefetch_enable_layout)
+        
+        # Prefetch lookahead slider (in minutes, 0 = Unlimited)
+        lookahead_layout = QHBoxLayout()
+        self.prefetch_lookahead_label = QLabel("Lookahead time:")
+        self.prefetch_lookahead_label.setToolTip(
+            "How far ahead (in minutes) to prefetch tiles.\n"
+            "Higher = more tiles prefetched ahead, uses more bandwidth and memory\n"
+            "Lower = fewer tiles prefetched, less resource usage\n\n"
+            "Example at 300 knots:\n"
+            "  • 5 min = ~25nm ahead\n"
+            "  • 10 min = ~50nm ahead\n"
+            "  • 30 min = ~150nm ahead\n"
+            "  • Unlimited = continues until max chunks/cycle or other limits"
+        )
+        lookahead_layout.addWidget(self.prefetch_lookahead_label)
+        
+        self.prefetch_lookahead_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.prefetch_lookahead_slider.setRange(1, 61)  # 1-60 minutes, 61 = Unlimited
+        # Load config: 0 means unlimited -> slider value 61
+        lookahead_config = int(float(getattr(self.cfg.autoortho, 'prefetch_lookahead', 10)))
+        if lookahead_config <= 0:
+            self.prefetch_lookahead_slider.setValue(61)  # Unlimited
+        else:
+            self.prefetch_lookahead_slider.setValue(min(lookahead_config, 60))
+        self.prefetch_lookahead_slider.setObjectName('prefetch_lookahead')
+        self.prefetch_lookahead_value = QLabel(
+            "Unlimited" if self.prefetch_lookahead_slider.value() == 61 
+            else f"{self.prefetch_lookahead_slider.value()} min"
+        )
+        self.prefetch_lookahead_slider.valueChanged.connect(
+            lambda v: self.prefetch_lookahead_value.setText(
+                "Unlimited" if v == 61 else f"{v} min"
+            )
+        )
+        lookahead_layout.addWidget(self.prefetch_lookahead_slider)
+        lookahead_layout.addWidget(self.prefetch_lookahead_value)
+        autoortho_layout.addLayout(lookahead_layout)
+        
+        # Prefetch interval slider (NEW)
+        interval_layout = QHBoxLayout()
+        self.prefetch_interval_label = QLabel("Check interval:")
+        self.prefetch_interval_label.setToolTip(
+            "How often (in seconds) to check for prefetch opportunities.\n"
+            "Lower = more responsive prefetching, slightly higher CPU\n"
+            "Higher = less frequent checks, lower CPU\n\n"
+            "Recommended: 2.0 sec (balanced)"
+        )
+        interval_layout.addWidget(self.prefetch_interval_label)
+        
+        self.prefetch_interval_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.prefetch_interval_slider.setRange(10, 100)  # 1.0-10.0 seconds (x10)
+        self.prefetch_interval_slider.setValue(
+            int(float(getattr(self.cfg.autoortho, 'prefetch_interval', 2.0)) * 10)
+        )
+        self.prefetch_interval_slider.setObjectName('prefetch_interval')
+        self.prefetch_interval_value = QLabel(
+            f"{self.prefetch_interval_slider.value() / 10:.1f} sec"
+        )
+        self.prefetch_interval_slider.valueChanged.connect(
+            lambda v: self.prefetch_interval_value.setText(f"{v / 10:.1f} sec")
+        )
+        interval_layout.addWidget(self.prefetch_interval_slider)
+        interval_layout.addWidget(self.prefetch_interval_value)
+        autoortho_layout.addLayout(interval_layout)
+        
+        # Prefetch max chunks slider (NEW)
+        max_chunks_layout = QHBoxLayout()
+        self.prefetch_max_chunks_label = QLabel("Max chunks/cycle:")
+        self.prefetch_max_chunks_label.setToolTip(
+            "Maximum number of chunks to submit per prefetch cycle.\n"
+            "Higher = more aggressive prefetching, more bandwidth\n"
+            "Lower = gentler prefetching, less bandwidth\n\n"
+            "Recommended: 32 (balanced), 64-128 (fast internet), 16 (slow internet)\n"
+            "Values above 128 are for very fast connections only."
+        )
+        max_chunks_layout.addWidget(self.prefetch_max_chunks_label)
+        
+        self.prefetch_max_chunks_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.prefetch_max_chunks_slider.setRange(8, 512)
+        self.prefetch_max_chunks_slider.setValue(
+            int(getattr(self.cfg.autoortho, 'prefetch_max_chunks', 32))
+        )
+        self.prefetch_max_chunks_slider.setObjectName('prefetch_max_chunks')
+        self.prefetch_max_chunks_value = QLabel(
+            f"{self.prefetch_max_chunks_slider.value()}"
+        )
+        self.prefetch_max_chunks_slider.valueChanged.connect(
+            lambda v: self.prefetch_max_chunks_value.setText(f"{v}")
+        )
+        max_chunks_layout.addWidget(self.prefetch_max_chunks_slider)
+        max_chunks_layout.addWidget(self.prefetch_max_chunks_value)
+        autoortho_layout.addLayout(max_chunks_layout)
+        
+        # Prefetch radius slider (unified for both velocity and SimBrief methods)
+        radius_layout = QHBoxLayout()
+        self.prefetch_radius_label = QLabel("Prefetch radius:")
+        self.prefetch_radius_label.setToolTip(
+            "Radius (in nautical miles) around the flight path to prefetch tiles.\n\n"
+            "Tiles within this radius of each sample point along the route are prefetched.\n"
+            "Used by both velocity-based and SimBrief flight plan prefetching.\n\n"
+            "Higher = wider coverage, more tiles prefetched, higher bandwidth\n"
+            "Lower = narrower corridor, fewer tiles, less bandwidth\n\n"
+            "Recommended:\n"
+            "  • 20 nm - Conservative (slow internet)\n"
+            "  • 40 nm - Balanced (default)\n"
+            "  • 60+ nm - Aggressive (fast internet, wide turns)"
+        )
+        radius_layout.addWidget(self.prefetch_radius_label)
+        
+        self.prefetch_radius_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.prefetch_radius_slider.setRange(10, 150)  # 10-150 nm
+        self.prefetch_radius_slider.setValue(
+            int(float(getattr(self.cfg.autoortho, 'prefetch_radius_nm', 40)))
+        )
+        self.prefetch_radius_slider.setObjectName('prefetch_radius_nm')
+        self.prefetch_radius_value = QLabel(
+            f"{self.prefetch_radius_slider.value()} nm"
+        )
+        self.prefetch_radius_slider.valueChanged.connect(
+            lambda v: self.prefetch_radius_value.setText(f"{v} nm")
+        )
+        radius_layout.addWidget(self.prefetch_radius_slider)
+        radius_layout.addWidget(self.prefetch_radius_value)
+        autoortho_layout.addLayout(radius_layout)
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # PREDICTIVE DDS SECTION (NEW)
+        # ═══════════════════════════════════════════════════════════════════
+        autoortho_layout.addSpacing(10)
+        predictive_dds_header = QLabel("Predictive DDS Generation")
+        predictive_dds_header.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        autoortho_layout.addWidget(predictive_dds_header)
+        
+        # Enable checkbox
+        predictive_enable_layout = QHBoxLayout()
+        self.predictive_dds_enabled_check = QCheckBox("Enable predictive DDS building")
+        self.predictive_dds_enabled_check.setChecked(
+            getattr(self.cfg.autoortho, 'predictive_dds_enabled', True)
+        )
+        self.predictive_dds_enabled_check.setToolTip(
+            "Pre-build DDS textures in the background after tiles are prefetched.\n\n"
+            "When enabled:\n"
+            "  • Downloaded tiles are compressed to DDS in the background\n"
+            "  • X-Plane reads are served from cache (near-instant)\n"
+            "  • Dramatically reduces stutters when entering new areas\n\n"
+            "When disabled:\n"
+            "  • Tiles are only downloaded, not pre-compressed\n"
+            "  • DDS compression happens when X-Plane reads (can stutter)"
+        )
+        self.predictive_dds_enabled_check.stateChanged.connect(
+            self._update_predictive_dds_controls
+        )
+        predictive_enable_layout.addWidget(self.predictive_dds_enabled_check)
+        predictive_enable_layout.addStretch()
+        autoortho_layout.addLayout(predictive_enable_layout)
+        
+        # Cache size slider
+        cache_layout = QHBoxLayout()
+        self.predictive_cache_label = QLabel("Cache size:")
+        self.predictive_cache_label.setToolTip(
+            "Maximum memory for pre-built DDS tiles.\n"
+            "Higher = more tiles cached, fewer stutters, more RAM used\n"
+            "Lower = fewer tiles cached, more potential stutters\n\n"
+            "Recommended:\n"
+            "  • 256 MB - Low RAM systems\n"
+            "  • 512 MB - Balanced (default)\n"
+            "  • 1024 MB - High RAM, long flights\n"
+            "  • 2048 MB - Maximum caching"
+        )
+        cache_layout.addWidget(self.predictive_cache_label)
+        
+        self.predictive_cache_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.predictive_cache_slider.setRange(128, 2048)
+        self.predictive_cache_slider.setSingleStep(64)
+        self.predictive_cache_slider.setValue(
+            int(getattr(self.cfg.autoortho, 'predictive_dds_cache_mb', 512))
+        )
+        self.predictive_cache_slider.setObjectName('predictive_dds_cache_mb')
+        self.predictive_cache_value = QLabel(
+            f"{self.predictive_cache_slider.value()} MB"
+        )
+        self.predictive_cache_slider.valueChanged.connect(
+            lambda v: self.predictive_cache_value.setText(f"{v} MB")
+        )
+        cache_layout.addWidget(self.predictive_cache_slider)
+        cache_layout.addWidget(self.predictive_cache_value)
+        autoortho_layout.addLayout(cache_layout)
+        
+        # Build interval slider
+        build_interval_layout = QHBoxLayout()
+        self.predictive_interval_label = QLabel("Build interval:")
+        self.predictive_interval_label.setToolTip(
+            "Minimum time between DDS builds (rate limiting).\n"
+            "Higher = less CPU usage, slower pre-building\n"
+            "Lower = faster pre-building, more CPU usage\n\n"
+            "Recommended:\n"
+            "  • 250 ms - Fast CPU, aggressive building\n"
+            "  • 500 ms - Balanced (default)\n"
+            "  • 1000 ms - Low-end CPU, minimal impact"
+        )
+        build_interval_layout.addWidget(self.predictive_interval_label)
+        
+        self.predictive_interval_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.predictive_interval_slider.setRange(100, 2000)
+        self.predictive_interval_slider.setSingleStep(50)
+        self.predictive_interval_slider.setPageStep(100)
+        self.predictive_interval_slider.setTickInterval(50)
+        # Snap to nearest 50ms step
+        raw_value = int(getattr(self.cfg.autoortho, 'predictive_dds_build_interval_ms', 500))
+        snapped_value = ((raw_value + 25) // 50) * 50  # Round to nearest 50
+        snapped_value = max(100, min(2000, snapped_value))  # Clamp to range
+        self.predictive_interval_slider.setValue(snapped_value)
+        self.predictive_interval_slider.setObjectName('predictive_dds_build_interval_ms')
+        self.predictive_interval_value = QLabel(
+            f"{self.predictive_interval_slider.value()} ms"
+        )
+        # Snap value to 50ms increments and update label
+        def on_interval_changed(v):
+            snapped = ((v + 25) // 50) * 50
+            snapped = max(100, min(2000, snapped))
+            if snapped != v:
+                self.predictive_interval_slider.setValue(snapped)
+            self.predictive_interval_value.setText(f"{snapped} ms")
+        self.predictive_interval_slider.valueChanged.connect(on_interval_changed)
+        build_interval_layout.addWidget(self.predictive_interval_slider)
+        build_interval_layout.addWidget(self.predictive_interval_value)
+        autoortho_layout.addLayout(build_interval_layout)
+        
+        # Use fallbacks checkbox
+        fallbacks_layout = QHBoxLayout()
+        self.predictive_use_fallbacks_check = QCheckBox("Apply fallbacks to prebuilt DDS")
+        self.predictive_use_fallbacks_check.setChecked(
+            getattr(self.cfg.autoortho, 'predictive_dds_use_fallbacks', True)
+        )
+        self.predictive_use_fallbacks_check.setToolTip(
+            "How to handle failed chunks when pre-building DDS.\n\n"
+            "When enabled (default):\n"
+            "  • Apply same fallback chain as live requests\n"
+            "  • Search disk cache, use lower zoom data if available\n"
+            "  • Best quality but may do extra disk/network I/O\n\n"
+            "When disabled:\n"
+            "  • Use missing color for failed chunks (fastest)\n"
+            "  • No extra I/O, minimal CPU overhead\n"
+            "  • Failed areas show configured missing color"
+        )
+        fallbacks_layout.addWidget(self.predictive_use_fallbacks_check)
+        fallbacks_layout.addStretch()
+        autoortho_layout.addLayout(fallbacks_layout)
+        
+        autoortho_layout.addSpacing(10)
+        # ═══════════════════════════════════════════════════════════════════
+        
+        # Initialize prefetch control states
+        self._update_prefetch_controls()
+
+        # Initialize time budget control states
+        self._update_time_budget_controls()
 
         # Fetch threads
         threads_layout = QHBoxLayout()
@@ -1256,6 +2412,7 @@ class ConfigUI(QMainWindow):
         )
         threads_layout.addWidget(threads_label)
         self.fetch_threads_spinbox = ModernSpinBox()
+        self.fetch_threads_spinbox.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
 
         max_threads = 1000
         self.fetch_threads_spinbox.setRange(1, max_threads)
@@ -1463,6 +2620,8 @@ class ConfigUI(QMainWindow):
             )
             compressor_layout.addWidget(compressor_label)
             self.compressor_combo = QComboBox()
+            self.compressor_combo.installEventFilter(self)
+            self.compressor_combo.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
             self.compressor_combo.addItems(supported_compressors)
             self.compressor_combo.setCurrentText(self.cfg.pydds.compressor)
             self.compressor_combo.setObjectName('compressor')
@@ -1491,6 +2650,8 @@ class ConfigUI(QMainWindow):
         )
         format_layout.addWidget(format_label)
         self.format_combo = QComboBox()
+        self.format_combo.installEventFilter(self)
+        self.format_combo.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
         self.format_combo.addItems(['BC1', 'BC3'])
         self.format_combo.setCurrentText(self.cfg.pydds.format)
         self.format_combo.setObjectName('format')
@@ -1546,6 +2707,8 @@ class ConfigUI(QMainWindow):
         )
         console_log_level_layout.addWidget(console_log_level_label)
         self.console_log_level_combo = QComboBox()
+        self.console_log_level_combo.installEventFilter(self)
+        self.console_log_level_combo.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
         self.console_log_level_combo.addItems(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
         console_level = getattr(self.cfg.general, 'console_log_level', 'INFO').upper()
         self.console_log_level_combo.setCurrentText(console_level)
@@ -1575,6 +2738,8 @@ class ConfigUI(QMainWindow):
         )
         file_log_level_layout.addWidget(file_log_level_label)
         self.file_log_level_combo = QComboBox()
+        self.file_log_level_combo.installEventFilter(self)
+        self.file_log_level_combo.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
         self.file_log_level_combo.addItems(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
         file_level = getattr(self.cfg.general, 'file_log_level', 'DEBUG').upper()
         self.file_log_level_combo.setCurrentText(file_level)
@@ -1686,6 +2851,102 @@ class ConfigUI(QMainWindow):
 
         self.settings_layout.addWidget(flightdata_group)
 
+        # Time Exclusion Settings group
+        time_exclusion_group = QGroupBox("Time Exclusion Settings")
+        time_exclusion_layout = QVBoxLayout()
+        time_exclusion_group.setLayout(time_exclusion_layout)
+
+        # Info label
+        time_exclusion_info = QLabel(
+            "Configure a time range during which AutoOrtho scenery will be disabled.\n"
+            "X-Plane will use default scenery during this time (e.g., for night flying)."
+        )
+        time_exclusion_info.setStyleSheet("color: #888; font-size: 11px;")
+        time_exclusion_info.setWordWrap(True)
+        time_exclusion_layout.addWidget(time_exclusion_info)
+        
+        time_exclusion_layout.addSpacing(5)
+
+        # Enable checkbox
+        self.time_exclusion_enabled_check = QCheckBox("Enable time-based exclusion")
+        time_exclusion_enabled = getattr(self.cfg.time_exclusion, 'enabled', False)
+        self.time_exclusion_enabled_check.setChecked(time_exclusion_enabled)
+        self.time_exclusion_enabled_check.setObjectName('time_exclusion_enabled')
+        self.time_exclusion_enabled_check.setToolTip(
+            "When enabled, AutoOrtho scenery will be hidden from X-Plane\n"
+            "during the specified time range (based on simulator local time).\n"
+            "X-Plane will fall back to default scenery during this period.\n"
+            "Useful for night flying when satellite imagery is less useful."
+        )
+        self.time_exclusion_enabled_check.toggled.connect(self._on_time_exclusion_toggled)
+        time_exclusion_layout.addWidget(self.time_exclusion_enabled_check)
+
+        # Time range inputs
+        time_range_layout = QHBoxLayout()
+        
+        # Start time
+        start_time_label = QLabel("Start time:")
+        start_time_label.setToolTip("Start of exclusion period (24-hour format HH:MM)")
+        time_range_layout.addWidget(start_time_label)
+        
+        self.time_exclusion_start_edit = QLineEdit(
+            str(getattr(self.cfg.time_exclusion, 'start_time', '22:00'))
+        )
+        self.time_exclusion_start_edit.setObjectName('time_exclusion_start_time')
+        self.time_exclusion_start_edit.setMaximumWidth(80)
+        self.time_exclusion_start_edit.setPlaceholderText("HH:MM")
+        self.time_exclusion_start_edit.setToolTip(
+            "Start time for exclusion in 24-hour format (e.g., 22:00 for 10 PM)"
+        )
+        time_range_layout.addWidget(self.time_exclusion_start_edit)
+        
+        time_range_layout.addSpacing(20)
+        
+        # End time
+        end_time_label = QLabel("End time:")
+        end_time_label.setToolTip("End of exclusion period (24-hour format HH:MM)")
+        time_range_layout.addWidget(end_time_label)
+        
+        self.time_exclusion_end_edit = QLineEdit(
+            str(getattr(self.cfg.time_exclusion, 'end_time', '06:00'))
+        )
+        self.time_exclusion_end_edit.setObjectName('time_exclusion_end_time')
+        self.time_exclusion_end_edit.setMaximumWidth(80)
+        self.time_exclusion_end_edit.setPlaceholderText("HH:MM")
+        self.time_exclusion_end_edit.setToolTip(
+            "End time for exclusion in 24-hour format (e.g., 06:00 for 6 AM)"
+        )
+        time_range_layout.addWidget(self.time_exclusion_end_edit)
+        
+        time_range_layout.addStretch()
+        time_exclusion_layout.addLayout(time_range_layout)
+
+        # Example label
+        time_example_label = QLabel(
+            "Example: 22:00 to 06:00 hides AutoOrtho during night hours"
+        )
+        time_example_label.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
+        time_exclusion_layout.addWidget(time_example_label)
+
+        time_exclusion_layout.addSpacing(5)
+
+        # Default to exclusion checkbox
+        self.time_exclusion_default_check = QCheckBox("Start Flight with AutoOrtho Exclusion")
+        default_to_exclusion = getattr(self.cfg.time_exclusion, 'default_to_exclusion', False)
+        self.time_exclusion_default_check.setChecked(default_to_exclusion)
+        self.time_exclusion_default_check.setObjectName('time_exclusion_default')
+        self.time_exclusion_default_check.setToolTip(
+            "When enabled, AutoOrtho will start with exclusion active until X-Plane starts\n"
+            "sending sim time data. This ensures night flights start with default scenery from the very beginning. Useful for night flights.\n\n"
+            "When disabled, AutoOrtho will start with normal operation until X-Plane starts sending sim time data."
+        )
+        time_exclusion_layout.addWidget(self.time_exclusion_default_check)
+
+        # Set initial enabled state for time inputs
+        self._set_time_exclusion_controls_enabled(time_exclusion_enabled)
+
+        self.settings_layout.addWidget(time_exclusion_group)
+
         self.settings_layout.addStretch()
 
     def show_missing_color_dialog(self):
@@ -1746,6 +3007,26 @@ class ConfigUI(QMainWindow):
                     slider.setEnabled(enabled)
             if self.compress_dsf_check is not None:
                 self.compress_dsf_check.setEnabled(enabled)
+        except Exception:
+            pass
+
+    def _on_time_exclusion_toggled(self):
+        """Handle time exclusion checkbox toggle."""
+        try:
+            enabled = self.time_exclusion_enabled_check.isChecked()
+            self._set_time_exclusion_controls_enabled(enabled)
+        except Exception:
+            pass
+
+    def _set_time_exclusion_controls_enabled(self, enabled):
+        """Enable/disable time exclusion time input fields."""
+        try:
+            if hasattr(self, 'time_exclusion_start_edit'):
+                self.time_exclusion_start_edit.setEnabled(enabled)
+            if hasattr(self, 'time_exclusion_end_edit'):
+                self.time_exclusion_end_edit.setEnabled(enabled)
+            if hasattr(self, 'time_exclusion_default_check'):
+                self.time_exclusion_default_check.setEnabled(enabled)
         except Exception:
             pass
 
@@ -2174,6 +3455,234 @@ class ConfigUI(QMainWindow):
             else:
                 raise ValueError(f"Invalid instigator: {instigator}")
 
+    def _update_time_budget_controls(self):
+        """Update enabled state of performance tuning controls based on use_time_budget checkbox."""
+        use_time_budget = self.use_time_budget_check.isChecked()
+        
+        # Time budget controls tile-level timeout
+        # Maxwait controls per-chunk timeout (always enabled, works with or without time budget)
+        # When time budget is disabled, tile budget slider is disabled (falls back to legacy mode)
+        
+        self.tile_budget_slider.setEnabled(use_time_budget)
+        self.tile_budget_label_title.setEnabled(use_time_budget)
+        self.tile_budget_value_label.setEnabled(use_time_budget)
+        
+        # Maxwait is now always enabled - it's a per-chunk timeout that works with the tile budget
+        # When time budget is enabled: maxwait limits per-chunk waits within the tile budget
+        # When time budget is disabled: maxwait is the only timeout mechanism (legacy mode)
+        
+        # Update visual styling to indicate disabled state
+        disabled_style = "color: #666;"
+        enabled_style = ""
+        
+        self.tile_budget_label_title.setStyleSheet(enabled_style if use_time_budget else disabled_style)
+        self.tile_budget_value_label.setStyleSheet(enabled_style if use_time_budget else disabled_style)
+
+    def _update_prefetch_controls(self):
+        """Update enabled state of prefetch controls based on enable checkbox."""
+        enabled = self.prefetch_enabled_check.isChecked()
+        
+        # Existing controls
+        self.prefetch_lookahead_slider.setEnabled(enabled)
+        self.prefetch_lookahead_label.setEnabled(enabled)
+        self.prefetch_lookahead_value.setEnabled(enabled)
+        
+        # New prefetch controls
+        self.prefetch_interval_slider.setEnabled(enabled)
+        self.prefetch_interval_label.setEnabled(enabled)
+        self.prefetch_interval_value.setEnabled(enabled)
+        
+        self.prefetch_max_chunks_slider.setEnabled(enabled)
+        self.prefetch_max_chunks_label.setEnabled(enabled)
+        self.prefetch_max_chunks_value.setEnabled(enabled)
+        
+        # Prefetch radius (unified setting for both methods)
+        self.prefetch_radius_slider.setEnabled(enabled)
+        self.prefetch_radius_label.setEnabled(enabled)
+        self.prefetch_radius_value.setEnabled(enabled)
+        
+        # Predictive DDS controls depend on prefetch being enabled
+        self.predictive_dds_enabled_check.setEnabled(enabled)
+        self._update_predictive_dds_controls()
+    
+    def _update_predictive_dds_controls(self):
+        """Update enabled state of predictive DDS controls."""
+        # Predictive DDS requires prefetch to be enabled
+        prefetch_enabled = self.prefetch_enabled_check.isChecked()
+        predictive_enabled = self.predictive_dds_enabled_check.isChecked()
+        
+        enabled = prefetch_enabled and predictive_enabled
+        
+        self.predictive_cache_slider.setEnabled(enabled)
+        self.predictive_cache_label.setEnabled(enabled)
+        self.predictive_cache_value.setEnabled(enabled)
+        
+        self.predictive_interval_slider.setEnabled(enabled)
+        self.predictive_interval_label.setEnabled(enabled)
+        self.predictive_interval_value.setEnabled(enabled)
+        
+        self.predictive_use_fallbacks_check.setEnabled(enabled)
+
+    def _init_dynamic_zoom_manager(self):
+        """Initialize the dynamic zoom manager from config."""
+        self._dynamic_zoom_manager = DynamicZoomManager()
+        existing_steps = getattr(self.cfg.autoortho, 'dynamic_zoom_steps', [])
+        
+        if existing_steps and existing_steps != [] and existing_steps != "[]":
+            self._dynamic_zoom_manager.load_from_config(existing_steps)
+        else:
+            # Initialize with current fixed max zoom values as base step
+            max_zoom = int(self.cfg.autoortho.max_zoom)
+            max_zoom_airports = int(self.cfg.autoortho.max_zoom_near_airports)
+            self._dynamic_zoom_manager.set_base_zoom(max_zoom, max_zoom_airports)
+        
+        self._update_dynamic_summary()
+
+    def _on_zoom_mode_changed(self, mode: str):
+        """Handle zoom mode toggle between Fixed and Dynamic."""
+        is_dynamic = mode == "Dynamic"
+        
+        # If switching to dynamic for first time and no steps configured
+        if is_dynamic and self._dynamic_zoom_manager.is_empty():
+            # Initialize with current fixed max zoom values
+            max_zoom = int(self.cfg.autoortho.max_zoom)
+            max_zoom_airports = int(self.cfg.autoortho.max_zoom_near_airports)
+            self._dynamic_zoom_manager.set_base_zoom(max_zoom, max_zoom_airports)
+            self._update_dynamic_summary()
+        
+        self._update_zoom_mode_visibility()
+
+    def _update_zoom_mode_visibility(self):
+        """Show/hide zoom controls based on selected mode."""
+        is_dynamic = self.max_zoom_mode_combo.currentText() == "Dynamic"
+        self.fixed_zoom_widget.setVisible(not is_dynamic)
+        self.dynamic_zoom_widget.setVisible(is_dynamic)
+        # Also hide/show the airport zoom slider (only visible in fixed mode)
+        if hasattr(self, 'max_zoom_near_airports_widget'):
+            self.max_zoom_near_airports_widget.setVisible(not is_dynamic)
+
+    def _open_quality_steps_dialog(self):
+        """Open the quality steps configuration dialog."""
+        dialog = QualityStepsDialog(
+            self, 
+            manager=self._dynamic_zoom_manager,
+            current_max_zoom=int(self.cfg.autoortho.max_zoom)
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._dynamic_zoom_manager = dialog.get_manager()
+            self._update_dynamic_summary()
+
+    def _update_dynamic_summary(self):
+        """Update the summary label for dynamic zoom steps."""
+        if not hasattr(self, '_dynamic_zoom_manager') or not hasattr(self, 'dynamic_zoom_summary'):
+            return
+        
+        steps = self._dynamic_zoom_manager.get_steps()
+        if not steps:
+            self.dynamic_zoom_summary.setText("No steps configured")
+        else:
+            # Show steps sorted by altitude (ascending for display)
+            # Format: ZL{normal}/ZL{airports}@{altitude}ft
+            sorted_steps = sorted(steps, key=lambda s: s.altitude_ft)
+            text = ", ".join(
+                f"ZL{s.zoom_level}/ZL{s.zoom_level_airports}@{s.altitude_ft:+}ft" 
+                for s in sorted_steps[:3]
+            )
+            if len(sorted_steps) > 3:
+                text += f" (+{len(sorted_steps)-3} more)"
+            self.dynamic_zoom_summary.setText(text)
+
+    def _update_fallback_extends_control(self):
+        """Update enabled state of fallback_extends_budget and timeout based on fallback level.
+        
+        The 'allow fallbacks to extend budget' option is only relevant when
+        fallback_level is 'Full' (index 2), since that's the only level that
+        does network fallbacks.
+        
+        The fallback timeout slider is only relevant when extends_budget is enabled.
+        """
+        is_full_fallback = self.fallback_level_combo.currentIndex() == 2
+        extends_budget = self.fallback_extends_budget_check.isChecked()
+        
+        # Enable extends_budget checkbox only for Full fallback
+        self.fallback_extends_budget_check.setEnabled(is_full_fallback)
+        
+        # Enable timeout slider only when Full fallback AND extends_budget is checked
+        timeout_enabled = is_full_fallback and extends_budget
+        self.fallback_timeout_slider.setEnabled(timeout_enabled)
+        self.fallback_timeout_label.setEnabled(timeout_enabled)
+        self.fallback_timeout_value_label.setEnabled(timeout_enabled)
+        
+        # Style for enabled/disabled labels
+        enabled_style = ""
+        disabled_style = "color: #666666;"
+        self.fallback_timeout_label.setStyleSheet(enabled_style if timeout_enabled else disabled_style)
+        self.fallback_timeout_value_label.setStyleSheet(enabled_style if timeout_enabled else disabled_style)
+        
+        # Update tooltips to explain why controls are disabled
+        if is_full_fallback:
+            self.fallback_extends_budget_check.setToolTip(
+                "When enabled, adds EXTRA time after the main budget expires\n"
+                "to recover missing chunks using lower-detail fallbacks.\n\n"
+                "How it works:\n"
+                "  • Main budget expires → 'Fallback Sweep' phase begins\n"
+                "  • All missing chunks are processed with lower-zoom alternatives\n"
+                "  • Maximum total time = Main budget + Extended fallback timeout\n\n"
+                "• Enabled: Better quality, fewer gray patches (recommended)\n"
+                "• Disabled: Strict timing, may have missing tiles"
+            )
+        else:
+            self.fallback_extends_budget_check.setToolTip(
+                "This option only applies when 'Full (Best Quality)' fallback is selected.\n"
+                "Select 'Full' fallback level to enable this option."
+            )
+        
+        if timeout_enabled:
+            self.fallback_timeout_label.setToolTip(
+                "TOTAL extra time for the fallback sweep phase.\n"
+                "This time is added AFTER the main budget expires to recover\n"
+                "all missing chunks using lower-detail alternatives.\n\n"
+                "Maximum total tile time = Main budget + This value\n"
+                "Example: 300s main + 30s fallback = 330s maximum\n\n"
+                "The fallback sweep efficiently processes ALL missing chunks\n"
+                "in batch, maximizing image quality within the extra time."
+            )
+        else:
+            self.fallback_timeout_label.setToolTip(
+                "Enable 'Allow fallbacks to extend time budget' to configure this setting."
+            )
+
+    def _fallback_str_to_index(self, value):
+        """Convert fallback_level config value to combo box index.
+        
+        Handles both new string values (none, cache, full) and legacy integer values.
+        """
+        if isinstance(value, str):
+            value_lower = value.lower().strip()
+            if value_lower == 'none':
+                return 0
+            elif value_lower == 'cache':
+                return 1
+            elif value_lower == 'full':
+                return 2
+            else:
+                # Try parsing as integer for backwards compatibility
+                try:
+                    return max(0, min(2, int(value)))
+                except ValueError:
+                    return 1  # Default to cache
+        elif isinstance(value, bool):
+            # Handle SectionParser converting '0' to False, '1' to True
+            return 2 if value else 0
+        elif isinstance(value, int):
+            return max(0, min(2, value))
+        else:
+            return 1  # Default to cache
+    
+    def _fallback_index_to_str(self, index):
+        """Convert combo box index to fallback_level config string."""
+        return ['none', 'cache', 'full'][max(0, min(2, index))]
+
     def validate_threads(self, value):
         """Validate fetch threads value and show warning if too high"""
         max_threads = os.cpu_count() or 1
@@ -2193,6 +3702,223 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.simheaven_compat = True
         else:
             self.cfg.autoortho.simheaven_compat = False
+
+    def _on_simbrief_userid_changed(self, text):
+        """Handle SimBrief User ID text change"""
+        self._update_simbrief_ui_state()
+        # Update config
+        if hasattr(self.cfg, 'simbrief'):
+            self.cfg.simbrief.userid = text.strip()
+
+    def _update_simbrief_ui_state(self):
+        """Update SimBrief UI visibility based on current state"""
+        userid = self.simbrief_userid_edit.text().strip()
+        has_userid = bool(userid)
+        
+        # Show/hide fetch button based on whether we have a user ID
+        self.simbrief_fetch_btn.setVisible(has_userid)
+        
+        # Hide error when user ID changes
+        self.simbrief_error_label.hide()
+        
+        # If no user ID and we had flight data, clear it
+        if not has_userid:
+            self.simbrief_info_frame.hide()
+            self.simbrief_use_flight_data_check.hide()
+            self.simbrief_route_settings_frame.hide()
+            self.simbrief_unload_btn.hide()
+            self.simbrief_flight_data = None
+            
+            # Clear the flight manager
+            from utils.simbrief_flight import simbrief_flight_manager
+            simbrief_flight_manager.clear()
+
+    def _on_simbrief_fetch(self):
+        """Handle SimBrief fetch button click"""
+        userid = self.simbrief_userid_edit.text().strip()
+        if not userid:
+            return
+        
+        # Disable button while fetching
+        self.simbrief_fetch_btn.setEnabled(False)
+        self.simbrief_fetch_btn.setText("Fetching...")
+        self.simbrief_error_label.hide()
+        
+        # Create and start worker
+        self.simbrief_fetch_worker = SimBriefFetchWorker(userid)
+        self.simbrief_fetch_worker.success.connect(self._on_simbrief_fetch_success)
+        self.simbrief_fetch_worker.error.connect(self._on_simbrief_fetch_error)
+        self.simbrief_fetch_worker.finished.connect(self._on_simbrief_fetch_finished)
+        self.simbrief_fetch_worker.start()
+
+    def _on_simbrief_fetch_success(self, data):
+        """Handle successful SimBrief fetch"""
+        self.simbrief_flight_data = data
+        self._display_simbrief_flight_info(data)
+        self.simbrief_info_frame.show()
+        self.simbrief_error_label.hide()
+        self.simbrief_use_flight_data_check.show()  # Show toggle when flight data loaded
+        self.simbrief_unload_btn.show()  # Show unload button when flight is loaded
+        
+        # Load flight data into the global flight manager for use by dynamic zoom and prefetcher
+        from utils.simbrief_flight import simbrief_flight_manager
+        if simbrief_flight_manager.load_flight_data(data):
+            log.info(f"SimBrief flight loaded into manager: {simbrief_flight_manager.origin} -> {simbrief_flight_manager.destination}")
+        else:
+            log.warning("Failed to load SimBrief flight data into manager")
+        
+        log.info("SimBrief flight data fetched successfully")
+
+    def _on_simbrief_fetch_error(self, error_msg):
+        """Handle SimBrief fetch error"""
+        self.simbrief_error_label.setText(f"⚠ {error_msg}")
+        self.simbrief_error_label.show()
+        self.simbrief_info_frame.show()
+        self.simbrief_route_label.setText("")
+        self.simbrief_details_label.setText("")
+        self.simbrief_use_flight_data_check.hide()  # Hide toggle on error
+        self.simbrief_route_settings_frame.hide()  # Hide route settings on error
+        self.simbrief_unload_btn.hide()  # Hide unload button on error
+        self.simbrief_flight_data = None
+        
+        # Clear the flight manager
+        from utils.simbrief_flight import simbrief_flight_manager
+        simbrief_flight_manager.clear()
+        
+        log.warning(f"SimBrief fetch error: {error_msg}")
+
+    def _on_simbrief_fetch_finished(self):
+        """Handle SimBrief fetch completion (success or error)"""
+        self.simbrief_fetch_btn.setEnabled(True)
+        self.simbrief_fetch_btn.setText("Fetch Flight Data")
+
+    def _on_simbrief_unload(self):
+        """Handle SimBrief unload button click - clears flight data"""
+        # Clear stored flight data
+        self.simbrief_flight_data = None
+        
+        # Clear the global flight manager
+        from utils.simbrief_flight import simbrief_flight_manager
+        simbrief_flight_manager.clear()
+        
+        # Hide flight info UI
+        self.simbrief_info_frame.hide()
+        self.simbrief_use_flight_data_check.hide()
+        self.simbrief_route_settings_frame.hide()
+        self.simbrief_unload_btn.hide()
+        self.simbrief_error_label.hide()
+        
+        # Uncheck the toggle since there's no flight data
+        self.simbrief_use_flight_data_check.setChecked(False)
+        
+        log.info("SimBrief flight data unloaded")
+
+    def _on_use_flight_data_changed(self, state):
+        """
+        Immediately update config when the 'Use Flight Data' toggle changes.
+        
+        This allows users to load SimBrief data after pressing Run and have
+        it take effect immediately without needing to save config.
+        """
+        is_checked = (state == 2)  # Qt.CheckState.Checked has value 2
+        
+        # Show/hide route settings based on checkbox state
+        self.simbrief_route_settings_frame.setVisible(is_checked)
+        
+        if hasattr(self.cfg, 'simbrief'):
+            self.cfg.simbrief.use_flight_data = is_checked
+            log.debug(f"SimBrief use_flight_data toggled: {self.cfg.simbrief.use_flight_data}")
+
+    def _on_route_consideration_radius_changed(self, value):
+        """Handle route consideration radius spinbox change"""
+        if hasattr(self.cfg, 'simbrief'):
+            self.cfg.simbrief.route_consideration_radius_nm = value
+            log.debug(f"SimBrief route_consideration_radius_nm changed: {value}")
+
+    def _on_route_deviation_threshold_changed(self, value):
+        """Handle route deviation threshold spinbox change"""
+        if hasattr(self.cfg, 'simbrief'):
+            self.cfg.simbrief.route_deviation_threshold_nm = value
+            log.debug(f"SimBrief route_deviation_threshold_nm changed: {value}")
+    
+    def _on_prefetch_while_parked_changed(self, state):
+        """Handle prefetch while parked checkbox change"""
+        is_checked = (state == 2)  # Qt.CheckState.Checked has value 2
+        if hasattr(self.cfg, 'simbrief'):
+            self.cfg.simbrief.prefetch_while_parked = is_checked
+            log.debug(f"SimBrief prefetch_while_parked changed: {is_checked}")
+
+    def _display_simbrief_flight_info(self, data):
+        """Display SimBrief flight information in the UI"""
+        try:
+            origin = data.get('origin', {})
+            destination = data.get('destination', {})
+            general = data.get('general', {})
+            aircraft = data.get('aircraft', {})
+            times = data.get('times', {})
+            navlog = data.get('navlog', {})
+            
+            # Route header
+            origin_icao = origin.get('icao_code', '????')
+            dest_icao = destination.get('icao_code', '????')
+            origin_name = origin.get('name', '')
+            dest_name = destination.get('name', '')
+            
+            route_text = f"{origin_icao} → {dest_icao}"
+            self.simbrief_route_label.setText(route_text)
+            
+            # Flight details
+            flight_number = general.get('flight_number', 'N/A')
+            aircraft_icao = aircraft.get('icaocode', 'N/A')
+            aircraft_name = aircraft.get('name', '')
+            
+            # Calculate flight time
+            est_time_enroute = times.get('est_time_enroute', '0')
+            try:
+                ete_seconds = int(est_time_enroute)
+                hours = ete_seconds // 3600
+                minutes = (ete_seconds % 3600) // 60
+                flight_time = f"{hours}h {minutes:02d}m"
+            except (ValueError, TypeError):
+                flight_time = "N/A"
+            
+            # Get cruise altitude and format as flight level
+            cruise_altitude_raw = general.get('initial_altitude', '')
+            try:
+                cruise_alt_ft = int(cruise_altitude_raw)
+                # Flight level = altitude / 100 (e.g., 30000 ft = FL300)
+                cruise_altitude = f"FL{cruise_alt_ft // 100}"
+            except (ValueError, TypeError):
+                cruise_altitude = cruise_altitude_raw if cruise_altitude_raw else "N/A"
+            
+            # Get number of waypoints
+            fixes = navlog.get('fix', [])
+            num_fixes = len(fixes) if isinstance(fixes, list) else 0
+            
+            # Get route
+            route_str = general.get('route', '')
+            # Truncate if too long
+            if len(route_str) > 80:
+                route_str = route_str[:77] + "..."
+            
+            details = (
+                f"<b>Flight:</b> {flight_number}<br>"
+                f"<b>Aircraft:</b> {aircraft_icao} ({aircraft_name})<br>"
+                f"<b>Route:</b> {origin_name} → {dest_name}<br>"
+                f"<b>Cruise Altitude:</b> {cruise_altitude}<br>"
+                f"<b>Est. Flight Time:</b> {flight_time}<br>"
+                f"<b>Waypoints:</b> {num_fixes} fixes"
+            )
+            
+            if route_str:
+                details += f"<br><b>Route:</b> <span style='color: #aaa; font-size: 11px;'>{route_str}</span>"
+            
+            self.simbrief_details_label.setText(details)
+            
+        except Exception as e:
+            log.error(f"Error displaying SimBrief flight info: {e}")
+            self.simbrief_error_label.setText(f"Error parsing flight data: {str(e)}")
+            self.simbrief_error_label.show()
 
     def browse_folder(self, line_edit):
         """Open folder browser dialog"""
@@ -2774,10 +4500,56 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.min_zoom = str(self.min_zoom_slider.value())
             self.cfg.autoortho.max_zoom_near_airports = str(self.max_zoom_near_airports_slider.value())
             self.cfg.autoortho.max_zoom = str(self.max_zoom_slider.value())
+            
+            # Dynamic zoom settings
+            zoom_mode = "dynamic" if self.max_zoom_mode_combo.currentText() == "Dynamic" else "fixed"
+            self.cfg.autoortho.max_zoom_mode = zoom_mode
+            if hasattr(self, '_dynamic_zoom_manager'):
+                self.cfg.autoortho.dynamic_zoom_steps = self._dynamic_zoom_manager.save_to_config()
+            
             self.cfg.autoortho.maxwait = str(
                 self.maxwait_slider.value() / 10.0
             )
             self.cfg.autoortho.suspend_maxwait = self.suspend_maxwait_check.isChecked()
+            
+            # Performance tuning settings
+            self.cfg.autoortho.use_time_budget = self.use_time_budget_check.isChecked()
+            self.cfg.autoortho.tile_time_budget = str(self.tile_budget_slider.value())
+            self.cfg.autoortho.fallback_level = self._fallback_index_to_str(
+                self.fallback_level_combo.currentIndex()
+            )
+            self.cfg.autoortho.fallback_extends_budget = self.fallback_extends_budget_check.isChecked()
+            self.cfg.autoortho.fallback_timeout = str(
+                self.fallback_timeout_slider.value()
+            )
+            
+            # Prefetch settings
+            self.cfg.autoortho.prefetch_enabled = self.prefetch_enabled_check.isChecked()
+            # Slider value 61 = Unlimited, save as 0 to config
+            lookahead_val = self.prefetch_lookahead_slider.value()
+            self.cfg.autoortho.prefetch_lookahead = str(
+                0 if lookahead_val == 61 else lookahead_val
+            )
+            self.cfg.autoortho.prefetch_interval = str(
+                self.prefetch_interval_slider.value() / 10.0
+            )
+            self.cfg.autoortho.prefetch_max_chunks = str(
+                self.prefetch_max_chunks_slider.value()
+            )
+            self.cfg.autoortho.prefetch_radius_nm = str(
+                self.prefetch_radius_slider.value()
+            )
+            
+            # Predictive DDS settings
+            self.cfg.autoortho.predictive_dds_enabled = self.predictive_dds_enabled_check.isChecked()
+            self.cfg.autoortho.predictive_dds_cache_mb = str(
+                self.predictive_cache_slider.value()
+            )
+            self.cfg.autoortho.predictive_dds_build_interval_ms = str(
+                self.predictive_interval_slider.value()
+            )
+            self.cfg.autoortho.predictive_dds_use_fallbacks = self.predictive_use_fallbacks_check.isChecked()
+            
             self.cfg.autoortho.fetch_threads = str(
                 self.fetch_threads_spinbox.value()
             )
@@ -2819,6 +4591,23 @@ class ConfigUI(QMainWindow):
             self.cfg.seasons.sum_saturation = str(self.sum_sat_slider.value())
             self.cfg.seasons.fal_saturation = str(self.fal_sat_slider.value())
             self.cfg.seasons.win_saturation = str(self.win_sat_slider.value())
+
+            # Time exclusion settings
+            if hasattr(self, 'time_exclusion_enabled_check'):
+                self.cfg.time_exclusion.enabled = self.time_exclusion_enabled_check.isChecked()
+            if hasattr(self, 'time_exclusion_start_edit'):
+                self.cfg.time_exclusion.start_time = self.time_exclusion_start_edit.text()
+            if hasattr(self, 'time_exclusion_end_edit'):
+                self.cfg.time_exclusion.end_time = self.time_exclusion_end_edit.text()
+            if hasattr(self, 'time_exclusion_default_check'):
+                self.cfg.time_exclusion.default_to_exclusion = self.time_exclusion_default_check.isChecked()
+
+        # SimBrief settings
+        if hasattr(self.cfg, 'simbrief'):
+            if hasattr(self, 'simbrief_userid_edit'):
+                self.cfg.simbrief.userid = self.simbrief_userid_edit.text().strip()
+            if hasattr(self, 'simbrief_use_flight_data_check'):
+                self.cfg.simbrief.use_flight_data = self.simbrief_use_flight_data_check.isChecked()
 
         self.cfg.save()
         self.ready.set()

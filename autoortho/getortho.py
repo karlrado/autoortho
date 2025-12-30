@@ -2,17 +2,18 @@
 import logging
 import atexit
 import os
+import re
 import time
 import threading
 import concurrent.futures
 import uuid
 import math
 import tracemalloc
-from typing import Optional
+from typing import Optional, Dict, Tuple, List
 
 from io import BytesIO
 from urllib.request import urlopen, Request
-from queue import Queue, PriorityQueue, Empty
+from queue import Queue, PriorityQueue, Empty, Full
 from functools import wraps, lru_cache
 from pathlib import Path
 from collections import OrderedDict
@@ -35,12 +36,34 @@ from utils.constants import (
     LOOKAHEAD_TIME_SEC,
 )
 from utils.apple_token_service import apple_token_service
+from utils.dynamic_zoom import DynamicZoomManager
+from utils.altitude_predictor import predict_altitude_at_closest_approach
+from utils.simbrief_flight import simbrief_flight_manager, PathPoint
 
 from datareftrack import dt as datareftracker
 
 MEMTRACE = False
 
 log = logging.getLogger(__name__)
+
+
+def create_http_session(pool_size=10):
+    """
+    Factory function to create an HTTP session with connection pooling.
+    
+    Returns a requests session configured with connection pooling.
+    """
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=pool_size,
+        pool_maxsize=pool_size,
+        max_retries=0,
+        pool_block=True,
+    )
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
+    log.debug(f"Created requests session (pool_size={pool_size})")
+    return session
 
 
 # JPEG decode concurrency: auto-tuned for optimal performance
@@ -54,6 +77,10 @@ _decode_sem = threading.Semaphore(_MAX_DECODE)
 tile_stats = StatTracker(20, 12)
 mm_stats = StatTracker(0, 5)
 partial_stats = StatTracker()
+
+# Track FULL tile creation duration (download + compose + compress)
+# This is the key metric for tuning tile_time_budget
+tile_creation_stats = StatTracker(0, 5, default=0, maxlen=50)
 
 stats_batcher = None
 
@@ -84,6 +111,51 @@ def bump_many(d: dict):
         stats_batcher.add_many(d)
     else:
         inc_many(d)
+
+
+def get_tile_creation_stats():
+    """
+    Get tile creation statistics for monitoring and tuning.
+    
+    Returns a dictionary with:
+    - count: Number of tiles created
+    - avg_time_s: Average creation time in seconds
+    - avg_time_by_mipmap: Dict of mipmap level -> average time in seconds
+    - averages: Rolling averages from tile_creation_stats (last 50 samples per mipmap)
+    
+    This is useful for tuning tile_time_budget - the average creation time
+    gives a good baseline for how long tiles actually take to create.
+    """
+    result = {
+        'count': 0,
+        'avg_time_s': 0.0,
+        'avg_time_by_mipmap': {},
+        'averages': {},
+    }
+    
+    try:
+        # Get rolling averages from StatTracker (recent samples)
+        result['averages'] = dict(tile_creation_stats.averages)
+        
+    except Exception as e:
+        log.debug(f"get_tile_creation_stats error: {e}")
+    
+    return result
+
+
+def log_tile_creation_summary():
+    """Log a summary of tile creation statistics."""
+    stats = get_tile_creation_stats()
+    if stats['count'] > 0:
+        log.info(f"TILE CREATION STATS: {stats['count']} tiles created, "
+                f"avg time: {stats['avg_time_s']:.2f}s")
+        if stats['avg_time_by_mipmap']:
+            mm_str = ", ".join(f"MM{k}: {v:.2f}s" for k, v in sorted(stats['avg_time_by_mipmap'].items()))
+            log.info(f"  Per-mipmap averages: {mm_str}")
+        if stats['averages']:
+            recent_str = ", ".join(f"MM{k}: {v:.2f}s" for k, v in sorted(stats['averages'].items()) if v > 0)
+            if recent_str:
+                log.info(f"  Recent averages (last 50): {recent_str}")
 
 
 seasons_enabled = CFG.seasons.enabled
@@ -247,28 +319,54 @@ def _calculate_spatial_priority(chunk_row: int, chunk_col: int, chunk_zoom: int,
         return float(base_mipmap_priority)
 
 
-def _safe_paste(dest_img, chunk_img, start_x, start_y):
+def _safe_paste(dest_img, chunk_img, start_x, start_y, defer_cleanup=False):
     """
     Paste chunk_img into dest_img at (start_x, start_y) with coordinate validation.
     
+    Args:
+        dest_img: Destination AoImage
+        chunk_img: Source chunk AoImage to paste
+        start_x, start_y: Position to paste at
+        defer_cleanup: If True, don't free chunk_img (caller will batch-free later)
+    
     Returns True if paste succeeded, False if skipped due to invalid coordinates.
-    Frees chunk_img native buffer after paste.
     """
     if start_x < 0 or start_y < 0:
         log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
+        if not defer_cleanup:
+            try:
+                chunk_img.close()
+            except Exception:
+                pass
         return False
     
     if not dest_img.paste(chunk_img, (start_x, start_y)):
         log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
+        if not defer_cleanup:
+            try:
+                chunk_img.close()
+            except Exception:
+                pass
         return False
     
-    # Free native buffer immediately after paste
-    try:
-        chunk_img.close()
-    except Exception:
-        pass
+    # Free native buffer immediately unless deferred
+    if not defer_cleanup:
+        try:
+            chunk_img.close()
+        except Exception:
+            pass
     
     return True
+
+
+def _batch_close_images(images):
+    """Batch-close multiple AoImage objects to free native memory."""
+    for img in images:
+        if img is not None:
+            try:
+                img.close()
+            except Exception:
+                pass
 
 
 def locked(fn):
@@ -279,6 +377,152 @@ def locked(fn):
             result = fn(self, *args, **kwargs)
         return result
     return wrapped
+
+
+class TimeBudget:
+    """
+    Track elapsed wall-clock time for a single X-Plane tile request.
+    
+    This class solves the per-chunk vs per-request timeout problem:
+    - Previously, each chunk had its own maxwait timeout, leading to
+      serialized chunks taking N * maxwait total time
+    - Now, all chunks share a single time budget, ensuring the total
+      wall-clock time stays close to the configured limit
+    
+    Usage:
+        budget = TimeBudget(max_seconds=2.0)
+        while not budget.exhausted:
+            chunk_ready = budget.wait_with_budget(chunk.ready)
+            if not chunk_ready:
+                break  # Budget exhausted or event not set
+    
+    Thread-safety: Uses time.monotonic() which is thread-safe and immune
+    to system clock adjustments.
+    """
+    
+    # Minimum wait granularity - how often we check if budget is exhausted
+    # during a wait. Smaller = more responsive but slightly more CPU.
+    # 50ms is a good balance: responsive enough for UI, not too chatty.
+    WAIT_GRANULARITY_SEC = 0.05
+    
+    def __init__(self, max_seconds: float):
+        """
+        Initialize a time budget.
+        
+        Args:
+            max_seconds: Maximum wall-clock time allowed for this request.
+                        This should be the value the user expects X-Plane
+                        to actually wait, not a per-chunk timeout.
+        """
+        self.max_seconds = max_seconds
+        self.start_time = time.monotonic()
+        self._exhausted = False
+        self._chunks_processed = 0
+        self._chunks_skipped = 0
+    
+    @property
+    def remaining(self) -> float:
+        """Return remaining time in seconds (never negative)."""
+        return max(0.0, self.max_seconds - self.elapsed)
+    
+    @property 
+    def elapsed(self) -> float:
+        """Return elapsed time since budget creation in seconds."""
+        return time.monotonic() - self.start_time
+    
+    @property
+    def exhausted(self) -> bool:
+        """
+        Check if the time budget is exhausted.
+        
+        Once exhausted, always returns True (sticky flag for efficiency).
+        """
+        if self._exhausted:
+            return True
+        if self.elapsed >= self.max_seconds:
+            self._exhausted = True
+            return True
+        return False
+    
+    def wait_with_budget(self, event: threading.Event, max_single_wait: float = None) -> bool:
+        """
+        Wait on an event while respecting both the time budget AND an optional per-chunk maxwait.
+        
+        This combines two timeout mechanisms:
+        1. Time budget: Total wall-clock time for the entire tile
+        2. Max single wait: Per-chunk timeout (like the old maxwait parameter)
+        
+        Args:
+            event: A threading.Event to wait on (e.g., chunk.ready)
+            max_single_wait: Optional per-chunk timeout in seconds. If provided,
+                           the wait will not exceed this time even if budget remains.
+                           This corresponds to the old "maxwait" config setting.
+        
+        Returns:
+            True if the event was set (success)
+            False if budget exhausted or max_single_wait exceeded before event was set
+        
+        Behavior:
+            - If event is already set, returns immediately with True
+            - If budget is already exhausted, returns event.is_set() immediately
+            - Otherwise, waits up to min(remaining_budget, max_single_wait)
+        """
+        # Fast path: already set
+        if event.is_set():
+            return True
+        
+        # Fast path: budget already gone
+        if self.exhausted:
+            return event.is_set()
+        
+        # Track start time for max_single_wait
+        single_wait_start = time.monotonic() if max_single_wait else None
+        
+        # Poll with granularity until event set or budget/maxwait exhausted
+        while not self.exhausted:
+            # Check max_single_wait limit
+            if max_single_wait is not None:
+                single_elapsed = time.monotonic() - single_wait_start
+                if single_elapsed >= max_single_wait:
+                    log.debug(f"max_single_wait ({max_single_wait:.2f}s) exceeded")
+                    break
+                single_remaining = max_single_wait - single_elapsed
+            else:
+                single_remaining = float('inf')
+            
+            # Wait the minimum of: budget remaining, single wait remaining, granularity
+            wait_time = min(self.remaining, single_remaining, self.WAIT_GRANULARITY_SEC)
+            if wait_time <= 0:
+                break
+            if event.wait(timeout=wait_time):
+                return True
+        
+        # Final check after loop exits
+        return event.is_set()
+    
+    def record_chunk_processed(self):
+        """Record that a chunk was successfully processed."""
+        self._chunks_processed += 1
+    
+    def record_chunk_skipped(self):
+        """Record that a chunk was skipped due to budget exhaustion."""
+        self._chunks_skipped += 1
+    
+    @property
+    def chunks_processed(self) -> int:
+        """Number of chunks successfully processed within budget."""
+        return self._chunks_processed
+    
+    @property
+    def chunks_skipped(self) -> int:
+        """Number of chunks skipped due to budget exhaustion."""
+        return self._chunks_skipped
+    
+    def __repr__(self):
+        return (f"TimeBudget(max={self.max_seconds:.2f}s, "
+                f"elapsed={self.elapsed:.2f}s, "
+                f"remaining={self.remaining:.2f}s, "
+                f"exhausted={self.exhausted})")
 
 
 class Getter(object):
@@ -319,21 +563,10 @@ class Getter(object):
         global STATS
         self.localdata.idx = idx
         
-        # Create thread-local session with optimized pool and NO retries
-        # (Circuit breaker handles retries, not session)
+        # Create thread-local session with connection pooling
         try:
-            session = requests.Session()
-            # Larger pool to avoid connection stalls
             pool_size = max(4, int(int(CFG.autoortho.fetch_threads) * 1.5))
-            adapter = requests.adapters.HTTPAdapter(
-                pool_connections=pool_size,
-                pool_maxsize=pool_size,
-                max_retries=0,  # Circuit breaker handles retries
-                pool_block=True,
-            )
-            session.mount('https://', adapter)
-            session.mount('http://', adapter)
-            self.localdata.session = session
+            self.localdata.session = create_http_session(pool_size=pool_size)
         except Exception as _e:
             log.warning(f"Failed to initialize thread-local session: {_e}")
             self.localdata.session = requests.Session()
@@ -361,6 +594,9 @@ class Getter(object):
                         log.debug(f"Chunk {obj} permanently failed ({obj.failure_reason}), not re-submitting")
                         continue
                     log.warning(f"Failed getting: {obj} {args} {kwargs}, re-submit.")
+                    # CRITICAL: Clear in_flight BEFORE re-submitting, otherwise submit()
+                    # will see in_flight=True and silently drop the chunk!
+                    obj.in_flight = False
                     self.submit(obj, *args, **kwargs)
             except Exception as err:
                 log.error(f"ERROR {err} getting: {obj} {args} {kwargs}, re-submit.")
@@ -368,6 +604,8 @@ class Getter(object):
                 if obj.permanent_failure:
                     log.debug(f"Chunk {obj} permanently failed during exception, not re-submitting")
                     continue
+                # CRITICAL: Clear in_flight BEFORE re-submitting
+                obj.in_flight = False
                 self.submit(obj, *args, **kwargs)
             finally:
                 obj.in_flight = False
@@ -420,6 +658,1931 @@ chunk_getter = ChunkGetter(int(CFG.autoortho.fetch_threads))
 log.info(f"chunk_getter: {chunk_getter}")
 #log.info(f"tile_getter: {tile_getter}")
 
+# ============================================================================
+# ASYNC CACHE WRITER
+# ============================================================================
+# A lightweight executor for background cache writes. This allows downloaded
+# chunks to be marked as "ready" immediately after download, rather than
+# waiting for disk I/O to complete. Cache writes are fire-and-forget since
+# a failed write only affects future cache hits, not current processing.
+#
+# Using 2 workers: cache writes are I/O-bound, not CPU-bound, so a small pool
+# is sufficient. More workers would just contend on disk I/O.
+# ============================================================================
+_cache_write_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, 
+    thread_name_prefix="cache_writer"
+)
+
+
+def _async_cache_write(chunk):
+    """Fire-and-forget cache write. Errors are logged but don't affect processing."""
+    try:
+        # Check if cache directory still exists (may have been cleaned up by temp directory)
+        # This prevents errors when diagnose() temp directories are deleted before async write
+        if not os.path.exists(chunk.cache_dir):
+            log.debug(f"Cache dir gone for {chunk}, skipping async write")
+            return
+        chunk.save_cache()
+    except (FileNotFoundError, OSError) as e:
+        # Directory may have been deleted between check and write (race condition)
+        # This is expected for temporary directories, so just log at debug level
+        log.debug(f"Async cache write skipped for {chunk}: {e}")
+    except Exception as e:
+        log.debug(f"Async cache write failed for {chunk}: {e}")
+
+
+def shutdown_cache_writer():
+    """Shutdown the cache writer executor gracefully. Called during module cleanup."""
+    try:
+        _cache_write_executor.shutdown(wait=False)
+    except Exception:
+        pass
+
+
+def flush_cache_writer(timeout=30.0):
+    """Wait for all pending cache writes to complete.
+    
+    This is useful for tests that need to verify cache contents after
+    get_img() returns. Since cache writes are asynchronous, you need to
+    call this before checking for cached files.
+    
+    This function shuts down the executor and recreates it to ensure
+    all pending tasks complete. This is the only reliable way to guarantee
+    all writes are flushed on all platforms (especially Windows).
+    
+    Args:
+        timeout: Maximum time to wait in seconds (default: 30.0)
+    """
+    global _cache_write_executor
+    try:
+        # Shutdown with wait=True ensures ALL pending tasks complete
+        _cache_write_executor.shutdown(wait=True)
+    except Exception:
+        pass
+    finally:
+        # Recreate the executor for subsequent operations
+        _cache_write_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="cache_writer"
+        )
+
+
+# ============================================================================
+# TERRAIN TILE LOOKUP
+# ============================================================================
+# Provides on-demand lookup of .ter files to discover actual zoom levels.
+# Uses lazy file existence checks instead of pre-indexing to handle
+# sceneries with millions of .ter files efficiently.
+#
+# Critical for predictive DDS generation: Without this, the prefetcher might
+# guess ZL16 based on altitude, but if the .ter file says ZL18 (airport tile),
+# the prefetched DDS would be at the wrong zoom level - a complete miss!
+#
+# Design for scale:
+# - NO pre-indexing (avoids 600MB+ RAM for 5M tiles)
+# - NO startup delay (avoids 30-60s scan)
+# - Lazy os.path.exists() checks (~0.1ms each, only when needed)
+#
+# Maptype handling:
+# - .ter files are always "BI" in standard AutoOrtho sceneries
+# - Custom Ortho4XP tiles may use other maptypes (EOX, Arc, etc.)
+# - We default to checking only "BI" for efficiency
+# - When X-Plane requests a DDS with a different maptype, we add it to
+#   the known maptypes set and check it in future lookups
+# ============================================================================
+
+# Module-level set of discovered maptypes from actual X-Plane requests
+# Starts with just "BI", grows if custom tiles use other providers
+_discovered_maptypes: set = {"BI"}
+_discovered_maptypes_lock = threading.Lock()
+
+
+def register_discovered_maptype(maptype: str) -> None:
+    """
+    Register a maptype discovered from an actual X-Plane DDS request.
+    
+    Called from FUSE layer when X-Plane requests a DDS with a maptype
+    other than "BI". This adapts the terrain lookup to also check
+    for custom tile maptypes.
+    """
+    global _discovered_maptypes
+    with _discovered_maptypes_lock:
+        if maptype not in _discovered_maptypes:
+            _discovered_maptypes.add(maptype)
+            log.info(f"TerrainTileLookup: Discovered custom maptype '{maptype}', "
+                    f"will now check for it in terrain lookups")
+
+
+def get_discovered_maptypes() -> set:
+    """Get the current set of discovered maptypes."""
+    with _discovered_maptypes_lock:
+        return _discovered_maptypes.copy()
+
+
+class TerrainTileLookup:
+    """
+    Lazy lookup of .ter files in scenery terrain folders.
+    
+    Instead of pre-indexing millions of files (which would use 600MB+ RAM
+    and take 30-60s at startup), this class performs on-demand file
+    existence checks when tiles are needed.
+    
+    Maptype strategy:
+    - Default: Check only "BI" (standard for AutoOrtho sceneries)
+    - Adaptive: When X-Plane requests a DDS with a different maptype,
+      it gets registered and future lookups will also check for it
+    - This handles custom Ortho4XP tiles without upfront I/O penalty
+    
+    Cost per prefetch cycle:
+    - 1 maptype × 6 zooms × os.path.exists() = ~0.6ms (uncached)
+    - Additional maptypes only added when evidence of custom tiles
+    
+    File format checked:
+    - {row}_{col}_{maptype}{zoom}.ter
+    
+    Example: 10880_10432_BI16.ter → row=10880, col=10432, maptype=BI, zoom=16
+    """
+    
+    def __init__(self, terrain_folder: str, scenery_name: str):
+        """
+        Args:
+            terrain_folder: Path to the terrain folder (e.g., .../z_ao_na/terrain)
+            scenery_name: Human-readable name for logging (e.g., "z_ao_na")
+        """
+        self._terrain_folder = terrain_folder
+        self._scenery_name = scenery_name
+        self._folder_exists = os.path.isdir(terrain_folder)
+        
+        # Simple LRU cache for recent lookups to avoid repeated fs checks
+        # Key: (row, col, maptype, zoom) → Value: bool (exists)
+        self._cache: Dict[Tuple[int, int, str, int], bool] = {}
+        self._cache_max_size = 10000  # ~1MB max
+        self._cache_lock = threading.Lock()
+        
+        # Stats
+        self._lookups = 0
+        self._cache_hits = 0
+        self._files_found = 0
+        
+        if self._folder_exists:
+            log.info(f"TerrainTileLookup: Ready for {scenery_name} at {terrain_folder}")
+        else:
+            log.warning(f"TerrainTileLookup: Folder not found: {terrain_folder}")
+    
+    def get_tiles_for_position(self, lat: float, lon: float,
+                               maptype_filter: Optional[str] = None,
+                               zoom_range: Tuple[int, int] = (14, 19)
+                               ) -> List[Tuple[int, int, str, int]]:
+        """
+        Find all .ter files that exist at a geographic position.
+        
+        Performs lazy file existence checks for each zoom level.
+        
+        Args:
+            lat: Latitude in degrees
+            lon: Longitude in degrees
+            maptype_filter: Maptype to check (e.g., "BI"). If None, checks common types.
+            zoom_range: (min_zoom, max_zoom) to check (default 14-19 for perf)
+        
+        Returns:
+            List of (row, col, maptype, zoom) tuples for tiles that exist.
+        """
+        if not self._folder_exists:
+            return []
+        
+        results = []
+        
+        # Get maptypes to check:
+        # 1. If specific maptype requested, use only that
+        # 2. Otherwise, use all discovered maptypes (starts with just "BI",
+        #    grows if X-Plane requests DDS files with other maptypes)
+        if maptype_filter:
+            maptypes_to_check = [maptype_filter]
+        else:
+            maptypes_to_check = list(get_discovered_maptypes())
+        
+        for zoom in range(zoom_range[0], zoom_range[1] + 1):
+            # Convert lat/lon to tile coords at this zoom
+            row, col = self._latlon_to_tile(lat, lon, zoom)
+            
+            for maptype in maptypes_to_check:
+                if self._tile_exists(row, col, maptype, zoom):
+                    results.append((row, col, maptype, zoom))
+                    # Found a tile at this zoom, no need to check other maptypes
+                    break
+        
+        return results
+    
+    def _tile_exists(self, row: int, col: int, maptype: str, zoom: int) -> bool:
+        """
+        Check if a specific .ter file exists.
+        
+        Uses a small cache to avoid repeated filesystem checks for the same tile.
+        """
+        cache_key = (row, col, maptype, zoom)
+        self._lookups += 1
+        
+        # Check cache first
+        with self._cache_lock:
+            if cache_key in self._cache:
+                self._cache_hits += 1
+                return self._cache[cache_key]
+        
+        # Build path and check filesystem
+        ter_filename = f"{row}_{col}_{maptype}{zoom}.ter"
+        ter_path = os.path.join(self._terrain_folder, ter_filename)
+        exists = os.path.exists(ter_path)
+        
+        if exists:
+            self._files_found += 1
+        
+        # Cache the result
+        with self._cache_lock:
+            # Simple eviction: clear half when full
+            if len(self._cache) >= self._cache_max_size:
+                # Keep most recent half (arbitrary, but simple)
+                keys_to_remove = list(self._cache.keys())[:self._cache_max_size // 2]
+                for key in keys_to_remove:
+                    del self._cache[key]
+            self._cache[cache_key] = exists
+        
+        return exists
+    
+    def has_tile(self, row: int, col: int, maptype: str, zoom: int) -> bool:
+        """Check if a specific tile exists."""
+        return self._tile_exists(row, col, maptype, zoom)
+    
+    # Tile grid alignment: .ter files are placed every 16 slippy coordinates
+    # because each tile covers a 16×16 chunk grid
+    TILE_GRID_STEP = 16
+    
+    @staticmethod
+    def _latlon_to_tile(lat: float, lon: float, zoom: int) -> Tuple[int, int]:
+        """
+        Convert lat/lon to tile coordinates at a specific zoom level.
+        
+        Uses Web Mercator (Slippy Map) convention, then aligns to tile grid.
+        
+        IMPORTANT: .ter files are placed every 16 slippy coordinates because
+        each tile covers a 16×16 chunk grid. Example:
+        - 144224_260256_BI18.ter covers slippy coords 260256-260271
+        - 144224_260272_BI18.ter covers slippy coords 260272-260287
+        
+        So we round DOWN to the nearest multiple of 16 to get the .ter filename.
+        
+        Returns:
+            (row, col) tuple aligned to 16-tile grid - NOTE: row is Y, col is X
+        """
+        n = 2 ** zoom
+        raw_col = int((lon + 180) / 360 * n)
+        
+        # Clamp latitude to valid Mercator range
+        lat_clamped = max(-85.0511, min(85.0511, lat))
+        lat_rad = math.radians(lat_clamped)
+        raw_row = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
+        
+        # Align to tile grid (every 16 slippy coordinates)
+        step = TerrainTileLookup.TILE_GRID_STEP
+        row = (raw_row // step) * step
+        col = (raw_col // step) * step
+        
+        return (row, col)
+    
+    def clear_cache(self) -> None:
+        """Clear the lookup cache."""
+        with self._cache_lock:
+            self._cache.clear()
+    
+    @property
+    def is_ready(self) -> bool:
+        """Always ready (no async indexing needed)."""
+        return self._folder_exists
+    
+    @property
+    def stats(self) -> dict:
+        """Return lookup statistics."""
+        hit_rate = (self._cache_hits / self._lookups * 100) if self._lookups > 0 else 0
+        return {
+            'scenery': self._scenery_name,
+            'lookups': self._lookups,
+            'cache_hits': self._cache_hits,
+            'hit_rate_pct': hit_rate,
+            'files_found': self._files_found,
+            'cache_size': len(self._cache),
+            'folder_exists': self._folder_exists,
+        }
+
+
+# Module-level terrain lookup management
+_terrain_lookups: List[TerrainTileLookup] = []
+_terrain_lookups_lock = threading.Lock()
+
+
+def register_terrain_index(terrain_folder: str, scenery_name: str) -> None:
+    """
+    Register a terrain lookup for a scenery.
+    
+    Called from autoortho_fuse.py when mounting a scenery.
+    No async indexing needed - lookups are lazy.
+    """
+    global _terrain_lookups
+    with _terrain_lookups_lock:
+        lookup = TerrainTileLookup(terrain_folder, scenery_name)
+        _terrain_lookups.append(lookup)
+        log.info(f"Registered terrain lookup for {scenery_name}")
+
+
+def get_all_tiles_for_position(lat: float, lon: float,
+                               maptype_filter: Optional[str] = None) -> List[Tuple[int, int, str, int]]:
+    """
+    Query all terrain lookups for tiles at a position.
+    
+    Args:
+        lat: Latitude in degrees
+        lon: Longitude in degrees
+        maptype_filter: Optional maptype to filter by
+        
+    Returns:
+        List of (row, col, maptype, zoom) tuples from all sceneries
+    """
+    results = []
+    with _terrain_lookups_lock:
+        for lookup in _terrain_lookups:
+            results.extend(lookup.get_tiles_for_position(lat, lon, maptype_filter))
+    return results
+
+
+def clear_terrain_indices() -> None:
+    """Clear all terrain lookups (for shutdown)."""
+    global _terrain_lookups
+    with _terrain_lookups_lock:
+        for lookup in _terrain_lookups:
+            lookup.clear_cache()
+        count = len(_terrain_lookups)
+        _terrain_lookups.clear()
+        log.info(f"Cleared {count} terrain lookups")
+
+
+def get_terrain_index_stats() -> List[dict]:
+    """Get statistics from all terrain lookups."""
+    with _terrain_lookups_lock:
+        return [lookup.stats for lookup in _terrain_lookups]
+
+
+# ============================================================================
+# SPATIAL PREFETCHER
+# ============================================================================
+# Proactively downloads tile chunks ahead of the aircraft based on position
+# and heading. This reduces in-flight stutters by having tiles ready before
+# X-Plane requests them.
+#
+# Key design principles:
+# 1. Low priority: Prefetched chunks don't compete with immediate requests
+# 2. Configurable: Users can enable/disable and tune parameters
+# 3. Conservative: Doesn't overwhelm network or CPU resources
+# 4. Non-blocking: Runs in background, never blocks main processing
+# ============================================================================
+
+class SpatialPrefetcher:
+    """
+    Background prefetcher that anticipates tile needs based on aircraft movement.
+    
+    The prefetcher periodically checks aircraft position and heading, calculates
+    which tiles will be needed, and submits low-priority download requests.
+    """
+    
+    # Priority offset for prefetched chunks (higher = lower priority)
+    # This ensures prefetch doesn't compete with immediate X-Plane requests
+    PREFETCH_PRIORITY_OFFSET = 100
+    
+    # Minimum speed (m/s) to trigger prefetching - don't prefetch when taxiing
+    MIN_SPEED_MPS = 25  # ~50 knots
+    
+    def __init__(self):
+        """Initialize the prefetcher with configuration from aoconfig."""
+        self._thread = None
+        self._stop_event = threading.Event()
+        self._running = False
+        self._prefetch_count = 0
+        self._tile_cacher = None
+        
+        # Track recently prefetched to avoid duplicates
+        # Use an LRU-like structure with max size
+        self._recently_prefetched = set()
+        self._max_recent = 500
+        
+        # Load configuration
+        self._load_config()
+        
+    def _load_config(self):
+        """Load prefetch configuration from aoconfig."""
+        self.enabled = getattr(CFG.autoortho, 'prefetch_enabled', True)
+        # Lookahead is now configured in MINUTES, convert to seconds
+        # 0 = Unlimited (use very large lookahead, effectively infinite)
+        lookahead_min = float(getattr(CFG.autoortho, 'prefetch_lookahead', 10))
+        self.lookahead_unlimited = (lookahead_min <= 0)
+        if self.lookahead_unlimited:
+            # Use 24 hours as "unlimited" - effectively infinite for flight purposes
+            self.lookahead_sec = 24 * 60 * 60  # 86400 seconds
+        else:
+            self.lookahead_sec = lookahead_min * 60  # Convert minutes to seconds
+            # Clamp to reasonable range (1-60 minutes = 60-3600 seconds)
+            self.lookahead_sec = max(60, min(3600, self.lookahead_sec))
+        
+        self.interval_sec = float(getattr(CFG.autoortho, 'prefetch_interval', 2.0))
+        self.max_chunks = int(getattr(CFG.autoortho, 'prefetch_max_chunks', 24))
+        
+        # Unified prefetch radius (used by both velocity and SimBrief methods)
+        # This replaces the old simbrief-specific route_prefetch_radius_nm
+        self.prefetch_radius_nm = float(getattr(CFG.autoortho, 'prefetch_radius_nm', 40))
+        self.prefetch_radius_nm = max(10, min(150, self.prefetch_radius_nm))
+        
+        self.interval_sec = max(1.0, min(10.0, self.interval_sec))
+        self.max_chunks = max(8, min(512, self.max_chunks))
+        
+    def set_tile_cacher(self, tile_cacher):
+        """Set the tile cacher reference for accessing tiles."""
+        self._tile_cacher = tile_cacher
+        
+    def start(self):
+        """Start the background prefetcher thread."""
+        if self._running:
+            return
+            
+        if not self.enabled:
+            log.info("Spatial prefetcher disabled by configuration")
+            return
+            
+        self._stop_event.clear()
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._prefetch_loop,
+            name="SpatialPrefetcher",
+            daemon=True
+        )
+        self._thread.start()
+        lookahead_str = "Unlimited" if self.lookahead_unlimited else f"{self.lookahead_sec/60:.0f}min"
+        log.info(f"Spatial prefetcher started (lookahead={lookahead_str}, "
+                f"interval={self.interval_sec}s, max_chunks={self.max_chunks})")
+        
+    def stop(self):
+        """Stop the background prefetcher thread."""
+        if not self._running:
+            return
+            
+        self._stop_event.set()
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+        log.info(f"Spatial prefetcher stopped (prefetched {self._prefetch_count} chunks total)")
+        bump('prefetch_total', self._prefetch_count)
+        
+    def _prefetch_loop(self):
+        """Main prefetch loop - runs in background thread."""
+        while not self._stop_event.is_set():
+            try:
+                self._do_prefetch_cycle()
+            except Exception as e:
+                log.debug(f"Prefetch cycle error: {e}")
+            
+            # Wait before next cycle, but allow early exit on stop
+            self._stop_event.wait(timeout=self.interval_sec)
+    
+    def _do_prefetch_cycle(self):
+        """
+        Execute one prefetch cycle.
+
+        If SimBrief flight data is loaded and enabled, prefetches along the
+        flight plan waypoints. Otherwise, uses velocity-based prediction.
+        
+        Falls back to velocity-based prefetching if aircraft deviates from route.
+        """
+        # Check if tile_cacher is available
+        if self._tile_cacher is None:
+            return
+
+        # Always use instantaneous position (that's where we actually are)
+        if not datareftracker.data_valid or not datareftracker.connected:
+            return
+            
+        lat = datareftracker.lat
+        lon = datareftracker.lon
+
+        # Validate position data
+        if lat < -90 or lat > 90 or lon < -180 or lon > 180:
+            return
+
+        # Check if SimBrief flight path prefetching should be used
+        if self._should_use_simbrief_prefetch(lat, lon):
+            chunks_submitted = self._prefetch_along_flight_plan(lat, lon)
+            if chunks_submitted > 0:
+                self._prefetch_count += chunks_submitted
+                log.debug(f"Prefetched {chunks_submitted} chunks along flight plan (total: {self._prefetch_count})")
+                bump('prefetch_chunk_count', chunks_submitted)
+            return
+        
+        # Fall back to velocity-based prefetching
+        self._do_velocity_prefetch_cycle(lat, lon)
+    
+    def _should_use_simbrief_prefetch(self, lat: float, lon: float) -> bool:
+        """
+        Check if SimBrief flight path prefetching should be used.
+        
+        Returns True if:
+        - SimBrief flight data is loaded
+        - use_flight_data toggle is enabled
+        - Aircraft is on-route (within deviation threshold) OR
+        - prefetch_while_parked is enabled AND aircraft is near origin airport
+        """
+        # Check if SimBrief integration is enabled
+        if not hasattr(CFG, 'simbrief'):
+            return False
+        
+        use_flight_data = getattr(CFG.simbrief, 'use_flight_data', False)
+        if isinstance(use_flight_data, str):
+            use_flight_data = use_flight_data.lower() in ('true', '1', 'yes', 'on')
+        
+        if not use_flight_data:
+            return False
+        
+        # Check if flight data is loaded
+        if not simbrief_flight_manager.is_loaded:
+            return False
+        
+        # Get deviation threshold from config
+        deviation_threshold = float(getattr(CFG.simbrief, 'route_deviation_threshold_nm', 40))
+        
+        # Check if aircraft is on-route
+        if simbrief_flight_manager.is_on_route(lat, lon, deviation_threshold):
+            return True
+        
+        # If prefetch_while_parked is enabled, allow prefetching when near origin
+        # This lets us start prefetching the route even before takeoff
+        prefetch_while_parked = getattr(CFG.simbrief, 'prefetch_while_parked', True)
+        if isinstance(prefetch_while_parked, str):
+            prefetch_while_parked = prefetch_while_parked.lower() in ('true', '1', 'yes', 'on')
+        
+        if prefetch_while_parked:
+            # Check if aircraft is near the origin airport (within 50nm)
+            # This allows prefetching to start while parked at the gate
+            origin_distance = simbrief_flight_manager.get_distance_from_origin(lat, lon)
+            if origin_distance is not None and origin_distance < 50:
+                log.debug(f"SimBrief prefetch: Aircraft near origin ({origin_distance:.1f}nm), enabling parked prefetch")
+                return True
+        
+        return False
+    
+    def _prefetch_along_flight_plan(self, lat: float, lon: float) -> int:
+        """
+        Prefetch tiles along the SimBrief flight plan path with time-based priority.
+        
+        This method interpolates points along the entire flight path (not just at
+        waypoints) and prioritizes tiles by time-to-encounter. Tiles the aircraft
+        will reach sooner are prefetched first.
+        
+        The path is interpolated at regular intervals to ensure uniform coverage
+        even when waypoints are far apart.
+        
+        Uses the flight plan altitude at each position to determine the
+        appropriate zoom level, matching what will actually be displayed.
+        
+        Skips tiles that are already opened by X-Plane (on-demand logic handles those).
+        
+        Returns number of chunks submitted.
+        """
+        chunks_submitted = 0
+        
+        # Use unified prefetch radius from config
+        prefetch_radius_nm = self.prefetch_radius_nm
+        
+        # Get interpolated path points with time-to-encounter
+        # Uses SimBrief's pre-calculated times (accounts for winds, climb/descent, etc.)
+        # Spacing determines how frequently we sample the path
+        # Smaller spacing = more uniform coverage, but more computation
+        spacing_nm = min(prefetch_radius_nm / 2, 15.0)  # Sample at half the radius or 15nm
+        
+        path_points = simbrief_flight_manager.get_path_points_with_time(
+            aircraft_lat=lat,
+            aircraft_lon=lon,
+            lookahead_sec=self.lookahead_sec,
+            spacing_nm=spacing_nm
+        )
+        
+        if not path_points:
+            # Fall back to waypoint-based prefetching if path generation fails
+            return self._prefetch_along_flight_plan_waypoints(lat, lon)
+        
+        # Get maptype for checking if tiles are opened
+        maptype_filter = self._get_maptype_filter()
+        default_maptype = maptype_filter or "EOX"
+        
+        # Collect tiles along the path with their time-to-encounter
+        # Use a dict to track earliest time for each tile (key = (row, col, zoom))
+        tile_times: Dict[Tuple[int, int, int], Tuple[float, int]] = {}  # key -> (time, altitude_agl)
+        
+        for point in path_points:
+            # Get zoom level for this point's altitude
+            zoom_level = self._get_zoom_for_altitude(point.altitude_agl_ft)
+            
+            # Get tiles within radius of this path point
+            tiles = self._get_tiles_in_radius(
+                point.lat, point.lon, prefetch_radius_nm, zoom_level
+            )
+            
+            # Track each tile with its earliest encounter time
+            for (row, col) in tiles:
+                tile_key = (row, col, zoom_level)
+                
+                # Skip if already in recently prefetched
+                if tile_key in self._recently_prefetched:
+                    continue
+                
+                # Keep the earliest time for each tile
+                if tile_key not in tile_times:
+                    tile_times[tile_key] = (point.time_to_reach_sec, point.altitude_agl_ft)
+                elif point.time_to_reach_sec < tile_times[tile_key][0]:
+                    tile_times[tile_key] = (point.time_to_reach_sec, point.altitude_agl_ft)
+        
+        # Sort tiles by time-to-encounter (earliest first = nearest in time)
+        sorted_tiles = sorted(tile_times.items(), key=lambda x: x[1][0])
+        
+        log.debug(f"Path prefetch: {len(path_points)} path points, {len(sorted_tiles)} unique tiles to prefetch")
+        
+        tiles_prefetched = 0
+        
+        # Prefetch tiles in order of encounter time
+        for (row, col, zoom), (time_sec, alt_agl) in sorted_tiles:
+            if chunks_submitted >= self.max_chunks:
+                break
+            
+            tile_key = (row, col, zoom)
+            
+            # Skip if tile is already opened by X-Plane (on-demand logic handles it)
+            if self._tile_cacher and self._tile_cacher.is_tile_opened_by_xplane(row, col, default_maptype, zoom):
+                log.debug(f"Skipping prefetch for {row},{col}@ZL{zoom} - already opened by X-Plane")
+                continue
+            
+            # Add to recently prefetched
+            self._recently_prefetched.add(tile_key)
+            if len(self._recently_prefetched) > self._max_recent:
+                try:
+                    self._recently_prefetched.pop()
+                except KeyError:
+                    pass
+            
+            # Prefetch this tile
+            submitted = self._prefetch_tile(row, col, zoom)
+            chunks_submitted += submitted
+            
+            if submitted > 0:
+                tiles_prefetched += 1
+                log.debug(f"Prefetch tile ({row},{col}) ZL{zoom}: ETA={time_sec/60:.1f}min, alt={alt_agl}ft AGL")
+        
+        return chunks_submitted
+    
+    def _prefetch_along_flight_plan_waypoints(self, lat: float, lon: float) -> int:
+        """
+        Fallback: Prefetch tiles around waypoints only (legacy behavior).
+        
+        Used when path interpolation fails or for compatibility.
+        Skips tiles already opened by X-Plane.
+        
+        Returns number of chunks submitted.
+        """
+        chunks_submitted = 0
+        
+        # Use unified prefetch radius from config
+        prefetch_radius_nm = self.prefetch_radius_nm
+        
+        # Get upcoming fixes (limited number to avoid overwhelming)
+        upcoming_fixes = simbrief_flight_manager.get_upcoming_fixes(lat, lon, count=15)
+        
+        if not upcoming_fixes:
+            return 0
+        
+        # Prefetch around each upcoming fix, stopping when we hit max chunks
+        for fix in upcoming_fixes:
+            if chunks_submitted >= self.max_chunks:
+                break
+            
+            # Determine zoom level based on the AGL altitude at this waypoint
+            zoom_level = self._get_zoom_for_altitude(fix.altitude_agl_ft)
+            
+            log.debug(f"Prefetch fix {fix.ident}: MSL={fix.altitude_ft}ft, "
+                     f"GND={fix.ground_height_ft}ft, AGL={fix.altitude_agl_ft}ft -> ZL{zoom_level}")
+            
+            # Prefetch tiles around this waypoint at the appropriate zoom level
+            submitted = self._prefetch_waypoint_area(
+                fix.lat, fix.lon, prefetch_radius_nm, zoom_level
+            )
+            chunks_submitted += submitted
+        
+        return chunks_submitted
+    
+    # Tile grid alignment: .ter files are placed every 16 slippy coordinates
+    TILE_GRID_STEP = 16
+    
+    def _get_tiles_in_radius(self, center_lat: float, center_lon: float,
+                              radius_nm: float, zoom: int) -> List[Tuple[int, int]]:
+        """
+        Get all tile coordinates (row, col) within a radius of a center point.
+        
+        IMPORTANT: Tiles are aligned to a 16-coordinate grid (each .ter covers
+        16×16 slippy tiles). We step through the grid in increments of 16.
+        
+        Args:
+            center_lat, center_lon: Center point coordinates
+            radius_nm: Radius in nautical miles
+            zoom: Zoom level for tile coordinates
+            
+        Returns:
+            List of (row, col) tuples for tiles within the radius (grid-aligned)
+        """
+        tiles = []
+        step = self.TILE_GRID_STEP
+        
+        # Convert radius to degrees (approximate)
+        # 1 nm ≈ 1/60 degree latitude
+        radius_deg_lat = radius_nm / 60.0
+        radius_deg_lon = radius_nm / (60.0 * max(0.1, math.cos(math.radians(center_lat))))
+        
+        # Calculate tile coordinates
+        n = 2 ** zoom
+        
+        def latlon_to_tile(lat, lon):
+            """Convert lat/lon to grid-aligned tile coordinates."""
+            raw_x = int((lon + 180) / 360 * n)
+            lat_clamped = max(-85.0511, min(85.0511, lat))
+            lat_rad = math.radians(lat_clamped)
+            raw_y = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
+            # Align to tile grid (every 16 slippy coordinates)
+            return ((raw_x // step) * step, (raw_y // step) * step)
+        
+        # Get tile range for the area (already grid-aligned)
+        col_center, row_center = latlon_to_tile(center_lat, center_lon)
+        col_min, row_min = latlon_to_tile(
+            center_lat + radius_deg_lat,
+            center_lon - radius_deg_lon
+        )
+        col_max, row_max = latlon_to_tile(
+            center_lat - radius_deg_lat,
+            center_lon + radius_deg_lon
+        )
+        
+        # Limit the area to prevent too many tiles
+        # Note: max_tiles_per_dim now counts actual tiles (each covers 16×16 area)
+        max_tiles_per_dim = 5
+        tiles_in_row = (row_max - row_min) // step + 1
+        tiles_in_col = (col_max - col_min) // step + 1
+        
+        if tiles_in_row > max_tiles_per_dim:
+            half_tiles = (max_tiles_per_dim // 2) * step
+            row_min = row_center - half_tiles
+            row_max = row_center + half_tiles
+        if tiles_in_col > max_tiles_per_dim:
+            half_tiles = (max_tiles_per_dim // 2) * step
+            col_min = col_center - half_tiles
+            col_max = col_center + half_tiles
+        
+        # Collect tiles in the area, stepping by 16 (tile grid)
+        for row in range(row_min, row_max + 1, step):
+            for col in range(col_min, col_max + 1, step):
+                tiles.append((row, col))
+        
+        return tiles
+    
+    def _prefetch_waypoint_area(self, waypoint_lat: float, waypoint_lon: float,
+                                  radius_nm: float, zoom: int) -> int:
+        """
+        Prefetch tiles within a radius around a waypoint.
+        Skips tiles already opened by X-Plane.
+        
+        Returns number of chunks submitted.
+        """
+        chunks_submitted = 0
+        
+        # Get maptype for checking if tiles are opened
+        maptype_filter = self._get_maptype_filter()
+        default_maptype = maptype_filter or "EOX"
+        
+        # Convert radius to degrees (approximate)
+        # 1 nm ≈ 1/60 degree latitude
+        radius_deg_lat = radius_nm / 60.0
+        radius_deg_lon = radius_nm / (60.0 * math.cos(math.radians(waypoint_lat)))
+        
+        # Calculate tile coordinates
+        n = 2 ** zoom
+        
+        def latlon_to_tile(lat, lon):
+            """Convert lat/lon to tile coordinates."""
+            x = int((lon + 180) / 360 * n)
+            lat_clamped = max(-85.0511, min(85.0511, lat))
+            lat_rad = math.radians(lat_clamped)
+            y = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
+            return (x, y)
+        
+        # Get tile range for the area
+        col_center, row_center = latlon_to_tile(waypoint_lat, waypoint_lon)
+        col_min, row_min = latlon_to_tile(
+            waypoint_lat + radius_deg_lat,
+            waypoint_lon - radius_deg_lon
+        )
+        col_max, row_max = latlon_to_tile(
+            waypoint_lat - radius_deg_lat,
+            waypoint_lon + radius_deg_lon
+        )
+        
+        # Limit the area to prevent too many tiles
+        max_tiles_per_dim = 3
+        if row_max - row_min > max_tiles_per_dim:
+            row_min = row_center - max_tiles_per_dim // 2
+            row_max = row_center + max_tiles_per_dim // 2
+        if col_max - col_min > max_tiles_per_dim:
+            col_min = col_center - max_tiles_per_dim // 2
+            col_max = col_center + max_tiles_per_dim // 2
+        
+        # Prefetch tiles in the area
+        for row in range(row_min, row_max + 1):
+            for col in range(col_min, col_max + 1):
+                if chunks_submitted >= self.max_chunks:
+                    return chunks_submitted
+                
+                # Create unique key for this tile
+                tile_key = (row, col, zoom)
+                
+                # Skip if recently prefetched
+                if tile_key in self._recently_prefetched:
+                    continue
+                
+                # Skip if tile is already opened by X-Plane
+                if self._tile_cacher and self._tile_cacher.is_tile_opened_by_xplane(row, col, default_maptype, zoom):
+                    log.debug(f"Skipping prefetch for {row},{col}@ZL{zoom} - already opened by X-Plane")
+                    continue
+                
+                # Add to recently prefetched
+                self._recently_prefetched.add(tile_key)
+                if len(self._recently_prefetched) > self._max_recent:
+                    try:
+                        self._recently_prefetched.pop()
+                    except KeyError:
+                        pass
+                
+                # Prefetch this tile
+                submitted = self._prefetch_tile(row, col, zoom)
+                chunks_submitted += submitted
+        
+        return chunks_submitted
+    
+    def _get_zoom_for_altitude(self, altitude_ft: int) -> int:
+        """
+        Get the appropriate zoom level for a given altitude.
+        
+        Uses the TileCacher's dynamic zoom manager if available and in dynamic mode.
+        Falls back to fixed max_zoom otherwise.
+        
+        Args:
+            altitude_ft: Altitude in feet
+            
+        Returns:
+            Appropriate zoom level for the altitude
+        """
+        # Check if we have access to the tile cacher and it's in dynamic mode
+        if self._tile_cacher is not None:
+            max_zoom_mode = getattr(CFG.autoortho, 'max_zoom_mode', 'fixed')
+            if max_zoom_mode == 'dynamic' and hasattr(self._tile_cacher, 'dynamic_zoom_manager'):
+                zoom = self._tile_cacher.dynamic_zoom_manager.get_zoom_for_altitude(altitude_ft)
+                log.debug(f"Dynamic zoom for altitude {altitude_ft}ft: ZL{zoom}")
+                return zoom
+        
+        # Fall back to fixed max_zoom
+        return int(getattr(CFG.autoortho, 'max_zoom', 16))
+    
+    def _get_predicted_altitude(self, lat: float, lon: float, 
+                                  hdg: float, spd: float, 
+                                  target_lat: float, target_lon: float) -> int:
+        """
+        Predict altitude at a target position based on current flight parameters.
+        
+        Uses vertical speed to estimate altitude change over the distance.
+        
+        Returns:
+            Predicted altitude in feet
+        """
+        # Get current altitude AGL and vertical speed
+        with datareftracker._lock:
+            if not datareftracker.data_valid:
+                return int(getattr(CFG.autoortho, 'max_zoom', 16))
+            current_alt = datareftracker.alt_agl_ft
+        
+        averages = datareftracker.get_flight_averages()
+        if averages is None:
+            return int(current_alt)
+        
+        vs_fpm = averages.get('vertical_speed_fpm', 0)
+        
+        # Calculate distance to target
+        delta_lat = target_lat - lat
+        delta_lon = target_lon - lon
+        cos_lat = math.cos(math.radians(lat))
+        distance_m = math.sqrt((delta_lat * 111320) ** 2 + (delta_lon * 111320 * cos_lat) ** 2)
+        
+        # Calculate time to reach target
+        if spd > 0:
+            time_sec = distance_m / spd
+        else:
+            time_sec = 0
+        
+        # Predict altitude change
+        alt_change = vs_fpm * (time_sec / 60)  # Convert seconds to minutes
+        predicted_alt = current_alt + alt_change
+        
+        # Clamp to reasonable values
+        return max(0, int(predicted_alt))
+    
+    def _do_velocity_prefetch_cycle(self, lat: float, lon: float):
+        """
+        Execute velocity-based prefetch cycle using radius-based sampling.
+        
+        Samples points along the predicted flight path at regular intervals,
+        then collects tiles within the prefetch radius at each sample point.
+        Tiles are prioritized by distance from the aircraft (nearest first).
+        
+        ZOOM LEVEL DETERMINATION:
+        1. PRIMARY: Query TerrainZoomIndex to find actual .ter files at each position
+           - This ensures we prefetch the exact tiles X-Plane will request
+           - Critical for airport tiles (ZL18) which would be missed by altitude guessing
+        2. FALLBACK: Use altitude-based zoom guessing if no terrain index available
+        """
+        # Try to get 60-second averaged flight data for stable prediction
+        averages = datareftracker.get_flight_averages()
+
+        if averages is not None:
+            hdg = averages['heading']
+            spd = averages['ground_speed_mps']
+        else:
+            hdg = datareftracker.hdg
+            spd = datareftracker.spd
+
+        # Don't prefetch if moving slowly (taxiing, parked)
+        if spd < self.MIN_SPEED_MPS:
+            return
+
+        # Calculate max distance based on lookahead time
+        max_distance_m = spd * self.lookahead_sec
+        
+        # Sample spacing: half the radius or 15nm max (like SimBrief approach)
+        spacing_nm = min(self.prefetch_radius_nm / 2, 15.0)
+        spacing_m = spacing_nm * 1852  # Convert nm to meters
+        
+        # Generate sample points along the flight path (nearest to farthest)
+        sample_points = []
+        distance_m = 0
+        hdg_rad = math.radians(hdg)
+        
+        while distance_m <= max_distance_m:
+            # Calculate position at this distance
+            delta_lat = (distance_m * math.cos(hdg_rad)) / 111320
+            cos_lat = math.cos(math.radians(lat))
+            if cos_lat > 0.01:
+                delta_lon = (distance_m * math.sin(hdg_rad)) / (111320 * cos_lat)
+            else:
+                delta_lon = 0
+            
+            sample_lat = lat + delta_lat
+            sample_lon = lon + delta_lon
+            
+            # Estimate altitude at this position
+            predicted_alt = self._get_predicted_altitude(
+                lat, lon, hdg, spd, sample_lat, sample_lon
+            )
+            
+            sample_points.append((sample_lat, sample_lon, distance_m, predicted_alt))
+            distance_m += spacing_m
+        
+        if not sample_points:
+            return
+        
+        # Collect tiles from all sample points, tracking distance for prioritization
+        # Key: (row, col, maptype, zoom), Value: distance_m (nearest wins)
+        tile_distances: Dict[Tuple[int, int, str, int], float] = {}
+        
+        maptype_filter = self._get_maptype_filter()
+        
+        for sample_lat, sample_lon, distance_m, predicted_alt in sample_points:
+            # PRIMARY: Query TerrainZoomIndex for actual tiles
+            tiles_from_index = get_all_tiles_for_position(
+                sample_lat, sample_lon, maptype_filter=maptype_filter
+            )
+            
+            if tiles_from_index:
+                # Use indexed tiles - get all within radius of this sample point
+                for row, col, maptype, zoom in tiles_from_index:
+                    tile_key = (row, col, maptype, zoom)
+                    # Keep the nearest distance for each tile
+                    if tile_key not in tile_distances or distance_m < tile_distances[tile_key]:
+                        tile_distances[tile_key] = distance_m
+            else:
+                # FALLBACK: Use altitude-based zoom guessing with radius
+                zoom_level = self._get_zoom_for_altitude(predicted_alt)
+                fallback_maptype = maptype_filter or "EOX"
+                
+                tiles_in_radius = self._get_tiles_in_radius(
+                    sample_lat, sample_lon, self.prefetch_radius_nm, zoom_level
+                )
+                
+                for row, col in tiles_in_radius:
+                    tile_key = (row, col, fallback_maptype, zoom_level)
+                    if tile_key not in tile_distances or distance_m < tile_distances[tile_key]:
+                        tile_distances[tile_key] = distance_m
+        
+        # Sort tiles by distance (nearest first - gradient from player outward)
+        sorted_tiles = sorted(tile_distances.items(), key=lambda x: x[1])
+        
+        # Prefetch tiles in order of proximity
+        chunks_submitted = 0
+        tiles_prefetched = 0
+        
+        for (row, col, maptype, zoom), distance in sorted_tiles:
+            if chunks_submitted >= self.max_chunks:
+                break
+            
+            tile_key = (row, col, maptype, zoom)
+            
+            # Skip if recently prefetched
+            if tile_key in self._recently_prefetched:
+                continue
+            
+            # Skip if tile is already opened by X-Plane (on-demand logic handles it)
+            if self._tile_cacher and self._tile_cacher.is_tile_opened_by_xplane(row, col, maptype, zoom):
+                log.debug(f"Skipping prefetch for {row},{col}@ZL{zoom} - already opened by X-Plane")
+                continue
+            
+            # Add to recently prefetched
+            self._recently_prefetched.add(tile_key)
+            if len(self._recently_prefetched) > self._max_recent:
+                try:
+                    self._recently_prefetched.pop()
+                except KeyError:
+                    pass
+            
+            submitted = self._prefetch_tile(row, col, zoom, maptype)
+            chunks_submitted += submitted
+            if submitted > 0:
+                tiles_prefetched += 1
+        
+        if chunks_submitted > 0:
+            self._prefetch_count += chunks_submitted
+            log.debug(f"Velocity prefetch: {chunks_submitted} chunks from {tiles_prefetched} tiles "
+                     f"(radius={self.prefetch_radius_nm}nm, total: {self._prefetch_count})")
+            bump('prefetch_chunk_count', chunks_submitted)
+    
+    def _get_maptype_filter(self) -> Optional[str]:
+        """
+        Get the maptype to filter by when querying terrain index.
+        
+        Returns:
+            Maptype string (e.g., "BI", "EOX") if override is set, None otherwise.
+            When None, all maptypes are accepted from the terrain index.
+        """
+        if self._tile_cacher is not None:
+            override = getattr(self._tile_cacher, 'maptype_override', None)
+            if override and override != "Use tile default":
+                return override
+        return None  # Accept any maptype from terrain index
+    
+    # Maximum chunks to submit per tile per prefetch cycle
+    # With 5 mipmaps (0-4), a ZL16 tile has 256+64+16+4+1 = 341 chunks total
+    # We limit per-tile to avoid one tile dominating the queue
+    MAX_CHUNKS_PER_TILE = 32
+    
+    def _prefetch_tile(self, row, col, zoom, maptype: Optional[str] = None):
+        """
+        Submit prefetch requests for a tile's chunks at ALL mipmap levels.
+        
+        Args:
+            row: Tile row coordinate
+            col: Tile column coordinate  
+            zoom: Zoom level (max zoom for this tile)
+            maptype: Optional maptype (e.g., "BI", "EOX"). If None, uses config.
+        
+        Returns number of chunks submitted.
+        
+        Downloads chunks for all mipmap levels (ZL16, ZL15, ZL14, etc.) to ensure
+        the prebuilt DDS matches on-demand behavior where X-Plane may request
+        any mipmap level first and get native-resolution chunks.
+        
+        IMPORTANT: Uses _open_tile()/_close_tile() pair to properly manage refs.
+        This ensures prefetched tiles can be evicted when no longer needed.
+        
+        If X-Plane has also opened this tile (refs > 1 after our open), we drop
+        it and let the on-demand tile build logic handle it instead.
+        """
+        # Get maptype from parameter or config
+        if maptype is None:
+            maptype = getattr(CFG.autoortho, 'maptype_override', None)
+            if not maptype or maptype == "Use tile default":
+                maptype = "EOX"
+        
+        tile = None
+        try:
+            # Use _open_tile() to properly increment refs (balanced with _close_tile below)
+            # This ensures prefetched tiles don't accumulate refs and block eviction.
+            tile = self._tile_cacher._open_tile(row, col, maptype, zoom)
+            if not tile:
+                return 0
+            
+            # If tile has refs > 1, X-Plane has also opened it - drop and let on-demand handle
+            # Our _open_tile incremented refs to 1 (new) or +1 (existing). If refs > 1 now,
+            # it means X-Plane is actively using this tile.
+            if tile.refs > 1:
+                log.debug(f"Tile {row},{col}@ZL{zoom} has refs={tile.refs}, X-Plane is using it - dropping prefetch")
+                return 0
+            
+            submitted = 0
+            
+            # =========================================================================
+            # Download chunks for ALL mipmap levels (not just mipmap 0)
+            # This ensures prebuilt DDS matches on-demand behavior where X-Plane
+            # may request any mipmap first and get native-resolution chunks.
+            #
+            # Mipmap levels and their zoom:
+            #   mipmap 0 → max_zoom (ZL16) → 256 chunks (highest detail)
+            #   mipmap 1 → max_zoom-1 (ZL15) → 64 chunks
+            #   mipmap 2 → max_zoom-2 (ZL14) → 16 chunks
+            #   mipmap 3 → max_zoom-3 (ZL13) → 4 chunks
+            #   mipmap 4 → max_zoom-4 (ZL12) → 1 chunk (lowest detail)
+            # =========================================================================
+            
+            for mipmap in range(tile.max_mipmap + 1):
+                mipmap_zoom = tile.max_zoom - mipmap
+                
+                # Don't go below minimum zoom
+                if mipmap_zoom < tile.min_zoom:
+                    break
+                
+                # Create chunks for this zoom level if they don't exist
+                tile._create_chunks(mipmap_zoom)
+                
+                mipmap_chunks = tile.chunks.get(mipmap_zoom, [])
+                if not mipmap_chunks:
+                    continue
+                
+                for chunk in mipmap_chunks:
+                    # Skip if already ready, in flight, or failed
+                    if chunk.ready.is_set():
+                        continue
+                    if chunk.in_queue or chunk.in_flight:
+                        continue
+                    if chunk.permanent_failure:
+                        continue
+                    
+                    # Priority: mipmap 0 = most important, higher mipmaps = less important
+                    # Lower priority number = more urgent
+                    chunk.priority = self.PREFETCH_PRIORITY_OFFSET + mipmap
+                    
+                    # Submit to chunk getter
+                    chunk_getter.submit(chunk)
+                    submitted += 1
+                    
+                    # Limit chunks per tile to avoid flooding queue with one tile
+                    if submitted >= self.MAX_CHUNKS_PER_TILE:
+                        break
+                
+                if submitted >= self.MAX_CHUNKS_PER_TILE:
+                    break
+            
+            # Register tile with completion tracker for predictive DDS generation
+            # This must happen AFTER creating all chunks so the tracker can count them
+            if tile_completion_tracker is not None and submitted > 0:
+                tile_completion_tracker.start_tracking(tile, zoom)
+            
+            return submitted
+            
+        except Exception as e:
+            log.debug(f"Prefetch error for tile {row},{col}: {e}")
+            return 0
+        finally:
+            # Always close the tile to decrement refs - this balances _open_tile() above.
+            # The tile stays in the cache (enable_cache=True) but with refs decremented,
+            # allowing eviction to work properly when the tile is no longer needed.
+            if tile is not None:
+                try:
+                    self._tile_cacher._close_tile(row, col, maptype, zoom)
+                except Exception:
+                    pass  # Don't let close errors mask the original exception
+
+
+# Global prefetcher instance
+spatial_prefetcher = SpatialPrefetcher()
+
+
+def start_prefetcher(tile_cacher):
+    """Start the spatial prefetcher with the given tile cacher."""
+    spatial_prefetcher.set_tile_cacher(tile_cacher)
+    spatial_prefetcher.start()
+
+
+def stop_prefetcher():
+    """Stop the spatial prefetcher."""
+    spatial_prefetcher.stop()
+
+
+# ============================================================================
+# PREDICTIVE DDS GENERATION
+# ============================================================================
+# Pre-builds DDS textures in the background after tiles are prefetched.
+# This eliminates the decode+compress stutter when X-Plane reads new tiles.
+#
+# Components:
+# 1. TileCompletionTracker - Monitors chunk downloads, detects when all ready
+# 2. PrebuiltDDSCache - Stores pre-built DDS for instant serving
+# 3. BackgroundDDSBuilder - Builds DDS from completed tiles in background
+# ============================================================================
+
+class _TrackedTile:
+    """Internal tracking state for a tile being prefetched."""
+    __slots__ = ('tile', 'zoom', 'expected_chunks', 'completed_chunks', 
+                 'start_time', 'completed_chunk_ids')
+    
+    def __init__(self, tile, zoom: int, expected_chunks: int):
+        self.tile = tile
+        self.zoom = zoom
+        self.expected_chunks = expected_chunks
+        self.completed_chunks = 0
+        self.start_time = time.monotonic()
+        self.completed_chunk_ids = set()  # Track which chunks reported complete
+
+
+class TileCompletionTracker:
+    """
+    Tracks chunk downloads and notifies when all chunks for a tile are ready.
+    
+    Thread-safe: chunks complete on ChunkGetter threads, notifications are
+    processed to avoid blocking download threads.
+    
+    Memory-bounded: Only tracks tiles that are actively being prefetched.
+    Tiles are removed from tracking once build is triggered or on timeout.
+    """
+    
+    def __init__(self, on_tile_complete=None):
+        """
+        Args:
+            on_tile_complete: Callback when all chunks are ready.
+                             Called with (tile_id, tile) from notification thread.
+                             If None, no callback is made.
+        """
+        self._lock = threading.Lock()
+        self._tracked_tiles: Dict[str, _TrackedTile] = {}
+        self._on_tile_complete = on_tile_complete
+        self._max_tracked = 200  # Limit memory usage
+        self._timeout_sec = 600  # Stop tracking after 10 minutes
+        self._last_cleanup = time.monotonic()
+        self._cleanup_interval = 60  # Cleanup every 60 seconds
+    
+    def start_tracking(self, tile, zoom: int) -> None:
+        """
+        Begin tracking a tile's chunk completion for ALL mipmap levels.
+        
+        Called by SpatialPrefetcher when it starts prefetching a tile.
+        If tile is already being tracked, this is a no-op.
+        
+        Counts chunks across all mipmap levels (not just mipmap 0) to ensure
+        we wait for all native-resolution chunks before building the DDS.
+        
+        Args:
+            tile: Tile object to track
+            zoom: Max zoom level for this tile (tile.max_zoom)
+        """
+        if tile is None:
+            return
+        
+        tile_id = tile.id
+        
+        with self._lock:
+            # Already tracking this tile
+            if tile_id in self._tracked_tiles:
+                return
+            
+            # Calculate expected chunk count across ALL mipmap levels
+            # Each mipmap has chunks at its corresponding zoom level:
+            #   mipmap 0 → max_zoom (256 chunks typically)
+            #   mipmap 1 → max_zoom-1 (64 chunks)
+            #   mipmap 2 → max_zoom-2 (16 chunks)
+            #   mipmap 3 → max_zoom-3 (4 chunks)
+            #   mipmap 4 → max_zoom-4 (1 chunk)
+            total_expected = 0
+            
+            for mipmap in range(tile.max_mipmap + 1):
+                mipmap_zoom = tile.max_zoom - mipmap
+                
+                # Don't go below minimum zoom
+                if mipmap_zoom < tile.min_zoom:
+                    break
+                
+                chunks = tile.chunks.get(mipmap_zoom, [])
+                if chunks:
+                    total_expected += len(chunks)
+                else:
+                    # Chunks not created yet - estimate from tile dimensions
+                    # Chunk count follows 4^mipmap pattern relative to mipmap 0
+                    zoom_diff = tile.tilename_zoom - mipmap_zoom
+                    if zoom_diff >= 0:
+                        chunks_per_row = tile.width >> zoom_diff
+                        chunks_per_col = tile.height >> zoom_diff
+                    else:
+                        chunks_per_row = tile.width << (-zoom_diff)
+                        chunks_per_col = tile.height << (-zoom_diff)
+                    total_expected += max(1, chunks_per_row) * max(1, chunks_per_col)
+            
+            # Enforce max tracked limit (evict oldest if needed)
+            if len(self._tracked_tiles) >= self._max_tracked:
+                self._evict_oldest_unlocked()
+            
+            self._tracked_tiles[tile_id] = _TrackedTile(tile, zoom, total_expected)
+            log.debug(f"TileCompletionTracker: Started tracking {tile_id} "
+                     f"(expecting {total_expected} chunks across all mipmaps)")
+            
+            # Periodic cleanup of stale entries
+            self._maybe_cleanup_unlocked()
+    
+    def notify_chunk_ready(self, tile_id: str, chunk) -> None:
+        """
+        Called when a chunk download completes.
+        
+        Thread-safe: may be called from any ChunkGetter thread.
+        Non-blocking: uses fire-and-forget pattern.
+        
+        Args:
+            tile_id: ID of the parent tile
+            chunk: The chunk that just completed
+        """
+        if not tile_id:
+            return
+        
+        tile_to_callback = None
+        
+        with self._lock:
+            tracked = self._tracked_tiles.get(tile_id)
+            if tracked is None:
+                # Not tracking this tile (not prefetched, or already completed)
+                return
+            
+            # Avoid double-counting the same chunk
+            chunk_key = chunk.chunk_id if chunk else None
+            if chunk_key and chunk_key in tracked.completed_chunk_ids:
+                return
+            
+            if chunk_key:
+                tracked.completed_chunk_ids.add(chunk_key)
+            tracked.completed_chunks += 1
+            
+            log.debug(f"TileCompletionTracker: {tile_id} chunk complete "
+                     f"({tracked.completed_chunks}/{tracked.expected_chunks})")
+            
+            # Check if tile is complete
+            if tracked.completed_chunks >= tracked.expected_chunks:
+                tile_to_callback = tracked.tile
+                # Remove from tracking (build will be triggered)
+                del self._tracked_tiles[tile_id]
+                log.debug(f"TileCompletionTracker: {tile_id} COMPLETE - all chunks ready")
+        
+        # Call callback OUTSIDE the lock to avoid deadlocks
+        if tile_to_callback is not None and self._on_tile_complete is not None:
+            try:
+                self._on_tile_complete(tile_id, tile_to_callback)
+            except Exception as e:
+                log.warning(f"TileCompletionTracker: Callback error for {tile_id}: {e}")
+    
+    def stop_tracking(self, tile_id: str) -> None:
+        """Stop tracking a tile (e.g., tile was evicted from cache)."""
+        with self._lock:
+            self._tracked_tiles.pop(tile_id, None)
+    
+    def _evict_oldest_unlocked(self) -> None:
+        """Evict the oldest tracked tile. Must hold _lock."""
+        if not self._tracked_tiles:
+            return
+        
+        oldest_id = None
+        oldest_time = float('inf')
+        
+        for tid, tracked in self._tracked_tiles.items():
+            if tracked.start_time < oldest_time:
+                oldest_time = tracked.start_time
+                oldest_id = tid
+        
+        if oldest_id:
+            del self._tracked_tiles[oldest_id]
+            log.debug(f"TileCompletionTracker: Evicted oldest tile {oldest_id}")
+    
+    def _maybe_cleanup_unlocked(self) -> None:
+        """Cleanup stale entries if enough time has passed. Must hold _lock."""
+        now = time.monotonic()
+        if now - self._last_cleanup < self._cleanup_interval:
+            return
+        
+        self._last_cleanup = now
+        cutoff = now - self._timeout_sec
+        
+        stale = [tid for tid, tracked in self._tracked_tiles.items()
+                 if tracked.start_time < cutoff]
+        
+        for tid in stale:
+            del self._tracked_tiles[tid]
+            log.debug(f"TileCompletionTracker: Cleaned up stale tile {tid}")
+    
+    @property
+    def tracked_count(self) -> int:
+        """Number of tiles currently being tracked."""
+        with self._lock:
+            return len(self._tracked_tiles)
+
+
+class PrebuiltDDSCache:
+    """
+    Cache for pre-built DDS byte buffers.
+    
+    Stores completed DDS textures built by BackgroundDDSBuilder.
+    These are served directly to X-Plane on cache hit, avoiding
+    the decode+compress overhead.
+    
+    Memory Management:
+    - Has its own memory limit (separate from tile cache)
+    - Uses LRU eviction when limit is reached
+    - Prebuilt tiles are evicted BEFORE active tiles
+    
+    Thread Safety:
+    - Reads and writes are protected by RLock
+    - Multiple FUSE threads may read concurrently
+    - Single builder thread writes
+    """
+    
+    def __init__(self, max_memory_bytes: int = 512 * 1024 * 1024):
+        """
+        Args:
+            max_memory_bytes: Maximum memory for prebuilt DDS (default 512MB)
+        """
+        self._lock = threading.RLock()
+        self._cache: OrderedDict = OrderedDict()
+        self._memory_used = 0
+        self._max_memory = max_memory_bytes
+        self._hits = 0
+        self._misses = 0
+    
+    def get(self, tile_id: str) -> Optional[bytes]:
+        """
+        Retrieve pre-built DDS bytes for a tile.
+        
+        Returns None if not in cache (cache miss).
+        Updates LRU order on hit.
+        
+        Thread-safe: may be called from multiple FUSE threads.
+        """
+        with self._lock:
+            if tile_id not in self._cache:
+                self._misses += 1
+                return None
+            
+            # Move to end (most recently used)
+            self._cache.move_to_end(tile_id)
+            self._hits += 1
+            return self._cache[tile_id]
+    
+    def store(self, tile_id: str, dds_bytes: bytes) -> None:
+        """
+        Store pre-built DDS bytes.
+        
+        Evicts oldest entries if memory limit exceeded.
+        
+        Thread-safe: called from builder thread.
+        """
+        if not dds_bytes:
+            return
+        
+        size = len(dds_bytes)
+        
+        with self._lock:
+            # Remove existing entry if present
+            if tile_id in self._cache:
+                old_size = len(self._cache[tile_id])
+                del self._cache[tile_id]
+                self._memory_used -= old_size
+            
+            # Evict until we have room
+            while self._memory_used + size > self._max_memory and self._cache:
+                oldest_id, oldest_bytes = self._cache.popitem(last=False)
+                self._memory_used -= len(oldest_bytes)
+                log.debug(f"PrebuiltDDSCache: Evicted {oldest_id} to make room")
+            
+            # Store new entry
+            self._cache[tile_id] = dds_bytes
+            self._memory_used += size
+            log.debug(f"PrebuiltDDSCache: Stored {tile_id} ({size} bytes, "
+                     f"total: {self._memory_used / (1024*1024):.1f}MB)")
+    
+    def remove(self, tile_id: str) -> None:
+        """Remove a tile from the cache (e.g., when tile is evicted from main cache)."""
+        with self._lock:
+            if tile_id in self._cache:
+                size = len(self._cache[tile_id])
+                del self._cache[tile_id]
+                self._memory_used -= size
+    
+    def clear(self) -> None:
+        """Clear all cached entries."""
+        with self._lock:
+            self._cache.clear()
+            self._memory_used = 0
+    
+    def contains(self, tile_id: str) -> bool:
+        """Check if tile is in cache without updating LRU."""
+        with self._lock:
+            return tile_id in self._cache
+    
+    @property
+    def stats(self) -> dict:
+        """Return cache statistics."""
+        with self._lock:
+            total = self._hits + self._misses
+            hit_rate = (self._hits / total * 100) if total > 0 else 0
+            return {
+                'entries': len(self._cache),
+                'memory_mb': self._memory_used / (1024 * 1024),
+                'max_memory_mb': self._max_memory / (1024 * 1024),
+                'hits': self._hits,
+                'misses': self._misses,
+                'hit_rate': hit_rate
+            }
+
+
+class BackgroundDDSBuilder:
+    """
+    Builds DDS textures from fully-downloaded tiles in the background.
+    
+    Design principles:
+    1. Single-threaded: Avoids CPU contention, predictable load
+    2. Rate-limited: Minimum interval between builds to prevent micro-stutters
+    3. Priority queue: Build tiles in submission order (FIFO for fairness)
+    4. Interruptible: Can pause/stop cleanly during shutdown
+    """
+    
+    # Maximum queue depth (prevents unbounded memory growth)
+    MAX_QUEUE_SIZE = 100
+    
+    def __init__(self, prebuilt_cache: PrebuiltDDSCache, 
+                 build_interval_sec: float = 0.5):
+        """
+        Args:
+            prebuilt_cache: Cache to store completed DDS buffers
+            build_interval_sec: Minimum time between builds (rate limiting)
+        """
+        self._queue = Queue(maxsize=self.MAX_QUEUE_SIZE)
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._prebuilt_cache = prebuilt_cache
+        self._build_interval = build_interval_sec
+        self._builds_completed = 0
+        self._builds_failed = 0
+        self._last_build_time = 0.0
+    
+    def start(self) -> None:
+        """Start the background builder thread."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._build_loop,
+            name="BackgroundDDSBuilder",
+            daemon=True
+        )
+        self._thread.start()
+        log.info(f"BackgroundDDSBuilder started (interval={self._build_interval*1000:.0f}ms)")
+    
+    def stop(self) -> None:
+        """Stop the background builder thread."""
+        self._stop_event.set()
+        
+        if self._thread is not None:
+            # Put a sentinel to unblock the queue.get()
+            try:
+                self._queue.put_nowait(None)
+            except Full:
+                pass
+            
+            self._thread.join(timeout=5.0)
+            self._thread = None
+        
+        log.info(f"BackgroundDDSBuilder stopped "
+                f"(built={self._builds_completed}, failed={self._builds_failed})")
+    
+    def submit(self, tile, priority: float = 0) -> bool:
+        """
+        Submit a tile for background DDS building.
+        
+        Args:
+            tile: Tile with all chunks downloaded
+            priority: Not used currently (FIFO order), reserved for future
+            
+        Returns:
+            True if queued, False if queue is full or tile already cached
+        """
+        if tile is None:
+            return False
+        
+        # Skip if already in prebuilt cache
+        if self._prebuilt_cache.contains(tile.id):
+            log.debug(f"BackgroundDDSBuilder: Skipping {tile.id} - already cached")
+            return False
+        
+        try:
+            self._queue.put_nowait((priority, tile))
+            log.debug(f"BackgroundDDSBuilder: Queued {tile.id} "
+                     f"(queue size: {self._queue.qsize()})")
+            return True
+        except Full:
+            log.debug(f"BackgroundDDSBuilder: Queue full, skipping {tile.id}")
+            return False
+    
+    def _build_loop(self) -> None:
+        """Main build loop - runs in background thread."""
+        while not self._stop_event.is_set():
+            try:
+                # Non-blocking get with timeout for clean shutdown
+                item = self._queue.get(timeout=1.0)
+            except Empty:
+                continue
+            
+            # Sentinel value signals shutdown
+            if item is None:
+                continue
+            
+            priority, tile = item
+            
+            # Rate limiting: ensure minimum interval between builds
+            elapsed = time.monotonic() - self._last_build_time
+            if elapsed < self._build_interval:
+                sleep_time = self._build_interval - elapsed
+                # Use stop_event.wait() for interruptible sleep
+                if self._stop_event.wait(timeout=sleep_time):
+                    # Stop requested during sleep
+                    continue
+            
+            # Build the DDS
+            self._build_tile_dds(tile)
+            self._last_build_time = time.monotonic()
+    
+    def _build_tile_dds(self, tile) -> None:
+        """
+        Build DDS for a single tile and store in prebuilt cache.
+        
+        Builds EACH mipmap from native-resolution chunks to match on-demand
+        behavior. This ensures prebuilt tiles are visually identical to tiles
+        that X-Plane requests directly.
+        
+        Uses the tile's existing infrastructure to get the composed image
+        for each mipmap level, then compresses each into the DDS.
+        """
+        tile_id = tile.id
+        build_start = time.monotonic()
+        mipmap_images = []  # Track images for cleanup
+        
+        try:
+            # Verify tile is still valid
+            if tile.dds is None:
+                log.debug(f"BackgroundDDSBuilder: {tile_id} - tile.dds is None, skipping")
+                return
+            
+            # Skip if already in cache (race condition check)
+            if self._prebuilt_cache.contains(tile_id):
+                log.debug(f"BackgroundDDSBuilder: {tile_id} - already in cache, skipping")
+                return
+            
+            # Step 1: Verify chunks are ready for ALL mipmap levels
+            # We need native chunks at each zoom level for proper mipmap building
+            total_chunks = 0
+            total_resolved = 0
+            total_with_data = 0
+            
+            for mipmap in range(tile.max_mipmap + 1):
+                mipmap_zoom = tile.max_zoom - mipmap
+                if mipmap_zoom < tile.min_zoom:
+                    break
+                
+                chunks = tile.chunks.get(mipmap_zoom, [])
+                if not chunks:
+                    # Chunks not created for this mipmap - can't build natively
+                    log.debug(f"BackgroundDDSBuilder: {tile_id} - no chunks for mipmap {mipmap} (zoom {mipmap_zoom})")
+                    continue
+                
+                total_chunks += len(chunks)
+                resolved = sum(1 for c in chunks if c.ready.is_set())
+                with_data = sum(1 for c in chunks if c.ready.is_set() and c.data)
+                total_resolved += resolved
+                total_with_data += with_data
+            
+            if total_resolved < total_chunks:
+                # Some chunks still downloading - not ready for prebuild yet
+                log.debug(f"BackgroundDDSBuilder: {tile_id} - only {total_resolved}/{total_chunks} chunks resolved")
+                return
+            
+            if total_with_data == 0:
+                # ALL chunks failed - nothing to build from
+                log.debug(f"BackgroundDDSBuilder: {tile_id} - all chunks failed, skipping")
+                return
+            
+            # Determine fallback behavior for prebuilds
+            use_fallbacks = getattr(CFG.autoortho, 'predictive_dds_use_fallbacks', True)
+            if isinstance(use_fallbacks, str):
+                use_fallbacks = use_fallbacks.lower() in ('true', '1', 'yes', 'on')
+            
+            fallback_override = None if use_fallbacks else 0
+            
+            failed_count = total_chunks - total_with_data
+            if failed_count > 0:
+                if use_fallbacks:
+                    log.debug(f"BackgroundDDSBuilder: {tile_id} - {failed_count}/{total_chunks} chunks failed, "
+                             f"will apply fallbacks")
+                else:
+                    log.debug(f"BackgroundDDSBuilder: {tile_id} - {failed_count}/{total_chunks} chunks failed, "
+                             f"will use missing color (fallbacks disabled)")
+            
+            # Step 2: Get mipmap 0 image to determine DDS dimensions
+            img0 = tile.get_img(0, startrow=0, endrow=None, maxwait=30,
+                               fallback_level_override=fallback_override)
+            
+            if img0 is None:
+                log.debug(f"BackgroundDDSBuilder: {tile_id} - mipmap 0 get_img returned None")
+                self._builds_failed += 1
+                return
+            
+            mipmap_images.append(img0)
+            width, height = img0.size
+            
+            # Step 3: Create DDS and compress mipmap 0
+            use_ispc = CFG.pydds.compressor.upper() == "ISPC"
+            dxt_format = CFG.pydds.format
+            
+            temp_dds = pydds.DDS(width, height, ispc=use_ispc, dxt_format=dxt_format)
+            
+            # Compress mipmap 0 only (not generating lower mipmaps from it)
+            temp_dds.gen_mipmaps(img0, startmipmap=0, maxmipmaps=1)
+            
+            # Step 4: Build each subsequent mipmap from its native chunks
+            # This matches on-demand behavior where X-Plane might request
+            # any mipmap first and get native-resolution chunks
+            for mipmap in range(1, tile.max_mipmap + 1):
+                mipmap_zoom = tile.max_zoom - mipmap
+                if mipmap_zoom < tile.min_zoom:
+                    break
+                
+                # Get native image for this mipmap level
+                img = tile.get_img(mipmap, startrow=0, endrow=None, maxwait=30,
+                                  fallback_level_override=fallback_override)
+                
+                if img is None:
+                    # Fall back to generating remaining mipmaps by downscaling
+                    log.debug(f"BackgroundDDSBuilder: {tile_id} - mipmap {mipmap} get_img failed, "
+                             f"will generate by downscaling")
+                    # Generate remaining mipmaps from what we have
+                    temp_dds.gen_mipmaps(img0, startmipmap=mipmap, maxmipmaps=99)
+                    break
+                
+                mipmap_images.append(img)
+                
+                # Compress just this mipmap from native image
+                temp_dds.gen_mipmaps(img, startmipmap=mipmap, maxmipmaps=1)
+            
+            # Step 5: Read out the complete DDS as bytes
+            dds_bytes = temp_dds.read(temp_dds.total_size)
+            
+            if not dds_bytes or len(dds_bytes) < 128:
+                log.debug(f"BackgroundDDSBuilder: {tile_id} - DDS read failed")
+                self._builds_failed += 1
+                return
+            
+            # Step 6: Store in prebuilt cache
+            self._prebuilt_cache.store(tile_id, dds_bytes)
+            
+            build_time = (time.monotonic() - build_start) * 1000
+            self._builds_completed += 1
+            
+            log.debug(f"BackgroundDDSBuilder: Built {tile_id} in {build_time:.0f}ms "
+                     f"({len(dds_bytes)} bytes, {len(mipmap_images)} native mipmaps)")
+            bump('prebuilt_dds_builds')
+            
+        except Exception as e:
+            log.warning(f"BackgroundDDSBuilder: Failed to build {tile_id}: {e}")
+            self._builds_failed += 1
+        finally:
+            # Clean up all mipmap images
+            for img in mipmap_images:
+                try:
+                    img.close()
+                except Exception:
+                    pass
+    
+    @property
+    def queue_size(self) -> int:
+        """Current number of tiles waiting to be built."""
+        return self._queue.qsize()
+    
+    @property
+    def stats(self) -> dict:
+        """Return builder statistics."""
+        return {
+            'queue_size': self._queue.qsize(),
+            'builds_completed': self._builds_completed,
+            'builds_failed': self._builds_failed,
+            'interval_ms': self._build_interval * 1000
+        }
+
+
+# Global instances for predictive DDS generation (initialized in start_predictive_dds)
+prebuilt_dds_cache: Optional[PrebuiltDDSCache] = None
+background_dds_builder: Optional[BackgroundDDSBuilder] = None
+tile_completion_tracker: Optional[TileCompletionTracker] = None
+
+
+def _on_tile_complete_callback(tile_id: str, tile) -> None:
+    """
+    Callback invoked when all chunks for a tile have been downloaded.
+    Submits the tile to the background DDS builder.
+    """
+    if background_dds_builder is not None:
+        background_dds_builder.submit(tile)
+
+
+def start_predictive_dds(tile_cacher=None) -> None:
+    """
+    Initialize and start the predictive DDS generation system.
+    
+    Should be called after start_prefetcher().
+    
+    Args:
+        tile_cacher: TileCacher instance (for future use)
+    """
+    global prebuilt_dds_cache, background_dds_builder, tile_completion_tracker
+    
+    # Check if enabled
+    enabled = getattr(CFG.autoortho, 'predictive_dds_enabled', True)
+    if isinstance(enabled, str):
+        enabled = enabled.lower() in ('true', '1', 'yes', 'on')
+    
+    if not enabled:
+        log.info("Predictive DDS generation disabled by configuration")
+        return
+    
+    # Get configuration
+    cache_mb = int(getattr(CFG.autoortho, 'predictive_dds_cache_mb', 512))
+    cache_mb = max(128, min(2048, cache_mb))  # Clamp to valid range
+    
+    build_interval_ms = int(getattr(CFG.autoortho, 'predictive_dds_build_interval_ms', 500))
+    build_interval_ms = max(100, min(2000, build_interval_ms))
+    build_interval_sec = build_interval_ms / 1000.0
+    
+    # Initialize components
+    prebuilt_dds_cache = PrebuiltDDSCache(max_memory_bytes=cache_mb * 1024 * 1024)
+    
+    background_dds_builder = BackgroundDDSBuilder(
+        prebuilt_cache=prebuilt_dds_cache,
+        build_interval_sec=build_interval_sec
+    )
+    
+    tile_completion_tracker = TileCompletionTracker(
+        on_tile_complete=_on_tile_complete_callback
+    )
+    
+    # Start the builder thread
+    background_dds_builder.start()
+    
+    log.info(f"Predictive DDS generation started "
+            f"(cache={cache_mb}MB, interval={build_interval_ms}ms)")
+
+
+def stop_predictive_dds() -> None:
+    """Stop the predictive DDS generation system."""
+    global background_dds_builder, tile_completion_tracker, prebuilt_dds_cache
+    
+    if background_dds_builder is not None:
+        stats = background_dds_builder.stats
+        background_dds_builder.stop()
+        log.info(f"BackgroundDDSBuilder: {stats['builds_completed']} tiles built, "
+                f"{stats['builds_failed']} failed")
+    
+    if prebuilt_dds_cache is not None:
+        stats = prebuilt_dds_cache.stats
+        log.info(f"PrebuiltDDSCache: {stats['hits']} hits, {stats['misses']} misses, "
+                f"{stats['hit_rate']:.1f}% hit rate, {stats['memory_mb']:.1f}MB used")
+    
+    # Clear references
+    background_dds_builder = None
+    tile_completion_tracker = None
+    prebuilt_dds_cache = None
+
+
 # HTTP status codes that indicate permanent failure (no retry)
 PERMANENT_FAILURE_CODES = {400, 401, 404, 405, 406, 410, 451}
 
@@ -456,15 +2619,19 @@ class Chunk(object):
     data = None
     img = None
     url = None
+    
+    # Parent tile ID for completion tracking (predictive DDS generation)
+    tile_id = None
 
     serverlist=['a','b','c','d']
 
-    def __init__(self, col, row, maptype, zoom, priority=0, cache_dir='.cache'):
+    def __init__(self, col, row, maptype, zoom, priority=0, cache_dir='.cache', tile_id=None):
         self.col = col
         self.row = row
         self.zoom = zoom
         self.maptype = maptype
         self.cache_dir = cache_dir
+        self.tile_id = tile_id  # Parent tile ID for completion tracking
         
         # Hack override maptype
         #self.maptype = "BI"
@@ -557,9 +2724,18 @@ class Chunk(object):
         if not data:
             return
 
+        # Check if cache directory still exists (may have been deleted by temp cleanup)
+        if not os.path.exists(self.cache_dir):
+            log.debug(f"Cache directory gone for {self}, skipping save")
+            return
+
         # Ensure cache directory exists
         try:
             os.makedirs(self.cache_dir, exist_ok=True)
+        except (FileNotFoundError, OSError):
+            # Directory path is invalid or was deleted
+            log.debug(f"Cannot create cache directory for {self}, skipping save")
+            return
         except Exception:
             pass
 
@@ -570,6 +2746,10 @@ class Chunk(object):
         try:
             with open(temp_filename, 'wb') as h:
                 h.write(data)
+        except FileNotFoundError as e:
+            # Directory was deleted between check and write (race with temp cleanup)
+            log.debug(f"Cache directory deleted during save for {self}: {e}")
+            return
         except Exception as e:
             # Could not write temp file
             try:
@@ -695,6 +2875,14 @@ class Chunk(object):
                     self.data = b''  # Empty data
                     self.ready.set()  # Mark as ready (with no data) to unblock waiters
                     bump(f'chunk_permanent_fail_{status_code}')
+                    # Notify tile completion tracker even on failure
+                    # This allows DDS prebuild to proceed with available chunks
+                    # (fallbacks will be applied during build for failed chunks)
+                    try:
+                        if tile_completion_tracker is not None and self.tile_id:
+                            tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
+                    except Exception:
+                        pass
                     return True  # Return True to stop worker retries
                 
                 # Check if transient failure has exceeded max retries
@@ -708,6 +2896,12 @@ class Chunk(object):
                         self.data = b''
                         self.ready.set()
                         bump(f'chunk_transient_fail_{status_code}_exhausted')
+                        # Notify tile completion tracker even on exhausted retries
+                        try:
+                            if tile_completion_tracker is not None and self.tile_id:
+                                tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
+                        except Exception:
+                            pass
                         return True
                     # Increase backoff for rate limiting
                     if status_code == 429:
@@ -752,8 +2946,27 @@ class Chunk(object):
 
         self.fetchtime = time.monotonic() - self.starttime
 
-        self.save_cache()
+        # OPTIMIZATION: Signal ready BEFORE cache write
+        # The chunk data is already in memory (self.data), so we can mark it
+        # as ready immediately. Cache writes are for future requests only.
         self.ready.set()
+        
+        # Notify tile completion tracker (for predictive DDS generation)
+        # Fire-and-forget: never block download on notification failure
+        try:
+            if tile_completion_tracker is not None and self.tile_id:
+                tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
+        except Exception:
+            pass  # Never block downloads
+        
+        # Submit cache write asynchronously - fire and forget
+        # This prevents disk I/O from blocking the download worker thread
+        try:
+            _cache_write_executor.submit(_async_cache_write, self)
+        except RuntimeError:
+            # Executor shut down (program exiting), write synchronously as fallback
+            self.save_cache()
+        
         return True
 
     def close(self):
@@ -811,7 +3024,26 @@ class Tile(object):
 
         self.bytes_read = 0
         self.lowest_offset = 99999999
-
+        
+        # Track when this tile was first requested for accurate tile creation time stats
+        self.first_request_time = None
+        # Track if tile completion has been reported (to avoid double-counting)
+        self._completion_reported = False
+        # Tile-level time budget - shared across all mipmap builds for this tile
+        # This ensures the budget limits the ENTIRE tile processing, not per-mipmap
+        self._tile_time_budget = None
+        
+        # === SHARED FALLBACK CHUNK POOL ===
+        # When multiple chunks fail and need the same parent chunk at a lower zoom,
+        # we share the download instead of fetching it multiple times.
+        # Key: (col, row, zoom) -> Chunk object
+        # Example: 4 ZL16 chunks that all need (2,2,ZL15) share one download.
+        self._fallback_chunk_pool = {}
+        self._fallback_pool_lock = threading.Lock()
+        
+        # Track if lazy mipmap building has been triggered for this tile
+        # This prevents repeated attempts after the first failure triggers a lazy build
+        self._lazy_build_attempted = False
 
         #self.tile_condition = threading.Condition()
         if min_zoom:
@@ -896,7 +3128,8 @@ class Tile(object):
             for r in range(row, row+height):
                 for c in range(col, col+width):
                     # FIXED: Create chunk and let it check cache during initialization
-                    chunk = Chunk(c, r, self.maptype, zoom, cache_dir=self.cache_dir)
+                    # Pass tile_id for completion tracking (predictive DDS generation)
+                    chunk = Chunk(c, r, self.maptype, zoom, cache_dir=self.cache_dir, tile_id=self.id)
                     self.chunks[zoom].append(chunk)
         else:
             log.debug(f"Reusing existing {len(self.chunks[zoom])} chunks for zoom {zoom}")
@@ -976,6 +3209,51 @@ class Tile(object):
                 log.error("Failed to get chunk.")
 
         return True
+    
+    def _populate_dds_from_prebuilt(self, prebuilt_bytes: bytes) -> bool:
+        """
+        Populate DDS mipmap buffers from prebuilt byte buffer.
+        
+        This copies the prebuilt DDS data into the tile's DDS structure
+        so that subsequent reads work correctly without re-checking the cache.
+        
+        Args:
+            prebuilt_bytes: Complete DDS file as bytes (including 128-byte header)
+            
+        Returns:
+            True if successful, False if DDS structure is invalid
+        """
+        if self.dds is None:
+            return False
+        
+        if not prebuilt_bytes or len(prebuilt_bytes) < 128:
+            return False
+        
+        try:
+            # The prebuilt bytes include the 128-byte DDS header followed by mipmap data
+            # We need to populate each mipmap's databuffer
+            for mm in self.dds.mipmap_list:
+                if mm.startpos >= len(prebuilt_bytes):
+                    # Prebuilt data doesn't include this mipmap - leave it for on-demand build
+                    break
+                
+                # Extract this mipmap's data from the prebuilt buffer
+                mm_end = min(mm.endpos, len(prebuilt_bytes))
+                if mm_end <= mm.startpos:
+                    break
+                    
+                mm_data = prebuilt_bytes[mm.startpos:mm_end]
+                
+                # Store in the mipmap's databuffer
+                mm.databuffer = BytesIO(initial_bytes=mm_data)
+                mm.retrieved = True
+            
+            log.debug(f"Populated DDS from prebuilt cache for {self}")
+            return True
+            
+        except Exception as e:
+            log.warning(f"Failed to populate DDS from prebuilt: {e}")
+            return False
    
     def find_mipmap_pos(self, offset):
         for m in self.dds.mipmap_list:
@@ -989,6 +3267,26 @@ class Tile(object):
         if self.dds is None:
             log.debug(f"GET_BYTES: DDS is None for {self}, likely closing; skipping")
             return True
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # PREDICTIVE DDS: Check prebuilt cache first
+        # ═══════════════════════════════════════════════════════════════════
+        # If we have a prebuilt DDS for this tile, populate the DDS structure
+        # from it and skip all the chunk download/decode/compress work.
+        if prebuilt_dds_cache is not None:
+            prebuilt_bytes = prebuilt_dds_cache.get(self.id)
+            if prebuilt_bytes is not None:
+                if self._populate_dds_from_prebuilt(prebuilt_bytes):
+                    log.debug(f"GET_BYTES: Prebuilt cache HIT for {self.id}")
+                    bump('prebuilt_cache_hit')
+                    return True
+                else:
+                    # Population failed - fall through to normal path
+                    log.debug(f"GET_BYTES: Prebuilt cache hit but populate failed for {self.id}")
+                    bump('prebuilt_cache_populate_fail')
+            else:
+                bump('prebuilt_cache_miss')
+        # ═══════════════════════════════════════════════════════════════════
 
         mipmap = self.find_mipmap_pos(offset)
         log.debug(f"Get_bytes for mipmap {mipmap} ...")
@@ -1044,8 +3342,9 @@ class Tile(object):
 
         log.debug(f"Startrow: {startrow} Endrow: {endrow} bytes_per_chunk_row: {bytes_per_chunk_row} width_px: {base_width_px} height_px: {base_height_px}")
         
+        # Pass the tile-level budget to get_img so it's shared across all partial reads
         new_im = self.get_img(mipmap, startrow, endrow,
-                maxwait=self.get_maxwait())
+                maxwait=self.get_maxwait(), time_budget=self._tile_time_budget)
         if not new_im:
             log.debug("No updates, so no image generated")
             return True
@@ -1099,6 +3398,13 @@ class Tile(object):
 
     def read_dds_bytes(self, offset, length):
         log.debug(f"READ DDS BYTES: {offset} {length}")
+        
+        # Track when this tile was first requested (for accurate tile creation time stats)
+        # NOTE: We do NOT create the time budget here because queue wait time shouldn't count.
+        # The budget is created lazily in get_img() when actual processing begins.
+        if self.first_request_time is None:
+            self.first_request_time = time.monotonic()
+            log.debug(f"READ_DDS_BYTES: First request for tile, budget will start when processing begins")
        
         if offset > 0 and offset < self.lowest_offset:
             self.lowest_offset = offset
@@ -1161,23 +3467,80 @@ class Tile(object):
         return outfile
 
     @locked
-    def get_img(self, mipmap, startrow=0, endrow=None, maxwait=5, min_zoom=None):
+    def get_img(self, mipmap, startrow=0, endrow=None, maxwait=5, min_zoom=None, time_budget=None,
+                fallback_level_override=None):
         #
         # Get an image for a particular mipmap
         #
+        # Args:
+        #   fallback_level_override: If provided, overrides the config fallback_level.
+        #       Used by BackgroundDDSBuilder when predictive_dds_use_fallbacks=False
+        #       to force fallback_level=0 (missing color only, no extra I/O).
+        #
+        
+        # === TIME BUDGET INITIALIZATION ===
+        # The time budget is created lazily here on first get_img call, NOT when X-Plane
+        # first requests the tile. This ensures queue wait time doesn't count against the budget.
+        # Only actual processing time (chunk downloads, composition, compression) is measured.
+        #
+        # The budget is stored on self._tile_time_budget so it's shared across all mipmap
+        # builds for this tile. If time_budget is explicitly provided (e.g., for pre-builds),
+        # use that instead.
+        
+        if time_budget is not None:
+            # Explicit budget provided (e.g., recursive pre-build calls) - use it
+            log.debug(f"GET_IMG: Using provided budget (elapsed={time_budget.elapsed:.2f}s, remaining={time_budget.remaining:.2f}s)")
+        elif self._tile_time_budget is not None:
+            # Budget already created for this tile - reuse it
+            time_budget = self._tile_time_budget
+            log.debug(f"GET_IMG: Using existing tile budget (elapsed={time_budget.elapsed:.2f}s, remaining={time_budget.remaining:.2f}s)")
+        else:
+            # First get_img call for this tile - create the budget NOW (processing begins)
+            use_time_budget = getattr(CFG.autoortho, 'use_time_budget', True)
+            if isinstance(use_time_budget, str):
+                use_time_budget = use_time_budget.lower() in ('true', '1', 'yes', 'on')
+            
+            if use_time_budget:
+                base_budget = float(getattr(CFG.autoortho, 'tile_time_budget', 5.0))
+                if CFG.autoortho.suspend_maxwait and not datareftracker.connected:
+                    effective_budget = base_budget * 10.0
+                    log.debug(f"GET_IMG: Startup mode - creating tile budget {effective_budget:.1f}s")
+                else:
+                    effective_budget = base_budget
+                    log.debug(f"GET_IMG: Creating tile budget {effective_budget:.1f}s (processing begins now)")
+                time_budget = TimeBudget(effective_budget)
+            else:
+                # Legacy mode: create budget from maxwait parameter
+                effective_maxwait = self.get_maxwait() if maxwait == 5 else maxwait
+                time_budget = TimeBudget(effective_maxwait)
+                log.debug(f"GET_IMG: Legacy mode - budget {effective_maxwait:.1f}s")
+            
+            # Store on tile for sharing across all mipmap builds
+            self._tile_time_budget = time_budget
 
-        # CRITICAL: If building mipmap 0, ensure lower mipmaps (1-4) are fully built first
-        # This ensures they're available in self.imgs for fallback upscaling
-        if mipmap == 0 and (startrow == 0 and endrow is None):
-            log.debug(f"GET_IMG: Building mipmap 0, ensuring lower mipmaps are available for fallback")
-            for lower_mm in range(1, min(self.max_mipmap + 1, 5)):
-                if lower_mm not in self.imgs:
-                    log.debug(f"GET_IMG: Pre-building mipmap {lower_mm} for fallback support")
-                    try:
-                        # Build the complete lower mipmap
-                        self.get_img(lower_mm, startrow=0, endrow=None, maxwait=maxwait, min_zoom=min_zoom)
-                    except Exception as e:
-                        log.debug(f"GET_IMG: Failed to pre-build mipmap {lower_mm}: {e}")
+        # === FALLBACK CONFIGURATION ===
+        # Get fallback settings for use by the fallback chain in process_chunk().
+        # 
+        # NOTE: Pre-building of lower mipmaps was removed due to severe diminishing returns:
+        # - Cost: Paid on 100% of new tiles (85 extra downloads + 1-3s delay)
+        # - Benefit: Only helped when mipmap 0 chunks fail (<5% of cases)
+        # - Alternative: Fallback 3 (Cascading Download) handles failures on-demand
+        #   with much lower overhead since it only activates when needed.
+        #
+        # fallback_level_override allows callers (e.g., BackgroundDDSBuilder) to
+        # force a specific fallback behavior, bypassing user config.
+        if fallback_level_override is not None:
+            fallback_level = fallback_level_override
+        else:
+            fallback_level = self.get_fallback_level()
+        fallback_extends_budget = self.get_fallback_extends_budget()
+        
+        # === FALLBACK BUDGET ===
+        # When fallback_extends_budget is True, we create a SEPARATE budget for fallback operations.
+        # This caps the TOTAL extra time spent on fallbacks (not per-chunk like before).
+        # The fallback_budget is created lazily when the main budget exhausts.
+        fallback_timeout = float(getattr(CFG.autoortho, 'fallback_timeout', 30.0))
+        fallback_budget = None  # Created lazily when needed
 
         # Get effective zoom  
         zoom = min((self.max_zoom - mipmap), self.max_zoom)
@@ -1271,24 +3634,102 @@ class Tile(object):
         
         log.debug(f"GET_IMG: Create new image: Zoom: {zoom} | {(img_width, img_height)}")
         
-        new_im = AoImage.new(
-            "RGBA",
-            (img_width, img_height),
-            (
-                CFG.autoortho.missing_color[0],
-                CFG.autoortho.missing_color[1],
-                CFG.autoortho.missing_color[2],
-            ),
-        )
+        # === PRE-INITIALIZE BASE LAYER FOR MIPMAP 0 ===
+        # When building mipmap 0 (highest detail), instead of starting with a blank 
+        # missing_color image, we initialize with an upscaled lower mipmap.
+        # This ensures any chunks that are skipped due to budget exhaustion still 
+        # show a blurry-but-colored texture instead of visible holes.
+        #
+        # Why this works:
+        # - Mipmaps are built 4->3->2->1->0, so lower mipmaps are usually available
+        # - Chunks overwrite the base as they complete (progressive refinement)
+        # - No hole detection needed - base layer guarantees coverage
+        # - Single upscale operation (efficient) vs per-hole fills
+        #
+        # Fallback order: mipmap 1 (best quality) -> 2 -> 3 -> 4 -> missing_color
+        
+        new_im = None
+        prefill_source_mm = None
+        
+        if mipmap == 0 and fallback_level >= 1:
+            # Try to find the best available lower mipmap to use as base
+            for source_mm in [1, 2, 3, 4]:
+                if source_mm > self.max_mipmap:
+                    continue
+                    
+                img_data = self.imgs.get(source_mm)
+                if not img_data:
+                    continue
+                
+                # Extract image from tuple format (image, col, row, zoom)
+                if isinstance(img_data, tuple):
+                    source_img = img_data[0]
+                else:
+                    source_img = img_data
+                
+                if source_img is None or getattr(source_img, '_freed', False):
+                    continue
+                
+                # Calculate scale factor: mipmap 1->0 = 2x, mipmap 2->0 = 4x, etc.
+                scale_factor = 1 << source_mm  # 2^source_mm
+                
+                # Verify source image dimensions match expected size
+                expected_source_width = img_width >> source_mm
+                expected_source_height = img_height >> source_mm
+                
+                if source_img._width != expected_source_width or source_img._height != expected_source_height:
+                    log.debug(f"GET_IMG: Prefill skipping mipmap {source_mm} - size mismatch: "
+                             f"got {source_img._width}x{source_img._height}, expected {expected_source_width}x{expected_source_height}")
+                    continue
+                
+                # Upscale to mipmap 0 size
+                log.debug(f"GET_IMG: Pre-initializing mipmap 0 base from mipmap {source_mm} "
+                         f"({source_img._width}x{source_img._height} -> {img_width}x{img_height}, scale={scale_factor}x)")
+                
+                try:
+                    new_im = source_img.scale(scale_factor)
+                    if new_im is not None and new_im._width == img_width and new_im._height == img_height:
+                        prefill_source_mm = source_mm
+                        bump(f'mipmap0_prefill_from_mm{source_mm}')
+                        log.debug(f"GET_IMG: Successfully pre-initialized base from mipmap {source_mm}")
+                        break
+                    else:
+                        # Scale failed or wrong size - clean up and try next
+                        if new_im is not None:
+                            try:
+                                new_im.close()
+                            except Exception:
+                                pass
+                        new_im = None
+                        log.debug(f"GET_IMG: Prefill scale from mipmap {source_mm} failed or wrong size")
+                except Exception as e:
+                    log.warning(f"GET_IMG: Prefill scale from mipmap {source_mm} exception: {e}")
+                    new_im = None
+        
+        # Fall back to missing_color if no lower mipmap available or prefill disabled
+        if new_im is None:
+            new_im = AoImage.new(
+                "RGBA",
+                (img_width, img_height),
+                (
+                    CFG.autoortho.missing_color[0],
+                    CFG.autoortho.missing_color[1],
+                    CFG.autoortho.missing_color[2],
+                ),
+            )
+            if mipmap == 0 and fallback_level >= 1:
+                log.debug(f"GET_IMG: No lower mipmap available for prefill, using missing_color")
+        else:
+            log.debug(f"GET_IMG: Using prefilled base from mipmap {prefill_source_mm}")
 
         log.debug(f"GET_IMG: Will use image {new_im}")
 
         # Check if we have any chunks to process
         if len(chunks) == 0:
             log.warning(f"GET_IMG: No chunks created for zoom {zoom}, mipmap {mipmap}")
-            # Create a placeholder image with the expected dimensions
-            placeholder_img = AoImage.new('RGBA', (img_width, img_height), (128, 128, 128))
-            return placeholder_img
+            # Return the missing_color filled image we already created
+            # This ensures consistency - X-Plane sees missing_color, not arbitrary gray
+            return new_im
             
         def process_chunk(chunk, skip_download_wait=False):
             """Process a single chunk and return (chunk, chunk_img, start_x, start_y)"""
@@ -1309,6 +3750,15 @@ class Tile(object):
                 # Return placeholder to prevent crash
                 return (chunk, None, 0, 0)
             
+            # === TIME BUDGET CHECK ===
+            # Early exit if the time budget is exhausted. This is the key improvement:
+            # instead of each chunk waiting maxwait seconds, we check the shared budget.
+            if time_budget.exhausted:
+                log.debug(f"Time budget exhausted (elapsed={time_budget.elapsed:.2f}s), skipping chunk {chunk}")
+                time_budget.record_chunk_skipped()
+                bump('chunk_budget_skipped')
+                return (chunk, None, start_x, start_y)
+            
             # Track if this chunk permanently failed
             is_permanent_failure = chunk.permanent_failure
             if is_permanent_failure:
@@ -1325,12 +3775,15 @@ class Tile(object):
                 chunk_ready = True
                 log.debug(f"Chunk {chunk} already downloaded, proceeding to decode")
             else:
-                # Download in progress, apply maxwait
-                chunk_ready = chunk.ready.wait(maxwait)
+                # Download in progress - use BOTH time budget AND per-chunk maxwait
+                # This respects the total tile budget while also limiting per-chunk waits
+                # The wait ends when either: budget exhausted, maxwait reached, or event set
+                chunk_ready = time_budget.wait_with_budget(chunk.ready, max_single_wait=maxwait)
                 if not chunk_ready:
-                    log.debug(f"Chunk {chunk} download timed out after {maxwait}s")
+                    log.debug(f"Chunk {chunk} wait ended (budget remaining={time_budget.remaining:.2f}s, maxwait={maxwait:.1f}s)")
 
             chunk_img = None
+            decode_failed = False
             if chunk_ready and chunk.data:
                 # We returned and have data!
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Ready and found chunk data.")
@@ -1339,42 +3792,131 @@ class Tile(object):
                         chunk_img = AoImage.load_from_memory(chunk.data)
                         if chunk_img is None:
                             log.warning(f"GET_IMG: load_from_memory returned None for {chunk}")
+                            decode_failed = True
                 except Exception as _e:
                     log.error(f"GET_IMG: load_from_memory exception for {chunk}: {_e}")
                     chunk_img = None
+                    decode_failed = True
+            elif chunk_ready and not chunk.data:
+                # Download "succeeded" but returned empty data
+                log.debug(f"GET_IMG: Chunk {chunk} ready but has no data")
+                decode_failed = True
+            
+            # Determine if we need fallbacks:
+            # - chunk didn't download in time (not chunk_ready)
+            # - chunk is permanently failed (404, etc)
+            # - chunk downloaded but decode failed (decode_failed)
+            needs_fallback = not chunk_ready or is_permanent_failure or decode_failed
             
             # FALLBACK CHAIN (in order of preference):
-            # Each fallback only runs if previous ones failed
-            # For permanent failures (404, etc), we ALWAYS try fallbacks to get lower-zoom alternatives
+            # Each fallback only runs if previous ones failed and fallback_level allows it.
+            # For permanent failures (404, etc), we ALWAYS try fallbacks to get lower-zoom alternatives.
+            #
+            # fallback_level controls which fallbacks are enabled:
+            #   0 = None: Skip all fallbacks (fastest, may have missing tiles)
+            #   1 = Cache-only: Fallback 1 (disk cache) + Fallback 2 (built mipmaps)
+            #   2 = Full: All fallbacks including Fallback 3 (network downloads)
             
-            # Fallback 1: Search disk cache for lower-zoom JPEGs
-            if not chunk_img and (not chunk_ready or is_permanent_failure):
-                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Searching disk cache for backup chunk.")
+            # Fallback 1: Search disk cache for lower-zoom JPEGs (enabled if fallback_level >= 1)
+            if not chunk_img and needs_fallback and fallback_level >= 1:
+                log.debug(f"GET_IMG(process_chunk): Fallback 1 - searching disk cache for backup chunk.")
                 chunk_img = self.get_best_chunk(chunk.col, chunk.row, mipmap, zoom)
                 # get_best_chunk bumps 'upscaled_from_jpeg_count' if successful
             
-            # Fallback 2: Scale from already-built mipmaps (if they exist)
-            if not chunk_img:
-                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Attempting scaling from built mipmaps.")
+            # === LAZY BUILD TRIGGER ===
+            # If Fallback 1 failed and we're building mipmap 0, trigger a lazy build
+            # of a lower mipmap (mipmap 2) to enable Fallback 2 for subsequent failures.
+            # This is on-demand (only when failures occur) unlike the removed pre-building.
+            if not chunk_img and mipmap == 0 and fallback_level >= 1:
+                if not self._lazy_build_attempted:
+                    log.debug(f"GET_IMG(process_chunk): Triggering lazy build after first failure")
+                    self._try_lazy_build_fallback_mipmap(time_budget)
+            
+            # Fallback 2: Scale from already-built mipmaps (enabled if fallback_level >= 1)
+            # Now may have something to use thanks to lazy build above
+            if not chunk_img and fallback_level >= 1:
+                log.debug(f"GET_IMG(process_chunk): Fallback 2 - scaling from built mipmaps.")
                 chunk_img = self.get_downscaled_from_higher_mipmap(mipmap, chunk.col, chunk.row, zoom)
                 # Note: scaling function bumps its own counters (upscaled_chunk_count or downscaled_chunk_count)
             
-            # Fallback 3: On-demand download of lower-detail chunks
-            if not chunk_img and (not chunk_ready or is_permanent_failure):
-                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Attempting cascading fallback (download).")
-                chunk_img = self.get_or_build_lower_mipmap_chunk(mipmap, chunk.col, chunk.row, zoom)
+            # Fallback 3: On-demand download of lower-detail chunks (enabled if fallback_level >= 2)
+            # This is the expensive network fallback - only use when quality is prioritized
+            if not chunk_img and needs_fallback and fallback_level >= 2:
+                # Budget strategy for cascading fallback:
+                # - Use main budget first (remaining time)
+                # - If fallback_extends_budget is True AND main budget exhausts during fallback,
+                #   switch to the extra fallback_budget
+                # - This ensures max total time is exactly: main_budget + fallback_timeout
+                nonlocal fallback_budget
+                
+                # Fallback budget is created lazily ONLY when main budget exhausts
+                # This ensures it truly extends the time rather than running in parallel
+                
+                if time_budget.exhausted and not fallback_extends_budget:
+                    # Main budget exhausted and no extension allowed - skip
+                    log.debug(f"GET_IMG(process_chunk): Skipping Fallback 3 - budget exhausted and fallback_extends_budget=False")
+                elif time_budget.exhausted and fallback_extends_budget:
+                    # Main budget exhausted - create/use fallback budget
+                    # Created NOW so the timer starts when main exhausts (true extension)
+                    if fallback_budget is None:
+                        fallback_budget = TimeBudget(fallback_timeout)
+                        log.info(f"GET_IMG: Main budget exhausted, creating fallback budget {fallback_timeout:.1f}s")
+                    
+                    if fallback_budget.exhausted:
+                        log.debug(f"GET_IMG(process_chunk): Skipping Fallback 3 - both budgets exhausted")
+                    else:
+                        log.debug(f"GET_IMG(process_chunk): Fallback 3 - main exhausted, using fallback budget "
+                                 f"(remaining={fallback_budget.remaining:.2f}s)")
+                        chunk_img = self.get_or_build_lower_mipmap_chunk(
+                            mipmap, chunk.col, chunk.row, zoom,
+                            main_budget=None,  # Main already exhausted
+                            fallback_budget=fallback_budget
+                        )
+                else:
+                    # Main budget still has time - use it first, may switch to fallback if main exhausts
+                    log.debug(f"GET_IMG(process_chunk): Fallback 3 - using main budget "
+                             f"(remaining={time_budget.remaining:.2f}s)" +
+                             (f", fallback budget ready (remaining={fallback_budget.remaining:.2f}s)" 
+                              if fallback_budget else ""))
+                    chunk_img = self.get_or_build_lower_mipmap_chunk(
+                        mipmap, chunk.col, chunk.row, zoom,
+                        main_budget=time_budget,
+                        fallback_budget=fallback_budget,  # May be None, will be created lazily
+                        fallback_timeout=fallback_timeout if fallback_extends_budget else None
+                    )
 
             if not chunk_ready and not chunk_img and not is_permanent_failure:
-                # Ran out of time, lower mipmap.  Retry...
-                # Don't retry permanent failures (404, etc) - they won't succeed
-                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Final retry for {chunk}, WAITING!")
-                bump('retry_chunk_count')
-                # Smart timeout for retry: check if already downloaded
-                if chunk.ready.is_set():
-                    chunk_ready = True
-                    log.debug(f"Chunk {chunk} downloaded during retry, proceeding to decode")
+                # === FINAL RETRY (OPTIMIZED) ===
+                # Only worth retrying if the chunk download is still pending.
+                # Pending means: in queue, in flight, or already completed (ready).
+                # If none of these are true, the download failed and won't be retried
+                # by the worker - so waiting would be pointless.
+                download_pending = chunk.in_flight or chunk.in_queue or chunk.ready.is_set()
+                
+                if time_budget.exhausted:
+                    log.debug(f"GET_IMG: Skipping final retry for {chunk} - budget exhausted")
+                    time_budget.record_chunk_skipped()
+                    bump('chunk_budget_skipped')
+                elif not download_pending:
+                    # Download failed completely and won't be retried - skip waiting
+                    log.debug(f"GET_IMG: Skipping retry for {chunk} - download not pending "
+                             f"(in_flight={chunk.in_flight}, in_queue={chunk.in_queue})")
+                    bump('chunk_retry_skipped_not_pending')
                 else:
-                    chunk_ready = chunk.ready.wait(maxwait)
+                    # Download still in progress or just completed - worth checking
+                    log.debug(f"GET_IMG: Final retry for {chunk} "
+                             f"(in_flight={chunk.in_flight}, in_queue={chunk.in_queue}, "
+                             f"budget remaining={time_budget.remaining:.2f}s)")
+                    bump('retry_chunk_count')
+                    
+                    if chunk.ready.is_set():
+                        # Completed during fallback attempts
+                        chunk_ready = True
+                        log.debug(f"Chunk {chunk} completed during fallbacks, proceeding to decode")
+                    else:
+                        # Still in progress - wait with reduced timeout (1s max for retry)
+                        chunk_ready = time_budget.wait_with_budget(chunk.ready, max_single_wait=1.0)
+                
                 if chunk_ready and chunk.data:
                     log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Final retry for {chunk}, SUCCESS!")
                     try:
@@ -1391,162 +3933,370 @@ class Tile(object):
                 bump('chunk_missing_count')
                 if is_permanent_failure:
                     log.info(f"Chunk {chunk} permanently failed and all fallbacks exhausted")
+            else:
+                # Successfully processed this chunk within budget
+                time_budget.record_chunk_processed()
                 
             return (chunk, chunk_img, start_x, start_y)
         
-        # Process chunks lazily - only after their download has started
+        # OPTIMIZATION: Submit all chunks to decode executor immediately
+        # Instead of polling for download_started, submit all chunks upfront.
+        # Each worker will wait on its chunk's ready event, sleeping efficiently.
+        # This removes polling overhead (~25ms per iteration) and lets the executor
+        # manage scheduling. The _decode_sem already limits concurrent decodes.
         max_pool_workers = min(CURRENT_CPU_COUNT, len(chunks), _MAX_DECODE)
         
-        processed_chunks = set()
         total_chunks = len(chunks)
         completed = 0
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_pool_workers)
         active_futures = {}
-        
-        start_time = time.time()
-        max_total_wait = max(10.0, self.maxchunk_wait * 10)  # At least 10s, or 10x maxwait
+        chunks_with_images = set()  # Track which chunks have images for fallback sweep
         
         try:
-            while len(processed_chunks) < len(chunks):
-                # Safety timeout check
-                if time.time() - start_time > max_total_wait:
-                    chunks_abandoned = len(chunks) - len(processed_chunks)
-                    if chunks_abandoned > 0:
-                        bump('chunk_missing_count', chunks_abandoned)
-                    log.warning(f"Lazy submission timeout after {max_total_wait}s, "
-                               f"processed {len(processed_chunks)}/{len(chunks)} chunks, abandoned {chunks_abandoned}")
+            # Submit all chunks immediately (except permanently failed ones)
+            for chunk in chunks:
+                if chunk.permanent_failure:
+                    bump('chunk_missing_count')
+                    continue
+                future = executor.submit(process_chunk, chunk)
+                active_futures[future] = chunk
+            
+            log.debug(f"GET_IMG: Submitted {len(active_futures)} chunks to decode executor")
+            
+            # Collect results as they complete, respecting time budget
+            while active_futures:
+                # === TIME BUDGET CHECK ===
+                if time_budget.exhausted:
+                    remaining = len(active_futures)
+                    if remaining > 0:
+                        bump('chunk_budget_exhausted', remaining)
+                    log.info(f"Time budget exhausted after {time_budget.elapsed:.2f}s for mipmap {mipmap}: "
+                            f"processed {time_budget.chunks_processed}, skipped {time_budget.chunks_skipped}, "
+                            f"remaining {remaining}/{total_chunks}")
                     break
                 
-                # Smart early exit - if all started downloads are done, exit
-                # Only use early exit when spatial priorities are active (during flight)
-                # to avoid incomplete mipmaps during initial load or tests
-                if datareftracker.data_valid and datareftracker.connected:
-                    chunks_started = sum(1 for c in chunks if c.download_started.is_set())
-                    if chunks_started > 0 and len(processed_chunks) >= chunks_started:
-                        chunks_never_started = len(chunks) - chunks_started
-                        if chunks_never_started > 0:
-                            log.debug(f"Early exit: {chunks_never_started} chunks never started")
-                        break
+                # Wait for completions with a short timeout to allow budget checks
+                done, pending = concurrent.futures.wait(
+                    active_futures.keys(), 
+                    timeout=0.05,  # Check budget every 50ms
+                    return_when=concurrent.futures.FIRST_COMPLETED
+                )
                 
-                # Find chunks whose downloads have started but haven't been submitted for processing yet
-                for chunk in chunks:
-                    chunk_id = id(chunk)
-                    if chunk_id in processed_chunks:
-                        continue
-                    
-                    # Skip permanently failed chunks immediately
-                    if chunk.permanent_failure:
-                        processed_chunks.add(chunk_id)
-                        bump('chunk_missing_count')
-                        continue
-                    
-                    # Submit when download has started
-                    if chunk.download_started.is_set():
-                        future = executor.submit(process_chunk, chunk)
-                        active_futures[future] = chunk
-                        processed_chunks.add(chunk_id)
-                
-                # Process any completed futures
-                if active_futures:
-                    done, pending = concurrent.futures.wait(
-                        active_futures.keys(), 
-                        timeout=0.025,  # Check 4x more frequently
-                        return_when=concurrent.futures.FIRST_COMPLETED
-                    )
-                    
-                    for future in done:
+                for future in done:
+                    try:
+                        chunk, chunk_img, start_x, start_y = future.result()
+                        completed += 1
+                        if chunk_img:
+                            _safe_paste(new_im, chunk_img, start_x, start_y)
+                            chunks_with_images.add(id(chunk))  # Track for fallback sweep
+                    except Exception as exc:
+                        log.error(f"Chunk processing failed: {exc}")
+                    finally:
+                        del active_futures[future]
+                    # Progress logging
+                    if total_chunks and (completed % max(1, total_chunks // 4) == 0):
+                        log.debug(f"GET_IMG progress: {completed}/{total_chunks} chunks for mip {mipmap}")
+            
+            # Process any remaining active futures (when budget wasn't exhausted)
+            # Budget exhaustion already logged above, so just drain remaining futures
+            remaining_futures = list(active_futures.keys())
+            if remaining_futures:
+                # Use short timeout to avoid blocking forever
+                timeout = max(0.5, time_budget.remaining) if not time_budget.exhausted else 0.5
+                try:
+                    for future in concurrent.futures.as_completed(remaining_futures, timeout=timeout):
                         try:
                             chunk, chunk_img, start_x, start_y = future.result()
-                            completed += 1
                             if chunk_img:
                                 _safe_paste(new_im, chunk_img, start_x, start_y)
+                                chunks_with_images.add(id(active_futures.get(future)))
                         except Exception as exc:
                             log.error(f"Chunk processing failed: {exc}")
                         finally:
-                            del active_futures[future]
-                        # Progress logging
-                        if total_chunks and (completed % max(1, total_chunks // 4) == 0):
-                            log.debug(f"GET_IMG progress: {completed}/{total_chunks} chunks for mip {mipmap}")
-                else:
-                    # No active futures yet, wait a bit before checking for started downloads
-                    time.sleep(0.01)  # Check 5x more frequently
-            
-            # Wait for any remaining futures to complete
-            for future in concurrent.futures.as_completed(active_futures.keys()):
-                try:
-                    chunk, chunk_img, start_x, start_y = future.result()
-                    if chunk_img:
-                        _safe_paste(new_im, chunk_img, start_x, start_y)
-                except Exception as exc:
-                    log.error(f"Chunk processing failed: {exc}")
-            
-            # CRITICAL: Process any chunks that never started downloading
-            # These would otherwise be left as missing color patches
-            unprocessed_chunks = [c for c in chunks if id(c) not in processed_chunks and not c.permanent_failure]
-            if unprocessed_chunks:
-                log.info(f"Processing {len(unprocessed_chunks)} chunks that never started downloading (fallback only)")
-                
-                # Submit ALL unprocessed chunks in parallel (not serial!)
-                unprocessed_futures = {}
-                for chunk in unprocessed_chunks:
-                    # Use skip_download_wait=True to go straight to fallbacks
-                    future = executor.submit(process_chunk, chunk, skip_download_wait=True)
-                    unprocessed_futures[future] = chunk
-                    processed_chunks.add(id(chunk))
-                
-                # Process results as they complete (parallel, not serial)
-                # Use try-except to handle TimeoutError gracefully instead of crashing
-                try:
-                    for future in concurrent.futures.as_completed(unprocessed_futures.keys(), timeout=10):
-                        try:
-                            chunk, chunk_img, start_x, start_y = future.result()
-                            if chunk_img:
-                                _safe_paste(new_im, chunk_img, start_x, start_y)
-                            else:
-                                bump('chunk_missing_count')
-                        except Exception as exc:
-                            chunk = unprocessed_futures.get(future, "unknown")
-                            log.debug(f"Fallback failed for unprocessed chunk {chunk}: {exc}")
-                            bump('chunk_missing_count')
+                            if future in active_futures:
+                                del active_futures[future]
                 except TimeoutError:
-                    # Some futures didn't complete in time - count them as missing
-                    # This prevents crashes when the system is overloaded
-                    unfinished_count = sum(1 for f in unprocessed_futures.keys() if not f.done())
-                    log.warning(f"Fallback processing timeout: {unfinished_count} chunks still pending, marking as missing")
-                    bump('chunk_missing_count', unfinished_count)
-                    bump('fallback_timeout_count')
+                    unfinished = len([f for f in remaining_futures if not f.done()])
+                    log.debug(f"Timeout waiting for {unfinished} remaining chunks")
+                    # Cancel remaining futures to free resources
+                    for future in remaining_futures:
+                        if not future.done():
+                            future.cancel()
+                    # Clear remaining references
+                    active_futures.clear()
+            
+            # === FALLBACK SWEEP PHASE ===
+            # After main budget expires, use fallback budget to fill in missing chunks
+            # This maximizes image quality by systematically processing all gaps
+            if fallback_extends_budget and time_budget.exhausted and fallback_level >= 2:
+                # Identify chunks without images
+                missing_chunks = [c for c in chunks if id(c) not in chunks_with_images 
+                                  and not c.permanent_failure]
+                
+                if missing_chunks:
+                    # Create fallback budget if not already created
+                    if fallback_budget is None:
+                        fallback_budget = TimeBudget(fallback_timeout)
+                        log.info(f"GET_IMG: Starting fallback sweep for {len(missing_chunks)} missing chunks "
+                                f"(budget={fallback_timeout:.1f}s)")
+                    elif not fallback_budget.exhausted:
+                        log.info(f"GET_IMG: Fallback sweep for {len(missing_chunks)} missing chunks "
+                                f"(remaining={fallback_budget.remaining:.2f}s)")
                     
+                    # Process missing chunks with fallback budget
+                    sweep_recovered = 0
+                    for chunk in missing_chunks:
+                        if fallback_budget.exhausted:
+                            log.debug(f"Fallback sweep: budget exhausted after recovering {sweep_recovered} chunks")
+                            break
+                        
+                        # Calculate position for this chunk
+                        start_x = int(chunk.width * (chunk.col - col))
+                        start_y = int(chunk.height * (chunk.row - row))
+                        
+                        # Try cascading fallback for this chunk
+                        chunk_img = self.get_or_build_lower_mipmap_chunk(
+                            mipmap, chunk.col, chunk.row, zoom,
+                            main_budget=None,  # Main already exhausted
+                            fallback_budget=fallback_budget
+                        )
+                        
+                        if chunk_img:
+                            _safe_paste(new_im, chunk_img, start_x, start_y)
+                            chunks_with_images.add(id(chunk))
+                            sweep_recovered += 1
+                            bump('fallback_sweep_recovered')
+                    
+                    if sweep_recovered > 0:
+                        log.info(f"GET_IMG: Fallback sweep recovered {sweep_recovered}/{len(missing_chunks)} chunks")
+                    
+                    # Update missing count for chunks we couldn't recover
+                    still_missing = len(missing_chunks) - sweep_recovered
+                    if still_missing > 0:
+                        bump('chunk_missing_count', still_missing)
         finally:
-            executor.shutdown(wait=True)
+            # Use wait=False to avoid blocking on cancelled/timed-out futures
+            # The futures will complete in the background but we won't wait for them
+            # Since process_chunk checks time_budget.exhausted, they should exit quickly
+            executor.shutdown(wait=False, cancel_futures=True)
 
-        if complete_img and mipmap <= self.max_mipmap:
+        # Determine if we need to cache this image for fallback/upscaling
+        should_cache = complete_img and mipmap <= self.max_mipmap
+        
+        if should_cache:
             log.debug(f"GET_IMG: Save complete image for later...")
             # Store image with metadata (col, row, zoom) for coordinate mapping in upscaling
             self.imgs[mipmap] = (new_im, col, row, zoom)
 
-        log.debug(f"GET_IMG: DONE!  IMG created {new_im}")
+        # Log budget summary including fallback budget if used
+        if fallback_budget is not None:
+            log.info(f"GET_IMG: DONE! Main budget: {time_budget.elapsed:.2f}s, "
+                    f"Fallback budget: {fallback_budget.elapsed:.2f}s/{fallback_timeout:.1f}s "
+                    f"(exhausted={fallback_budget.exhausted})")
+        else:
+            log.debug(f"GET_IMG: DONE!  IMG created {new_im}")
 
+        # OPTIMIZATION: In-place desaturation when image isn't cached
+        # Only copy when image was saved to cache AND needs desaturation
         if seasons_enabled:
             saturation = 0.01 * season_saturation_locked(self.row, self.col, self.tilename_zoom)
             if saturation < 1.0:    # desaturation is expensive
-                new_im = new_im.copy().desaturate(saturation)
+                if should_cache:
+                    # Must copy because original is cached for fallback use
+                    new_im = new_im.copy().desaturate(saturation)
+                else:
+                    # In-place desaturation - assign result for error handling
+                    new_im = new_im.desaturate(saturation)
+        
         # Return image along with mipmap and zoom level this was created at
         return new_im
 
-    def get_or_build_lower_mipmap_chunk(self, target_mipmap, col, row, zoom):
+    def _try_lazy_build_fallback_mipmap(self, time_budget=None):
+        """
+        Lazy build a lower-detail mipmap when the first chunk failure occurs.
+        
+        This is triggered on-demand (not proactively like pre-building) to provide
+        Fallback 2 support. When a mipmap 0 chunk fails, we quickly build mipmap 2
+        (which has only 16 chunks at ZL14 vs 256 at ZL16), enabling subsequent
+        failing chunks to upscale from the built image.
+        
+        Key differences from pre-building:
+        - Only runs when a failure actually occurs (not on every tile)
+        - Only runs once per tile (tracked by _lazy_build_attempted)
+        - Uses reduced time budget to avoid blocking
+        - Builds mipmap 2 (faster than mipmap 1, still useful for upscaling)
+        
+        Returns:
+            True if a mipmap was successfully built, False otherwise
+        """
+        # Only attempt once per tile
+        if self._lazy_build_attempted:
+            return False
+        
+        self._lazy_build_attempted = True
+        
+        # Choose which mipmap to build:
+        # - Mipmap 2 (ZL14): 16 chunks, fast to build, 4x upscale to mipmap 0
+        # - Mipmap 3 (ZL13): 4 chunks, very fast, 8x upscale (lower quality)
+        # We use mipmap 2 as a balance between speed and quality
+        target_mipmap = min(2, self.max_mipmap)
+        
+        # Skip if target_mipmap is 0 - we're already building mipmap 0,
+        # so building it again as a "fallback" is redundant
+        if target_mipmap == 0:
+            log.debug("Lazy build: max_mipmap is 0, no lower-detail mipmap available")
+            return False
+        
+        # Skip if we somehow already have this mipmap
+        if target_mipmap in self.imgs:
+            log.debug(f"Lazy build: mipmap {target_mipmap} already exists")
+            return True
+        
+        # Calculate available budget for lazy build
+        # Use at most 1.5 seconds or 30% of remaining budget
+        if time_budget and not time_budget.exhausted:
+            max_lazy_budget = min(1.5, time_budget.remaining * 0.3)
+            if max_lazy_budget < 0.3:
+                log.debug(f"Lazy build: insufficient budget ({max_lazy_budget:.2f}s), skipping")
+                return False
+            lazy_budget = TimeBudget(max_lazy_budget)
+        else:
+            # No budget or exhausted - use a small fixed budget
+            lazy_budget = TimeBudget(1.0)
+        
+        log.debug(f"Lazy build: triggering build of mipmap {target_mipmap} "
+                 f"(budget={lazy_budget.max_seconds:.2f}s)")
+        bump('lazy_build_triggered')
+        
+        try:
+            # Build the lower mipmap
+            # This will populate self.imgs[target_mipmap] for Fallback 2 to use
+            result = self.get_img(
+                target_mipmap, 
+                startrow=0, 
+                endrow=None, 
+                maxwait=1.0,
+                time_budget=lazy_budget
+            )
+            
+            if result and target_mipmap in self.imgs:
+                log.debug(f"Lazy build: successfully built mipmap {target_mipmap}")
+                bump('lazy_build_success')
+                return True
+            else:
+                log.debug(f"Lazy build: mipmap {target_mipmap} build returned but not in imgs")
+                return False
+                
+        except Exception as e:
+            log.debug(f"Lazy build: failed to build mipmap {target_mipmap}: {e}")
+            bump('lazy_build_failed')
+            return False
+
+    def _get_shared_fallback_chunk(self, col, row, zoom):
+        """
+        Get or create a fallback chunk from the shared pool.
+        
+        This enables chunk sharing: when multiple high-zoom chunks fail and need
+        the same parent chunk, they share a single download instead of each
+        downloading it independently.
+        
+        Thread-safe: Uses a lock to prevent race conditions.
+        
+        Args:
+            col, row, zoom: Coordinates of the fallback chunk to get/create
+            
+        Returns:
+            Chunk object (may already be ready, in-flight, or newly created)
+        """
+        key = (col, row, zoom)
+        
+        with self._fallback_pool_lock:
+            if key in self._fallback_chunk_pool:
+                chunk = self._fallback_chunk_pool[key]
+                log.debug(f"Reusing shared fallback chunk {chunk} from pool")
+                bump('fallback_chunk_pool_hit')
+                return chunk
+            
+            # Create new chunk and add to pool
+            # Use HIGH priority (low number) for fallback chunks since they're blocking
+            # tile completion. Regular mipmap 0 chunks have priority ~5-10, so we use
+            # priority 0 to ensure fallback chunks get processed urgently.
+            # Pass tile_id for completion tracking (predictive DDS generation)
+            chunk = Chunk(col, row, self.maptype, zoom, priority=0, cache_dir=self.cache_dir, tile_id=self.id)
+            self._fallback_chunk_pool[key] = chunk
+            bump('fallback_chunk_pool_miss')
+            
+            # Check cache - if hit, it's ready immediately
+            if chunk.ready.is_set():
+                log.debug(f"Created shared fallback chunk {chunk} - already cached")
+            else:
+                log.debug(f"Created shared fallback chunk {chunk} - needs download")
+            
+            return chunk
+
+    def get_or_build_lower_mipmap_chunk(self, target_mipmap, col, row, zoom, 
+                                         main_budget=None, fallback_budget=None,
+                                         fallback_timeout=None):
         """
         Cascading fallback: Try to get/build progressively lower-detail mipmaps.
         Only downloads chunks on-demand when needed (lazy evaluation).
         
+        OPTIMIZED: Uses shared chunk pool to prevent duplicate downloads.
+        When multiple chunks fail and need the same parent, they share one download.
+        
+        Budget strategy:
+        - Uses main_budget first (remaining time from tile's main budget)
+        - When main_budget exhausts, creates/switches to fallback_budget (extra time)
+        - This ensures max total time is: main_budget + fallback_timeout
+        
         Args:
             target_mipmap: The mipmap level we need (e.g., 0)
             col, row, zoom: Chunk coordinates at target zoom
+            main_budget: Primary TimeBudget (tile's main budget)
+            fallback_budget: Extra TimeBudget for fallback extension (may be None, created lazily)
+            fallback_timeout: Seconds for fallback budget (used to create it lazily when main exhausts)
         
         Returns:
             Upscaled AoImage or None
         """
+        # Track the fallback budget - may be created lazily when main exhausts
+        _fallback_budget = fallback_budget
+        _using_fallback_budget = False
+        
+        def get_active_budget():
+            """Return the currently active budget, switching from main to fallback when needed."""
+            nonlocal _fallback_budget, _using_fallback_budget
+            if main_budget and not main_budget.exhausted:
+                return main_budget
+            # Main exhausted - try fallback budget
+            if _fallback_budget is None and fallback_timeout:
+                # Create fallback budget NOW (timer starts when main exhausts)
+                _fallback_budget = TimeBudget(fallback_timeout)
+                log.info(f"Cascading fallback: main budget exhausted, creating fallback budget {fallback_timeout:.1f}s")
+            if _fallback_budget and not _fallback_budget.exhausted:
+                if not _using_fallback_budget:
+                    log.debug(f"Cascading fallback: switching to fallback budget "
+                             f"(remaining={_fallback_budget.remaining:.2f}s)")
+                    _using_fallback_budget = True
+                return _fallback_budget
+            return None
+        
+        # Early exit if both budgets exhausted
+        active_budget = get_active_budget()
+        if main_budget is None and fallback_budget is None:
+            pass  # No budget constraints
+        elif active_budget is None:
+            log.debug(f"Cascading fallback: skipping - all budgets exhausted")
+            return None
+        
         # Try each progressively lower-detail mipmap
         for fallback_mipmap in range(target_mipmap + 1, self.max_mipmap + 1):
+            # Check budget at each iteration (may switch from main to fallback)
+            active_budget = get_active_budget()
+            if (main_budget is not None or fallback_budget is not None) and active_budget is None:
+                log.debug(f"Cascading fallback: stopping at mipmap {fallback_mipmap} - all budgets exhausted")
+                break
+            
             log.debug(f"Cascading fallback: trying mipmap {fallback_mipmap} for failed mipmap {target_mipmap}")
             
             # Calculate coordinates at fallback mipmap level
@@ -1555,63 +4305,82 @@ class Tile(object):
             fallback_row = row >> mipmap_diff
             fallback_zoom = zoom - mipmap_diff
             
-            # Try to get the chunk at this fallback level
-            fallback_chunk = Chunk(fallback_col, fallback_row, self.maptype, fallback_zoom, cache_dir=self.cache_dir)
+            # OPTIMIZED: Use shared pool to prevent duplicate downloads
+            # Multiple failing chunks that need the same parent share one download
+            fallback_chunk = self._get_shared_fallback_chunk(fallback_col, fallback_row, fallback_zoom)
             
-            # Check cache first
+            # If not ready, submit for download and wait
             if not fallback_chunk.ready.is_set():
-                if fallback_chunk.get_cache():
-                    fallback_chunk.ready.set()
-                    log.debug(f"Cascading fallback: found cached chunk at mipmap {fallback_mipmap}")
-                else:
-                    # Not in cache, try to download it (with shorter timeout)
+                # Submit if not already in flight or queue
+                if not fallback_chunk.in_flight and not fallback_chunk.in_queue:
                     chunk_getter.submit(fallback_chunk)
-                    # Wait with reduced timeout (don't want to cascade delays)
-                    fallback_chunk_ready = fallback_chunk.ready.wait(timeout=min(3.0, self.get_maxwait() / 2))
-                    if not fallback_chunk_ready:
-                        log.debug(f"Cascading fallback: mipmap {fallback_mipmap} also timed out, trying next level")
-                        fallback_chunk.close()
-                        continue
-            
-            # We have the chunk data, decode and upscale it
-            if fallback_chunk.data:
-                try:
-                    with _decode_sem:
-                        fallback_img = AoImage.load_from_memory(fallback_chunk.data)
-                        if fallback_img is None:
-                            log.warning(f"GET_IMG: Fallback load_from_memory returned None for {fallback_chunk}")
-                            continue
-                    
-                    # Calculate which portion to extract and upscale
-                    scale_factor = 1 << mipmap_diff
-                    offset_col = col % scale_factor
-                    offset_row = row % scale_factor
-                    
-                    log.debug(f"CASCADE DEBUG: target=({col},{row}), fallback_chunk=({fallback_col},{fallback_row}), offset=({offset_col},{offset_row}), scale={scale_factor}")
-                    
-                    # Pixel position in fallback image
-                    pixel_x = offset_col * (256 // scale_factor)
-                    pixel_y = offset_row * (256 // scale_factor)
-                    crop_size = 256 // scale_factor
-                    
-                    # Upscale to 256x256
-                    upscaled = fallback_img.crop_and_upscale(
-                        pixel_x, pixel_y, crop_size, crop_size, scale_factor
+                
+                # Wait for download with budget awareness
+                # Uses active_budget which may switch from main to fallback mid-wait
+                per_chunk_timeout = self.get_maxwait()
+                active_budget = get_active_budget()
+                if active_budget:
+                    fallback_chunk_ready = active_budget.wait_with_budget(
+                        fallback_chunk.ready, max_single_wait=per_chunk_timeout
                     )
-                    
-                    log.debug(f"Cascading fallback SUCCESS: upscaled mipmap {fallback_mipmap} -> {target_mipmap} at {col}x{row} (scale {scale_factor}x)")
-                    bump('upscaled_chunk_count')
-                    bump('chunk_from_cascade_fallback')
-                    
-                    fallback_chunk.close()
-                    return upscaled
-                    
-                except Exception as e:
-                    log.warning(f"Cascading fallback: failed to upscale from mipmap {fallback_mipmap}: {e}")
-                    fallback_chunk.close()
+                else:
+                    # No budget constraints - use simple timeout
+                    fallback_chunk_ready = fallback_chunk.ready.wait(timeout=per_chunk_timeout)
+                
+                if not fallback_chunk_ready:
+                    # Check if we can switch to fallback budget and continue
+                    active_budget = get_active_budget()
+                    if active_budget:
+                        log.debug(f"Cascading fallback: mipmap {fallback_mipmap} timed out, "
+                                 f"continuing with budget (remaining={active_budget.remaining:.2f}s)")
+                    else:
+                        log.debug(f"Cascading fallback: mipmap {fallback_mipmap} timed out, all budgets exhausted")
+                    # Don't close - shared pool manages lifecycle
                     continue
             
-            fallback_chunk.close()
+            # Chunk is ready - check if we have valid data
+            if not fallback_chunk.data:
+                log.debug(f"Cascading fallback: chunk {fallback_chunk} ready but no data")
+                continue
+            
+            # Decode and upscale
+            try:
+                with _decode_sem:
+                    fallback_img = AoImage.load_from_memory(fallback_chunk.data)
+                    if fallback_img is None:
+                        log.warning(f"Cascading fallback: load_from_memory returned None for {fallback_chunk}")
+                        continue
+                
+                # Calculate which portion to extract and upscale
+                scale_factor = 1 << mipmap_diff
+                offset_col = col % scale_factor
+                offset_row = row % scale_factor
+                
+                log.debug(f"CASCADE DEBUG: target=({col},{row}), fallback_chunk=({fallback_col},{fallback_row}), "
+                         f"offset=({offset_col},{offset_row}), scale={scale_factor}")
+                
+                # Pixel position in fallback image
+                pixel_x = offset_col * (256 // scale_factor)
+                pixel_y = offset_row * (256 // scale_factor)
+                crop_size = 256 // scale_factor
+                
+                # Upscale to 256x256
+                upscaled = fallback_img.crop_and_upscale(
+                    pixel_x, pixel_y, crop_size, crop_size, scale_factor
+                )
+                
+                log.debug(f"Cascading fallback SUCCESS: upscaled mipmap {fallback_mipmap} -> {target_mipmap} "
+                         f"at {col}x{row} (scale {scale_factor}x)")
+                bump('upscaled_chunk_count')
+                bump('chunk_from_cascade_fallback')
+                
+                # Don't close fallback_chunk - shared pool manages lifecycle
+                # Other threads may still be using this chunk
+                return upscaled
+                
+            except Exception as e:
+                log.warning(f"Cascading fallback: failed to upscale from mipmap {fallback_mipmap}: {e}")
+                continue
         
         log.debug(f"Cascading fallback: all mipmaps failed for {col}x{row} at mipmap {target_mipmap}")
         return None
@@ -1761,14 +4530,28 @@ class Tile(object):
         return None
 
     def get_best_chunk(self, col, row, mm, zoom):
-        # For adaptive system, search up to actual_max_zoom level
+        """
+        Search disk cache for lower-zoom JPEG chunks and upscale to fill missing chunk.
+        
+        OPTIMIZED: Uses direct filesystem checks instead of creating Chunk objects.
+        This avoids the overhead of creating threading primitives (Event objects)
+        for each cache lookup. Only reads file data when cache hit is confirmed.
+        
+        Args:
+            col, row: Chunk coordinates at target zoom
+            mm: Target mipmap level
+            zoom: Target zoom level
+            
+        Returns:
+            Upscaled AoImage or None if no cached fallback found
+        """
         max_search_zoom = self.max_zoom
 
         for i in range(mm + 1, self.max_mipmap + 1):
             # Difference between requested mm and found image mm level
             diff = i - mm
             
-            # Equivalent col, row, zl
+            # Equivalent col, row, zl at lower zoom
             col_p = col >> diff
             row_p = row >> diff
             zoom_p = zoom - i
@@ -1779,22 +4562,67 @@ class Tile(object):
 
             scalefactor = min(1 << diff, 16)
 
-            # Check if we have a cached chunk
-            c = Chunk(col_p, row_p, self.maptype, zoom_p, cache_dir=self.cache_dir)
-            log.debug(f"Check cache for {c}")
-            cached = c.get_cache()
-            if not cached:
-                c.close()
+            # OPTIMIZED: Direct cache path check without Chunk object creation
+            # This avoids creating threading.Event objects for each lookup
+            chunk_id = f"{col_p}_{row_p}_{zoom_p}_{self.maptype}"
+            cache_path = os.path.join(self.cache_dir, f"{chunk_id}.jpg")
+            
+            # Fast existence check - avoids Chunk object overhead
+            if not os.path.isfile(cache_path):
+                bump('chunk_miss')
                 continue
+            
+            # Cache file exists - read and validate
+            bump('chunk_hit')
+            log.debug(f"Found cache file for {chunk_id}, reading...")
+            
+            # Read file data with retry for Windows file locking
+            data = None
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    data = Path(cache_path).read_bytes()
+                    break
+                except PermissionError:
+                    if attempt < max_attempts:
+                        time.sleep(0.02 * attempt)
+                        continue
+                    log.debug(f"Permission denied reading cache {cache_path}")
+                    break
+                except FileNotFoundError:
+                    # File was deleted between check and read (race condition)
+                    break
+                except OSError as e:
+                    winerr = getattr(e, 'winerror', None)
+                    if winerr in (5, 32, 33) and attempt < max_attempts:
+                        time.sleep(0.02 * attempt)
+                        continue
+                    log.debug(f"OSError reading cache {cache_path}: {e}")
+                    break
+            
+            if not data:
+                continue
+            
+            # Validate JPEG header
+            if not _is_jpeg(data[:3]):
+                log.debug(f"Cache file {cache_path} not a valid JPEG")
+                continue
+            
+            # Touch the file to update mtime for LRU cache management
+            try:
+                os.utime(cache_path, None)
+            except (FileNotFoundError, PermissionError):
+                pass
         
             log.debug(f"Found cached JPEG for {col}x{row}x{zoom} (mm{mm}) at {col_p}x{row_p}x{zoom_p} (mm{i}), upscaling {scalefactor}x")
+            
             # Offset into chunk
             col_offset = col % scalefactor
             row_offset = row % scalefactor
 
             log.debug(f"UPSCALE DEBUG: col={col}, row={row}, col_p={col_p}, row_p={row_p}, col_offset={col_offset}, row_offset={row_offset}, scalefactor={scalefactor}")
 
-            # Pixel width
+            # Pixel dimensions to extract from source
             w_p = max(1, 256 >> diff)
             h_p = max(1, 256 >> diff)
 
@@ -1802,26 +4630,27 @@ class Tile(object):
 
             # Load image to crop
             try:
-                img_p = AoImage.load_from_memory(c.data)
+                img_p = AoImage.load_from_memory(data)
             except Exception as e:
-                log.error(f"Exception loading chunk {c} into memory: {e}")
-                c.close()
+                log.error(f"Exception loading cached JPEG {chunk_id} into memory: {e}")
                 continue
             
             if not img_p:
-                log.warning(f"Failed to load chunk {c} into memory (returned None).")
-                c.close()
+                log.warning(f"Failed to load cached JPEG {chunk_id} into memory (returned None).")
                 continue
 
-            # Crop
-            crop_img = AoImage.new('RGBA', (w_p, h_p), (0,255,0))
+            # Crop the relevant portion
+            crop_img = AoImage.new('RGBA', (w_p, h_p), (0, 255, 0))
             img_p.crop(crop_img, (col_offset * w_p, row_offset * h_p))
             chunk_img = crop_img.scale(scalefactor)
 
-            # Close the cache chunk to free memory before returning
-            c.close()
+            # Free source image memory
+            try:
+                img_p.close()
+            except Exception:
+                pass
             
-            # Track upscaling from cached JPEGs separately
+            # Track upscaling from cached JPEGs
             bump('upscaled_from_jpeg_count')
             return chunk_img
 
@@ -1834,6 +4663,66 @@ class Tile(object):
             effective_maxwait = 20
         return effective_maxwait
 
+    def get_fallback_level(self):
+        """Get the fallback level as an integer.
+        
+        Converts string config values to integer:
+        - 'none' -> 0 (skip all fallbacks)
+        - 'cache' -> 1 (disk cache and pre-built mipmaps only)
+        - 'full' -> 2 (all fallbacks including network downloads)
+        
+        For backwards compatibility, also accepts integer strings '0', '1', '2'
+        and boolean True/False (legacy config parsing artifacts).
+        """
+        fb_value = getattr(CFG.autoortho, 'fallback_level', 'cache')
+        
+        # Handle string values
+        if isinstance(fb_value, str):
+            fb_lower = fb_value.lower().strip()
+            if fb_lower == 'none':
+                return 0
+            elif fb_lower == 'cache':
+                return 1
+            elif fb_lower == 'full':
+                return 2
+            else:
+                # Try parsing as integer for backwards compatibility
+                try:
+                    # Clamp to valid range 0-2
+                    return max(0, min(2, int(fb_value)))
+                except ValueError:
+                    return 1  # Default to cache
+        # Handle boolean (from SectionParser when value was '0' or '1')
+        elif isinstance(fb_value, bool):
+            return 2 if fb_value else 0
+        # Handle integer
+        elif isinstance(fb_value, int):
+            return max(0, min(2, fb_value))
+        else:
+            return 1  # Default to cache
+
+    def get_fallback_extends_budget(self):
+        """Check if fallbacks should extend beyond the time budget.
+        
+        When True and fallback_level is 'full', network fallbacks will continue
+        even after the tile time budget is exhausted (prioritizing quality over timing).
+        
+        When False, fallbacks respect the time budget strictly (prioritizing timing over quality).
+        
+        Returns:
+            bool: True if fallbacks should ignore budget exhaustion
+        """
+        fb_value = getattr(CFG.autoortho, 'fallback_extends_budget', False)
+        
+        # Handle string values from config
+        if isinstance(fb_value, str):
+            return fb_value.lower().strip() in ('true', '1', 'yes', 'on')
+        # Handle boolean directly
+        elif isinstance(fb_value, bool):
+            return fb_value
+        else:
+            return False  # Default: respect budget
+
     #@profile
     @locked
     def get_mipmap(self, mipmap=0):
@@ -1842,21 +4731,43 @@ class Tile(object):
         # Otherwise we risk contention such as waiting get_img call attempting to build an image as 
         # another thread closes chunks.
         #
+        
+        # Start timing FULL tile creation (download + compose + compress)
+        # Use monotonic() for consistent interval measurement (immune to clock adjustments)
+        tile_creation_start = time.monotonic()
 
         log.debug(f"GET_MIPMAP: {self}")
 
         if mipmap > self.max_mipmap:
             mipmap = self.max_mipmap
+        
+        # === BUDGET TIMING ===
+        # The tile budget starts when get_img() is first called, NOT when X-Plane first
+        # requests the tile. This means queue wait time doesn't count against the budget.
+        # Only actual processing time (chunk downloads, composition, compression) counts.
+        #
+        # NOTE: We intentionally do NOT skip get_img/gen_mipmaps when budget is exhausted.
+        # Even if the budget is exhausted, we must still:
+        # 1. Call get_img() to create an image filled with missing_color
+        # 2. Call gen_mipmaps() to compress it into the DDS buffer
+        # This ensures X-Plane receives a valid DDS with missing_color tiles instead of
+        # black/uninitialized data. Once X-Plane reads a DDS, it's cached and won't refresh.
+        # The get_img() method handles budget exhaustion gracefully by skipping chunk downloads
+        # but still returning a valid (missing_color filled) image for compression.
+        
+        if self._tile_time_budget and self._tile_time_budget.exhausted:
+            log.debug(f"GET_MIPMAP: Tile budget exhausted, will build mipmap {mipmap} with missing_color (no new downloads)")
 
         # We can have multiple threads wait on get_img ...
         log.debug(f"GET_MIPMAP: Next call is get_img which may block!.............")
-        new_im = self.get_img(mipmap, maxwait=self.get_maxwait())
+        # Pass the tile-level budget to get_img so it's shared across all mipmap builds
+        new_im = self.get_img(mipmap, maxwait=self.get_maxwait(), time_budget=self._tile_time_budget)
         if not new_im:
             log.debug("GET_MIPMAP: No updates, so no image generated")
             return True
 
         self.ready.clear()
-        start_time = time.time()
+        compress_start_time = time.monotonic()
         try:
             if mipmap == 0:
                 self.dds.gen_mipmaps(new_im, mipmap, 0) 
@@ -1866,21 +4777,44 @@ class Tile(object):
             pass
             #new_im.close()
 
-        end_time = time.time()
+        compress_end_time = time.monotonic()
         self.ready.set()
 
+        # Calculate timing metrics
         zoom = self.max_zoom - mipmap
-        tile_time = end_time - start_time
-        mm_stats.set(mipmap, tile_time)
+        compress_time = compress_end_time - compress_start_time
+        total_creation_time = compress_end_time - tile_creation_start
+        
+        # Track compression time (legacy stat)
+        mm_stats.set(mipmap, compress_time)
+        
+        # Track FULL tile creation time (new stat for tuning tile_time_budget)
+        tile_creation_stats.set(mipmap, total_creation_time)
 
-        # Record mm stats via counters for aggregation
+        # Record per-mipmap count via counters for aggregation
         try:
             bump_many({
                 f"mm_count:{mipmap}": 1,
-                f"mm_time_total_ms:{mipmap}": int(tile_time * 1000)
             })
         except Exception:
             pass
+        
+        # Log tile completion when mipmap 0 is done (full tile delivered to X-Plane)
+        if mipmap == 0 and not self._completion_reported:
+            self._completion_reported = True
+            # Calculate time from first X-Plane request to completion
+            if self.first_request_time is not None:
+                tile_completion_time = time.monotonic() - self.first_request_time
+            else:
+                # Fallback: use the mipmap creation time if first_request_time wasn't set
+                tile_completion_time = total_creation_time
+            
+            log.debug(f"GET_MIPMAP: Tile {self} COMPLETED in {tile_completion_time:.2f}s "
+                     f"(mipmap 0 done, time from first request)")
+        
+        # Log per-mipmap creation time for visibility
+        log.debug(f"GET_MIPMAP: Tile {self} mipmap {mipmap} created in {total_creation_time:.2f}s "
+                 f"(download+compose: {total_creation_time - compress_time:.2f}s, compress: {compress_time:.2f}s)")
 
         # Don't close all chunks since we don't gen all mipmaps 
         if mipmap == 0:
@@ -1912,16 +4846,21 @@ class Tile(object):
     def close(self):
         log.debug(f"Closing {self}")
 
-        if self.dds.mipmap_list[0].retrieved:
-            if self.bytes_read < self.dds.mipmap_list[0].length:
-                log.warning(f"TILE: {self} retrieved mipmap 0, but only read {self.bytes_read}. Lowest offset: {self.lowest_offset}")
-            else:
-                log.debug(f"TILE: {self} retrieved mipmap 0, full read of mipmap! {self.bytes_read}.")
-
-
+        # Check refs first - if still referenced, don't close yet
         if self.refs > 0:
             log.warning(f"TILE: Trying to close, but has refs: {self.refs}")
             return
+
+        # Log mipmap retrieval status (safely check dds first)
+        if self.dds is not None:
+            try:
+                if self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
+                    if self.bytes_read < self.dds.mipmap_list[0].length:
+                        log.warning(f"TILE: {self} retrieved mipmap 0, but only read {self.bytes_read}. Lowest offset: {self.lowest_offset}")
+                    else:
+                        log.debug(f"TILE: {self} retrieved mipmap 0, full read of mipmap! {self.bytes_read}.")
+            except (AttributeError, IndexError):
+                pass  # DDS structure incomplete, continue with cleanup
 
         # ------------------------------------------------------------------
         # Memory-reclamation additions
@@ -1937,23 +4876,50 @@ class Tile(object):
                     im = img_data
                 
                 if im is not None and hasattr(im, "close"):
-                    im.close()
+                    try:
+                        im.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         finally:
             self.imgs.clear()
 
         # 2) Release DDS mip-map ByteIO buffers so the underlying bytes
         #    are no longer referenced from Python.
         if self.dds is not None:
-            for mm in getattr(self.dds, "mipmap_list", []):
-                mm.databuffer = None
+            try:
+                for mm in getattr(self.dds, "mipmap_list", []):
+                    mm.databuffer = None
+            except Exception:
+                pass
             # Drop the DDS object reference itself
             self.dds = None
 
-        for chunks in self.chunks.values():
-            for chunk in chunks:
-                chunk.close()
+        # 3) Close all chunks
+        try:
+            for chunks in self.chunks.values():
+                for chunk in chunks:
+                    try:
+                        chunk.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         self.chunks = {}
         
+        # 4) Close all fallback chunks in the shared pool
+        try:
+            with self._fallback_pool_lock:
+                for chunk in self._fallback_chunk_pool.values():
+                    try:
+                        chunk.close()
+                    except Exception:
+                        pass
+                self._fallback_chunk_pool.clear()
+        except Exception:
+            pass
+
 
 class TileCacher(object):
     hits = 0
@@ -1993,6 +4959,29 @@ class TileCacher(object):
         self.target_zoom_level_near_airports = int(CFG.autoortho.max_zoom_near_airports)
         log.info(f"Target zoom level set to ZL{self.target_zoom_level}")
 
+        # Dynamic zoom configuration
+        # When "dynamic", zoom level is computed based on predicted altitude at tile
+        # When "fixed" (default), uses the configured max_zoom value
+        self.max_zoom_mode = str(CFG.autoortho.max_zoom_mode).lower()
+        self.dynamic_zoom_manager = DynamicZoomManager()
+        self._last_logged_dynamic_zoom = None  # Track last logged zoom to reduce spam
+        if self.max_zoom_mode == "dynamic":
+            self.dynamic_zoom_manager.load_from_config(
+                CFG.autoortho.dynamic_zoom_steps
+            )
+            step_count = len(self.dynamic_zoom_manager.get_steps())
+            log.info("=" * 60)
+            log.info("DYNAMIC ZOOM MODE ACTIVATED")
+            log.info(f"  Quality steps configured: {step_count}")
+            if step_count > 0:
+                log.info(f"  Steps: {self.dynamic_zoom_manager.get_summary()}")
+                log.info("  Zoom levels will be adjusted based on predicted altitude")
+            else:
+                log.warning("  No quality steps configured - using default zoom")
+            log.info("=" * 60)
+        else:
+            log.info("Using fixed max zoom level (ZL%d)", self.target_zoom_level)
+
         self.clean_t = threading.Thread(target=self.clean, daemon=True)
         self.clean_t.start()
 
@@ -2001,11 +4990,219 @@ class TileCacher(object):
             self.enable_cache = True
             self.cache_tile_lim = 50
     
-    def _get_target_zoom_level(self, default_zoom: int) -> int:
+    def _compute_dynamic_zoom(self, row: int, col: int, tile_zoom: int) -> int:
+        """
+        Compute dynamic zoom level based on predicted altitude at tile.
+
+        Uses the aircraft's averaged flight data (heading, speed, vertical speed)
+        to predict what altitude the aircraft will be at when it reaches the
+        closest point to this tile. Then returns the appropriate zoom level
+        from the configured quality steps.
+        
+        If SimBrief flight data is loaded and the "use_flight_data" toggle is enabled,
+        and the aircraft is on-route, uses the flight plan altitude for that position
+        instead of DataRef-based prediction.
+
+        Args:
+            row: Tile row coordinate
+            col: Tile column coordinate
+            tile_zoom: Default zoom level for this tile
+
+        Returns:
+            The computed max zoom level for this tile
+        """
+        # Get tile center coordinates (needed for both methods)
+        tile_lat, tile_lon = _chunk_to_latlon(row, col, tile_zoom)
+        
+        # Check if SimBrief flight data should be used
+        simbrief_altitude_agl = self._get_simbrief_altitude_for_tile(tile_lat, tile_lon)
+        if simbrief_altitude_agl is not None:
+            # Use SimBrief flight plan AGL altitude for zoom calculation
+            if tile_zoom == 18 and not CFG.autoortho.using_custom_tiles:
+                zoom = self.dynamic_zoom_manager.get_airport_zoom_for_altitude(simbrief_altitude_agl)
+                log.debug(f"Dynamic zoom (SimBrief): {simbrief_altitude_agl}ft AGL -> ZL{zoom} (airport tile)")
+                return zoom
+            zoom = self.dynamic_zoom_manager.get_zoom_for_altitude(simbrief_altitude_agl)
+            log.debug(f"Dynamic zoom (SimBrief): {simbrief_altitude_agl}ft AGL -> ZL{zoom}")
+            return zoom
+        
+        # Fall back to DataRef-based calculation
+        return self._compute_dynamic_zoom_from_datarefs(row, col, tile_zoom, tile_lat, tile_lon)
+    
+    def _get_simbrief_altitude_for_tile(self, tile_lat: float, tile_lon: float) -> Optional[int]:
+        """
+        Get conservative AGL altitude from SimBrief flight plan for a tile position.
+        
+        Returns the planned altitude Above Ground Level (AGL) if:
+        - SimBrief flight data is loaded
+        - The "use_flight_data" toggle is enabled
+        - The aircraft is currently on-route (within deviation threshold)
+        
+        When multiple waypoints are within the consideration radius:
+        - Uses the LOWEST flight altitude (MSL) - accounts for descent
+        - Uses the HIGHEST ground elevation - accounts for mountains
+        - Conservative AGL = lowest_MSL - highest_ground
+        
+        This ensures maximum detail when flying over areas with varied terrain
+        (e.g., descending over mountains).
+        
+        AGL Calculation:
+            AGL = MSL altitude - terrain elevation (ground_height from SimBrief)
+            
+            AGL is used because it represents the actual height above the terrain
+            being viewed. This is more relevant for imagery quality:
+            - 10,000 ft MSL over 5,000 ft mountains = 5,000 ft AGL (needs higher zoom)
+            - 10,000 ft MSL over the ocean = 10,000 ft AGL (can use lower zoom)
+        
+        Args:
+            tile_lat: Tile center latitude
+            tile_lon: Tile center longitude
+            
+        Returns:
+            Conservative AGL altitude in feet if SimBrief data should be used, None otherwise
+        """
+        # Check if SimBrief integration is enabled
+        if not hasattr(CFG, 'simbrief'):
+            return None
+        
+        use_flight_data = getattr(CFG.simbrief, 'use_flight_data', False)
+        if isinstance(use_flight_data, str):
+            use_flight_data = use_flight_data.lower() in ('true', '1', 'yes', 'on')
+        
+        if not use_flight_data:
+            return None
+        
+        # Check if flight data is loaded
+        if not simbrief_flight_manager.is_loaded:
+            return None
+        
+        # Get aircraft position to check if on-route
+        with datareftracker._lock:
+            if not datareftracker.data_valid:
+                return None
+            aircraft_lat = datareftracker.lat
+            aircraft_lon = datareftracker.lon
+        
+        # Get deviation threshold from config
+        deviation_threshold = float(getattr(CFG.simbrief, 'route_deviation_threshold_nm', 40))
+        
+        # Check if aircraft is on-route
+        if not simbrief_flight_manager.is_on_route(aircraft_lat, aircraft_lon, deviation_threshold):
+            log.debug(f"Aircraft deviated from route, using DataRef-based zoom calculation")
+            return None
+        
+        # Get consideration radius from config
+        consideration_radius = float(getattr(CFG.simbrief, 'route_consideration_radius_nm', 50))
+        
+        # Get AGL altitude at tile position (uses lowest AGL of fixes within radius)
+        # use_agl=True returns Above Ground Level altitude for better terrain awareness
+        altitude_agl = simbrief_flight_manager.get_altitude_at_position(
+            tile_lat, tile_lon, consideration_radius, use_agl=True
+        )
+        
+        return altitude_agl
+    
+    def _compute_dynamic_zoom_from_datarefs(self, row: int, col: int, tile_zoom: int,
+                                             tile_lat: float, tile_lon: float) -> int:
+        """
+        Compute dynamic zoom level using DataRef-based altitude prediction.
+        
+        This is the fallback method when SimBrief data is not available or
+        when the aircraft has deviated from the planned route.
+        """
+        # Get flight averages for prediction
+        averages = datareftracker.get_flight_averages()
+
+        # If no valid averages, try to use current altitude (AGL)
+        if averages is None:
+            with datareftracker._lock:
+                if datareftracker.data_valid and datareftracker.alt_agl_ft > 0:
+                    zoom = self.dynamic_zoom_manager.get_zoom_for_altitude(
+                        datareftracker.alt_agl_ft
+                    )
+                    log.debug(f"Dynamic zoom (current AGL): {datareftracker.alt_agl_ft:.0f}ft -> ZL{zoom}")
+                    return zoom
+            # Fall back to base step or fixed zoom
+            base = self.dynamic_zoom_manager.get_base_step()
+            fallback_zoom = base.zoom_level if base else self.target_zoom_level
+            log.debug(f"Dynamic zoom: no flight data, using fallback ZL{fallback_zoom}")
+            return fallback_zoom
+
+        # Get current position (with lock for thread safety)
+        with datareftracker._lock:
+            if not datareftracker.data_valid:
+                base = self.dynamic_zoom_manager.get_base_step()
+                fallback_zoom = base.zoom_level if base else self.target_zoom_level
+                log.debug(f"Dynamic zoom: no valid datarefs, using fallback ZL{fallback_zoom}")
+                return fallback_zoom
+
+            aircraft_lat = datareftracker.lat
+            aircraft_lon = datareftracker.lon
+            aircraft_alt_ft = datareftracker.alt_agl_ft
+
+        # Predict altitude at closest approach (using AGL for terrain-aware calculations)
+        predicted_alt, will_approach = predict_altitude_at_closest_approach(
+            aircraft_lat=aircraft_lat,
+            aircraft_lon=aircraft_lon,
+            aircraft_alt_ft=aircraft_alt_ft,
+            aircraft_hdg=averages['heading'],
+            aircraft_speed_mps=averages['ground_speed_mps'],
+            vertical_speed_fpm=averages['vertical_speed_fpm'],
+            tile_lat=tile_lat,
+            tile_lon=tile_lon
+        )
+
+        # Get zoom level for predicted altitude
+        # Use airport zoom level when near airports (tile_zoom == 18)
+        if tile_zoom == 18 and not CFG.autoortho.using_custom_tiles:
+            zoom = self.dynamic_zoom_manager.get_airport_zoom_for_altitude(predicted_alt)
+            log.debug(f"Dynamic zoom (predicted): {predicted_alt:.0f}ft AGL -> ZL{zoom} (airport tile)")
+            return zoom
+        zoom = self.dynamic_zoom_manager.get_zoom_for_altitude(predicted_alt)
+        log.debug(f"Dynamic zoom (predicted): {predicted_alt:.0f}ft AGL -> ZL{zoom}")
+        return zoom
+
+    def _get_target_zoom_level(self, default_zoom: int, row: int = None, col: int = None) -> int:
+        """
+        Get target zoom level for a tile.
+
+        In fixed mode: Uses the configured max_zoom (current behavior)
+        In dynamic mode: Computes zoom based on predicted altitude at tile
+
+        Args:
+            default_zoom: The default/base zoom level for this tile
+            row: Tile row coordinate (required for dynamic mode)
+            col: Tile column coordinate (required for dynamic mode)
+
+        Returns:
+            The target zoom level, capped to tile's max supported zoom
+        """
+        # Dynamic mode - compute based on altitude prediction
+        if self.max_zoom_mode == "dynamic" and row is not None and col is not None:
+            dynamic_zoom = self._compute_dynamic_zoom(row, col, default_zoom)
+            # Still cap to tile's max supported zoom (default + 1 is X-Plane's limit)
+            final_zoom = min(default_zoom + 1, dynamic_zoom)
+            
+            # Log when dynamic zoom changes the zoom level (reduce log spam)
+            if final_zoom != self._last_logged_dynamic_zoom:
+                fixed_zoom = self.target_zoom_level
+                if default_zoom == 18 and not CFG.autoortho.using_custom_tiles:
+                    fixed_zoom = self.target_zoom_level_near_airports
+                if final_zoom != fixed_zoom:
+                    log.info(f"Dynamic zoom: ZL{final_zoom} (was fixed ZL{fixed_zoom}) - altitude-based adjustment")
+                self._last_logged_dynamic_zoom = final_zoom
+            
+            return final_zoom
+
+        # Fixed mode - existing behavior
         if CFG.autoortho.using_custom_tiles:
             uncapped_target_zoom = self.target_zoom_level
         else:
-            uncapped_target_zoom = self.target_zoom_level_near_airports if default_zoom == 18 else self.target_zoom_level
+            uncapped_target_zoom = (
+                self.target_zoom_level_near_airports
+                if default_zoom == 18
+                else self.target_zoom_level
+            )
         return min(default_zoom + 1, uncapped_target_zoom)
 
     def _to_tile_id(self, row, col, map_type, zoom):
@@ -2116,6 +5313,10 @@ class TileCacher(object):
         # Faster cadence when a shared stats store is present (macOS parent)
         fast_mode = self._has_shared_store()
         poll_interval = 3 if fast_mode else 15
+        
+        # Maximum tile count before forced eviction (prevents memory bloat from tile object overhead)
+        # Each tile object costs ~10-50KB in overhead even without loaded data
+        max_tile_count = 5000
 
         while True:
             process = psutil.Process(os.getpid())
@@ -2145,12 +5346,26 @@ class TileCacher(object):
             # Hysteresis target: evict down to limit - headroom
             headroom = max(int(self.cache_mem_lim * self.evict_hysteresis_frac), self.evict_headroom_min_bytes)
             target_bytes = max(0, int(self.cache_mem_lim) - headroom)
+            
+            # Check if we need to evict based on tile count (prevents unbounded tile accumulation)
+            tile_count = len(self.tiles)
+            need_tile_count_eviction = tile_count > max_tile_count
 
             # Leader election: only one worker performs eviction when shared store is present
-            if effective_mem > self.cache_mem_lim:
+            need_mem_eviction = effective_mem > self.cache_mem_lim
+            if need_mem_eviction or need_tile_count_eviction:
                 if not self._try_acquire_evict_leader():
                     time.sleep(poll_interval)
                     continue
+                    
+            # Evict if too many tiles (regardless of memory)
+            if need_tile_count_eviction:
+                target_tile_count = int(max_tile_count * 0.8)  # Evict down to 80% of max
+                tiles_to_evict = tile_count - target_tile_count
+                if tiles_to_evict > 0:
+                    log.info(f"Tile count eviction: {tile_count} tiles, evicting {tiles_to_evict} to reach {target_tile_count}")
+                    with self.tc_lock:
+                        self._evict_batch(tiles_to_evict)
 
             # Evict while above target using adaptive batch sizing
             while self.tiles and effective_mem > target_bytes:
@@ -2211,12 +5426,13 @@ class TileCacher(object):
             if not tile:
                 self.misses += 1
                 bump('tile_mem_miss')
-                # Use target zoom level directly - much cleaner than offset calculations
+                # Use target zoom level - supports both fixed and dynamic modes
+                # Pass row/col for dynamic zoom computation based on predicted altitude
                 tile = Tile(
                     col, row, map_type, zoom, 
                     cache_dir=self.cache_dir,
                     min_zoom=self.min_zoom,
-                    max_zoom=self._get_target_zoom_level(zoom),
+                    max_zoom=self._get_target_zoom_level(zoom, row=row, col=col),
                 )
                 self.tiles[idx] = tile
                 # New tile becomes MRU
@@ -2228,6 +5444,10 @@ class TileCacher(object):
                 # Only in this case would this cache have made a difference
                 self.hits += 1
                 bump('tile_mem_hits')
+                # Reset time budget when tile is re-opened from cache
+                # This ensures returning to an area gets a fresh budget, not the
+                # exhausted budget from a previous (possibly failed) request.
+                tile._tile_time_budget = None
 
             tile.refs += 1
         return tile
@@ -2257,6 +5477,24 @@ class TileCacher(object):
                 log.debug(f"Still have {t.refs} refs for {tile_id}")
 
         return True
+    
+    def is_tile_opened_by_xplane(self, row: int, col: int, map_type: str, zoom: int) -> bool:
+        """
+        Check if a tile is currently opened by X-Plane (has refs > 0).
+        
+        This is used by the prefetcher to skip tiles that X-Plane is already
+        loading - the on-demand tile build logic will handle those.
+        
+        Returns:
+            True if tile exists and has refs > 0 (being used by X-Plane)
+            False if tile doesn't exist or has refs <= 0
+        """
+        tile_id = self._to_tile_id(row, col, map_type, zoom)
+        with self.tc_lock:
+            t = self.tiles.get(tile_id)
+            if t and t.refs > 0:
+                return True
+        return False
 
 # ============================================================
 # Module-level cleanup helpers

@@ -126,8 +126,10 @@ def test_read_mid(tmpdir):
     # The ends should be identical
     assert data1[0:384] == data2[128:512]
 
-    # The beginning portion should be empty
-    assert data2[:128] == b'\x88'*128
+    # The beginning portion should be fallback BC1 blocks (missing_color pattern)
+    # BC1 block for missing_color [66,77,55] = b'fBfB\x00\x00\x00\x00' (8 bytes)
+    expected_bc1_block = b'fBfB\x00\x00\x00\x00'
+    assert data2[:128] == expected_bc1_block * 16
 
     dds.write(outpath)
     expectedbytes = 11184952 
@@ -171,11 +173,13 @@ def test_gen_mipmap_len(tmpdir):
     assert data != b'\xFF'*16
     assert data != b'\x00'*16
 
-    # For other data verify it has not been processed
+    # For other data verify it has not been processed (returns fallback BC1 blocks)
+    # BC1 block for missing_color [66,77,55] = b'fBfB\x00\x00\x00\x00' (8 bytes)
     dds.seek(262144)
     data = dds.read(16)
     assert data
-    assert data == b'\xFF'*16
+    expected_bc1_block = b'fBfB\x00\x00\x00\x00'
+    assert data == expected_bc1_block * 2
 
     with open(outpath, 'rb') as h:
         h.seek(131072)

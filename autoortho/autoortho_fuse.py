@@ -16,6 +16,7 @@ from functools import wraps, lru_cache
 
 from aoconfig import CFG
 from utils.constants import system_type
+from time_exclusion import time_exclusion_manager
 import logging
 log = logging.getLogger(__name__)
 
@@ -246,6 +247,19 @@ class AutoOrtho(Operations):
         self.cache_dir = cache_dir
 
         self.tc = getortho.TileCacher(cache_dir)
+        
+        # Register terrain index for this scenery
+        # This indexes .ter files to discover actual tile zoom levels
+        # Critical for predictive DDS: ensures we prefetch the exact tiles X-Plane will request
+        terrain_folder = os.path.join(self.root, "terrain")
+        scenery_name = os.path.basename(self.root)
+        getortho.register_terrain_index(terrain_folder, scenery_name)
+        
+        # Start spatial prefetcher for proactive tile loading
+        getortho.start_prefetcher(self.tc)
+        
+        # Start predictive DDS generation (pre-builds DDS in background)
+        getortho.start_predictive_dds(self.tc)
     
         #self.path_condition = threading.Condition()
         #self.read_lock = threading.Lock()
@@ -262,6 +276,10 @@ class AutoOrtho(Operations):
         self._ft_start_lock = threading.Lock()
 
         self.use_ns = kwargs.get("use_ns", False)
+        
+        # Initialize time exclusion manager with dataref tracker
+        from datareftrack import dt as datareftracker
+        time_exclusion_manager.set_dataref_tracker(datareftracker)
 
     # Helpers
     # =======
@@ -325,6 +343,46 @@ class AutoOrtho(Operations):
 
     def _tile_key(self, row, col, maptype, zoom):
         return (row, col, maptype, zoom)
+
+    def _calculate_build_timeout(self):
+        """
+        Calculate dynamic build_timeout based on tile_time_budget settings.
+        
+        This ensures the FUSE lock timeout is always sufficient for tile building:
+        - Base: tile_time_budget (time allowed for chunk downloads)
+        - Extended: + fallback_timeout if fallback_extends_budget is enabled
+        - Buffer: + 15 seconds for DDS operations and overhead
+        
+        Returns timeout in seconds (int).
+        """
+        # Get tile_time_budget (default 120s)
+        tile_budget = getattr(CFG.autoortho, 'tile_time_budget', 120.0)
+        if isinstance(tile_budget, str):
+            try:
+                tile_budget = float(tile_budget)
+            except ValueError:
+                tile_budget = 120.0
+        
+        # Check if fallback extends the budget
+        fallback_extends = getattr(CFG.autoortho, 'fallback_extends_budget', False)
+        if isinstance(fallback_extends, str):
+            fallback_extends = fallback_extends.lower().strip() in ('true', '1', 'yes', 'on')
+        
+        # Get fallback_timeout if extended fallbacks are enabled (default 30s)
+        fallback_timeout = 0
+        if fallback_extends:
+            fallback_timeout = getattr(CFG.autoortho, 'fallback_timeout', 30)
+            if isinstance(fallback_timeout, str):
+                try:
+                    fallback_timeout = float(fallback_timeout)
+                except ValueError:
+                    fallback_timeout = 30
+        
+        # Calculate total: budget + extended fallback + 15s buffer
+        # The 15s buffer accounts for DDS read/write, processing overhead, and safety margin
+        build_timeout = int(tile_budget + fallback_timeout + 15)
+        
+        return build_timeout
 
     def _failfast(self, msg, exc=None):
         log.error(msg)
@@ -418,14 +476,53 @@ class AutoOrtho(Operations):
                 return 22369776
 
 
-    @lru_cache(maxsize=1024)
     def getattr(self, path, fh=None):
         log.debug(f"GETATTR {path}")
-
-
-        m = self.dds_re.match(path)
-
+        
+        # Check for DSF time exclusion (not cached to allow dynamic hiding)
+        if self.dsf_re.match(path):
+            if time_exclusion_manager.should_hide_dsf(path):
+                log.debug(f"GETATTR: Hiding DSF due to time exclusion: {path}")
+                raise FuseOSError(errno.ENOENT)
+        
+        # Generate fresh timestamps for each call
         now = int(time.time())
+        
+        m = self.dds_re.match(path)
+        if m:
+            # DDS files are virtual - use cached size calculation but fresh timestamps
+            return self._getattr_dds(path, m, now)
+        elif path.endswith(".poison"):
+            return self._getattr_poison(now)
+        elif path.endswith("AOISWORKING"):
+            return self._getattr_marker(now)
+        else:
+            # Real filesystem files - never cache, always get fresh stats
+            return self._getattr_real_file(path)
+
+    def _get_dds_size_cached(self, row, col, maptype, zoom):
+        """Get DDS size from cache or compute it.
+        
+        Uses _size_cache dict which can be updated with actual tile sizes
+        when tiles are opened (see open() method). This allows the cache
+        to reflect real sizes once known, rather than being stuck with
+        computed approximations.
+        """
+        key = (row, col, maptype, zoom)
+        dds_size = self._size_cache.get(key)
+        if dds_size is None:
+            dds_size = self._calculate_dds_size(str(zoom))
+            # Store computed size for future calls until actual size is known
+            self._size_cache[key] = dds_size
+        return dds_size
+
+    def _getattr_dds(self, path, match, now):
+        """Get attributes for virtual DDS files."""
+        self._ensure_flighttrack_started(reason_path=path)
+        row, col, maptype, zoom = match.groups()
+        dds_size = self._get_dds_size_cached(int(row), int(col), maptype, int(zoom))
+        log.debug("GETATTR: Fetch for path: %s", path)
+        
         attrs = {
             'st_atime': now, 
             'st_ctime': now, 
@@ -435,59 +532,84 @@ class AutoOrtho(Operations):
             'st_nlink': 1,
             'st_uid': self.default_uid,
             'st_gid': self.default_gid,
+            'st_size': dds_size,
         }
-        if m:
-            self._ensure_flighttrack_started(reason_path=path)
-            row, col, maptype, zoom = m.groups()
-            key = (int(row), int(col), maptype, int(zoom))
-            dds_size = self._size_cache.get(key)
-            log.debug("GETATTR: Fetch for path: %s", path)
-            if dds_size is None:
-                dds_size = self._calculate_dds_size(zoom)
-
-            attrs['st_size'] = dds_size
-
-        elif path.endswith(".poison"):
-
-            attrs['st_size'] = 0
-            log.info("Poison pill.  Exiting!")
-            fuse_ptr = ctypes.c_void_p(_libfuse.fuse_get_context().contents.fuse)
-            do_fuse_exit(fuse_ptr=fuse_ptr)
-
-        elif path.endswith("AOISWORKING"):
-            attrs['st_size'] = 0
-
-        else:
-            full_path = self._full_path(path)
-            exists = os.path.exists(full_path)
-            log.debug(f"GETATTR FULLPATH {full_path}  Exists? {exists}")
-            st = os.lstat(full_path)
-            log.debug(f"GETATTR: Orig stat: {st}")
-            attrs = {k: getattr(st, k) for k in (
-                'st_atime',
-                'st_ctime',
-                'st_gid',
-                'st_mode',
-                'st_mtime',
-                'st_nlink',
-                'st_size',
-                'st_uid',
-                'st_ino',
-                'st_dev',
-                )}
-
         log.debug(f"GETATTR: ATTRS: {attrs}")
         return attrs
 
-    @lru_cache(maxsize=1024)
-    def readdir(self, path, fh):
+    def _getattr_poison(self, now):
+        """Handle poison pill for shutdown."""
+        log.info("Poison pill.  Exiting!")
+        fuse_ptr = ctypes.c_void_p(_libfuse.fuse_get_context().contents.fuse)
+        do_fuse_exit(fuse_ptr=fuse_ptr)
+        
+        attrs = {
+            'st_atime': now, 
+            'st_ctime': now, 
+            'st_mtime': now,
+            'st_mode': 33206,
+            'st_blksize': 32768,
+            'st_nlink': 1,
+            'st_uid': self.default_uid,
+            'st_gid': self.default_gid,
+            'st_size': 0,
+        }
+        return attrs
 
+    def _getattr_marker(self, now):
+        """Get attributes for AOISWORKING marker file."""
+        attrs = {
+            'st_atime': now, 
+            'st_ctime': now, 
+            'st_mtime': now,
+            'st_mode': 33206,
+            'st_blksize': 32768,
+            'st_nlink': 1,
+            'st_uid': self.default_uid,
+            'st_gid': self.default_gid,
+            'st_size': 0,
+        }
+        return attrs
+
+    def _getattr_real_file(self, path):
+        """Get attributes for real filesystem files - never cached."""
+        full_path = self._full_path(path)
+        exists = os.path.exists(full_path)
+        log.debug(f"GETATTR FULLPATH {full_path}  Exists? {exists}")
+        st = os.lstat(full_path)
+        log.debug(f"GETATTR: Orig stat: {st}")
+        attrs = {k: getattr(st, k) for k in (
+            'st_atime',
+            'st_ctime',
+            'st_gid',
+            'st_mode',
+            'st_mtime',
+            'st_nlink',
+            'st_size',
+            'st_uid',
+            'st_ino',
+            'st_dev',
+        )}
+        log.debug(f"GETATTR: ATTRS: {attrs}")
+        return attrs
+
+    def readdir(self, path, fh):
+        """List directory contents, filtering DSF files during time exclusion."""
         if path in ["/textures", "/terrain"]:
             return ['.', '..', 'AOISWORKING']
 
         full_path = self._full_path(path)
         if os.path.isdir(full_path):
-            return ['.', '..', *os.listdir(full_path)]
+            entries = ['.', '..']
+            for entry in os.listdir(full_path):
+                # Check if this is a DSF file that should be hidden
+                entry_path = os.path.join(path, entry)
+                if entry.endswith('.dsf'):
+                    if time_exclusion_manager.should_hide_dsf(entry_path):
+                        log.debug(f"READDIR: Hiding DSF due to time exclusion: {entry}")
+                        continue
+                entries.append(entry)
+            return entries
         return ['.', '..']
 
     def readlink(self, path):
@@ -567,8 +689,16 @@ class AutoOrtho(Operations):
         full_path = self._full_path(path)
         log.debug(f"OPEN: FULLPATH {full_path}")
 
+        # Handle DSF files with time exclusion tracking
         if self.dsf_re.match(path):
+            # Check if DSF should be hidden (but not if already in use)
+            if time_exclusion_manager.should_hide_dsf(path):
+                log.info(f"OPEN: DSF hidden due to time exclusion: {path}")
+                raise FuseOSError(errno.ENOENT)
+            
             log.info(f"OPEN: Detected DSF open: {path}")
+            # Register this DSF as being in use (prevents hiding during active use)
+            time_exclusion_manager.register_dsf_open(path)
         
         dds_match = self.dds_re.match(path)
         if dds_match:
@@ -576,6 +706,12 @@ class AutoOrtho(Operations):
             row = int(row)
             col = int(col)
             zoom = int(zoom)
+            
+            # Register non-BI maptypes for terrain lookup (custom Ortho4XP tiles)
+            # This allows the prefetcher to also check for custom tile maptypes
+            if maptype != "BI":
+                getortho.register_discovered_maptype(maptype)
+            
             t = self.tc._open_tile(row, col, maptype, zoom)
             try:
                 self._size_cache[(row, col, maptype, zoom)] = t.dds.total_size
@@ -611,13 +747,15 @@ class AutoOrtho(Operations):
             key = self._tile_key(row, col, maptype, zoom)
             lock = self._tile_locks[key]
             
-            # Get configurable timeout, default 60 seconds
-            build_timeout = getattr(CFG.fuse, 'build_timeout', 60)
-            if isinstance(build_timeout, str):
-                try:
-                    build_timeout = int(build_timeout)
-                except ValueError:
-                    build_timeout = 60
+            # Calculate build_timeout dynamically based on tile_time_budget
+            # This ensures the FUSE lock timeout is always >= the tile build time
+            # Formula: tile_time_budget + fallback_timeout (if enabled) + 15s buffer
+            #
+            # The buffer accounts for:
+            # - DDS read/write operations after tile is built
+            # - Any processing overhead
+            # - Margin of safety to prevent premature lock timeout
+            build_timeout = self._calculate_build_timeout()
             
             if not lock.acquire(timeout=build_timeout):
                 # CRITICAL FIX: Instead of raising EIO (which causes CTD on Windows
@@ -689,6 +827,12 @@ class AutoOrtho(Operations):
     #@locked
     def release(self, path, fh):
         log.debug(f"RELEASE: {path}")
+        
+        # Unregister DSF close for time exclusion tracking
+        if self.dsf_re.match(path):
+            log.debug(f"RELEASE: DSF closed: {path}")
+            time_exclusion_manager.register_dsf_close(path)
+        
         dds_match = self.dds_re.match(path)
         if dds_match:
             row, col, maptype, zoom = dds_match.groups()
