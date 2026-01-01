@@ -684,9 +684,12 @@ class DatarefTracker(object):
                 )
                 return []
 
-            # Decode all values
+            # Decode all values - use idx from packet to place in correct position
+            # X-Plane sends each value with its assigned index, which may not
+            # be in sequential order
             num_values = len(values_data) // self.VALUE_SIZE
-            retvalues = []
+            num_datarefs = len(self.datarefs)
+            retvalues = [None] * num_datarefs  # Pre-allocate with None
 
             for i in range(num_values):
                 offset = self.PACKET_HEADER_SIZE + (i * self.VALUE_SIZE)
@@ -694,12 +697,27 @@ class DatarefTracker(object):
 
                 try:
                     (idx, value) = struct.unpack("<if", singledata)
-                    retvalues.append(value)
+                    # Use the idx from the packet to place value correctly
+                    if 0 <= idx < num_datarefs:
+                        retvalues[idx] = value
+                    else:
+                        log.warning(
+                            f"Received dataref index {idx} out of range "
+                            f"(expected 0-{num_datarefs - 1})"
+                        )
                 except struct.error as e:
                     log.error(
                         f"Struct unpacking error at index {i}: {e}"
                     )
                     return []
+
+            # Check if we got all required values (first 5 are essential)
+            if any(v is None for v in retvalues[:5]):
+                log.debug("Incomplete packet: missing essential datarefs")
+                return []
+
+            # Replace remaining None values with -1.0 for optional datarefs
+            retvalues = [v if v is not None else -1.0 for v in retvalues]
 
             return retvalues
 
