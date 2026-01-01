@@ -206,6 +206,7 @@ class AOStats(object):
             try:
                 snap = _store.snapshot() if _store else dict(STATS.items())
                 log.info(f"STATS: {snap}")
+                        
             except Exception as e:
                 log.debug(f"aostats.show error: {e}")
 

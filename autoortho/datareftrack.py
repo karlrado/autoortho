@@ -265,6 +265,7 @@ class DatarefTracker(object):
         self.pressure_alt = -1.0  # Pressure altitude in feet
         self.connected = False
         self.data_valid = False
+        self.has_ever_connected = False  # True once first connection established
 
         # Flight data averager for smoothed predictions
         self.flight_averager = FlightDataAverager()
@@ -571,6 +572,7 @@ class DatarefTracker(object):
                 if not self.connected:
                     log.info("Flight is starting.")
                     self.connected = True
+                    self.has_ever_connected = True  # Permanent flag for startup detection
 
                 # Accept 5, 6, or 7 values for backward compatibility
                 # (6th value is local_time_sec, 7th is pressure_alt)
