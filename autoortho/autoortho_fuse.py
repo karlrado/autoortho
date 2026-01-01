@@ -350,6 +350,8 @@ class AutoOrtho(Operations):
         
         This ensures the FUSE lock timeout is always sufficient for tile building:
         - Base: tile_time_budget (time allowed for chunk downloads)
+        - Startup: applies same multiplier (3x, capped at 300s) when suspend_maxwait 
+          is enabled and not yet connected to X-Plane
         - Extended: + fallback_timeout if fallback_extends_budget is enabled
         - Buffer: + 15 seconds for DDS operations and overhead
         
@@ -362,6 +364,24 @@ class AutoOrtho(Operations):
                 tile_budget = float(tile_budget)
             except ValueError:
                 tile_budget = 120.0
+        
+        # Account for startup multiplier - must match getortho.py logic
+        # During initial startup (before first connection), budget is multiplied.
+        # Uses has_ever_connected to distinguish true startup from temporary disconnects
+        # caused by stuttering (which should NOT get extended timeouts).
+        try:
+            from datareftrack import dt as datareftracker
+            suspend_maxwait = getattr(CFG.autoortho, 'suspend_maxwait', True)
+            if isinstance(suspend_maxwait, str):
+                suspend_maxwait = suspend_maxwait.lower().strip() in ('true', '1', 'yes', 'on')
+            
+            if suspend_maxwait and not getattr(datareftracker, 'has_ever_connected', False):
+                # Match getortho.py: 10x multiplier for initial loading
+                startup_multiplier = 10.0
+                max_startup_budget = 1800.0
+                tile_budget = min(tile_budget * startup_multiplier, max_startup_budget)
+        except ImportError:
+            pass  # datareftracker not available, use base budget
         
         # Check if fallback extends the budget
         fallback_extends = getattr(CFG.autoortho, 'fallback_extends_budget', False)

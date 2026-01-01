@@ -317,6 +317,7 @@ class DatarefTracker(object):
         self.local_time_sec = -1.0  # Local time (seconds since midnight)
         self.connected = False
         self.data_valid = False
+        self.has_ever_connected = False  # True once first connection established
 
         # Thread management
         self.t = None
@@ -576,6 +577,7 @@ class DatarefTracker(object):
                 if not self.connected:
                     log.info("Flight is starting.")
                     self.connected = True
+                    self.has_ever_connected = True  # Permanent flag for startup detection
 
                 # Accept 5 or 6 values
                 # Datarefs: lat, lon, y_agl (m), hdg, spd, local_time_sec

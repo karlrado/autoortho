@@ -658,6 +658,102 @@ chunk_getter = ChunkGetter(int(CFG.autoortho.fetch_threads))
 log.info(f"chunk_getter: {chunk_getter}")
 #log.info(f"tile_getter: {tile_getter}")
 
+
+# ============================================================================
+# SERVER HEALTH TRACKER
+# ============================================================================
+# Monitors chunk download performance to detect throttling/slow servers.
+# Provides visibility into stall conditions without changing behavior.
+# Helps diagnose situations where servers are slow-rolling responses.
+# ============================================================================
+
+class ServerHealthTracker:
+    """
+    Tracks recent chunk download performance to detect server slowdowns.
+    
+    This is an observability tool - it logs warnings and updates stats but
+    doesn't change download behavior. Helps diagnose stall conditions.
+    
+    Thread-safe: Uses lock for all state access.
+    """
+    
+    # How long to track downloads (sliding window)
+    WINDOW_SEC = 30.0
+    
+    # Thresholds for warnings
+    SLOW_THRESHOLD_SEC = 10.0      # Downloads taking >10s are "slow"
+    SLOW_RATE_WARNING = 0.5       # Warn if >50% of downloads are slow
+    STALL_DETECTION_SEC = 60.0    # Warn if no completions in 60s
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._completions = []  # List of (timestamp, duration_sec)
+        self._last_completion_time = time.monotonic()
+        self._last_warning_time = 0.0
+        self._warning_cooldown_sec = 30.0  # Don't spam warnings
+    
+    def record_completion(self, duration_sec: float) -> None:
+        """Record a chunk download completion with its duration."""
+        now = time.monotonic()
+        with self._lock:
+            self._completions.append((now, duration_sec))
+            self._last_completion_time = now
+            self._prune_old()
+            self._check_health(now)
+    
+    def record_stall_check(self) -> None:
+        """
+        Called periodically to check for stall conditions.
+        Should be called even when no completions are happening.
+        """
+        now = time.monotonic()
+        with self._lock:
+            self._prune_old()
+            time_since_last = now - self._last_completion_time
+            
+            if time_since_last > self.STALL_DETECTION_SEC:
+                if now - self._last_warning_time > self._warning_cooldown_sec:
+                    log.warning(f"SERVER HEALTH: No chunk completions in {time_since_last:.1f}s - "
+                               f"possible server throttling or network issue")
+                    bump('server_stall_warning')
+                    self._last_warning_time = now
+    
+    def _prune_old(self) -> None:
+        """Remove completions outside the window. Must hold lock."""
+        cutoff = time.monotonic() - self.WINDOW_SEC
+        while self._completions and self._completions[0][0] < cutoff:
+            self._completions.pop(0)
+    
+    def _check_health(self, now: float) -> None:
+        """Check for slow server conditions. Must hold lock."""
+        if not self._completions:
+            return
+        
+        slow_count = sum(1 for _, dur in self._completions if dur > self.SLOW_THRESHOLD_SEC)
+        slow_rate = slow_count / len(self._completions)
+        
+        if slow_rate > self.SLOW_RATE_WARNING:
+            if now - self._last_warning_time > self._warning_cooldown_sec:
+                avg_duration = sum(dur for _, dur in self._completions) / len(self._completions)
+                log.warning(f"SERVER HEALTH: {slow_rate*100:.0f}% of recent downloads are slow "
+                           f"(>{self.SLOW_THRESHOLD_SEC}s). Avg: {avg_duration:.1f}s. "
+                           f"Server may be throttling.")
+                bump('server_slow_warning')
+                self._last_warning_time = now
+
+
+# Global instance (lazy initialization to avoid startup overhead)
+_server_health_tracker: Optional[ServerHealthTracker] = None
+
+
+def _get_health_tracker() -> ServerHealthTracker:
+    """Get or create the server health tracker."""
+    global _server_health_tracker
+    if _server_health_tracker is None:
+        _server_health_tracker = ServerHealthTracker()
+    return _server_health_tracker
+
+
 # ============================================================================
 # ASYNC CACHE WRITER
 # ============================================================================
@@ -2599,6 +2695,11 @@ MAX_TRANSIENT_RETRIES = {
     504: 5,   # Gateway timeout - infrastructure
 }
 
+# Maximum total attempts (including initial + all retries) before giving up
+# This prevents infinite retry loops for persistent failures (e.g., network issues,
+# invalid responses) that don't return specific HTTP error codes
+MAX_TOTAL_ATTEMPTS = 15
+
 
 class Chunk(object):
     col = -1
@@ -2807,6 +2908,24 @@ class Chunk(object):
             self.ready.set()
             return True
 
+        # === TOTAL ATTEMPT LIMIT ===
+        # Prevent infinite retries for persistent failures (network issues,
+        # invalid responses, etc.) that don't return specific HTTP codes
+        if self.attempt >= MAX_TOTAL_ATTEMPTS:
+            log.warning(f"Chunk {self} exceeded {MAX_TOTAL_ATTEMPTS} total attempts, marking as permanently failed")
+            self.permanent_failure = True
+            self.failure_reason = "max_total_attempts"
+            self.data = b''
+            self.ready.set()
+            bump('chunk_max_attempts_exhausted')
+            # Notify tile completion tracker
+            try:
+                if tile_completion_tracker is not None and self.tile_id:
+                    tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
+            except Exception:
+                pass
+            return True  # Return True to stop worker retries
+
         if not self.starttime:
             self.starttime = time.time()
 
@@ -2842,7 +2961,10 @@ class Chunk(object):
             log.debug("EOX DETECTED")
             header.update({'referer': 'https://s2maps.eu/'})
        
-        time.sleep((self.attempt/10))
+        # Capped backoff: grows with attempts but maxes at 2 seconds
+        # This prevents runaway delays when server is slow/throttling
+        backoff_sleep = min(2.0, self.attempt / 10.0)
+        time.sleep(backoff_sleep)
         self.attempt += 1
 
         log.debug(f"Requesting {self.url} ..")
@@ -2950,6 +3072,19 @@ class Chunk(object):
         # The chunk data is already in memory (self.data), so we can mark it
         # as ready immediately. Cache writes are for future requests only.
         self.ready.set()
+        
+        # Record completion time for server health tracking and slow download stats
+        try:
+            duration_sec = self.fetchtime if self.fetchtime else 0
+            _get_health_tracker().record_completion(duration_sec)
+            # Track slow downloads for visibility
+            duration_ms = int(duration_sec * 1000)
+            if duration_ms > 5000:  # >5s is noteworthy
+                bump('chunk_slow_download')
+            if duration_ms > 15000:  # >15s is very slow
+                bump('chunk_very_slow_download')
+        except Exception:
+            pass  # Never block downloads on health tracking
         
         # Notify tile completion tracker (for predictive DDS generation)
         # Fire-and-forget: never block download on notification failure
@@ -3502,9 +3637,20 @@ class Tile(object):
             
             if use_time_budget:
                 base_budget = float(getattr(CFG.autoortho, 'tile_time_budget', 5.0))
-                if CFG.autoortho.suspend_maxwait and not datareftracker.connected:
-                    effective_budget = base_budget * 10.0
-                    log.debug(f"GET_IMG: Startup mode - creating tile budget {effective_budget:.1f}s")
+                # Use has_ever_connected to distinguish true startup from temporary disconnects.
+                # During stutters, X-Plane may briefly stop sending UDP packets, causing
+                # connected=False. We don't want longer timeouts during stutters - only
+                # during the actual initial scenery load (before first connection).
+                if CFG.autoortho.suspend_maxwait and not datareftracker.has_ever_connected:
+                    # Startup mode: increase budget but cap to reasonable maximum
+                    # 10x multiplier for initial loading to allow more tiles to complete.
+                    # The has_ever_connected check ensures this only applies during true
+                    # startup, not during temporary disconnects from stuttering.
+                    startup_multiplier = 10.0
+                    max_startup_budget = 1800.0  # 30 minute absolute cap
+                    effective_budget = min(base_budget * startup_multiplier, max_startup_budget)
+                    log.debug(f"GET_IMG: Startup mode - creating tile budget {effective_budget:.1f}s "
+                              f"(base={base_budget:.1f}s × {startup_multiplier})")
                 else:
                     effective_budget = base_budget
                     log.debug(f"GET_IMG: Creating tile budget {effective_budget:.1f}s (processing begins now)")
@@ -3600,9 +3746,10 @@ class Tile(object):
                 # This ensures lower-detail tiles load first, minimizing missing tiles
                 base_priority = self.max_mipmap - mipmap
                 
-                # During initial load (before flight starts), further deprioritize high-detail
-                # to ensure lower mipmaps load completely first
-                if CFG.autoortho.suspend_maxwait and not datareftracker.connected:
+                # During initial load (before first connection), further deprioritize high-detail
+                # to ensure lower mipmaps load completely first.
+                # Uses has_ever_connected to avoid applying during temporary stutters.
+                if CFG.autoortho.suspend_maxwait and not datareftracker.has_ever_connected:
                     # Add penalty to high-detail mipmaps during initial load
                     # Mipmap 0 gets +20, mipmap 4 gets +0
                     initial_load_penalty = (self.max_mipmap - mipmap) * 5
@@ -4659,7 +4806,8 @@ class Tile(object):
 
     def get_maxwait(self):
         effective_maxwait = self.maxchunk_wait
-        if CFG.autoortho.suspend_maxwait and not datareftracker.connected:
+        # Only extend maxwait during true initial loading, not during temporary disconnects
+        if CFG.autoortho.suspend_maxwait and not datareftracker.has_ever_connected:
             effective_maxwait = 20
         return effective_maxwait
 
@@ -5113,27 +5261,42 @@ class TileCacher(object):
         # Get flight averages for prediction
         averages = datareftracker.get_flight_averages()
 
+        # Helper to determine if this is an airport tile
+        is_airport_tile = tile_zoom == 18 and not CFG.autoortho.using_custom_tiles
+
         # If no valid averages, try to use current altitude (AGL)
         if averages is None:
             with datareftracker._lock:
                 if datareftracker.data_valid and datareftracker.alt_agl_ft > 0:
-                    zoom = self.dynamic_zoom_manager.get_zoom_for_altitude(
-                        datareftracker.alt_agl_ft
-                    )
-                    log.debug(f"Dynamic zoom (current AGL): {datareftracker.alt_agl_ft:.0f}ft -> ZL{zoom}")
+                    if is_airport_tile:
+                        zoom = self.dynamic_zoom_manager.get_airport_zoom_for_altitude(
+                            datareftracker.alt_agl_ft
+                        )
+                        log.debug(f"Dynamic zoom (current AGL): {datareftracker.alt_agl_ft:.0f}ft -> ZL{zoom} (airport tile)")
+                    else:
+                        zoom = self.dynamic_zoom_manager.get_zoom_for_altitude(
+                            datareftracker.alt_agl_ft
+                        )
+                        log.debug(f"Dynamic zoom (current AGL): {datareftracker.alt_agl_ft:.0f}ft -> ZL{zoom}")
                     return zoom
             # Fall back to base step or fixed zoom
             base = self.dynamic_zoom_manager.get_base_step()
-            fallback_zoom = base.zoom_level if base else self.target_zoom_level
-            log.debug(f"Dynamic zoom: no flight data, using fallback ZL{fallback_zoom}")
+            if is_airport_tile:
+                fallback_zoom = base.zoom_level_airports if base else 18
+            else:
+                fallback_zoom = base.zoom_level if base else self.target_zoom_level
+            log.debug(f"Dynamic zoom: no flight data, using fallback ZL{fallback_zoom}{' (airport tile)' if is_airport_tile else ''}")
             return fallback_zoom
 
         # Get current position (with lock for thread safety)
         with datareftracker._lock:
             if not datareftracker.data_valid:
                 base = self.dynamic_zoom_manager.get_base_step()
-                fallback_zoom = base.zoom_level if base else self.target_zoom_level
-                log.debug(f"Dynamic zoom: no valid datarefs, using fallback ZL{fallback_zoom}")
+                if is_airport_tile:
+                    fallback_zoom = base.zoom_level_airports if base else 18
+                else:
+                    fallback_zoom = base.zoom_level if base else self.target_zoom_level
+                log.debug(f"Dynamic zoom: no valid datarefs, using fallback ZL{fallback_zoom}{' (airport tile)' if is_airport_tile else ''}")
                 return fallback_zoom
 
             aircraft_lat = datareftracker.lat
