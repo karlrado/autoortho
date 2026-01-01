@@ -204,6 +204,48 @@ When extended fallbacks are enabled, this controls how long each lower-detail mi
 
 ---
 
+### Startup Loading Behavior
+
+#### Suspend Maxwait (`suspend_maxwait`)
+- **Type:** Boolean (True/False)
+- **Default:** True
+- **Config file:** `suspend_maxwait = True`
+
+When enabled, AutoOrtho extends timeout values during initial scenery loading (before the first flight begins). This allows more time for downloads to complete during the initial load, resulting in fewer missing tiles when the flight starts.
+
+**How it works:**
+- AutoOrtho detects the "loading" phase by tracking if X-Plane has **ever** sent flight data via UDP
+- During initial loading (before first connection), the tile time budget is multiplied by 10×
+- Once the flight begins (X-Plane starts sending position data), normal timeouts resume permanently
+- **Important:** Temporary disconnects (e.g., from stuttering) do NOT re-enable extended timeouts
+
+| Phase | Time Budget Behavior |
+|-------|---------------------|
+| Initial loading (never connected) | `tile_time_budget × 10` |
+| Flying (UDP connected) | `tile_time_budget` (normal) |
+| Temporary disconnect (stutter) | `tile_time_budget` (normal - no penalty) |
+
+**Stall Detection:**
+AutoOrtho monitors download progress and will log warnings if downloads appear stalled:
+- After 60 seconds with no successful downloads: `"Downloads appear slow..."` warning
+- After 180 seconds with no successful downloads: `"⚠️ DOWNLOADS STALLED..."` warning
+
+These warnings help identify server-side throttling vs client-side issues.
+
+**Note:** If you experience very long loading times (>5 minutes stuck at "Reading scenery files"), this may indicate:
+- Server throttling (especially with BI/Bing imagery during high-traffic periods)
+- Network connectivity issues
+- Very high zoom level with slow internet connection
+
+**Troubleshooting Long Loading Times:**
+1. Check AutoOrtho logs for "Downloads appear slow" or "DOWNLOADS STALLED" warnings - these indicate server throttling
+2. Try a different imagery source (GO2, EOX) to rule out server-specific issues
+3. Lower your max zoom level temporarily to reduce download volume
+4. Ensure your file cache is enabled - subsequent flights load much faster
+5. If issues persist, set `suspend_maxwait = False` for stricter timeouts during loading (may result in more missing tiles initially)
+
+---
+
 ### Dynamic Zoom Levels
 
 The Dynamic Zoom system automatically adjusts imagery quality based on your altitude Above Ground Level (AGL). This provides higher detail when flying low and saves resources at high altitudes where detail matters less.

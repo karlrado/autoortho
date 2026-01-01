@@ -21,21 +21,53 @@ from pathlib import Path
 from contextlib import contextmanager
 from multiprocessing.managers import BaseManager
 
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho import aoconfig
+except ImportError:
+    import aoconfig
 
-import aoconfig
-import aostats
-import winsetup
-import macsetup
-from utils.mount_utils import (
-    cleanup_mountpoint,
-    _is_frozen,
-    is_only_ao_placeholder,
-    clear_ao_placeholder,
-    safe_ismount,
-)
-from utils.constants import MAPTYPES, system_type
+try:
+    from autoortho import aostats
+except ImportError:
+    import aostats
 
-from version import __version__
+try:
+    from autoortho import winsetup
+except ImportError:
+    import winsetup
+
+try:
+    from autoortho import macsetup
+except ImportError:
+    import macsetup
+
+try:
+    from autoortho.utils.mount_utils import (
+        cleanup_mountpoint,
+        _is_frozen,
+        is_only_ao_placeholder,
+        clear_ao_placeholder,
+        safe_ismount,
+    )
+except ImportError:
+    from utils.mount_utils import (
+        cleanup_mountpoint,
+        _is_frozen,
+        is_only_ao_placeholder,
+        clear_ao_placeholder,
+        safe_ismount,
+    )
+
+try:
+    from autoortho.utils.constants import MAPTYPES, system_type
+except ImportError:
+    from utils.constants import MAPTYPES, system_type
+
+try:
+    from autoortho.version import __version__
+except ImportError:
+    from version import __version__
 
 import logging
 log = logging.getLogger(__name__)
@@ -46,7 +78,12 @@ import geocoder
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QIcon
-import config_ui_qt as config_ui
+
+try:
+    from autoortho import config_ui_qt as config_ui
+except ImportError:
+    import config_ui_qt as config_ui
+
 USE_QT = True
 
 

@@ -7,15 +7,27 @@ from io import BytesIO
 from binascii import hexlify
 from ctypes import *
 #from PIL import Image
-from aoimage import AoImage as Image
+
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho.aoimage import AoImage as Image
+except ImportError:
+    from aoimage import AoImage as Image
 
 import threading
 
 #from functools import lru_cache, cache
 
 #from memory_profiler import profile
-from aoconfig import CFG
-from utils.constants import system_type
+try:
+    from autoortho.aoconfig import CFG
+except ImportError:
+    from aoconfig import CFG
+
+try:
+    from autoortho.utils.constants import system_type
+except ImportError:
+    from utils.constants import system_type
 
 import logging
 log = logging.getLogger(__name__)

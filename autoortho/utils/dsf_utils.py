@@ -8,8 +8,16 @@ import uuid
 from logging import getLogger
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
-from aoconfig import CFG
-from utils.constants import system_type
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho.aoconfig import CFG
+except ImportError:
+    from aoconfig import CFG
+
+try:
+    from autoortho.utils.constants import system_type
+except ImportError:
+    from utils.constants import system_type
 
 from enum import Enum
 

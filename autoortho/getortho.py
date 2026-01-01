@@ -18,29 +18,75 @@ from functools import wraps, lru_cache
 from pathlib import Path
 from collections import OrderedDict
 
-import pydds
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho import pydds
+except ImportError:
+    import pydds
 
 import requests
 import psutil
-from aoimage import AoImage
 
-from aoconfig import CFG
-from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat
-from utils.constants import (
-    system_type, 
-    CURRENT_CPU_COUNT,
-    EARTH_RADIUS_M,
-    PRIORITY_DISTANCE_WEIGHT,
-    PRIORITY_DIRECTION_WEIGHT,
-    PRIORITY_MIPMAP_WEIGHT,
-    LOOKAHEAD_TIME_SEC,
-)
-from utils.apple_token_service import apple_token_service
-from utils.dynamic_zoom import DynamicZoomManager
-from utils.altitude_predictor import predict_altitude_at_closest_approach
-from utils.simbrief_flight import simbrief_flight_manager, PathPoint
+try:
+    from autoortho.aoimage import AoImage
+except ImportError:
+    from aoimage import AoImage
 
-from datareftrack import dt as datareftracker
+try:
+    from autoortho.aoconfig import CFG
+except ImportError:
+    from aoconfig import CFG
+
+try:
+    from autoortho.aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat
+except ImportError:
+    from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat
+
+try:
+    from autoortho.utils.constants import (
+        system_type, 
+        CURRENT_CPU_COUNT,
+        EARTH_RADIUS_M,
+        PRIORITY_DISTANCE_WEIGHT,
+        PRIORITY_DIRECTION_WEIGHT,
+        PRIORITY_MIPMAP_WEIGHT,
+        LOOKAHEAD_TIME_SEC,
+    )
+except ImportError:
+    from utils.constants import (
+        system_type, 
+        CURRENT_CPU_COUNT,
+        EARTH_RADIUS_M,
+        PRIORITY_DISTANCE_WEIGHT,
+        PRIORITY_DIRECTION_WEIGHT,
+        PRIORITY_MIPMAP_WEIGHT,
+        LOOKAHEAD_TIME_SEC,
+    )
+
+try:
+    from autoortho.utils.apple_token_service import apple_token_service
+except ImportError:
+    from utils.apple_token_service import apple_token_service
+
+try:
+    from autoortho.utils.dynamic_zoom import DynamicZoomManager
+except ImportError:
+    from utils.dynamic_zoom import DynamicZoomManager
+
+try:
+    from autoortho.utils.altitude_predictor import predict_altitude_at_closest_approach
+except ImportError:
+    from utils.altitude_predictor import predict_altitude_at_closest_approach
+
+try:
+    from autoortho.utils.simbrief_flight import simbrief_flight_manager, PathPoint
+except ImportError:
+    from utils.simbrief_flight import simbrief_flight_manager, PathPoint
+
+try:
+    from autoortho.datareftrack import dt as datareftracker
+except ImportError:
+    from datareftrack import dt as datareftracker
 
 MEMTRACE = False
 
@@ -657,6 +703,7 @@ chunk_getter = ChunkGetter(int(CFG.autoortho.fetch_threads))
 
 log.info(f"chunk_getter: {chunk_getter}")
 #log.info(f"tile_getter: {tile_getter}")
+
 
 # ============================================================================
 # ASYNC CACHE WRITER
@@ -2599,6 +2646,11 @@ MAX_TRANSIENT_RETRIES = {
     504: 5,   # Gateway timeout - infrastructure
 }
 
+# Maximum total attempts (including initial + all retries) before giving up
+# This prevents infinite retry loops for persistent failures (e.g., network issues,
+# invalid responses) that don't return specific HTTP error codes
+MAX_TOTAL_ATTEMPTS = 15
+
 
 class Chunk(object):
     col = -1
@@ -2807,6 +2859,24 @@ class Chunk(object):
             self.ready.set()
             return True
 
+        # === TOTAL ATTEMPT LIMIT ===
+        # Prevent infinite retries for persistent failures (network issues,
+        # invalid responses, etc.) that don't return specific HTTP codes
+        if self.attempt >= MAX_TOTAL_ATTEMPTS:
+            log.warning(f"Chunk {self} exceeded {MAX_TOTAL_ATTEMPTS} total attempts, marking as permanently failed")
+            self.permanent_failure = True
+            self.failure_reason = "max_total_attempts"
+            self.data = b''
+            self.ready.set()
+            bump('chunk_max_attempts_exhausted')
+            # Notify tile completion tracker
+            try:
+                if tile_completion_tracker is not None and self.tile_id:
+                    tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
+            except Exception:
+                pass
+            return True  # Return True to stop worker retries
+
         if not self.starttime:
             self.starttime = time.time()
 
@@ -2842,7 +2912,10 @@ class Chunk(object):
             log.debug("EOX DETECTED")
             header.update({'referer': 'https://s2maps.eu/'})
        
-        time.sleep((self.attempt/10))
+        # Capped backoff: grows with attempts but maxes at 2 seconds
+        # This prevents runaway delays when server is slow/throttling
+        backoff_sleep = min(2.0, self.attempt / 10.0)
+        time.sleep(backoff_sleep)
         self.attempt += 1
 
         log.debug(f"Requesting {self.url} ..")
@@ -2950,6 +3023,16 @@ class Chunk(object):
         # The chunk data is already in memory (self.data), so we can mark it
         # as ready immediately. Cache writes are for future requests only.
         self.ready.set()
+        
+        # Track slow downloads for visibility in stats
+        try:
+            duration_ms = int((self.fetchtime or 0) * 1000)
+            if duration_ms > 5000:  # >5s is noteworthy
+                bump('chunk_slow_download')
+            if duration_ms > 15000:  # >15s is very slow
+                bump('chunk_very_slow_download')
+        except Exception:
+            pass
         
         # Notify tile completion tracker (for predictive DDS generation)
         # Fire-and-forget: never block download on notification failure
@@ -3502,9 +3585,20 @@ class Tile(object):
             
             if use_time_budget:
                 base_budget = float(getattr(CFG.autoortho, 'tile_time_budget', 5.0))
-                if CFG.autoortho.suspend_maxwait and not datareftracker.connected:
-                    effective_budget = base_budget * 10.0
-                    log.debug(f"GET_IMG: Startup mode - creating tile budget {effective_budget:.1f}s")
+                # Use has_ever_connected to distinguish true startup from temporary disconnects.
+                # During stutters, X-Plane may briefly stop sending UDP packets, causing
+                # connected=False. We don't want longer timeouts during stutters - only
+                # during the actual initial scenery load (before first connection).
+                if CFG.autoortho.suspend_maxwait and not datareftracker.has_ever_connected:
+                    # Startup mode: increase budget but cap to reasonable maximum
+                    # 10x multiplier for initial loading to allow more tiles to complete.
+                    # The has_ever_connected check ensures this only applies during true
+                    # startup, not during temporary disconnects from stuttering.
+                    startup_multiplier = 10.0
+                    max_startup_budget = 1800.0  # 30 minute absolute cap
+                    effective_budget = min(base_budget * startup_multiplier, max_startup_budget)
+                    log.debug(f"GET_IMG: Startup mode - creating tile budget {effective_budget:.1f}s "
+                              f"(base={base_budget:.1f}s × {startup_multiplier})")
                 else:
                     effective_budget = base_budget
                     log.debug(f"GET_IMG: Creating tile budget {effective_budget:.1f}s (processing begins now)")
@@ -3600,9 +3694,10 @@ class Tile(object):
                 # This ensures lower-detail tiles load first, minimizing missing tiles
                 base_priority = self.max_mipmap - mipmap
                 
-                # During initial load (before flight starts), further deprioritize high-detail
-                # to ensure lower mipmaps load completely first
-                if CFG.autoortho.suspend_maxwait and not datareftracker.connected:
+                # During initial load (before first connection), further deprioritize high-detail
+                # to ensure lower mipmaps load completely first.
+                # Uses has_ever_connected to avoid applying during temporary stutters.
+                if CFG.autoortho.suspend_maxwait and not datareftracker.has_ever_connected:
                     # Add penalty to high-detail mipmaps during initial load
                     # Mipmap 0 gets +20, mipmap 4 gets +0
                     initial_load_penalty = (self.max_mipmap - mipmap) * 5
@@ -3784,12 +3879,21 @@ class Tile(object):
 
             chunk_img = None
             decode_failed = False
-            if chunk_ready and chunk.data:
+            
+            # TOCTOU FIX: Capture local reference to chunk.data before checking/using.
+            # This prevents a race condition where another thread (e.g., Chunk.close())
+            # could set chunk.data = None between our check and use. Python's GIL makes
+            # reference assignment atomic, so once we have a local ref, the object won't
+            # be garbage collected even if chunk.data is cleared elsewhere.
+            # This pattern matches save_cache() which uses the same approach.
+            chunk_data = chunk.data
+            
+            if chunk_ready and chunk_data:
                 # We returned and have data!
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Ready and found chunk data.")
                 try:
                     with _decode_sem:
-                        chunk_img = AoImage.load_from_memory(chunk.data)
+                        chunk_img = AoImage.load_from_memory(chunk_data)
                         if chunk_img is None:
                             log.warning(f"GET_IMG: load_from_memory returned None for {chunk}")
                             decode_failed = True
@@ -3797,7 +3901,7 @@ class Tile(object):
                     log.error(f"GET_IMG: load_from_memory exception for {chunk}: {_e}")
                     chunk_img = None
                     decode_failed = True
-            elif chunk_ready and not chunk.data:
+            elif chunk_ready and not chunk_data:
                 # Download "succeeded" but returned empty data
                 log.debug(f"GET_IMG: Chunk {chunk} ready but has no data")
                 decode_failed = True
@@ -3917,11 +4021,13 @@ class Tile(object):
                         # Still in progress - wait with reduced timeout (1s max for retry)
                         chunk_ready = time_budget.wait_with_budget(chunk.ready, max_single_wait=1.0)
                 
-                if chunk_ready and chunk.data:
+                # TOCTOU FIX: Capture local reference for retry path (same pattern as above)
+                retry_chunk_data = chunk.data
+                if chunk_ready and retry_chunk_data:
                     log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Final retry for {chunk}, SUCCESS!")
                     try:
                         with _decode_sem:
-                            chunk_img = AoImage.load_from_memory(chunk.data)
+                            chunk_img = AoImage.load_from_memory(retry_chunk_data)
                             if chunk_img is None:
                                 log.warning(f"GET_IMG: load_from_memory returned None on retry for {chunk}")
                     except Exception as _e:
@@ -4338,15 +4444,20 @@ class Tile(object):
                     # Don't close - shared pool manages lifecycle
                     continue
             
+            # TOCTOU FIX: Capture local reference before checking/using.
+            # Same pattern as process_chunk() - prevents race where another thread
+            # could clear fallback_chunk.data between our check and decode.
+            fallback_data = fallback_chunk.data
+            
             # Chunk is ready - check if we have valid data
-            if not fallback_chunk.data:
+            if not fallback_data:
                 log.debug(f"Cascading fallback: chunk {fallback_chunk} ready but no data")
                 continue
             
             # Decode and upscale
             try:
                 with _decode_sem:
-                    fallback_img = AoImage.load_from_memory(fallback_chunk.data)
+                    fallback_img = AoImage.load_from_memory(fallback_data)
                     if fallback_img is None:
                         log.warning(f"Cascading fallback: load_from_memory returned None for {fallback_chunk}")
                         continue
@@ -4659,7 +4770,8 @@ class Tile(object):
 
     def get_maxwait(self):
         effective_maxwait = self.maxchunk_wait
-        if CFG.autoortho.suspend_maxwait and not datareftracker.connected:
+        # Only extend maxwait during true initial loading, not during temporary disconnects
+        if CFG.autoortho.suspend_maxwait and not datareftracker.has_ever_connected:
             effective_maxwait = 20
         return effective_maxwait
 
@@ -5113,27 +5225,42 @@ class TileCacher(object):
         # Get flight averages for prediction
         averages = datareftracker.get_flight_averages()
 
+        # Helper to determine if this is an airport tile
+        is_airport_tile = tile_zoom == 18 and not CFG.autoortho.using_custom_tiles
+
         # If no valid averages, try to use current altitude (AGL)
         if averages is None:
             with datareftracker._lock:
                 if datareftracker.data_valid and datareftracker.alt_agl_ft > 0:
-                    zoom = self.dynamic_zoom_manager.get_zoom_for_altitude(
-                        datareftracker.alt_agl_ft
-                    )
-                    log.debug(f"Dynamic zoom (current AGL): {datareftracker.alt_agl_ft:.0f}ft -> ZL{zoom}")
+                    if is_airport_tile:
+                        zoom = self.dynamic_zoom_manager.get_airport_zoom_for_altitude(
+                            datareftracker.alt_agl_ft
+                        )
+                        log.debug(f"Dynamic zoom (current AGL): {datareftracker.alt_agl_ft:.0f}ft -> ZL{zoom} (airport tile)")
+                    else:
+                        zoom = self.dynamic_zoom_manager.get_zoom_for_altitude(
+                            datareftracker.alt_agl_ft
+                        )
+                        log.debug(f"Dynamic zoom (current AGL): {datareftracker.alt_agl_ft:.0f}ft -> ZL{zoom}")
                     return zoom
             # Fall back to base step or fixed zoom
             base = self.dynamic_zoom_manager.get_base_step()
-            fallback_zoom = base.zoom_level if base else self.target_zoom_level
-            log.debug(f"Dynamic zoom: no flight data, using fallback ZL{fallback_zoom}")
+            if is_airport_tile:
+                fallback_zoom = base.zoom_level_airports if base else 18
+            else:
+                fallback_zoom = base.zoom_level if base else self.target_zoom_level
+            log.debug(f"Dynamic zoom: no flight data, using fallback ZL{fallback_zoom}{' (airport tile)' if is_airport_tile else ''}")
             return fallback_zoom
 
         # Get current position (with lock for thread safety)
         with datareftracker._lock:
             if not datareftracker.data_valid:
                 base = self.dynamic_zoom_manager.get_base_step()
-                fallback_zoom = base.zoom_level if base else self.target_zoom_level
-                log.debug(f"Dynamic zoom: no valid datarefs, using fallback ZL{fallback_zoom}")
+                if is_airport_tile:
+                    fallback_zoom = base.zoom_level_airports if base else 18
+                else:
+                    fallback_zoom = base.zoom_level if base else self.target_zoom_level
+                log.debug(f"Dynamic zoom: no valid datarefs, using fallback ZL{fallback_zoom}{' (airport tile)' if is_airport_tile else ''}")
                 return fallback_zoom
 
             aircraft_lat = datareftracker.lat
@@ -5183,14 +5310,16 @@ class TileCacher(object):
             # Still cap to tile's max supported zoom (default + 1 is X-Plane's limit)
             final_zoom = min(default_zoom + 1, dynamic_zoom)
             
-            # Log when dynamic zoom changes the zoom level (reduce log spam)
-            if final_zoom != self._last_logged_dynamic_zoom:
-                fixed_zoom = self.target_zoom_level
-                if default_zoom == 18 and not CFG.autoortho.using_custom_tiles:
-                    fixed_zoom = self.target_zoom_level_near_airports
-                if final_zoom != fixed_zoom:
-                    log.info(f"Dynamic zoom: ZL{final_zoom} (was fixed ZL{fixed_zoom}) - altitude-based adjustment")
-                self._last_logged_dynamic_zoom = final_zoom
+            # Log when dynamic zoom changes from the fixed config value (DEBUG level to reduce spam)
+            # Only log once per unique (final_zoom, fixed_zoom) pair to avoid flooding logs
+            fixed_zoom = self.target_zoom_level
+            if default_zoom == 18 and not CFG.autoortho.using_custom_tiles:
+                fixed_zoom = self.target_zoom_level_near_airports
+            
+            log_key = (final_zoom, fixed_zoom, default_zoom)
+            if log_key != self._last_logged_dynamic_zoom and final_zoom != fixed_zoom:
+                log.debug(f"Dynamic zoom: ZL{final_zoom} (was fixed ZL{fixed_zoom}) - altitude-based adjustment")
+                self._last_logged_dynamic_zoom = log_key
             
             return final_zoom
 

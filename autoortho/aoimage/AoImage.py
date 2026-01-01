@@ -4,7 +4,12 @@ import os
 import sys
 from ctypes import *
 
-from utils.constants import system_type
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho.utils.constants import system_type
+except ImportError:
+    from utils.constants import system_type
+
 import logging
 log = logging.getLogger(__name__)
 

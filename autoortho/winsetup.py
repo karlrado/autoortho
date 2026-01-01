@@ -8,7 +8,11 @@ import subprocess
 from ctypes import CDLL
 from ctypes.util import find_library
 
-from aoconfig import CFG
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho.aoconfig import CFG
+except ImportError:
+    from aoconfig import CFG
 
 log = logging.getLogger(__name__)
 
