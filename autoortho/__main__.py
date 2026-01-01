@@ -8,7 +8,10 @@ if getattr(sys, 'frozen', False):
     multiprocessing.freeze_support()
 
 if os.environ.get("AO_RUN_MODE") == "macfuse_worker":
-    from macfuse_worker import main as _ao_worker_main
+    try:
+        from autoortho.macfuse_worker import main as _ao_worker_main
+    except ImportError:
+        from macfuse_worker import main as _ao_worker_main
     _ao_worker_main()
     os._exit(0)
 
@@ -17,14 +20,26 @@ import logging
 import logging.handlers
 import atexit, signal, threading
 import platform
-from aoconfig import CFG
 from pathlib import Path
-from utils.constants import system_type
+
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho.aoconfig import CFG
+except ImportError:
+    from aoconfig import CFG
+
+try:
+    from autoortho.utils.constants import system_type
+except ImportError:
+    from utils.constants import system_type
 
 # Install crash handler EARLY, before any C extensions load
 # This allows us to log C-level crashes (segfaults, access violations)
 try:
-    from crash_handler import install_crash_handler
+    try:
+        from autoortho.crash_handler import install_crash_handler
+    except ImportError:
+        from crash_handler import install_crash_handler
     install_crash_handler()
 except Exception as e:
     # Don't fail if crash handler can't be installed
@@ -58,7 +73,10 @@ def _global_shutdown(signum=None, frame=None):
         pass
 
     try:
-        from autoortho.getortho import shutdown as _go_shutdown
+        try:
+            from autoortho.getortho import shutdown as _go_shutdown
+        except ImportError:
+            from getortho import shutdown as _go_shutdown
         _go_shutdown()
     except Exception:
         pass
@@ -193,7 +211,11 @@ try:
 except Exception:
     pass
 
-import autoortho
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho import autoortho
+except ImportError:
+    import autoortho
 
 if __name__ == "__main__":
     try:

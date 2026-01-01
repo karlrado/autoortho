@@ -2,20 +2,39 @@ import argparse
 import logging
 import logging.handlers
 import os
-from mfusepy import FUSE
 import sys
 
-from autoortho_fuse import AutoOrtho, fuse_option_profiles_by_os
-from aostats import update_process_memory_stat, clear_process_memory_stat
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho.mfusepy import FUSE
+except ImportError:
+    from mfusepy import FUSE
+
+try:
+    from autoortho.autoortho_fuse import AutoOrtho, fuse_option_profiles_by_os
+except ImportError:
+    from autoortho_fuse import AutoOrtho, fuse_option_profiles_by_os
+
+try:
+    from autoortho.aostats import update_process_memory_stat, clear_process_memory_stat
+except ImportError:
+    from aostats import update_process_memory_stat, clear_process_memory_stat
 
 log = logging.getLogger(__name__)
 
 # Install crash handler for macOS worker subprocess
-# CRITICAL: macOS uses subprocesses, each needs its own crash handler!
+# CRITICAL: macOS FUSE workers must NOT install signal handlers!
+# macFUSE uses internal signal handling (SIGBUS, etc.) and our custom handlers
+# interfere with this, causing the FUSE event loop to exit silently.
+# We only install the Python exception hook, skipping signal handlers.
 try:
-    from crash_handler import install_crash_handler
-    install_crash_handler()
-    log.debug("Crash handler installed in macOS worker subprocess")
+    try:
+        from autoortho.crash_handler import install_crash_handler
+    except ImportError:
+        from crash_handler import install_crash_handler
+    # skip_signal_handlers=True prevents interference with macFUSE's signal handling
+    install_crash_handler(skip_signal_handlers=True)
+    log.debug("Crash handler installed in macOS worker subprocess (signal handlers skipped)")
 except Exception as e:
     # Don't fail if crash handler can't be installed
     print(f"Warning: macOS worker could not install crash handler: {e}", file=sys.stderr)
@@ -106,7 +125,10 @@ def main():
         raise
     finally:
         try:
-            from getortho import stats_batcher, shutdown
+            try:
+                from autoortho.getortho import stats_batcher, shutdown
+            except ImportError:
+                from getortho import stats_batcher, shutdown
             if stats_batcher:
                 stats_batcher.stop()
             shutdown()

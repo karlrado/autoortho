@@ -9,20 +9,42 @@ import errno
 import ctypes
 import threading
 
-import flighttrack
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho import flighttrack
+except ImportError:
+    import flighttrack
 
 from collections import defaultdict
 from functools import wraps, lru_cache
 
-from aoconfig import CFG
-from utils.constants import system_type
-from time_exclusion import time_exclusion_manager
+try:
+    from autoortho.aoconfig import CFG
+except ImportError:
+    from aoconfig import CFG
+
+try:
+    from autoortho.utils.constants import system_type
+except ImportError:
+    from utils.constants import system_type
+
+try:
+    from autoortho.time_exclusion import time_exclusion_manager
+except ImportError:
+    from time_exclusion import time_exclusion_manager
+
 import logging
 log = logging.getLogger(__name__)
 
-from mfusepy import FUSE, FuseOSError, Operations, fuse_get_context, _libfuse
+try:
+    from autoortho.mfusepy import FUSE, FuseOSError, Operations, fuse_get_context, _libfuse
+except ImportError:
+    from mfusepy import FUSE, FuseOSError, Operations, fuse_get_context, _libfuse
 
-import getortho
+try:
+    from autoortho import getortho
+except ImportError:
+    import getortho
 
 def _rgb_to_rgb565(r: int, g: int, b: int) -> int:
     """Convert RGB888 to RGB565 format used by BC1/DXT1 compression."""
@@ -278,7 +300,10 @@ class AutoOrtho(Operations):
         self.use_ns = kwargs.get("use_ns", False)
         
         # Initialize time exclusion manager with dataref tracker
-        from datareftrack import dt as datareftracker
+        try:
+            from autoortho.datareftrack import dt as datareftracker
+        except ImportError:
+            from datareftrack import dt as datareftracker
         time_exclusion_manager.set_dataref_tracker(datareftracker)
 
     # Helpers
@@ -350,6 +375,8 @@ class AutoOrtho(Operations):
         
         This ensures the FUSE lock timeout is always sufficient for tile building:
         - Base: tile_time_budget (time allowed for chunk downloads)
+        - Startup: applies same multiplier (3x, capped at 300s) when suspend_maxwait 
+          is enabled and not yet connected to X-Plane
         - Extended: + fallback_timeout if fallback_extends_budget is enabled
         - Buffer: + 15 seconds for DDS operations and overhead
         
@@ -362,6 +389,24 @@ class AutoOrtho(Operations):
                 tile_budget = float(tile_budget)
             except ValueError:
                 tile_budget = 120.0
+        
+        # Account for startup multiplier - must match getortho.py logic
+        # During initial startup (before first connection), budget is multiplied.
+        # Uses has_ever_connected to distinguish true startup from temporary disconnects
+        # caused by stuttering (which should NOT get extended timeouts).
+        try:
+            from datareftrack import dt as datareftracker
+            suspend_maxwait = getattr(CFG.autoortho, 'suspend_maxwait', True)
+            if isinstance(suspend_maxwait, str):
+                suspend_maxwait = suspend_maxwait.lower().strip() in ('true', '1', 'yes', 'on')
+            
+            if suspend_maxwait and not getattr(datareftracker, 'has_ever_connected', False):
+                # Match getortho.py: 10x multiplier for initial loading
+                startup_multiplier = 10.0
+                max_startup_budget = 1800.0
+                tile_budget = min(tile_budget * startup_multiplier, max_startup_budget)
+        except ImportError:
+            pass  # datareftracker not available, use base budget
         
         # Check if fallback extends the budget
         fallback_extends = getattr(CFG.autoortho, 'fallback_extends_budget', False)
@@ -415,18 +460,32 @@ class AutoOrtho(Operations):
 
     @lru_cache(maxsize=1024)
     def _calculate_dds_size(self, zoom):
-        """Calculate the actual DDS file size based on tile parameters and current configuration."""
+        """Calculate the actual DDS file size based on tile parameters and current configuration.
+        
+        IMPORTANT: In dynamic zoom mode, the actual tile zoom can vary based on altitude prediction.
+        To avoid truncated texture issues, we calculate size for the MAXIMUM possible zoom level
+        that a tile could use, which is zoom + 1 (the X-Plane limit for tile imagery).
+        This ensures FUSE always reports a size >= the actual DDS size.
+        """
         try:
             # Convert parameters to the format expected by the tile system
             zoom = int(zoom)
             
-            # Replicate the max_zoom selection logic from TileCacher
-            if CFG.autoortho.using_custom_tiles:
-                uncapped_target_zoom = self.tc.target_zoom_level
+            # Check if dynamic zoom mode is enabled
+            max_zoom_mode = str(CFG.autoortho.max_zoom_mode).lower()
+            
+            if max_zoom_mode == "dynamic":
+                # In dynamic zoom mode, the actual zoom can be up to zoom + 1
+                # We MUST use the maximum possible size to avoid X-Plane seeing truncated textures
+                # (the DDS header declares the full size, so the file must be at least that big)
+                max_zoom = zoom + 1
             else:
-                uncapped_target_zoom = self.tc.target_zoom_level_near_airports if zoom == 18 else self.tc.target_zoom_level
-
-            max_zoom = min(zoom + 1,uncapped_target_zoom)
+                # Fixed mode - use the configured target zoom levels
+                if CFG.autoortho.using_custom_tiles:
+                    uncapped_target_zoom = self.tc.target_zoom_level
+                else:
+                    uncapped_target_zoom = self.tc.target_zoom_level_near_airports if zoom == 18 else self.tc.target_zoom_level
+                max_zoom = min(zoom + 1, uncapped_target_zoom)
             
             # Replicate tile dimension calculation logic from Tile.__init__
             width = 16  # Default tile width in chunks

@@ -21,7 +21,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
 
 
-from aoconfig import CFG
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho.aoconfig import CFG
+except ImportError:
+    from aoconfig import CFG
 
 import logging
 log = logging.getLogger(__name__)

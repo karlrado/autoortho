@@ -1,6 +1,11 @@
 import os
 import logging
-from utils.mount_utils import safe_ismount
+
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho.utils.mount_utils import safe_ismount
+except ImportError:
+    from utils.mount_utils import safe_ismount
 
 log = logging.getLogger(__name__)
 

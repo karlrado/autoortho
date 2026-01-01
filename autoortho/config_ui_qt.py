@@ -13,12 +13,37 @@ import re
 import webbrowser
 import requests
 from packaging import version
-import utils.resources_rc
-from utils.constants import MAPTYPES, system_type
-from utils.mappers import map_kubilus_region_to_simheaven_region
-from utils.dsf_utils import DsfUtils, dsf_utils
-from utils.mount_utils import cleanup_mountpoint, safe_ismount
-from utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
+
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    import autoortho.utils.resources_rc
+except ImportError:
+    import utils.resources_rc
+
+try:
+    from autoortho.utils.constants import MAPTYPES, system_type
+except ImportError:
+    from utils.constants import MAPTYPES, system_type
+
+try:
+    from autoortho.utils.mappers import map_kubilus_region_to_simheaven_region
+except ImportError:
+    from utils.mappers import map_kubilus_region_to_simheaven_region
+
+try:
+    from autoortho.utils.dsf_utils import DsfUtils, dsf_utils
+except ImportError:
+    from utils.dsf_utils import DsfUtils, dsf_utils
+
+try:
+    from autoortho.utils.mount_utils import cleanup_mountpoint, safe_ismount
+except ImportError:
+    from utils.mount_utils import cleanup_mountpoint, safe_ismount
+
+try:
+    from autoortho.utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
+except ImportError:
+    from utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -36,8 +61,15 @@ from PySide6.QtGui import (
     QPixmap, QIcon, QColor, QWheelEvent, QCursor
 )
 
-import downloader
-from version import __version__
+try:
+    from autoortho import downloader
+except ImportError:
+    import downloader
+
+try:
+    from autoortho.version import __version__
+except ImportError:
+    from version import __version__
 
 log = logging.getLogger(__name__)
 
