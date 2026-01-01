@@ -2,8 +2,16 @@ import struct, re, os, math, time, datetime, atexit
 import py7zr
 import py7zr.io
 
-from aoconfig import CFG
-from aostats import STATS, StatTracker, inc_stat
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho.aoconfig import CFG
+except ImportError:
+    from aoconfig import CFG
+
+try:
+    from autoortho.aostats import STATS, StatTracker, inc_stat
+except ImportError:
+    from aostats import STATS, StatTracker, inc_stat
 from functools import lru_cache
 
 import logging

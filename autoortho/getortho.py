@@ -18,29 +18,75 @@ from functools import wraps, lru_cache
 from pathlib import Path
 from collections import OrderedDict
 
-import pydds
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho import pydds
+except ImportError:
+    import pydds
 
 import requests
 import psutil
-from aoimage import AoImage
 
-from aoconfig import CFG
-from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat
-from utils.constants import (
-    system_type, 
-    CURRENT_CPU_COUNT,
-    EARTH_RADIUS_M,
-    PRIORITY_DISTANCE_WEIGHT,
-    PRIORITY_DIRECTION_WEIGHT,
-    PRIORITY_MIPMAP_WEIGHT,
-    LOOKAHEAD_TIME_SEC,
-)
-from utils.apple_token_service import apple_token_service
-from utils.dynamic_zoom import DynamicZoomManager
-from utils.altitude_predictor import predict_altitude_at_closest_approach
-from utils.simbrief_flight import simbrief_flight_manager, PathPoint
+try:
+    from autoortho.aoimage import AoImage
+except ImportError:
+    from aoimage import AoImage
 
-from datareftrack import dt as datareftracker
+try:
+    from autoortho.aoconfig import CFG
+except ImportError:
+    from aoconfig import CFG
+
+try:
+    from autoortho.aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat
+except ImportError:
+    from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat
+
+try:
+    from autoortho.utils.constants import (
+        system_type, 
+        CURRENT_CPU_COUNT,
+        EARTH_RADIUS_M,
+        PRIORITY_DISTANCE_WEIGHT,
+        PRIORITY_DIRECTION_WEIGHT,
+        PRIORITY_MIPMAP_WEIGHT,
+        LOOKAHEAD_TIME_SEC,
+    )
+except ImportError:
+    from utils.constants import (
+        system_type, 
+        CURRENT_CPU_COUNT,
+        EARTH_RADIUS_M,
+        PRIORITY_DISTANCE_WEIGHT,
+        PRIORITY_DIRECTION_WEIGHT,
+        PRIORITY_MIPMAP_WEIGHT,
+        LOOKAHEAD_TIME_SEC,
+    )
+
+try:
+    from autoortho.utils.apple_token_service import apple_token_service
+except ImportError:
+    from utils.apple_token_service import apple_token_service
+
+try:
+    from autoortho.utils.dynamic_zoom import DynamicZoomManager
+except ImportError:
+    from utils.dynamic_zoom import DynamicZoomManager
+
+try:
+    from autoortho.utils.altitude_predictor import predict_altitude_at_closest_approach
+except ImportError:
+    from utils.altitude_predictor import predict_altitude_at_closest_approach
+
+try:
+    from autoortho.utils.simbrief_flight import simbrief_flight_manager, PathPoint
+except ImportError:
+    from utils.simbrief_flight import simbrief_flight_manager, PathPoint
+
+try:
+    from autoortho.datareftrack import dt as datareftracker
+except ImportError:
+    from datareftrack import dt as datareftracker
 
 MEMTRACE = False
 

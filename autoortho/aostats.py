@@ -6,8 +6,11 @@ from collections.abc import MutableMapping
 from multiprocessing.managers import BaseManager
 import psutil
 
-
-from aoconfig import CFG
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho.aoconfig import CFG
+except ImportError:
+    from aoconfig import CFG
 import logging
 log = logging.getLogger(__name__)
 

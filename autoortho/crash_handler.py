@@ -18,7 +18,12 @@ import signal
 import logging
 import traceback
 from datetime import datetime
-from utils.constants import LOGS_DIR
+
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho.utils.constants import LOGS_DIR
+except ImportError:
+    from utils.constants import LOGS_DIR
 
 
 log = logging.getLogger(__name__)

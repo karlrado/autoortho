@@ -2,18 +2,33 @@ import argparse
 import logging
 import logging.handlers
 import os
-from mfusepy import FUSE
 import sys
 
-from autoortho_fuse import AutoOrtho, fuse_option_profiles_by_os
-from aostats import update_process_memory_stat, clear_process_memory_stat
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho.mfusepy import FUSE
+except ImportError:
+    from mfusepy import FUSE
+
+try:
+    from autoortho.autoortho_fuse import AutoOrtho, fuse_option_profiles_by_os
+except ImportError:
+    from autoortho_fuse import AutoOrtho, fuse_option_profiles_by_os
+
+try:
+    from autoortho.aostats import update_process_memory_stat, clear_process_memory_stat
+except ImportError:
+    from aostats import update_process_memory_stat, clear_process_memory_stat
 
 log = logging.getLogger(__name__)
 
 # Install crash handler for macOS worker subprocess
 # CRITICAL: macOS uses subprocesses, each needs its own crash handler!
 try:
-    from crash_handler import install_crash_handler
+    try:
+        from autoortho.crash_handler import install_crash_handler
+    except ImportError:
+        from crash_handler import install_crash_handler
     install_crash_handler()
     log.debug("Crash handler installed in macOS worker subprocess")
 except Exception as e:
@@ -106,7 +121,10 @@ def main():
         raise
     finally:
         try:
-            from getortho import stats_batcher, shutdown
+            try:
+                from autoortho.getortho import stats_batcher, shutdown
+            except ImportError:
+                from getortho import stats_batcher, shutdown
             if stats_batcher:
                 stats_batcher.stop()
             shutdown()

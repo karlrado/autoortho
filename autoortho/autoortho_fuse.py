@@ -9,20 +9,42 @@ import errno
 import ctypes
 import threading
 
-import flighttrack
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho import flighttrack
+except ImportError:
+    import flighttrack
 
 from collections import defaultdict
 from functools import wraps, lru_cache
 
-from aoconfig import CFG
-from utils.constants import system_type
-from time_exclusion import time_exclusion_manager
+try:
+    from autoortho.aoconfig import CFG
+except ImportError:
+    from aoconfig import CFG
+
+try:
+    from autoortho.utils.constants import system_type
+except ImportError:
+    from utils.constants import system_type
+
+try:
+    from autoortho.time_exclusion import time_exclusion_manager
+except ImportError:
+    from time_exclusion import time_exclusion_manager
+
 import logging
 log = logging.getLogger(__name__)
 
-from mfusepy import FUSE, FuseOSError, Operations, fuse_get_context, _libfuse
+try:
+    from autoortho.mfusepy import FUSE, FuseOSError, Operations, fuse_get_context, _libfuse
+except ImportError:
+    from mfusepy import FUSE, FuseOSError, Operations, fuse_get_context, _libfuse
 
-import getortho
+try:
+    from autoortho import getortho
+except ImportError:
+    import getortho
 
 def _rgb_to_rgb565(r: int, g: int, b: int) -> int:
     """Convert RGB888 to RGB565 format used by BC1/DXT1 compression."""
@@ -278,7 +300,10 @@ class AutoOrtho(Operations):
         self.use_ns = kwargs.get("use_ns", False)
         
         # Initialize time exclusion manager with dataref tracker
-        from datareftrack import dt as datareftracker
+        try:
+            from autoortho.datareftrack import dt as datareftracker
+        except ImportError:
+            from datareftrack import dt as datareftracker
         time_exclusion_manager.set_dataref_tracker(datareftracker)
 
     # Helpers
