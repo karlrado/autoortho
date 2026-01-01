@@ -199,12 +199,18 @@ def _install_exception_hook():
     log.info("Installed Python exception hook")
 
 
-def install_crash_handler():
+def install_crash_handler(skip_signal_handlers: bool = False):
     """
     Install crash handlers for the platform.
     
     This should be called early in the application startup, preferably
     in __main__.py before importing any C extensions.
+    
+    Args:
+        skip_signal_handlers: If True, skip installing signal handlers 
+            (SIGSEGV, SIGABRT, etc.) but still install the Python exception
+            hook. This is useful for macOS FUSE worker subprocesses where
+            signal handlers interfere with macFUSE's internal signaling.
     
     Returns:
         bool: True if handler was installed successfully
@@ -220,8 +226,10 @@ def install_crash_handler():
     # Always install Python exception hook
     _install_exception_hook()
     
-    # Install platform-specific handlers
-    if sys.platform.startswith('linux') or sys.platform == 'darwin':
+    # Install platform-specific signal handlers (unless skipped)
+    if skip_signal_handlers:
+        log.info("Skipping signal handlers (skip_signal_handlers=True)")
+    elif sys.platform.startswith('linux') or sys.platform == 'darwin':
         _install_unix_handlers()
     elif sys.platform == 'win32':
         _install_windows_handlers()

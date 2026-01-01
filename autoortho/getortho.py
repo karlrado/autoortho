@@ -5310,14 +5310,16 @@ class TileCacher(object):
             # Still cap to tile's max supported zoom (default + 1 is X-Plane's limit)
             final_zoom = min(default_zoom + 1, dynamic_zoom)
             
-            # Log when dynamic zoom changes the zoom level (reduce log spam)
-            if final_zoom != self._last_logged_dynamic_zoom:
-                fixed_zoom = self.target_zoom_level
-                if default_zoom == 18 and not CFG.autoortho.using_custom_tiles:
-                    fixed_zoom = self.target_zoom_level_near_airports
-                if final_zoom != fixed_zoom:
-                    log.info(f"Dynamic zoom: ZL{final_zoom} (was fixed ZL{fixed_zoom}) - altitude-based adjustment")
-                self._last_logged_dynamic_zoom = final_zoom
+            # Log when dynamic zoom changes from the fixed config value (DEBUG level to reduce spam)
+            # Only log once per unique (final_zoom, fixed_zoom) pair to avoid flooding logs
+            fixed_zoom = self.target_zoom_level
+            if default_zoom == 18 and not CFG.autoortho.using_custom_tiles:
+                fixed_zoom = self.target_zoom_level_near_airports
+            
+            log_key = (final_zoom, fixed_zoom, default_zoom)
+            if log_key != self._last_logged_dynamic_zoom and final_zoom != fixed_zoom:
+                log.debug(f"Dynamic zoom: ZL{final_zoom} (was fixed ZL{fixed_zoom}) - altitude-based adjustment")
+                self._last_logged_dynamic_zoom = log_key
             
             return final_zoom
 

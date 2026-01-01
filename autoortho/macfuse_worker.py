@@ -23,14 +23,18 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 # Install crash handler for macOS worker subprocess
-# CRITICAL: macOS uses subprocesses, each needs its own crash handler!
+# CRITICAL: macOS FUSE workers must NOT install signal handlers!
+# macFUSE uses internal signal handling (SIGBUS, etc.) and our custom handlers
+# interfere with this, causing the FUSE event loop to exit silently.
+# We only install the Python exception hook, skipping signal handlers.
 try:
     try:
         from autoortho.crash_handler import install_crash_handler
     except ImportError:
         from crash_handler import install_crash_handler
-    install_crash_handler()
-    log.debug("Crash handler installed in macOS worker subprocess")
+    # skip_signal_handlers=True prevents interference with macFUSE's signal handling
+    install_crash_handler(skip_signal_handlers=True)
+    log.debug("Crash handler installed in macOS worker subprocess (signal handlers skipped)")
 except Exception as e:
     # Don't fail if crash handler can't be installed
     print(f"Warning: macOS worker could not install crash handler: {e}", file=sys.stderr)

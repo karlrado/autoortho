@@ -460,18 +460,32 @@ class AutoOrtho(Operations):
 
     @lru_cache(maxsize=1024)
     def _calculate_dds_size(self, zoom):
-        """Calculate the actual DDS file size based on tile parameters and current configuration."""
+        """Calculate the actual DDS file size based on tile parameters and current configuration.
+        
+        IMPORTANT: In dynamic zoom mode, the actual tile zoom can vary based on altitude prediction.
+        To avoid truncated texture issues, we calculate size for the MAXIMUM possible zoom level
+        that a tile could use, which is zoom + 1 (the X-Plane limit for tile imagery).
+        This ensures FUSE always reports a size >= the actual DDS size.
+        """
         try:
             # Convert parameters to the format expected by the tile system
             zoom = int(zoom)
             
-            # Replicate the max_zoom selection logic from TileCacher
-            if CFG.autoortho.using_custom_tiles:
-                uncapped_target_zoom = self.tc.target_zoom_level
+            # Check if dynamic zoom mode is enabled
+            max_zoom_mode = str(CFG.autoortho.max_zoom_mode).lower()
+            
+            if max_zoom_mode == "dynamic":
+                # In dynamic zoom mode, the actual zoom can be up to zoom + 1
+                # We MUST use the maximum possible size to avoid X-Plane seeing truncated textures
+                # (the DDS header declares the full size, so the file must be at least that big)
+                max_zoom = zoom + 1
             else:
-                uncapped_target_zoom = self.tc.target_zoom_level_near_airports if zoom == 18 else self.tc.target_zoom_level
-
-            max_zoom = min(zoom + 1,uncapped_target_zoom)
+                # Fixed mode - use the configured target zoom levels
+                if CFG.autoortho.using_custom_tiles:
+                    uncapped_target_zoom = self.tc.target_zoom_level
+                else:
+                    uncapped_target_zoom = self.tc.target_zoom_level_near_airports if zoom == 18 else self.tc.target_zoom_level
+                max_zoom = min(zoom + 1, uncapped_target_zoom)
             
             # Replicate tile dimension calculation logic from Tile.__init__
             width = 16  # Default tile width in chunks
