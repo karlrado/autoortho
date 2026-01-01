@@ -185,18 +185,9 @@ def clear_process_memory_stat():
 
 
 class AOStats(object):
-    # Stall detection thresholds
-    STALL_WARNING_SECONDS = 60  # Warn after 60s with no successful downloads
-    STALL_SEVERE_SECONDS = 180  # More urgent warning after 3 minutes
-    
     def __init__(self):
         self.running = False
         self._t = threading.Thread(daemon=True, target=self.show)
-        # Stall detection state
-        self._last_req_ok = 0
-        self._last_req_ok_change_time = time.time()
-        self._stall_warning_logged = False
-        self._severe_warning_logged = False
 
     def start(self):
         self.running = True
@@ -212,35 +203,6 @@ class AOStats(object):
             try:
                 snap = _store.snapshot() if _store else dict(STATS.items())
                 log.info(f"STATS: {snap}")
-                
-                # Stall detection: check if req_ok has increased
-                current_req_ok = snap.get('req_ok', 0)
-                now = time.time()
-                
-                if current_req_ok > self._last_req_ok:
-                    # Downloads are progressing - reset stall tracking
-                    self._last_req_ok = current_req_ok
-                    self._last_req_ok_change_time = now
-                    if self._stall_warning_logged or self._severe_warning_logged:
-                        log.info("Downloads resumed - server connection restored")
-                    self._stall_warning_logged = False
-                    self._severe_warning_logged = False
-                else:
-                    # No new downloads - check stall duration
-                    stall_duration = now - self._last_req_ok_change_time
-                    
-                    if stall_duration >= self.STALL_SEVERE_SECONDS and not self._severe_warning_logged:
-                        log.warning(
-                            f"⚠️ DOWNLOADS STALLED: No successful requests for {int(stall_duration)}s. "
-                            f"Server may be throttling or unreachable. Last req_ok={current_req_ok}"
-                        )
-                        self._severe_warning_logged = True
-                    elif stall_duration >= self.STALL_WARNING_SECONDS and not self._stall_warning_logged:
-                        log.warning(
-                            f"Downloads appear slow: No new successful requests for {int(stall_duration)}s. "
-                            f"This may indicate server throttling."
-                        )
-                        self._stall_warning_logged = True
                         
             except Exception as e:
                 log.debug(f"aostats.show error: {e}")

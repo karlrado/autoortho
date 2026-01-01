@@ -660,101 +660,6 @@ log.info(f"chunk_getter: {chunk_getter}")
 
 
 # ============================================================================
-# SERVER HEALTH TRACKER
-# ============================================================================
-# Monitors chunk download performance to detect throttling/slow servers.
-# Provides visibility into stall conditions without changing behavior.
-# Helps diagnose situations where servers are slow-rolling responses.
-# ============================================================================
-
-class ServerHealthTracker:
-    """
-    Tracks recent chunk download performance to detect server slowdowns.
-    
-    This is an observability tool - it logs warnings and updates stats but
-    doesn't change download behavior. Helps diagnose stall conditions.
-    
-    Thread-safe: Uses lock for all state access.
-    """
-    
-    # How long to track downloads (sliding window)
-    WINDOW_SEC = 30.0
-    
-    # Thresholds for warnings
-    SLOW_THRESHOLD_SEC = 10.0      # Downloads taking >10s are "slow"
-    SLOW_RATE_WARNING = 0.5       # Warn if >50% of downloads are slow
-    STALL_DETECTION_SEC = 60.0    # Warn if no completions in 60s
-    
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._completions = []  # List of (timestamp, duration_sec)
-        self._last_completion_time = time.monotonic()
-        self._last_warning_time = 0.0
-        self._warning_cooldown_sec = 30.0  # Don't spam warnings
-    
-    def record_completion(self, duration_sec: float) -> None:
-        """Record a chunk download completion with its duration."""
-        now = time.monotonic()
-        with self._lock:
-            self._completions.append((now, duration_sec))
-            self._last_completion_time = now
-            self._prune_old()
-            self._check_health(now)
-    
-    def record_stall_check(self) -> None:
-        """
-        Called periodically to check for stall conditions.
-        Should be called even when no completions are happening.
-        """
-        now = time.monotonic()
-        with self._lock:
-            self._prune_old()
-            time_since_last = now - self._last_completion_time
-            
-            if time_since_last > self.STALL_DETECTION_SEC:
-                if now - self._last_warning_time > self._warning_cooldown_sec:
-                    log.warning(f"SERVER HEALTH: No chunk completions in {time_since_last:.1f}s - "
-                               f"possible server throttling or network issue")
-                    bump('server_stall_warning')
-                    self._last_warning_time = now
-    
-    def _prune_old(self) -> None:
-        """Remove completions outside the window. Must hold lock."""
-        cutoff = time.monotonic() - self.WINDOW_SEC
-        while self._completions and self._completions[0][0] < cutoff:
-            self._completions.pop(0)
-    
-    def _check_health(self, now: float) -> None:
-        """Check for slow server conditions. Must hold lock."""
-        if not self._completions:
-            return
-        
-        slow_count = sum(1 for _, dur in self._completions if dur > self.SLOW_THRESHOLD_SEC)
-        slow_rate = slow_count / len(self._completions)
-        
-        if slow_rate > self.SLOW_RATE_WARNING:
-            if now - self._last_warning_time > self._warning_cooldown_sec:
-                avg_duration = sum(dur for _, dur in self._completions) / len(self._completions)
-                log.warning(f"SERVER HEALTH: {slow_rate*100:.0f}% of recent downloads are slow "
-                           f"(>{self.SLOW_THRESHOLD_SEC}s). Avg: {avg_duration:.1f}s. "
-                           f"Server may be throttling.")
-                bump('server_slow_warning')
-                self._last_warning_time = now
-
-
-# Global instance (lazy initialization to avoid startup overhead)
-_server_health_tracker: Optional[ServerHealthTracker] = None
-
-
-def _get_health_tracker() -> ServerHealthTracker:
-    """Get or create the server health tracker."""
-    global _server_health_tracker
-    if _server_health_tracker is None:
-        _server_health_tracker = ServerHealthTracker()
-    return _server_health_tracker
-
-
-# ============================================================================
 # ASYNC CACHE WRITER
 # ============================================================================
 # A lightweight executor for background cache writes. This allows downloaded
@@ -3073,18 +2978,15 @@ class Chunk(object):
         # as ready immediately. Cache writes are for future requests only.
         self.ready.set()
         
-        # Record completion time for server health tracking and slow download stats
+        # Track slow downloads for visibility in stats
         try:
-            duration_sec = self.fetchtime if self.fetchtime else 0
-            _get_health_tracker().record_completion(duration_sec)
-            # Track slow downloads for visibility
-            duration_ms = int(duration_sec * 1000)
+            duration_ms = int((self.fetchtime or 0) * 1000)
             if duration_ms > 5000:  # >5s is noteworthy
                 bump('chunk_slow_download')
             if duration_ms > 15000:  # >15s is very slow
                 bump('chunk_very_slow_download')
         except Exception:
-            pass  # Never block downloads on health tracking
+            pass
         
         # Notify tile completion tracker (for predictive DDS generation)
         # Fire-and-forget: never block download on notification failure
@@ -3931,12 +3833,21 @@ class Tile(object):
 
             chunk_img = None
             decode_failed = False
-            if chunk_ready and chunk.data:
+            
+            # TOCTOU FIX: Capture local reference to chunk.data before checking/using.
+            # This prevents a race condition where another thread (e.g., Chunk.close())
+            # could set chunk.data = None between our check and use. Python's GIL makes
+            # reference assignment atomic, so once we have a local ref, the object won't
+            # be garbage collected even if chunk.data is cleared elsewhere.
+            # This pattern matches save_cache() which uses the same approach.
+            chunk_data = chunk.data
+            
+            if chunk_ready and chunk_data:
                 # We returned and have data!
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Ready and found chunk data.")
                 try:
                     with _decode_sem:
-                        chunk_img = AoImage.load_from_memory(chunk.data)
+                        chunk_img = AoImage.load_from_memory(chunk_data)
                         if chunk_img is None:
                             log.warning(f"GET_IMG: load_from_memory returned None for {chunk}")
                             decode_failed = True
@@ -3944,7 +3855,7 @@ class Tile(object):
                     log.error(f"GET_IMG: load_from_memory exception for {chunk}: {_e}")
                     chunk_img = None
                     decode_failed = True
-            elif chunk_ready and not chunk.data:
+            elif chunk_ready and not chunk_data:
                 # Download "succeeded" but returned empty data
                 log.debug(f"GET_IMG: Chunk {chunk} ready but has no data")
                 decode_failed = True
@@ -4064,11 +3975,13 @@ class Tile(object):
                         # Still in progress - wait with reduced timeout (1s max for retry)
                         chunk_ready = time_budget.wait_with_budget(chunk.ready, max_single_wait=1.0)
                 
-                if chunk_ready and chunk.data:
+                # TOCTOU FIX: Capture local reference for retry path (same pattern as above)
+                retry_chunk_data = chunk.data
+                if chunk_ready and retry_chunk_data:
                     log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Final retry for {chunk}, SUCCESS!")
                     try:
                         with _decode_sem:
-                            chunk_img = AoImage.load_from_memory(chunk.data)
+                            chunk_img = AoImage.load_from_memory(retry_chunk_data)
                             if chunk_img is None:
                                 log.warning(f"GET_IMG: load_from_memory returned None on retry for {chunk}")
                     except Exception as _e:
@@ -4485,15 +4398,20 @@ class Tile(object):
                     # Don't close - shared pool manages lifecycle
                     continue
             
+            # TOCTOU FIX: Capture local reference before checking/using.
+            # Same pattern as process_chunk() - prevents race where another thread
+            # could clear fallback_chunk.data between our check and decode.
+            fallback_data = fallback_chunk.data
+            
             # Chunk is ready - check if we have valid data
-            if not fallback_chunk.data:
+            if not fallback_data:
                 log.debug(f"Cascading fallback: chunk {fallback_chunk} ready but no data")
                 continue
             
             # Decode and upscale
             try:
                 with _decode_sem:
-                    fallback_img = AoImage.load_from_memory(fallback_chunk.data)
+                    fallback_img = AoImage.load_from_memory(fallback_data)
                     if fallback_img is None:
                         log.warning(f"Cascading fallback: load_from_memory returned None for {fallback_chunk}")
                         continue
