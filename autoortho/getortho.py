@@ -3099,7 +3099,6 @@ class Tile(object):
         self.maptype = maptype
         self.tilename_zoom = int(zoom)
         self.chunks = {}
-        self.cache_file = (-1, None)
         self.ready = threading.Event()
         self._lock = threading.RLock()
         self.refs = 0
@@ -3144,10 +3143,7 @@ class Tile(object):
         # Hack override maptype
         #self.maptype = "BI"
 
-        #self._find_cached_tiles()
         self.ready.clear()
-        
-        #self._find_cache_file()
 
         if not priority:
             self.priority = zoom
@@ -3216,20 +3212,6 @@ class Tile(object):
                     self.chunks[zoom].append(chunk)
         else:
             log.debug(f"Reusing existing {len(self.chunks[zoom])} chunks for zoom {zoom}")
-
-    def _find_cache_file(self):
-        #with self.tile_condition:
-        with self.tile_lock:
-            for z in range(self.max_zoom, (self.min_zoom-1), -1):
-                cache_file = os.path.join(self.cache_dir, f"{self.row}_{self.col}_{self.maptype}_{self.tilename_zoom}_{z}.dds")
-                if os.path.exists(cache_file):
-                    log.info(f"Found cache for {cache_file}...")
-                    self.cache_file = (z, cache_file)
-                    self.ready.set()
-                    return
-
-        #log.info(f"No cache found for {self}!")
-
 
     def _get_quick_zoom(self, quick_zoom=0, min_zoom=None):
         """Calculate tile parameters for the given zoom level.

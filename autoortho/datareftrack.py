@@ -252,7 +252,10 @@ class DatarefTracker(object):
         messages.
         """
         # Thread synchronization
-        self._lock = threading.Lock()
+        # Use RLock (reentrant lock) to allow the same thread to acquire the lock
+        # multiple times - required because properties like alt_agl_ft acquire the
+        # lock internally, and callers may already hold the lock when accessing them.
+        self._lock = threading.RLock()
         self._shutdown_flag = threading.Event()
 
         # Flight data (protected by _lock)

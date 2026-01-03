@@ -90,3 +90,84 @@ def clear_ao_placeholder(mountpoint: str) -> None:
         log.info(f"Cleared AO placeholder from: {mountpoint}")
     except Exception as e:
         log.warning(f"clear_ao_placeholder failed for {mountpoint}: {e}")
+
+
+def cleanup_stale_mount_folders(custom_scenery_path: str) -> int:
+    """
+    Clean up stale z_ao_* mount folders left behind from a crash.
+    
+    When AutoOrtho crashes during flight, it can leave lingering mount folders
+    in the Custom Scenery directory. These folders cause errors on subsequent
+    mounts because AutoOrtho detects them as already mounted.
+    
+    This function finds and removes any z_ao_* folders that:
+    - Are not currently mounted
+    - Are empty or contain only AutoOrtho placeholder content
+    
+    Args:
+        custom_scenery_path: Path to the X-Plane Custom Scenery folder
+        
+    Returns:
+        Number of stale folders cleaned up
+    """
+    if not custom_scenery_path or not os.path.isdir(custom_scenery_path):
+        log.debug(f"cleanup_stale_mount_folders: invalid path: {custom_scenery_path}")
+        return 0
+    
+    cleaned_count = 0
+    
+    try:
+        entries = os.listdir(custom_scenery_path)
+    except Exception as e:
+        log.warning(f"cleanup_stale_mount_folders: failed to list {custom_scenery_path}: {e}")
+        return 0
+    
+    for entry in entries:
+        # Only process z_ao_* folders
+        if not entry.startswith("z_ao_"):
+            continue
+        
+        folder_path = os.path.join(custom_scenery_path, entry)
+        
+        # Skip if not a directory
+        if not os.path.isdir(folder_path):
+            continue
+        
+        # Skip if currently mounted
+        if safe_ismount(folder_path):
+            log.debug(f"cleanup_stale_mount_folders: skipping mounted folder: {folder_path}")
+            continue
+        
+        # Check if folder is empty or contains only placeholder content
+        if is_only_ao_placeholder(folder_path):
+            try:
+                # First clear the placeholder content
+                clear_ao_placeholder(folder_path)
+                
+                # Remove any remaining ignorable files
+                for ignore_file in _IGNORE_FILES:
+                    ignore_path = os.path.join(folder_path, ignore_file)
+                    if os.path.exists(ignore_path):
+                        try:
+                            os.remove(ignore_path)
+                        except Exception:
+                            pass
+                
+                # Now try to remove the empty directory
+                if os.path.exists(folder_path):
+                    os.rmdir(folder_path)
+                
+                log.info(f"Cleaned up stale mount folder: {folder_path}")
+                cleaned_count += 1
+            except OSError as e:
+                # Directory not empty or other error - skip it
+                log.warning(f"cleanup_stale_mount_folders: could not remove {folder_path}: {e}")
+            except Exception as e:
+                log.warning(f"cleanup_stale_mount_folders: unexpected error for {folder_path}: {e}")
+        else:
+            log.debug(f"cleanup_stale_mount_folders: skipping non-placeholder folder: {folder_path}")
+    
+    if cleaned_count > 0:
+        log.info(f"Cleaned up {cleaned_count} stale mount folder(s)")
+    
+    return cleaned_count
