@@ -45,6 +45,7 @@ except ImportError:
 try:
     from autoortho.utils.mount_utils import (
         cleanup_mountpoint,
+        cleanup_stale_mount_folders,
         _is_frozen,
         is_only_ao_placeholder,
         clear_ao_placeholder,
@@ -53,6 +54,7 @@ try:
 except ImportError:
     from utils.mount_utils import (
         cleanup_mountpoint,
+        cleanup_stale_mount_folders,
         _is_frozen,
         is_only_ao_placeholder,
         clear_ao_placeholder,
@@ -668,6 +670,14 @@ class AOMount:
         self._reporter_thread = None
 
     def mount_sceneries(self, blocking=True):
+        # Clean up any stale mount folders left behind from a crash
+        try:
+            custom_scenery_path = getattr(self.cfg, 'xplane_custom_scenery_path', None)
+            if custom_scenery_path:
+                cleanup_stale_mount_folders(custom_scenery_path)
+        except Exception as e:
+            log.warning(f"Failed to cleanup stale mount folders: {e}")
+
         if not self.cfg.scenery_mounts:
             log.warning(f"No installed sceneries detected.  Exiting.")
             return

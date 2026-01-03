@@ -5,20 +5,47 @@ Time Exclusion Manager for AutoOrtho.
 
 This module provides time-based exclusion functionality that allows users to
 disable AutoOrtho's scenery during specific time ranges in the simulator.
-When active, AutoOrtho's DSF files are hidden from X-Plane, causing it to
-fall back to default scenery.
+When active, AutoOrtho's DSF files are redirected to X-Plane's global default
+scenery, ensuring terrain data is always available.
 
 The manager ensures safe transitions by:
 - Tracking which DSF files are currently in use
-- Not hiding DSFs that are actively being read
+- Not redirecting DSFs that are actively being read
 - Only applying exclusions to new DSF accesses
+
+Key design principle: NEVER hide DSF files from X-Plane. X-Plane indexes DSF
+files at flight load time. If we hide files, X-Plane finds no terrain data.
+Instead, we redirect reads to global scenery DSF files.
+
+Decision Preservation During Temporary Disconnections:
+------------------------------------------------------
+When the simulator time becomes available, the exclusion state is determined
+based on actual sim time rather than the default_to_exclusion setting. This
+decision is preserved across temporary disconnections (e.g., scenery reload).
+
+This prevents a common issue where:
+1. User starts with "default to exclusion" enabled
+2. Time exclusion is initially active
+3. Sim time becomes available and shows daytime → exclusion deactivates
+4. User triggers "Reload Scenery" in X-Plane
+5. During reload, sim time is temporarily unavailable
+6. WITHOUT preservation: exclusion would re-activate (using default)
+7. WITH preservation: exclusion stays inactive (using preserved decision)
+
+IMPORTANT LIMITATIONS:
+- The preserved decision persists until AutoOrtho is fully restarted
+- To reset to the default_to_exclusion behavior, quit and restart AutoOrtho
+- The preserved decision is updated whenever new sim time is received
+- If sim time indicates a change in exclusion state (e.g., crossing into
+  night time), the state will update accordingly when time becomes available
 
 Usage:
     from time_exclusion import time_exclusion_manager
 
-    # Check if a DSF path should be hidden
-    if time_exclusion_manager.should_hide_dsf(path):
-        # Return file not found or hide from directory listing
+    # Check if a DSF should be redirected to global scenery
+    redirect_path = time_exclusion_manager.get_redirect_path(path)
+    if redirect_path:
+        # Use redirect_path instead of original path for all file operations
         pass
 
     # Register DSF usage (call when DSF is opened)
@@ -28,6 +55,8 @@ Usage:
     time_exclusion_manager.register_dsf_close(path)
 """
 
+import os
+import re
 import threading
 import time
 import logging
@@ -39,6 +68,82 @@ except ImportError:
     from aoconfig import CFG
 
 log = logging.getLogger(__name__)
+
+
+def _parse_dsf_coordinates(path):
+    """
+    Parse a DSF file path to extract the tile coordinates.
+    
+    DSF files are named like: +40-120.dsf, -12+045.dsf, etc.
+    The path structure is: .../Earth nav data/<folder>/<filename>.dsf
+    where folder is like +40-120 (10-degree grid) and filename is the 1-degree tile.
+    
+    Args:
+        path: Path to DSF file (can be FUSE virtual path like /Earth nav data/+40-120/+45-118.dsf)
+        
+    Returns:
+        tuple: (folder_name, filename) e.g. ("+40-120", "+45-118.dsf") or (None, None) if parsing fails
+    """
+    if path is None:
+        return None, None
+    
+    # Normalize path separators
+    normalized = path.replace('\\', '/')
+    
+    # Match pattern: /Earth nav data/<folder>/<filename>.dsf
+    # folder is like +40-120, filename is like +45-118.dsf
+    match = re.search(r'/Earth nav data/([-+]\d+[-+]\d+)/([-+]\d+[-+]\d+\.dsf)$', normalized, re.IGNORECASE)
+    if match:
+        return match.group(1), match.group(2)
+    
+    # Also try matching just the filename pattern for relative paths
+    match = re.search(r'([-+]\d+[-+]\d+)/([-+]\d+[-+]\d+\.dsf)$', normalized, re.IGNORECASE)
+    if match:
+        return match.group(1), match.group(2)
+    
+    return None, None
+
+
+def _find_global_scenery_dsf(folder, filename):
+    """
+    Find the corresponding global scenery DSF file for a given tile.
+    
+    Searches in order:
+    1. X-Plane 12 Global Scenery
+    2. X-Plane 12 Demo Areas
+    
+    Args:
+        folder: The Earth nav data folder (e.g., "+40-120")
+        filename: The DSF filename (e.g., "+45-118.dsf")
+        
+    Returns:
+        str: Full path to the global scenery DSF, or None if not found
+    """
+    xplane_path = getattr(CFG.paths, 'xplane_path', '')
+    if not xplane_path:
+        log.warning("X-Plane path not configured, cannot find global scenery")
+        return None
+    
+    # Primary location: X-Plane 12 Global Scenery
+    global_path = os.path.join(
+        xplane_path, "Global Scenery", "X-Plane 12 Global Scenery",
+        "Earth nav data", folder, filename
+    )
+    if os.path.exists(global_path):
+        log.debug(f"Found global scenery DSF: {global_path}")
+        return global_path
+    
+    # Fallback: X-Plane 12 Demo Areas
+    demo_path = os.path.join(
+        xplane_path, "Global Scenery", "X-Plane 12 Demo Areas",
+        "Earth nav data", folder, filename
+    )
+    if os.path.exists(demo_path):
+        log.debug(f"Found demo area DSF: {demo_path}")
+        return demo_path
+    
+    log.debug(f"No global scenery DSF found for {folder}/{filename}")
+    return None
 
 
 def parse_time_string(time_str):
@@ -107,6 +212,16 @@ class TimeExclusionManager:
         
         # Track if sim time has become available (for one-time logging)
         self._sim_time_was_available = False
+        
+        # Preserve the last exclusion decision made based on actual sim time.
+        # This allows us to maintain the correct state during temporary disconnections
+        # (e.g., scenery reload) without falling back to the default_to_exclusion setting.
+        # Once we've made a decision based on sim time, we preserve it until:
+        # - A new sim time value causes a different decision
+        # - AutoOrtho is restarted
+        self._sim_time_decision_made = False  # True once we've used real sim time
+        self._last_sim_time_decision = False  # The last exclusion decision from sim time
+        self._last_sim_time_value = -1.0  # The last sim time we saw (for logging)
         
         # Reference to dataref tracker (set later to avoid circular import)
         self._dataref_tracker = None
@@ -225,6 +340,16 @@ class TimeExclusionManager:
         """
         Check if time exclusion should be active based on current sim time.
         
+        Decision Preservation Logic:
+        - When sim time first becomes available, we make a decision based on actual time
+        - If sim time becomes temporarily unavailable (e.g., during scenery reload),
+          we preserve the last sim-time-based decision rather than falling back to the
+          default_to_exclusion setting
+        - This prevents exclusion from being incorrectly re-activated during reloads
+          when the actual sim time indicated it should be inactive
+        - The preserved decision persists until AutoOrtho is restarted or new sim time
+          is received that would change the decision
+        
         Returns:
             bool: True if exclusion should be active
         """
@@ -241,11 +366,24 @@ class TimeExclusionManager:
         current_time = self._dataref_tracker.get_local_time_sec()
         
         if current_time < 0:
-            # No valid sim time available - reset the flag so we log again next time
+            # No valid sim time available
             if self._sim_time_was_available:
                 self._sim_time_was_available = False
-                log.debug("Sim time no longer available")
-            # Use configured default
+                log.debug("Sim time no longer available (temporary disconnection)")
+            
+            # KEY CHANGE: If we previously made a decision based on actual sim time,
+            # preserve that decision during temporary disconnections (e.g., scenery reload).
+            # This prevents the issue where exclusion gets re-activated during reload
+            # when actual sim time had already determined it should be inactive.
+            if self._sim_time_decision_made:
+                log.debug(
+                    f"Sim time unavailable - preserving last sim-time decision: "
+                    f"exclusion={'active' if self._last_sim_time_decision else 'inactive'} "
+                    f"(last sim time was {format_time_from_seconds(self._last_sim_time_value)})"
+                )
+                return self._last_sim_time_decision
+            
+            # No previous sim-time decision - use configured default
             if default_to_exclusion:
                 log.debug("Sim time not available - defaulting to exclusion active")
             return default_to_exclusion
@@ -255,7 +393,15 @@ class TimeExclusionManager:
             self._sim_time_was_available = True
             log.info(f"Sim time now available: {format_time_from_seconds(current_time)}")
         
-        return self._is_time_in_range(current_time, start_sec, end_sec)
+        # Calculate exclusion state based on actual sim time
+        should_exclude = self._is_time_in_range(current_time, start_sec, end_sec)
+        
+        # Store this decision for use during temporary disconnections
+        self._sim_time_decision_made = True
+        self._last_sim_time_decision = should_exclude
+        self._last_sim_time_value = current_time
+        
+        return should_exclude
     
     def is_exclusion_active(self):
         """
@@ -288,17 +434,38 @@ class TimeExclusionManager:
                     enabled, start_sec, end_sec, default_to_excl = self._get_config()
                     current_time_sec = self._dataref_tracker.get_local_time_sec() if self._dataref_tracker else -1
                     if current_time_sec < 0:
-                        log.info(
-                            f"Time exclusion ACTIVATED (sim time not yet available, using default) "
-                            f"(exclusion range: {format_time_from_seconds(start_sec)} - {format_time_from_seconds(end_sec)})"
-                        )
+                        # Sim time not available - check why exclusion was activated
+                        if self._sim_time_decision_made and self._last_sim_time_decision:
+                            # Preserved decision from previous sim time (shouldn't normally happen
+                            # for activation since we preserve the last decision, but handle it)
+                            log.info(
+                                f"Time exclusion ACTIVATED - DSF reads will redirect to global scenery "
+                                f"(using preserved decision from sim time {format_time_from_seconds(self._last_sim_time_value)}) "
+                                f"(exclusion range: {format_time_from_seconds(start_sec)} - {format_time_from_seconds(end_sec)})"
+                            )
+                        else:
+                            # Using default setting (no sim time ever received)
+                            log.info(
+                                f"Time exclusion ACTIVATED - DSF reads will redirect to global scenery "
+                                f"(sim time not yet available, using default) "
+                                f"(exclusion range: {format_time_from_seconds(start_sec)} - {format_time_from_seconds(end_sec)})"
+                            )
                     else:
                         log.info(
                             f"Time exclusion ACTIVATED at sim time {format_time_from_seconds(current_time_sec)} "
+                            f"- DSF reads will redirect to global scenery "
                             f"(exclusion range: {format_time_from_seconds(start_sec)} - {format_time_from_seconds(end_sec)})"
                         )
                 else:
-                    log.info("Time exclusion DEACTIVATED")
+                    current_time_sec = self._dataref_tracker.get_local_time_sec() if self._dataref_tracker else -1
+                    if current_time_sec < 0 and self._sim_time_decision_made:
+                        # Deactivated due to preserved decision
+                        log.info(
+                            f"Time exclusion DEACTIVATED - DSF reads will use AutoOrtho scenery "
+                            f"(preserving decision from sim time {format_time_from_seconds(self._last_sim_time_value)})"
+                        )
+                    else:
+                        log.info("Time exclusion DEACTIVATED - DSF reads will use AutoOrtho scenery")
             
             return self._exclusion_active
     
@@ -354,29 +521,74 @@ class TimeExclusionManager:
     
     def should_hide_dsf(self, path):
         """
-        Determine if a DSF file should be hidden from X-Plane.
+        DEPRECATED: Use get_redirect_path() instead.
         
-        A DSF is hidden if:
-        1. Time exclusion is enabled and currently active
-        2. The DSF is NOT currently in use
-        
-        This ensures safe transitions - DSFs that are already being used
-        will continue to be served until they are released.
+        This method is kept for backward compatibility but should not be used.
+        Hiding DSF files causes X-Plane to have no terrain data because X-Plane
+        indexes DSF files at flight load time. Instead, we redirect to global scenery.
         
         Args:
             path: Path to the DSF file
             
         Returns:
-            bool: True if the DSF should be hidden
+            bool: Always returns False now - DSFs should never be hidden
+        """
+        # NEVER hide DSF files - this causes missing terrain in X-Plane
+        # X-Plane indexes DSF files at flight load time. If we return ENOENT,
+        # X-Plane has no terrain data for those tiles.
+        # Instead, use get_redirect_path() to redirect to global scenery.
+        return False
+    
+    def get_redirect_path(self, path):
+        """
+        Get the redirect path for a DSF file during time exclusion.
+        
+        When time exclusion is active, DSF files should be served from
+        X-Plane's global scenery instead of AutoOrtho's scenery. This ensures:
+        1. X-Plane always sees DSF files (proper indexing)
+        2. Terrain data is always available
+        3. Smooth transitions between ortho and default scenery
+        
+        Args:
+            path: Path to the DSF file (FUSE virtual path)
+            
+        Returns:
+            str: Path to global scenery DSF if redirection is needed, None otherwise
         """
         if not self.is_exclusion_active():
-            return False
+            return None
         
-        # Don't hide DSFs that are currently in use
+        # Don't redirect DSFs that are currently in use (safe transition)
         if self.is_dsf_in_use(path):
-            return False
+            return None
         
-        return True
+        # Parse the DSF path to get folder and filename
+        folder, filename = _parse_dsf_coordinates(path)
+        if not folder or not filename:
+            log.debug(f"Could not parse DSF path for redirect: {path}")
+            return None
+        
+        # Find the corresponding global scenery DSF
+        global_dsf = _find_global_scenery_dsf(folder, filename)
+        if global_dsf:
+            log.debug(f"Redirecting DSF {path} to global scenery: {global_dsf}")
+            return global_dsf
+        
+        # No global scenery found - don't redirect, serve the original
+        log.debug(f"No global scenery available for {path}, serving original")
+        return None
+    
+    def is_redirect_active(self):
+        """
+        Check if DSF redirection is currently active.
+        
+        This is a simpler check than get_redirect_path() for cases where
+        you just need to know if redirection is happening (e.g., for logging).
+        
+        Returns:
+            bool: True if time exclusion is active
+        """
+        return self.is_exclusion_active()
     
     def _normalize_path(self, path):
         """
@@ -399,7 +611,7 @@ class TimeExclusionManager:
         
         Returns:
             dict: Status information including enabled state, time range,
-                  current exclusion state, and active DSF count
+                  current exclusion state, active DSF count, and redirect status
         """
         with self._lock:
             enabled, start_sec, end_sec, default_to_excl = self._get_config()
@@ -407,15 +619,30 @@ class TimeExclusionManager:
             if self._dataref_tracker:
                 current_time = self._dataref_tracker.get_local_time_sec()
             
+            # Check if global scenery is available
+            xplane_path = getattr(CFG.paths, 'xplane_path', '')
+            global_scenery_available = False
+            if xplane_path:
+                global_path = os.path.join(
+                    xplane_path, "Global Scenery", "X-Plane 12 Global Scenery"
+                )
+                global_scenery_available = os.path.isdir(global_path)
+            
             return {
                 'enabled': enabled,
                 'start_time': format_time_from_seconds(start_sec) if start_sec is not None else "N/A",
                 'end_time': format_time_from_seconds(end_sec) if end_sec is not None else "N/A",
                 'default_to_exclusion': default_to_excl,
                 'exclusion_active': self._exclusion_active,
+                'redirect_active': self._exclusion_active,  # Redirect is now the mechanism
                 'current_sim_time': format_time_from_seconds(current_time) if current_time >= 0 else "N/A",
                 'sim_time_available': current_time >= 0,
                 'active_dsf_count': len(self._active_dsfs),
+                'global_scenery_available': global_scenery_available,
+                # Preserved decision info (for debugging and status display)
+                'sim_time_decision_made': self._sim_time_decision_made,
+                'preserved_decision': self._last_sim_time_decision if self._sim_time_decision_made else None,
+                'preserved_from_time': format_time_from_seconds(self._last_sim_time_value) if self._sim_time_decision_made else "N/A",
             }
 
 
