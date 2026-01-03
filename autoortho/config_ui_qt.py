@@ -1927,8 +1927,8 @@ class ConfigUI(QMainWindow):
         max_zoom_near_airports_layout.addWidget(self.max_zoom_near_airports_slider)
         max_zoom_near_airports_layout.addWidget(self.max_zoom_near_airports_label)
 
-        if not self.cfg.autoortho.using_custom_tiles:
-            autoortho_layout.addWidget(self.max_zoom_near_airports_widget)
+        # Always add to layout (to prevent orphan window popup), visibility controlled separately
+        autoortho_layout.addWidget(self.max_zoom_near_airports_widget)
 
         # Now update visibility after all zoom widgets are created
         self._update_zoom_mode_visibility()
@@ -3589,9 +3589,10 @@ class ConfigUI(QMainWindow):
         is_dynamic = self.max_zoom_mode_combo.currentText() == "Dynamic"
         self.fixed_zoom_widget.setVisible(not is_dynamic)
         self.dynamic_zoom_widget.setVisible(is_dynamic)
-        # Also hide/show the airport zoom slider (only visible in fixed mode)
+        # Also hide/show the airport zoom slider (only visible in fixed mode AND not using custom tiles)
         if hasattr(self, 'max_zoom_near_airports_widget'):
-            self.max_zoom_near_airports_widget.setVisible(not is_dynamic)
+            using_custom_tiles = self.cfg.autoortho.using_custom_tiles
+            self.max_zoom_near_airports_widget.setVisible(not is_dynamic and not using_custom_tiles)
 
     def _open_quality_steps_dialog(self):
         """Open the quality steps configuration dialog."""

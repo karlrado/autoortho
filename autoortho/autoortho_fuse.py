@@ -296,6 +296,10 @@ class AutoOrtho(Operations):
         self._size_cache = {}
         self._ft_started = False
         self._ft_start_lock = threading.Lock()
+        
+        # Track redirected DSF file handles: fh -> redirect_path
+        # Used when time exclusion redirects DSF reads to global scenery
+        self._redirected_dsf_fhs = {}
 
         self.use_ns = kwargs.get("use_ns", False)
         
@@ -538,11 +542,14 @@ class AutoOrtho(Operations):
     def getattr(self, path, fh=None):
         log.debug(f"GETATTR {path}")
         
-        # Check for DSF time exclusion (not cached to allow dynamic hiding)
+        # Check for DSF time exclusion redirect
+        # Instead of hiding DSF files (which breaks X-Plane's indexing),
+        # we redirect to X-Plane's global scenery DSF files
         if self.dsf_re.match(path):
-            if time_exclusion_manager.should_hide_dsf(path):
-                log.debug(f"GETATTR: Hiding DSF due to time exclusion: {path}")
-                raise FuseOSError(errno.ENOENT)
+            redirect_path = time_exclusion_manager.get_redirect_path(path)
+            if redirect_path:
+                log.debug(f"GETATTR: Redirecting DSF to global scenery: {path} -> {redirect_path}")
+                return self._getattr_redirected_dsf(redirect_path)
         
         # Generate fresh timestamps for each call
         now = int(time.time())
@@ -651,9 +658,48 @@ class AutoOrtho(Operations):
         )}
         log.debug(f"GETATTR: ATTRS: {attrs}")
         return attrs
+    
+    def _getattr_redirected_dsf(self, redirect_path):
+        """Get attributes for a DSF file redirected to global scenery.
+        
+        When time exclusion is active, DSF reads are redirected to X-Plane's
+        global scenery instead of serving empty/hidden files. This ensures
+        X-Plane always has terrain data.
+        
+        Args:
+            redirect_path: Absolute path to the global scenery DSF file
+            
+        Returns:
+            dict: File attributes from the redirected DSF file
+        """
+        try:
+            st = os.lstat(redirect_path)
+            log.debug(f"GETATTR: Redirected DSF stat: {st}")
+            attrs = {k: getattr(st, k) for k in (
+                'st_atime',
+                'st_ctime',
+                'st_gid',
+                'st_mode',
+                'st_mtime',
+                'st_nlink',
+                'st_size',
+                'st_uid',
+                'st_ino',
+                'st_dev',
+            )}
+            log.debug(f"GETATTR: Redirected DSF ATTRS: {attrs}")
+            return attrs
+        except OSError as e:
+            log.warning(f"GETATTR: Failed to stat redirected DSF {redirect_path}: {e}")
+            raise FuseOSError(e.errno)
 
     def readdir(self, path, fh):
-        """List directory contents, filtering DSF files during time exclusion."""
+        """List directory contents.
+        
+        DSF files are ALWAYS shown regardless of time exclusion state.
+        X-Plane indexes DSF files at flight load time - hiding them causes
+        missing terrain. Instead, we redirect reads to global scenery DSF files.
+        """
         if path in ["/textures", "/terrain"]:
             return ['.', '..', 'AOISWORKING']
 
@@ -661,12 +707,8 @@ class AutoOrtho(Operations):
         if os.path.isdir(full_path):
             entries = ['.', '..']
             for entry in os.listdir(full_path):
-                # Check if this is a DSF file that should be hidden
-                entry_path = os.path.join(path, entry)
-                if entry.endswith('.dsf'):
-                    if time_exclusion_manager.should_hide_dsf(entry_path):
-                        log.debug(f"READDIR: Hiding DSF due to time exclusion: {entry}")
-                        continue
+                # DSF files are always included - never filter them out
+                # Time exclusion is handled by redirecting reads, not hiding files
                 entries.append(entry)
             return entries
         return ['.', '..']
@@ -748,15 +790,29 @@ class AutoOrtho(Operations):
         full_path = self._full_path(path)
         log.debug(f"OPEN: FULLPATH {full_path}")
 
-        # Handle DSF files with time exclusion tracking
+        # Handle DSF files with time exclusion redirect
         if self.dsf_re.match(path):
-            # Check if DSF should be hidden (but not if already in use)
-            if time_exclusion_manager.should_hide_dsf(path):
-                log.info(f"OPEN: DSF hidden due to time exclusion: {path}")
-                raise FuseOSError(errno.ENOENT)
+            # Check if DSF should be redirected to global scenery
+            redirect_path = time_exclusion_manager.get_redirect_path(path)
+            if redirect_path:
+                log.info(f"OPEN: DSF [{path}] opened in GLOBAL SCENERY mode (time exclusion active) -> {redirect_path}")
+                try:
+                    if system_type == 'windows':
+                        fh = os.open(redirect_path, flags | os.O_BINARY)
+                    else:
+                        fh = os.open(redirect_path, flags)
+                    # Track this as a redirected DSF for release()
+                    self._redirected_dsf_fhs[fh] = redirect_path
+                    # Register this DSF as being in use (safe transition)
+                    time_exclusion_manager.register_dsf_open(path)
+                    return fh
+                except OSError as e:
+                    log.warning(f"OPEN: Failed to open redirected DSF {redirect_path}: {e}, falling back to ORTHO mode")
+                    # Fall through to open the original file
             
-            log.info(f"OPEN: Detected DSF open: {path}")
-            # Register this DSF as being in use (prevents hiding during active use)
+            # Normal mode - serve AutoOrtho ortho scenery
+            log.info(f"OPEN: DSF [{path}] opened in ORTHO mode (AutoOrtho scenery)")
+            # Register this DSF as being in use (prevents redirect during active use)
             time_exclusion_manager.register_dsf_open(path)
         
         dds_match = self.dds_re.match(path)
@@ -891,6 +947,11 @@ class AutoOrtho(Operations):
         if self.dsf_re.match(path):
             log.debug(f"RELEASE: DSF closed: {path}")
             time_exclusion_manager.register_dsf_close(path)
+            
+            # Clean up redirected DSF tracking
+            if fh in self._redirected_dsf_fhs:
+                log.debug(f"RELEASE: Cleaning up redirected DSF handle: {fh}")
+                del self._redirected_dsf_fhs[fh]
         
         dds_match = self.dds_re.match(path)
         if dds_match:

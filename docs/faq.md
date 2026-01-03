@@ -188,6 +188,20 @@ For detailed explanations, see the [Performance Tuning Guide](performance.md).
 
 **Recommendation:** Keep `use_time_budget = True` to use the new predictable system.
 
+### Time exclusion re-activated after scenery reload
+
+**Symptom:** You have "Default to Exclusion" enabled, the exclusion correctly deactivated when sim time showed daytime, but after triggering "Reload Scenery" the exclusion incorrectly re-activated and you see global scenery instead of orthos.
+
+**Solution:** This issue has been fixed. AutoOrtho now preserves the exclusion decision made based on actual sim time during temporary disconnections (like scenery reload).
+
+If you're still experiencing this issue:
+1. Make sure you're running the latest version of AutoOrtho
+2. If the state seems "stuck", restart AutoOrtho to reset to the default behavior
+
+**Technical details:** When X-Plane reloads scenery, the UDP connection temporarily disconnects, making sim time unavailable. AutoOrtho now remembers the last decision made with real sim time and uses it during these brief disconnections, rather than falling back to the `default_to_exclusion` setting.
+
+See [Time Exclusion - Decision Preservation](performance.md#decision-preservation-during-scenery-reload) for more details.
+
 ### I see a messge in the logs, but otherwise things work fine.
 The log will log various things, typically info and warnings can be ignored
 unless other issues are seen.
