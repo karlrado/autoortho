@@ -643,7 +643,12 @@ class DDS(Structure):
         while True:
             # PHASE 2 FIX #9: Lock per-mipmap to prevent concurrent generation
             # This prevents race conditions when multiple threads generate same mipmap
-            mipmap_lock = self.mipmap_locks.get(mipmap, threading.Lock())
+            #
+            # NOTE: All mipmap indices are pre-initialized in __init__, so the lock
+            # MUST exist. Using direct index access (not .get()) to fail loudly if
+            # there's ever a bug where mipmap indices aren't properly initialized,
+            # rather than silently creating non-shared locks that cause races.
+            mipmap_lock = self.mipmap_locks[mipmap]
             
             with mipmap_lock:
                 # Check if already retrieved (another thread may have done it)

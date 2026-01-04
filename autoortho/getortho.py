@@ -2391,12 +2391,40 @@ class BackgroundDDSBuilder:
         
         Uses the tile's existing infrastructure to get the composed image
         for each mipmap level, then compresses each into the DDS.
+        
+        Lock Contention Avoidance:
+        - Attempts non-blocking lock acquisition before starting build
+        - If tile is locked (X-Plane is building it), skips to avoid stalling
+        - Holds lock for entire build to prevent concurrent builds
         """
         tile_id = tile.id
         build_start = time.monotonic()
         mipmap_images = []  # Track images for cleanup
+        lock_acquired = False
         
         try:
+            # ═══════════════════════════════════════════════════════════════════
+            # LOCK CONTENTION AVOIDANCE
+            # ═══════════════════════════════════════════════════════════════════
+            # Try to acquire the tile's lock non-blocking. If X-Plane is currently
+            # building this tile (holding the lock), we skip rather than stall the
+            # background builder thread. The tile will be built by X-Plane anyway.
+            #
+            # Using non-blocking acquire prevents scenarios where:
+            # 1. X-Plane requests tile -> FUSE acquires _tile_locks[key] -> get_mipmap() acquires tile._lock
+            # 2. BackgroundDDSBuilder tries to build same tile -> blocks on tile._lock
+            # 3. Builder thread stalls for potentially 300+ seconds
+            #
+            # By skipping locked tiles, we keep the background builder responsive
+            # and avoid wasting thread time on tiles that are already being built.
+            if hasattr(tile, '_lock'):
+                if not tile._lock.acquire(blocking=False):
+                    log.debug(f"BackgroundDDSBuilder: {tile_id} - tile is locked (in-use), skipping")
+                    bump('prebuilt_dds_skipped_locked')
+                    return
+                lock_acquired = True
+            # ═══════════════════════════════════════════════════════════════════
+            
             # Verify tile is still valid
             if tile.dds is None:
                 log.debug(f"BackgroundDDSBuilder: {tile_id} - tile.dds is None, skipping")
@@ -2524,6 +2552,15 @@ class BackgroundDDSBuilder:
             log.warning(f"BackgroundDDSBuilder: Failed to build {tile_id}: {e}")
             self._builds_failed += 1
         finally:
+            # Release tile lock if we acquired it
+            # This MUST come before image cleanup to avoid holding the lock
+            # longer than necessary
+            if lock_acquired:
+                try:
+                    tile._lock.release()
+                except Exception:
+                    pass  # Lock may have been released elsewhere (shouldn't happen)
+            
             # Clean up all mipmap images
             for img in mipmap_images:
                 try:
@@ -3807,6 +3844,11 @@ class Tile(object):
             # Return the missing_color filled image we already created
             # This ensures consistency - X-Plane sees missing_color, not arbitrary gray
             return new_im
+        
+        # Track if any executor thread needs a lazy build.
+        # We defer lazy builds to after the executor completes to avoid lock contention:
+        # calling get_img() from within an executor thread would block on self._lock.
+        needs_lazy_build = False
             
         def process_chunk(chunk, skip_download_wait=False):
             """Process a single chunk and return (chunk, chunk_img, start_x, start_y)"""
@@ -3910,13 +3952,17 @@ class Tile(object):
                 # get_best_chunk bumps 'upscaled_from_jpeg_count' if successful
             
             # === LAZY BUILD TRIGGER ===
-            # If Fallback 1 failed and we're building mipmap 0, trigger a lazy build
-            # of a lower mipmap (mipmap 2) to enable Fallback 2 for subsequent failures.
-            # This is on-demand (only when failures occur) unlike the removed pre-building.
+            # NOTE: Lazy build is now deferred to AFTER the executor completes.
+            # Calling get_img() from within an executor thread would cause lock contention:
+            # the executor thread would block waiting for self._lock (held by the main thread),
+            # while the main thread waits for executor futures - causing a 300s stall.
+            # Instead, we mark that lazy build is needed and handle it after the main loop.
+            # The nonlocal variable allows the outer scope to detect this need.
             if not chunk_img and mipmap == 0 and fallback_level >= 1:
                 if not self._lazy_build_attempted:
-                    log.debug(f"GET_IMG(process_chunk): Triggering lazy build after first failure")
-                    self._try_lazy_build_fallback_mipmap(time_budget)
+                    log.debug(f"GET_IMG(process_chunk): Marking lazy build as needed (will run after executor)")
+                    nonlocal needs_lazy_build
+                    needs_lazy_build = True
             
             # Fallback 2: Scale from already-built mipmaps (enabled if fallback_level >= 1)
             # Now may have something to use thanks to lazy build above
@@ -4167,6 +4213,32 @@ class Tile(object):
             # The futures will complete in the background but we won't wait for them
             # Since process_chunk checks time_budget.exhausted, they should exit quickly
             executor.shutdown(wait=False, cancel_futures=True)
+        
+        # === DEFERRED LAZY BUILD ===
+        # If any executor thread signaled that lazy build is needed, do it now.
+        # This runs in the main thread which already holds self._lock, avoiding the
+        # lock contention that caused 300s stalls when calling get_img() from executor threads.
+        if needs_lazy_build and mipmap == 0 and not self._lazy_build_attempted:
+            log.debug(f"GET_IMG: Running deferred lazy build (main thread, lock held)")
+            self._try_lazy_build_fallback_mipmap(time_budget)
+            
+            # After lazy build, re-process any chunks that still need images
+            # The lazy build created lower-detail mipmaps that Fallback 2 can use
+            missing_after_lazy = [c for c in chunks if id(c) not in chunks_with_images 
+                                  and not c.permanent_failure]
+            if missing_after_lazy and len(self.imgs) > 0:
+                log.debug(f"GET_IMG: Re-processing {len(missing_after_lazy)} chunks after lazy build")
+                for chunk in missing_after_lazy:
+                    if time_budget.exhausted:
+                        break
+                    # Try Fallback 2 now that we have built lower mipmaps
+                    chunk_img = self.get_downscaled_from_higher_mipmap(mipmap, chunk.col, chunk.row, zoom)
+                    if chunk_img:
+                        start_x = int(chunk.width * (chunk.col - col))
+                        start_y = int(chunk.height * (chunk.row - row))
+                        _safe_paste(new_im, chunk_img, start_x, start_y)
+                        chunks_with_images.add(id(chunk))
+                        log.debug(f"GET_IMG: Recovered chunk via deferred lazy build fallback")
 
         # Determine if we need to cache this image for fallback/upscaling
         should_cache = complete_img and mipmap <= self.max_mipmap
