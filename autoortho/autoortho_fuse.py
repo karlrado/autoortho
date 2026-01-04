@@ -877,6 +877,41 @@ class AutoOrtho(Operations):
                 # due to EXCEPTION_IN_PAGE_ERROR), return fallback placeholder data.
                 # X-Plane will show a gray/missing texture, but won't crash.
                 log.error(f"Tile build lock timeout for {key} after {build_timeout}s - returning fallback data")
+                
+                # ═══════════════════════════════════════════════════════════════
+                # ENHANCED DIAGNOSTICS: Log tile state to help debug lock stalls
+                # ═══════════════════════════════════════════════════════════════
+                # When a lock timeout occurs, it's often difficult to determine
+                # what caused the stall. This diagnostic block attempts to gather
+                # tile state information (without acquiring locks) to help identify:
+                # - Whether the tile exists and has valid DDS
+                # - How many chunks have been processed
+                # - Whether the tile's ready event is set
+                # - Reference count (is something else holding it?)
+                try:
+                    # Attempt to get tile info WITHOUT acquiring locks (best-effort)
+                    # Use _get_tile which may briefly acquire tc_lock, but won't
+                    # block on the tile's internal lock
+                    t = self.tc.tiles.get(self.tc._to_tile_id(row, col, maptype, zoom))
+                    if t:
+                        # Gather diagnostic info (all attribute reads are safe)
+                        diag_refs = getattr(t, 'refs', 'N/A')
+                        diag_ready = t.ready.is_set() if hasattr(t, 'ready') else 'N/A'
+                        diag_dds = t.dds is not None if hasattr(t, 'dds') else 'N/A'
+                        diag_chunks = len(t.chunks) if hasattr(t, 'chunks') else 'N/A'
+                        diag_budget = None
+                        if hasattr(t, '_tile_time_budget') and t._tile_time_budget:
+                            budget = t._tile_time_budget
+                            diag_budget = f"elapsed={budget.elapsed:.1f}s, exhausted={budget.exhausted}"
+                        
+                        log.error(f"  DIAGNOSTIC: tile={t}, refs={diag_refs}, ready={diag_ready}, "
+                                 f"has_dds={diag_dds}, chunk_zooms={diag_chunks}, budget={diag_budget}")
+                    else:
+                        log.error(f"  DIAGNOSTIC: Tile not found in cache (may have been evicted)")
+                except Exception as diag_err:
+                    log.error(f"  DIAGNOSTIC: Failed to gather tile state: {diag_err}")
+                # ═══════════════════════════════════════════════════════════════
+                
                 return _generate_fallback_dds_bytes(offset, length)
             
             try:

@@ -3765,6 +3765,21 @@ class ConfigUI(QMainWindow):
             # Clear the flight manager
             from utils.simbrief_flight import simbrief_flight_manager
             simbrief_flight_manager.clear()
+        else:
+            # If we have a userid and use_flight_data was previously enabled in config,
+            # show the checkbox and route settings so user can see the current state
+            use_flight_data = False
+            if hasattr(self.cfg, 'simbrief'):
+                use_flight_data = getattr(self.cfg.simbrief, 'use_flight_data', False)
+                if isinstance(use_flight_data, str):
+                    use_flight_data = use_flight_data.lower() in ('true', '1', 'yes', 'on')
+            
+            if use_flight_data or self.simbrief_use_flight_data_check.isChecked():
+                # Show the checkbox so user can see the current state
+                self.simbrief_use_flight_data_check.show()
+                # Show route settings if the checkbox is checked
+                if self.simbrief_use_flight_data_check.isChecked():
+                    self.simbrief_route_settings_frame.show()
 
     def _on_simbrief_fetch(self):
         """Handle SimBrief fetch button click"""
