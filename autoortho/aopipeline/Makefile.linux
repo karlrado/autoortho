@@ -1,5 +1,10 @@
 # Makefile.linux for aopipeline - Native performance pipeline
 # Builds libaopipeline.so with all native components
+#
+# Components:
+# - AoCache: Parallel batch cache file I/O
+# - AoDecode: Parallel JPEG decoding with libturbojpeg
+# - AoDDS: Native DDS texture building
 
 PKGROOT     := ..
 TJ_LIB      := ../aoimage/lib/linlibturbojpeg.a
@@ -14,11 +19,11 @@ CFLAGS      := -O3 -Wall -fPIC -fvisibility=hidden -fdiagnostics-color \
 
 LDFLAGS     := -shared -rdynamic -fopenmp
 
-# Source files - built incrementally as phases complete
-SOURCES     := aocache.c aodecode.c aodds.c aohttp.c aopipeline.c
+# Source files (no HTTP - uses Python requests instead)
+SOURCES     := aocache.c aodecode.c aodds.c aopipeline.c
 OBJECTS     := $(SOURCES:.c=.o)
 
-.PHONY: all clean phase1 phase2 phase3 phase5 phase6
+.PHONY: all clean phase1 phase2 phase3
 
 # Default: build everything available
 all: libaopipeline.so
@@ -31,16 +36,8 @@ phase1: aocache.o
 phase2: aocache.o aodecode.o
 	$(LD) -o libaopipeline.so $(LDFLAGS) aocache.o aodecode.o $(TJ_LIB) -lm
 
-# Phase 3: Add DDS building
-phase3: aocache.o aodecode.o aodds.o
-	$(LD) -o libaopipeline.so $(LDFLAGS) aocache.o aodecode.o aodds.o $(TJ_LIB) -lm -ldl
-
-# Phase 5: Add HTTP (requires libcurl)
-phase5: aocache.o aodecode.o aodds.o aohttp.o
-	$(LD) -o libaopipeline.so $(LDFLAGS) aocache.o aodecode.o aodds.o aohttp.o $(TJ_LIB) -lm -ldl -lcurl
-
-# Phase 6: Complete pipeline
-phase6: libaopipeline.so
+# Phase 3: Add DDS building (complete pipeline)
+phase3: libaopipeline.so
 
 # Pattern rules
 aocache.o: aocache.c aocache.h internal.h
@@ -52,16 +49,13 @@ aodecode.o: aodecode.c aodecode.h aocache.h internal.h
 aodds.o: aodds.c aodds.h aodecode.h internal.h
 	$(CC) $(CFLAGS) -c aodds.c -o $@
 
-aohttp.o: aohttp.c aohttp.h internal.h
-	$(CC) $(CFLAGS) -DAOPIPELINE_HAS_CURL -c aohttp.c -o $@
-
-aopipeline.o: aopipeline.c aopipeline.h aocache.h aodecode.h aodds.h aohttp.h internal.h
+aopipeline.o: aopipeline.c aopipeline.h aocache.h aodecode.h aodds.h internal.h
 	$(CC) $(CFLAGS) -c aopipeline.c -o $@
 
 # Full library with static turbojpeg
 libaopipeline.so: $(OBJECTS) $(TJ_LIB)
 	@test -f "$(TJ_LIB)" || { echo "ERROR: missing $(TJ_LIB)"; exit 1; }
-	$(LD) -o $@ $(LDFLAGS) $(OBJECTS) $(TJ_LIB) -lm -ldl -lcurl
+	$(LD) -o $@ $(LDFLAGS) $(OBJECTS) $(TJ_LIB) -lm -ldl
 
 clean:
 	rm -f $(OBJECTS) libaopipeline.so libaocache.so

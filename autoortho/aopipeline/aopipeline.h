@@ -8,7 +8,6 @@
  * - aocache:  Parallel cache file I/O
  * - aodecode: Parallel JPEG decoding with turbojpeg
  * - aodds:    DDS texture building with ISPC compression
- * - aohttp:   HTTP client pool with libcurl
  * 
  * Quick Start:
  *   // Build a DDS tile from cached JPEGs
@@ -54,7 +53,6 @@ extern "C" {
 #include "aocache.h"
 #include "aodecode.h"
 #include "aodds.h"
-#include "aohttp.h"
 
 /*============================================================================
  * Pipeline Statistics
@@ -82,11 +80,6 @@ typedef struct {
     /* DDS building */
     int32_t mipmaps_generated;
     double compress_ms;
-    
-    /* HTTP (if used) */
-    int32_t http_requests;
-    int32_t http_failures;
-    double http_ms;
     
     /* Total */
     double total_ms;
@@ -126,13 +119,11 @@ AOPIPELINE_API const char* aopipeline_version(void);
  * @param out_cache     Output: 1 if cache I/O available
  * @param out_decode    Output: 1 if JPEG decoding available  
  * @param out_dds       Output: 1 if DDS building available
- * @param out_http      Output: 1 if HTTP client available
  */
 AOPIPELINE_API void aopipeline_check_components(
     int32_t* out_cache,
     int32_t* out_decode,
-    int32_t* out_dds,
-    int32_t* out_http
+    int32_t* out_dds
 );
 
 /**
@@ -158,44 +149,6 @@ AOPIPELINE_API void aopipeline_check_components(
  * @return 1 on success, 0 on failure
  */
 AOPIPELINE_API int32_t aopipeline_build_cached_tile(
-    const char* cache_dir,
-    int32_t tile_row,
-    int32_t tile_col,
-    const char* maptype,
-    int32_t zoom,
-    int32_t chunks_per_side,
-    dds_format_t format,
-    const uint8_t* missing_color,
-    uint8_t* dds_output,
-    uint32_t output_size,
-    uint32_t* bytes_written,
-    aopipeline_stats_t* stats
-);
-
-/**
- * Download chunks and build DDS (full pipeline).
- * 
- * For when chunks are not yet cached. Downloads, caches, and builds.
- * Requires HTTP component to be available.
- * 
- * @param url_template      URL pattern with {col}, {row}, {zoom} placeholders
- * @param cache_dir         Directory to cache downloaded chunks
- * @param tile_row          Tile row coordinate
- * @param tile_col          Tile column coordinate
- * @param maptype           Map source identifier
- * @param zoom              Zoom level
- * @param chunks_per_side   Chunks per side
- * @param format            Compression format
- * @param missing_color     RGB color for failed downloads
- * @param dds_output        Pre-allocated output buffer
- * @param output_size       Size of output buffer
- * @param bytes_written     Output: actual bytes written
- * @param stats             Output: optional statistics
- * 
- * @return 1 on success, 0 on failure
- */
-AOPIPELINE_API int32_t aopipeline_download_and_build(
-    const char* url_template,
     const char* cache_dir,
     int32_t tile_row,
     int32_t tile_col,

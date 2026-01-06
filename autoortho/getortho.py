@@ -106,7 +106,11 @@ def _get_native_cache():
         return _native_cache
     _native_cache_checked = True
     try:
-        from autoortho.aopipeline import AoCache
+        # Handle imports for both frozen (PyInstaller) and direct Python execution
+        try:
+            from autoortho.aopipeline import AoCache
+        except ImportError:
+            from aopipeline import AoCache
         if AoCache.is_available():
             _native_cache = AoCache
             log.info(f"Native cache I/O enabled: {AoCache.get_version()}")
@@ -165,7 +169,11 @@ def _get_native_dds():
         return _native_dds
     _native_dds_checked = True
     try:
-        from autoortho.aopipeline import AoDDS
+        # Handle imports for both frozen (PyInstaller) and direct Python execution
+        try:
+            from autoortho.aopipeline import AoDDS
+        except ImportError:
+            from aopipeline import AoDDS
         if AoDDS.is_available():
             _native_dds = AoDDS
             log.info(f"Native DDS building enabled: {AoDDS.get_version()}")
@@ -225,40 +233,6 @@ def _build_dds_native(cache_dir: str, tile_row: int, tile_col: int,
     except Exception as e:
         log.debug(f"Native DDS build exception: {e}")
         return None
-
-
-# ============================================================================
-# Native HTTP Client Integration
-# ============================================================================
-# When available, uses libcurl multi-interface for high-performance parallel
-# chunk downloads. Key benefits:
-# - Connection pooling and reuse (avoids TCP/TLS handshake per request)
-# - HTTP/2 multiplexing (100+ streams over single connection)
-# - Reduced Python overhead (no object creation per request)
-# - Batch submission (submit many URLs, poll for completion)
-# ============================================================================
-
-_native_http = None
-_native_http_checked = False
-
-def _get_native_http():
-    """Lazily load and return native HTTP module, or None if unavailable."""
-    global _native_http, _native_http_checked
-    if _native_http_checked:
-        return _native_http
-    _native_http_checked = True
-    try:
-        from autoortho.aopipeline import AoHttp
-        if AoHttp.is_available():
-            _native_http = AoHttp
-            log.info(f"Native HTTP enabled: {AoHttp.get_version()}")
-        else:
-            log.debug("Native HTTP library not available, using Python requests")
-    except ImportError as e:
-        log.debug(f"Native HTTP import failed: {e}")
-    except Exception as e:
-        log.warning(f"Native HTTP initialization failed: {e}")
-    return _native_http
 
 
 MEMTRACE = False
@@ -866,337 +840,17 @@ class ChunkGetter(Getter):
         return obj.get(*args, **kwargs)
 
 
-class NativeChunkGetter:
-    """
-    High-performance chunk downloader using native libcurl.
-    
-    Design rationale:
-    - Uses libcurl multi-interface for connection pooling and HTTP/2 multiplexing
-    - Batches multiple chunks to amortize Python overhead
-    - Falls back to Python ChunkGetter for retries and edge cases
-    
-    Architecture:
-    - submit() adds chunks to a pending queue
-    - A batch processor thread collects pending chunks every N ms
-    - Native HTTP downloads all URLs in parallel
-    - Results are processed back to chunks (data, ready flag, cache write)
-    - Failed downloads are requeued for retry via Python fallback
-    
-    This provides 2-5x speedup for initial 100k+ chunk loads while
-    maintaining all retry logic and error handling from the Python path.
-    """
-    
-    # Configuration
-    BATCH_SIZE = 64           # Max chunks per batch (matches curl's default max connections)
-    BATCH_INTERVAL_MS = 50    # How often to process pending chunks
-    TIMEOUT_MS = 30000        # Per-request timeout
-    
-    def __init__(self, num_workers: int, fallback_getter: Getter = None):
-        """
-        Args:
-            num_workers: Number of concurrent connections (passed to AoHttp.init)
-            fallback_getter: Python ChunkGetter for retries (created if None)
-        """
-        self.num_workers = num_workers
-        self._pending = []
-        self._pending_lock = threading.Lock()
-        self._running = False
-        self._processor_thread = None
-        self._native_http = None
-        self._fallback = fallback_getter
-        self._stats = {'batches': 0, 'chunks': 0, 'native_ok': 0, 'fallback': 0}
-        
-    def start(self):
-        """Initialize native HTTP and start batch processor."""
-        self._native_http = _get_native_http()
-        if self._native_http is None:
-            log.warning("NativeChunkGetter: native HTTP not available, using fallback only")
-            return False
-        
-        # Initialize native HTTP pool
-        try:
-            self._native_http.init(max_connections=self.num_workers)
-            self._native_http.set_user_agent("curl/7.68.0")
-        except Exception as e:
-            log.warning(f"NativeChunkGetter: failed to init native HTTP: {e}")
-            return False
-        
-        # Create fallback getter if not provided
-        if self._fallback is None:
-            self._fallback = ChunkGetter(max(4, self.num_workers // 4))
-        
-        # Start batch processor
-        self._running = True
-        self._processor_thread = threading.Thread(
-            target=self._batch_processor_loop,
-            name="NativeChunkBatch",
-            daemon=True
-        )
-        self._processor_thread.start()
-        
-        log.info(f"NativeChunkGetter started: {self.num_workers} connections, "
-                 f"batch_size={self.BATCH_SIZE}, interval={self.BATCH_INTERVAL_MS}ms")
-        return True
-    
-    def stop(self):
-        """Shutdown the native HTTP pool and processor thread."""
-        self._running = False
-        if self._processor_thread:
-            self._processor_thread.join(timeout=2.0)
-        if self._native_http:
-            try:
-                self._native_http.shutdown()
-            except Exception:
-                pass
-        log.info(f"NativeChunkGetter stopped: {self._stats}")
-    
-    def submit(self, chunk, *args, **kwargs):
-        """
-        Submit a chunk for download.
-        
-        Interface matches Getter.submit() for compatibility.
-        Chunks are batched and downloaded via native HTTP.
-        """
-        # Skip if already done or in flight
-        if chunk.ready.is_set():
-            return
-        if chunk.in_queue:
-            return
-        if chunk.in_flight:
-            return
-        if chunk.permanent_failure:
-            return
-        
-        # Check cache first (before queuing for download)
-        if chunk.get_cache():
-            chunk.download_started.set()
-            chunk.ready.set()
-            bump('chunk_hit')
-            return
-        
-        chunk.in_queue = True
-        
-        with self._pending_lock:
-            self._pending.append((chunk, args, kwargs))
-    
-    def _batch_processor_loop(self):
-        """
-        Main loop: collect pending chunks and process in batches.
-        
-        Runs in dedicated thread, polls pending queue, batches chunks,
-        downloads via native HTTP, and processes results.
-        """
-        while self._running:
-            try:
-                self._process_one_batch()
-            except Exception as e:
-                log.error(f"NativeChunkGetter batch error: {e}")
-            
-            # Sleep between batches
-            time.sleep(self.BATCH_INTERVAL_MS / 1000.0)
-    
-    def _process_one_batch(self):
-        """Collect and process one batch of pending chunks."""
-        # Collect pending chunks (up to BATCH_SIZE)
-        with self._pending_lock:
-            if not self._pending:
-                return
-            batch = self._pending[:self.BATCH_SIZE]
-            self._pending = self._pending[self.BATCH_SIZE:]
-        
-        if not batch:
-            return
-        
-        self._stats['batches'] += 1
-        self._stats['chunks'] += len(batch)
-        
-        # Mark all as in-flight
-        for chunk, args, kwargs in batch:
-            chunk.in_queue = False
-            chunk.in_flight = True
-            chunk.download_started.set()
-        
-        # Build URLs for each chunk
-        urls = []
-        chunk_map = {}  # url -> (chunk, args, kwargs)
-        
-        for chunk, args, kwargs in batch:
-            try:
-                url = self._build_chunk_url(chunk)
-                if url:
-                    urls.append(url)
-                    chunk_map[url] = (chunk, args, kwargs)
-                else:
-                    # Failed to build URL, send to fallback
-                    chunk.in_flight = False
-                    self._submit_to_fallback(chunk, args, kwargs)
-            except Exception as e:
-                log.debug(f"Failed to build URL for {chunk}: {e}")
-                chunk.in_flight = False
-                self._submit_to_fallback(chunk, args, kwargs)
-        
-        if not urls:
-            return
-        
-        # Download all URLs via native HTTP
-        try:
-            results = self._native_http.get_batch_sync(urls, timeout_ms=self.TIMEOUT_MS)
-        except Exception as e:
-            log.warning(f"Native batch download failed: {e}, falling back to Python")
-            # Fall back all chunks to Python getter
-            for url in urls:
-                chunk, args, kwargs = chunk_map[url]
-                chunk.in_flight = False
-                self._submit_to_fallback(chunk, args, kwargs)
-            return
-        
-        # Process results
-        for i, url in enumerate(urls):
-            chunk, args, kwargs = chunk_map[url]
-            result = results[i]
-            
-            try:
-                self._process_download_result(chunk, result)
-            except Exception as e:
-                log.debug(f"Error processing result for {chunk}: {e}")
-                chunk.in_flight = False
-                self._submit_to_fallback(chunk, args, kwargs)
-    
-    def _build_chunk_url(self, chunk) -> str:
-        """
-        Build the download URL for a chunk.
-        
-        Extracted from Chunk.get() to allow native batch downloads.
-        Must match the URL construction logic exactly.
-        """
-        server_num = 0  # Use first server for native batch
-        server = chunk.serverlist[server_num] if chunk.serverlist else ""
-        quadkey = _gtile_to_quadkey(chunk.col, chunk.row, chunk.zoom)
-        
-        MAPID = "s2cloudless-2023_3857"
-        MATRIXSET = "g"
-        
-        MAPTYPES = {
-            "EOX": f"https://{server}.tiles.maps.eox.at/wmts/?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={chunk.zoom}&TileCol={chunk.col}&TileRow={chunk.row}",
-            "BI": f"https://t.ssl.ak.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=15312",
-            "GO2": f"http://mts{server_num}.google.com/vt/lyrs=s&x={chunk.col}&y={chunk.row}&z={chunk.zoom}",
-            "ARC": f"http://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{chunk.zoom}/{chunk.row}/{chunk.col}",
-            "NAIP": f"http://naip.maptiles.arcgis.com/arcgis/rest/services/NAIP/MapServer/tile/{chunk.zoom}/{chunk.row}/{chunk.col}",
-            "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{chunk.zoom}/{chunk.row}/{chunk.col}",
-            "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{chunk.zoom}/{chunk.row}/{chunk.col}",
-            "YNDX": f"https://sat{server_num+1:02d}.maps.yandex.net/tiles?l=sat&v=3.1814.0&x={chunk.col}&y={chunk.row}&z={chunk.zoom}",
-        }
-        
-        # APPLE requires dynamic token - fall back to Python for this
-        if chunk.maptype.upper() == "APPLE":
-            return None  # Will be handled by fallback
-        
-        return MAPTYPES.get(chunk.maptype.upper())
-    
-    def _process_download_result(self, chunk, result):
-        """
-        Process a download result and update chunk state.
-        
-        Args:
-            chunk: The Chunk object
-            result: FetchResult from AoHttp (has data, success, status_code, error)
-        """
-        chunk.in_flight = False
-        
-        if not result.success or result.status_code != 200:
-            # Failed - increment attempt counter and check for retry
-            chunk.attempt += 1
-            
-            # Check permanent failure codes
-            if result.status_code in PERMANENT_FAILURE_CODES:
-                chunk.permanent_failure = True
-                chunk.failure_reason = result.status_code
-                chunk.data = b''
-                chunk.ready.set()
-                bump(f'chunk_permanent_fail_{result.status_code}')
-                self._notify_tracker(chunk)
-                return
-            
-            # Check retry limits
-            if chunk.attempt >= MAX_TOTAL_ATTEMPTS:
-                chunk.permanent_failure = True
-                chunk.failure_reason = "max_total_attempts"
-                chunk.data = b''
-                chunk.ready.set()
-                bump('chunk_max_attempts_exhausted')
-                self._notify_tracker(chunk)
-                return
-            
-            # Retry via Python fallback (handles backoff, server rotation, etc.)
-            self._stats['fallback'] += 1
-            self._submit_to_fallback(chunk, (), {})
-            return
-        
-        # Success - validate JPEG and update chunk
-        data = result.data
-        if data and len(data) >= 3 and _is_jpeg(data[:3]):
-            chunk.data = data
-            bump('bytes_dl', len(data))
-        else:
-            chunk.data = b''
-            log.debug(f"Native download for {chunk} not a JPEG: {data[:3] if data else 'empty'}")
-        
-        self._stats['native_ok'] += 1
-        bump('req_ok')
-        
-        # Mark ready
-        chunk.ready.set()
-        
-        # Notify tile completion tracker
-        self._notify_tracker(chunk)
-        
-        # Async cache write
-        try:
-            _cache_write_executor.submit(_async_cache_write, chunk)
-        except RuntimeError:
-            chunk.save_cache()
-    
-    def _notify_tracker(self, chunk):
-        """Notify tile completion tracker if available."""
-        try:
-            if tile_completion_tracker is not None and chunk.tile_id:
-                tile_completion_tracker.notify_chunk_ready(chunk.tile_id, chunk)
-        except Exception:
-            pass
-    
-    def _submit_to_fallback(self, chunk, args, kwargs):
-        """Submit chunk to Python fallback getter."""
-        if self._fallback:
-            chunk.in_queue = False  # Reset for fallback submission
-            self._fallback.submit(chunk, *args, **kwargs)
-    
-    @property
-    def stats(self):
-        """Return download statistics."""
-        return self._stats.copy()
-
-
 def _create_chunk_getter(num_workers: int):
     """
-    Factory function to create the appropriate chunk getter.
+    Factory function to create the chunk getter.
     
-    Uses NativeChunkGetter when native HTTP is available for better
-    performance with large numbers of concurrent downloads.
-    Falls back to Python ChunkGetter otherwise.
+    Uses Python ChunkGetter with per-thread connection pooling via requests.Session.
+    Each worker thread maintains its own HTTP session for connection reuse.
+    
+    Native aopipeline components (AoCache, AoDDS) are used for cache I/O and
+    DDS building where parallel native processing provides clear benefits.
     """
-    native_http = _get_native_http()
-    
-    if native_http is not None:
-        # Try to create and start native getter
-        native_getter = NativeChunkGetter(num_workers)
-        if native_getter.start():
-            log.info(f"Using NativeChunkGetter ({num_workers} connections)")
-            return native_getter
-        else:
-            log.info("NativeChunkGetter failed to start, using Python fallback")
-    
-    # Fall back to Python implementation
-    log.info(f"Using Python ChunkGetter ({num_workers} workers)")
+    log.info(f"Using ChunkGetter ({num_workers} workers)")
     return ChunkGetter(num_workers)
 
 
