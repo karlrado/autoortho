@@ -187,6 +187,16 @@ predictive_dds_build_interval_ms = 500
 #   - Pro: Faster prebuilds, no extra I/O
 #   - Con: Failed chunks show missing color instead of fallback data
 predictive_dds_use_fallbacks = True
+# Disk-based DDS cache size in MB (0 = disabled, 1024-16384 recommended)
+# This is an overflow cache for when memory cache is full
+# Uses temp directory, auto-cleaned on session end
+# Set to 0 to disable disk caching entirely (memory-only mode)
+ephemeral_dds_cache_mb = 4096
+# Maximum threads for native pipeline (0 = auto from CPU cores)
+# Controls parallelism for cache I/O, JPEG decoding, and DDS compression
+# Lower values reduce CPU usage but slow down DDS building
+# Set to 1 for single-threaded mode (lowest CPU, slowest builds)
+native_pipeline_threads = 0
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False

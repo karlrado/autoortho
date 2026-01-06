@@ -132,7 +132,73 @@ pip install -r requirements.txt
 pip install -r requirements-build.txt
 ```
 
-## Building
+## Building the Native Pipeline
+
+The native pipeline (`aopipeline`) requires additional dependencies and must be built separately for each platform.
+
+### macOS (ARM64/x86_64)
+
+**Prerequisites:**
+```bash
+brew install libomp jpeg-turbo curl
+```
+
+**Build:**
+```bash
+cd autoortho/aopipeline
+make -f Makefile.macos
+# Output: lib/macos/libaopipeline.dylib
+```
+
+### Linux
+
+**Prerequisites:**
+```bash
+# Debian/Ubuntu
+sudo apt-get install libomp-dev libturbojpeg0-dev libcurl4-openssl-dev
+
+# Fedora/RHEL
+sudo dnf install libomp-devel turbojpeg-devel libcurl-devel
+```
+
+**Build:**
+```bash
+cd autoortho/aopipeline
+make -f Makefile.linux
+# Output: lib/linux/libaopipeline.so
+```
+
+### Windows (MinGW-w64)
+
+**Prerequisites:**
+- MinGW-w64 toolchain
+- TurboJPEG library
+- libcurl for Windows
+
+**Build:**
+```bash
+cd autoortho/aopipeline
+make -f Makefile.mingw64
+# Output: lib/windows/aopipeline.dll
+```
+
+### Native Pipeline Components
+
+| Component | Dependencies | Purpose |
+|-----------|--------------|---------|
+| `aocache.c` | OpenMP | Parallel batch file I/O |
+| `aodecode.c` | TurboJPEG, OpenMP | Parallel JPEG decoding |
+| `aodds.c` | ISPC texcomp, OpenMP | DDS texture compression |
+| `aohttp.c` | libcurl | Native HTTP client |
+
+### Fallback Behavior
+
+If the native library is not available:
+- AutoOrtho automatically falls back to the Python implementation
+- All functionality works, just slower for CPU-intensive operations
+- Log messages indicate which path is used
+
+## Building the Application
 
 The `Makefile` provides targets for each platform:
 

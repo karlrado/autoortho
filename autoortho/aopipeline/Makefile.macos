@@ -1,0 +1,82 @@
+# Makefile.macos for aopipeline - Native performance pipeline
+# Builds libaopipeline.dylib with all native components
+
+PKGROOT     := ..
+TJ_INC      ?= /opt/homebrew/opt/jpeg-turbo/include
+TJ_LIB      := ../aoimage/lib/maclibturbojpeg.a
+CURL_INC    ?= /opt/homebrew/opt/curl/include
+ISPC_LIB    := ../lib/macos/libispc_texcomp.dylib
+
+CC          := clang
+ARCH        := arm64
+MIN_MACOS   := 11.0
+
+# OpenMP support via Homebrew libomp
+OMP_INC     ?= /opt/homebrew/opt/libomp/include
+OMP_LIB     ?= /opt/homebrew/opt/libomp/lib
+
+CFLAGS      := -O3 -Wall -fPIC -fvisibility=hidden -fdiagnostics-color \
+               -arch $(ARCH) -mmacosx-version-min=$(MIN_MACOS) \
+               -I$(TJ_INC) -I$(OMP_INC) -I../aoimage \
+               -Xpreprocessor -fopenmp
+
+LDFLAGS     := -dynamiclib -undefined dynamic_lookup \
+               -arch $(ARCH) -mmacosx-version-min=$(MIN_MACOS) \
+               -Wl,-install_name,@rpath/libaopipeline.dylib \
+               -L$(OMP_LIB) -lomp
+
+# Source files - built incrementally as phases complete
+SOURCES     := aocache.c aodecode.c aodds.c aohttp.c aopipeline.c
+OBJECTS     := $(SOURCES:.c=.o)
+HEADERS     := aocache.h aodecode.h aodds.h aohttp.h aopipeline.h internal.h
+
+.PHONY: all clean phase1 phase2 phase3 phase5 phase6
+
+# Default: build everything available
+all: libaopipeline.dylib
+
+# Phase 1: Cache I/O only
+phase1: aocache.o
+	$(CC) -o libaocache.dylib $(LDFLAGS) aocache.o
+
+# Phase 2: Add decoding
+phase2: aocache.o aodecode.o
+	$(CC) -o libaopipeline.dylib $(LDFLAGS) aocache.o aodecode.o $(TJ_LIB)
+
+# Phase 3: Add DDS building
+phase3: aocache.o aodecode.o aodds.o
+	$(CC) -o libaopipeline.dylib $(LDFLAGS) aocache.o aodecode.o aodds.o $(TJ_LIB)
+
+# Phase 5: Add HTTP (requires libcurl)
+phase5: aocache.o aodecode.o aodds.o aohttp.o
+	$(CC) -o libaopipeline.dylib $(LDFLAGS) aocache.o aodecode.o aodds.o aohttp.o $(TJ_LIB) -lcurl
+
+# Phase 6: Complete pipeline
+phase6: libaopipeline.dylib
+
+# Pattern rules
+aocache.o: aocache.c aocache.h internal.h
+	@test -d "$(OMP_INC)" || { echo "ERROR: OpenMP not found at $(OMP_INC). Install with: brew install libomp"; exit 1; }
+	$(CC) $(CFLAGS) -c aocache.c -o $@
+
+aodecode.o: aodecode.c aodecode.h aocache.h internal.h
+	@test -f "$(TJ_INC)/turbojpeg.h" || { echo "ERROR: turbojpeg.h not found at $(TJ_INC)"; exit 1; }
+	$(CC) $(CFLAGS) -c aodecode.c -o $@
+
+aodds.o: aodds.c aodds.h aodecode.h internal.h
+	$(CC) $(CFLAGS) -c aodds.c -o $@
+
+aohttp.o: aohttp.c aohttp.h internal.h
+	$(CC) $(CFLAGS) -I$(CURL_INC) -DAOPIPELINE_HAS_CURL -c aohttp.c -o $@
+
+aopipeline.o: aopipeline.c aopipeline.h aocache.h aodecode.h aodds.h aohttp.h internal.h
+	$(CC) $(CFLAGS) -c aopipeline.c -o $@
+
+# Full library with static turbojpeg
+libaopipeline.dylib: $(OBJECTS) $(TJ_LIB)
+	@test -f "$(TJ_LIB)" || { echo "ERROR: missing $(TJ_LIB)"; exit 1; }
+	$(CC) -o $@ $(LDFLAGS) $(OBJECTS) $(TJ_LIB) -lcurl
+
+clean:
+	rm -f $(OBJECTS) libaopipeline.dylib libaocache.dylib
+
