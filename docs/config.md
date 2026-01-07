@@ -65,27 +65,35 @@ Controls how many CPU threads the native pipeline uses for parallel operations (
 
 **Recommendation:** Leave at 0 unless you need to limit CPU usage for other applications.
 
-### Ephemeral DDS Cache (`ephemeral_dds_cache_mb`)
+### Predictive DDS Disk Cache (`ephemeral_dds_cache_mb`)
 - **Type:** Integer (megabytes)
 - **Default:** 4096
-- **Range:** 0 - 16384
+- **Range:** 1024 - 16384
 - **Config file:** `ephemeral_dds_cache_mb = 4096`
 
-Size of the disk-based overflow cache for pre-built DDS textures.
+Size of the disk cache for pre-built DDS textures. The predictive DDS system builds tiles in the background and stores them on disk for instant serving when X-Plane requests them.
 
 | Value | Behavior |
 |-------|----------|
-| **0** | Disabled - memory-only caching |
 | **1024-4096** | Balanced - good for most systems |
-| **8192-16384** | Large - for systems with fast SSDs |
+| **8192** | Large flights - covers more waypoints |
+| **16384** | Maximum capacity - long-haul flights |
+
+**Why disk-only caching?**
+
+AutoOrtho uses disk-only caching (no dedicated RAM cache) because:
+- **SSD reads are fast enough:** Reading a pre-built DDS from disk takes ~1-2ms, which is negligible compared to the ~100-500ms build time it saves
+- **OS file cache handles hot files:** Your operating system automatically keeps frequently accessed files in RAM
+- **Simpler memory management:** No need to configure RAM limits - the OS handles it naturally
+- **Session-based:** Cache is fresh every session, avoiding stale texture issues
 
 **Key properties:**
 - Uses OS temp directory (not your JPEG cache)
 - Automatically cleaned when AutoOrtho exits
 - Fresh cache every session (no stale tiles)
-- Settings changes take effect immediately
+- OS file cache keeps hot files in RAM automatically
 
-**Recommendation:** 4096MB for most users. Set to 0 if you're low on disk space or prefer memory-only caching.
+**Recommendation:** 4096MB for most users. Increase to 8192-16384MB for long-haul flights covering many tiles.
 
 ### Apple Maps Caveat
 

@@ -1,11 +1,15 @@
 """
 test_dds_cache.py - Unit tests for DDS caching system
 
-Tests the EphemeralDDSCache and HybridDDSCache classes:
+Tests the EphemeralDDSCache class (disk-only cache for predictive DDS):
 - Session isolation
 - LRU eviction
 - Size limits
 - Cleanup on shutdown
+
+Note: Predictive DDS uses disk-only caching via EphemeralDDSCache.
+The PrebuiltDDSCache (RAM) and HybridDDSCache are kept for potential
+future use but are not used by the predictive DDS system.
 """
 
 import os
@@ -294,13 +298,29 @@ class TestPrebuiltDDSCache:
 class TestCacheIntegration:
     """Integration tests for cache system."""
     
-    def test_hybrid_cache_in_builder(self):
-        """Test that HybridDDSCache works with BackgroundDDSBuilder."""
-        from autoortho.getortho import start_predictive_dds, stop_predictive_dds
+    def test_disk_cache_in_builder(self):
+        """Test that EphemeralDDSCache works with BackgroundDDSBuilder.
         
-        # This would require full setup, just verify imports work
+        The predictive DDS system now uses disk-only caching for simplicity:
+        - SSD reads (~1-2ms) are fast enough vs build time (~100-500ms)
+        - OS file cache keeps hot files in RAM automatically
+        - No need for separate RAM cache configuration
+        """
+        from autoortho.getortho import start_predictive_dds, stop_predictive_dds
+        from autoortho.getortho import EphemeralDDSCache
+        
+        # Verify imports work
         assert start_predictive_dds is not None
         assert stop_predictive_dds is not None
+        
+        # Verify EphemeralDDSCache has the expected interface
+        cache = EphemeralDDSCache(max_size_mb=1)
+        assert hasattr(cache, 'get')
+        assert hasattr(cache, 'store')
+        assert hasattr(cache, 'contains')
+        assert hasattr(cache, 'stats')
+        assert hasattr(cache, 'cleanup')
+        cache.cleanup()
 
 
 # ============================================================================

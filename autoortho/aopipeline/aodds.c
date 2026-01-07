@@ -5,11 +5,17 @@
  * Includes ISPC texcomp integration for high-performance compression.
  */
 
+/* Enable dladdr() on Linux/glibc */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "aodds.h"
 #include "aodecode.h"
 #include "aocache.h"
 #include "internal.h"
 #include <stdio.h>
+#include <string.h>
 #include <math.h>
 #include <turbojpeg.h>
 
@@ -68,6 +74,7 @@ static CompressBlocksBC1_fn ispc_compress_bc1 = NULL;
 static CompressBlocksBC3_fn ispc_compress_bc3 = NULL;
 static int ispc_initialized = 0;
 static int ispc_available = 0;
+static int force_fallback = 0;  /* When set, use fallback even if ISPC is available */
 
 #ifdef AOPIPELINE_WINDOWS
 static HMODULE ispc_lib = NULL;
@@ -75,47 +82,113 @@ static HMODULE ispc_lib = NULL;
 static void* ispc_lib = NULL;
 #endif
 
+/* Helper to get directory containing a path */
+static void get_directory(char* dest, size_t dest_size, const char* path) {
+    /* Use snprintf for safe copy with guaranteed null-termination */
+    snprintf(dest, dest_size, "%s", path);
+    
+    /* Find last separator */
+    char* last_sep = NULL;
+    for (char* p = dest; *p; p++) {
+#ifdef AOPIPELINE_WINDOWS
+        if (*p == '\\' || *p == '/') last_sep = p;
+#else
+        if (*p == '/') last_sep = p;
+#endif
+    }
+    if (last_sep) {
+        *last_sep = '\0';
+    }
+}
+
 AODDS_API int32_t aodds_init_ispc(void) {
     if (ispc_initialized) {
         return ispc_available;
     }
     ispc_initialized = 1;
     
-    /* Determine library path */
+    /* Determine library name and subdirectory */
     const char* lib_name;
+    const char* lib_subdir;
 #ifdef AOPIPELINE_WINDOWS
     lib_name = "ispc_texcomp.dll";
+    lib_subdir = "windows";
 #elif defined(AOPIPELINE_MACOS)
     lib_name = "libispc_texcomp.dylib";
+    lib_subdir = "macos";
 #else
     lib_name = "libispc_texcomp.so";
+    lib_subdir = "linux";
 #endif
     
-    /* Try to load from lib directory relative to this module */
+    char module_path[4096] = {0};
+    char module_dir[4096] = {0};
+    char lib_path[4096] = {0};
+    
 #ifdef AOPIPELINE_WINDOWS
-    char lib_path[MAX_PATH];
-    snprintf(lib_path, MAX_PATH, "../lib/windows/%s", lib_name);
-    ispc_lib = LoadLibraryA(lib_path);
+    /* Get path to this DLL (aopipeline.dll) */
+    HMODULE self_module = NULL;
+    GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        (LPCSTR)aodds_init_ispc,
+        &self_module
+    );
+    if (self_module) {
+        GetModuleFileNameA(self_module, module_path, sizeof(module_path));
+        get_directory(module_dir, sizeof(module_dir), module_path);
+        
+        /* 
+         * aopipeline.dll is in: autoortho/aopipeline/lib/windows/
+         * ISPC lib is in:       autoortho/lib/windows/
+         * So we need: ../../lib/windows/ispc_texcomp.dll
+         */
+        snprintf(lib_path, sizeof(lib_path), "%s\\..\\..\\..\\lib\\%s\\%s", 
+                 module_dir, lib_subdir, lib_name);
+        ispc_lib = LoadLibraryA(lib_path);
+        
+        /* Also try the aopipeline lib dir (in case user copied it there) */
+        if (!ispc_lib) {
+            snprintf(lib_path, sizeof(lib_path), "%s\\%s", module_dir, lib_name);
+            ispc_lib = LoadLibraryA(lib_path);
+        }
+    }
+    
+    /* Fallback: try just the library name (relies on PATH) */
     if (!ispc_lib) {
-        /* Try current directory */
         ispc_lib = LoadLibraryA(lib_name);
     }
+    
     if (ispc_lib) {
         ispc_compress_bc1 = (CompressBlocksBC1_fn)GetProcAddress(ispc_lib, "CompressBlocksBC1");
         ispc_compress_bc3 = (CompressBlocksBC3_fn)GetProcAddress(ispc_lib, "CompressBlocksBC3");
     }
 #else
-    char lib_path[4096];
-#ifdef AOPIPELINE_MACOS
-    snprintf(lib_path, sizeof(lib_path), "../lib/macos/%s", lib_name);
-#else
-    snprintf(lib_path, sizeof(lib_path), "../lib/linux/%s", lib_name);
-#endif
-    ispc_lib = dlopen(lib_path, RTLD_NOW);
+    /* Unix: use dladdr to find this shared library's path */
+    Dl_info dl_info;
+    if (dladdr((void*)aodds_init_ispc, &dl_info) && dl_info.dli_fname) {
+        get_directory(module_dir, sizeof(module_dir), dl_info.dli_fname);
+        
+        /* 
+         * libaopipeline.so is in: autoortho/aopipeline/lib/{linux,macos}/
+         * ISPC lib is in:         autoortho/lib/{linux,macos}/
+         * So we need: ../../../lib/{platform}/libispc_texcomp.{so,dylib}
+         */
+        snprintf(lib_path, sizeof(lib_path), "%s/../../../lib/%s/%s", 
+                 module_dir, lib_subdir, lib_name);
+        ispc_lib = dlopen(lib_path, RTLD_NOW);
+        
+        /* Also try the aopipeline lib dir (in case user copied it there) */
+        if (!ispc_lib) {
+            snprintf(lib_path, sizeof(lib_path), "%s/%s", module_dir, lib_name);
+            ispc_lib = dlopen(lib_path, RTLD_NOW);
+        }
+    }
+    
+    /* Fallback: try standard library paths */
     if (!ispc_lib) {
-        /* Try standard paths */
         ispc_lib = dlopen(lib_name, RTLD_NOW);
     }
+    
     if (ispc_lib) {
         ispc_compress_bc1 = (CompressBlocksBC1_fn)dlsym(ispc_lib, "CompressBlocksBC1");
         ispc_compress_bc3 = (CompressBlocksBC3_fn)dlsym(ispc_lib, "CompressBlocksBC3");
@@ -124,6 +197,14 @@ AODDS_API int32_t aodds_init_ispc(void) {
     
     ispc_available = (ispc_compress_bc1 != NULL && ispc_compress_bc3 != NULL);
     return ispc_available;
+}
+
+AODDS_API void aodds_set_use_ispc(int32_t use_ispc) {
+    force_fallback = !use_ispc;
+}
+
+AODDS_API int32_t aodds_get_use_ispc(void) {
+    return ispc_available && !force_fallback;
 }
 
 /*============================================================================
@@ -484,6 +565,138 @@ static void compress_bc1_fallback(const aodecode_image_t* image, uint8_t* output
     }
 }
 
+/*============================================================================
+ * BC3 Fallback Compression (DXT5)
+ * 
+ * BC3 block layout (16 bytes total):
+ *   - Bytes 0-7:  Alpha block (DXT5 alpha compression)
+ *   - Bytes 8-15: Color block (same as BC1/DXT1)
+ * 
+ * Alpha block format:
+ *   - Byte 0: alpha0 (reference alpha value)
+ *   - Byte 1: alpha1 (reference alpha value)
+ *   - Bytes 2-7: 16 3-bit indices (48 bits) selecting from 8 derived alphas
+ * 
+ * Alpha derivation (when alpha0 > alpha1):
+ *   alpha[0] = alpha0
+ *   alpha[1] = alpha1
+ *   alpha[2] = (6*alpha0 + 1*alpha1) / 7
+ *   alpha[3] = (5*alpha0 + 2*alpha1) / 7
+ *   alpha[4] = (4*alpha0 + 3*alpha1) / 7
+ *   alpha[5] = (3*alpha0 + 4*alpha1) / 7
+ *   alpha[6] = (2*alpha0 + 5*alpha1) / 7
+ *   alpha[7] = (1*alpha0 + 6*alpha1) / 7
+ *============================================================================*/
+
+static void compress_alpha_block(const uint8_t* rgba, uint8_t* block) {
+    /* Find min/max alpha values in the 4x4 block */
+    uint8_t min_alpha = 255;
+    uint8_t max_alpha = 0;
+    
+    for (int i = 0; i < 16; i++) {
+        uint8_t a = rgba[i * 4 + 3];  /* Alpha is 4th component */
+        if (a < min_alpha) min_alpha = a;
+        if (a > max_alpha) max_alpha = a;
+    }
+    
+    /* Set reference alpha values
+     * Use alpha0 > alpha1 mode for full 8-value interpolation */
+    uint8_t alpha0, alpha1;
+    if (max_alpha == min_alpha) {
+        /* Solid alpha - avoid division issues */
+        alpha0 = max_alpha;
+        alpha1 = max_alpha > 0 ? max_alpha - 1 : 0;
+    } else {
+        alpha0 = max_alpha;
+        alpha1 = min_alpha;
+    }
+    
+    /* Ensure alpha0 > alpha1 for 8-value interpolation mode */
+    if (alpha0 <= alpha1) {
+        alpha0 = alpha1 + 1;
+        if (alpha0 == 0) alpha0 = 1;  /* Handle overflow */
+    }
+    
+    block[0] = alpha0;
+    block[1] = alpha1;
+    
+    /* Calculate 8 interpolated alpha values */
+    int32_t alphas[8];
+    alphas[0] = alpha0;
+    alphas[1] = alpha1;
+    alphas[2] = (6 * alpha0 + 1 * alpha1 + 3) / 7;
+    alphas[3] = (5 * alpha0 + 2 * alpha1 + 3) / 7;
+    alphas[4] = (4 * alpha0 + 3 * alpha1 + 3) / 7;
+    alphas[5] = (3 * alpha0 + 4 * alpha1 + 3) / 7;
+    alphas[6] = (2 * alpha0 + 5 * alpha1 + 3) / 7;
+    alphas[7] = (1 * alpha0 + 6 * alpha1 + 3) / 7;
+    
+    /* Encode 16 3-bit indices into 48 bits (6 bytes) */
+    uint64_t indices = 0;
+    for (int i = 0; i < 16; i++) {
+        int32_t a = rgba[i * 4 + 3];
+        
+        /* Find closest alpha value */
+        int32_t best_idx = 0;
+        int32_t best_dist = INT32_MAX;
+        for (int j = 0; j < 8; j++) {
+            int32_t dist = (a - alphas[j]) * (a - alphas[j]);
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_idx = j;
+            }
+        }
+        
+        indices |= ((uint64_t)best_idx << (i * 3));
+    }
+    
+    /* Write 48 bits (6 bytes) of indices */
+    block[2] = (indices >> 0) & 0xFF;
+    block[3] = (indices >> 8) & 0xFF;
+    block[4] = (indices >> 16) & 0xFF;
+    block[5] = (indices >> 24) & 0xFF;
+    block[6] = (indices >> 32) & 0xFF;
+    block[7] = (indices >> 40) & 0xFF;
+}
+
+static void compress_bc3_fallback(const aodecode_image_t* image, uint8_t* output) {
+    int32_t blocks_x = (image->width + 3) / 4;
+    int32_t blocks_y = (image->height + 3) / 4;
+    
+#pragma omp parallel for schedule(static)
+    for (int32_t by = 0; by < blocks_y; by++) {
+        for (int32_t bx = 0; bx < blocks_x; bx++) {
+            uint8_t block_rgba[16 * 4];
+            
+            /* Extract 4x4 block */
+            for (int y = 0; y < 4; y++) {
+                int32_t src_y = by * 4 + y;
+                if (src_y >= image->height) src_y = image->height - 1;
+                
+                for (int x = 0; x < 4; x++) {
+                    int32_t src_x = bx * 4 + x;
+                    if (src_x >= image->width) src_x = image->width - 1;
+                    
+                    const uint8_t* src = image->data + 
+                                         (src_y * image->stride) + 
+                                         (src_x * 4);
+                    uint8_t* dst = block_rgba + ((y * 4 + x) * 4);
+                    memcpy(dst, src, 4);
+                }
+            }
+            
+            /* BC3 block = 16 bytes: 8 bytes alpha + 8 bytes color */
+            uint8_t* block_out = output + ((by * blocks_x + bx) * 16);
+            
+            /* Compress alpha block (bytes 0-7) */
+            compress_alpha_block(block_rgba, block_out);
+            
+            /* Compress color block (bytes 8-15) - same as BC1 */
+            compress_bc1_block_simple(block_rgba, block_out + 8);
+        }
+    }
+}
+
 AODDS_API uint32_t aodds_compress(
     const aodecode_image_t* image,
     dds_format_t format,
@@ -501,7 +714,7 @@ AODDS_API uint32_t aodds_compress(
     uint32_t blocks_y = (image->height + 3) / 4;
     uint32_t output_size = blocks_x * blocks_y * block_size;
     
-    if (ispc_available) {
+    if (ispc_available && !force_fallback) {
         /* Use ISPC compression */
         rgba_surface_t surface = {
             .ptr = image->data,
@@ -516,14 +729,12 @@ AODDS_API uint32_t aodds_compress(
             ispc_compress_bc3(&surface, output);
         }
     } else {
-        /* Fallback compression */
+        /* Fallback compression (simple inline implementation) */
         if (format == DDS_FORMAT_BC1) {
             compress_bc1_fallback(image, output);
         } else {
-            /* BC3 fallback not implemented - use BC1 */
-            compress_bc1_fallback(image, output);
-            /* Note: This produces incorrect output for BC3 */
-            /* A real BC3 fallback would need additional alpha block handling */
+            /* BC3 = alpha block + BC1 color block */
+            compress_bc3_fallback(image, output);
         }
     }
     
@@ -570,28 +781,36 @@ AODDS_API int32_t aodds_build_tile(
         return 0;
     }
     
-    /* Build cache paths for all chunks */
+    /* ═══════════════════════════════════════════════════════════════════════
+     * PATH STRING OPTIMIZATION (Phase 2.1)
+     * ═══════════════════════════════════════════════════════════════════════
+     * BEFORE: 256 mallocs of 4KB each = 1MB total, 257 allocations
+     * AFTER:  1 contiguous buffer with 512-byte slots = 128KB, 2 allocations
+     * 
+     * Path format: {cache_dir}/{col}_{row}_{zoom}_{maptype}.jpg
+     * Typical path: ~60-80 chars, 512 bytes is generous with room for long paths
+     * ═══════════════════════════════════════════════════════════════════════*/
+    #define PATH_SLOT_SIZE 512
+    
+    char* path_buffer = (char*)malloc(chunk_count * PATH_SLOT_SIZE);
     char** cache_paths = (char**)malloc(chunk_count * sizeof(char*));
-    if (!cache_paths) {
+    
+    if (!path_buffer || !cache_paths) {
+        free(path_buffer);
+        free(cache_paths);
         safe_strcpy(request->error, "Memory allocation failed", 256);
         return 0;
     }
     
     for (int32_t i = 0; i < chunk_count; i++) {
-        cache_paths[i] = (char*)malloc(4096);
-        if (!cache_paths[i]) {
-            for (int32_t j = 0; j < i; j++) free(cache_paths[j]);
-            free(cache_paths);
-            safe_strcpy(request->error, "Memory allocation failed", 256);
-            return 0;
-        }
+        cache_paths[i] = path_buffer + (i * PATH_SLOT_SIZE);
         
         int32_t chunk_row = i / chunks_per_side;
         int32_t chunk_col = i % chunks_per_side;
         int32_t abs_col = request->tile_col * chunks_per_side + chunk_col;
         int32_t abs_row = request->tile_row * chunks_per_side + chunk_row;
         
-        snprintf(cache_paths[i], 4096, "%s/%d_%d_%d_%s.jpg",
+        snprintf(cache_paths[i], PATH_SLOT_SIZE, "%s/%d_%d_%d_%s.jpg",
                  request->cache_dir, abs_col, abs_row, 
                  request->zoom, request->maptype);
     }
@@ -601,7 +820,7 @@ AODDS_API int32_t aodds_build_tile(
         chunk_count, sizeof(aodecode_image_t)
     );
     if (!chunks) {
-        for (int32_t i = 0; i < chunk_count; i++) free(cache_paths[i]);
+        free(path_buffer);
         free(cache_paths);
         safe_strcpy(request->error, "Memory allocation failed", 256);
         return 0;
@@ -615,11 +834,11 @@ AODDS_API int32_t aodds_build_tile(
     request->stats.chunks_decoded = decoded;
     request->stats.chunks_failed = chunk_count - decoded;
     
-    /* Free cache paths */
-    for (int32_t i = 0; i < chunk_count; i++) {
-        free(cache_paths[i]);
-    }
+    /* Free path buffers (now just 2 frees instead of 257) */
+    free(path_buffer);
     free(cache_paths);
+    
+    #undef PATH_SLOT_SIZE
     
     /* Allocate composed tile image */
     aodecode_image_t tile_image = {0};
@@ -658,9 +877,33 @@ AODDS_API int32_t aodds_build_tile(
         mipmap_count, request->format
     );
     
-    /* Generate and compress mipmaps */
+    /* ═══════════════════════════════════════════════════════════════════════
+     * MIPMAP BUFFER REUSE (Phase 2.2)
+     * ═══════════════════════════════════════════════════════════════════════
+     * BEFORE: Allocate new buffer for each mipmap level (~12 allocations)
+     * AFTER:  Pre-allocate two ping-pong buffers (2 allocations)
+     * 
+     * For 4096x4096 tile:
+     * - mip_buf_a: 16MB (for levels 1, 3, 5, 7, 9, 11 - odd levels)
+     * - mip_buf_b: 4MB (for levels 2, 4, 6, 8, 10 - even levels)
+     * 
+     * Level 0: compress tile_image
+     * Level 1: reduce tile→mip_a, compress mip_a
+     * Level 2: reduce mip_a→mip_b, compress mip_b
+     * Level 3: reduce mip_b→mip_a (fits in 16MB), compress mip_a
+     * ... alternating between buffers
+     * ═══════════════════════════════════════════════════════════════════════*/
+    
+    /* Allocate ping-pong buffers for mipmaps */
+    int32_t mip1_size = (tile_size / 2) * (tile_size / 2) * 4;  /* Level 1 size */
+    int32_t mip2_size = (tile_size / 4) * (tile_size / 4) * 4;  /* Level 2 size */
+    
+    uint8_t* mip_buf_a = (mipmap_count > 1) ? (uint8_t*)malloc(mip1_size) : NULL;
+    uint8_t* mip_buf_b = (mipmap_count > 2) ? (uint8_t*)malloc(mip2_size) : NULL;
+    
     aodecode_image_t current = tile_image;
     aodecode_image_t next = {0};
+    int use_buf_a = 1;  /* Toggle for ping-pong */
     
     for (int32_t mip = 0; mip < mipmap_count; mip++) {
         /* Compress current mipmap */
@@ -677,27 +920,31 @@ AODDS_API int32_t aodds_build_tile(
             next.height = current.height / 2;
             next.stride = next.width * 4;
             next.channels = 4;
-            next.data = (uint8_t*)malloc(next.width * next.height * 4);
+            
+            /* Use pre-allocated ping-pong buffers */
+            if (use_buf_a && mip_buf_a) {
+                next.data = mip_buf_a;
+            } else if (!use_buf_a && mip_buf_b) {
+                next.data = mip_buf_b;
+            } else {
+                /* Fallback: allocate if ping-pong buffer unavailable */
+                next.data = (uint8_t*)malloc(next.width * next.height * 4);
+            }
             
             if (next.data) {
                 aodds_reduce_half(&current, &next);
-                
-                /* Free current (except first which is tile_image) */
-                if (mip > 0) {
-                    free(current.data);
-                }
                 current = next;
                 memset(&next, 0, sizeof(next));
+                use_buf_a = !use_buf_a;  /* Toggle for next iteration */
             } else {
                 break;  /* Out of memory, stop generating mipmaps */
             }
         }
     }
     
-    /* Clean up last mipmap */
-    if (current.data != tile_image.data) {
-        free(current.data);
-    }
+    /* Clean up - only free the pre-allocated buffers, not the reused ones */
+    free(mip_buf_a);
+    free(mip_buf_b);
     free(tile_image.data);
     
     request->dds_written = offset;
@@ -747,31 +994,51 @@ AODDS_API int32_t aodds_build_from_chunks(
     uint32_t offset = aodds_write_header(dds_output, tile_size, tile_size, 
                                           mipmap_count, format);
     
-    /* Generate mipmaps */
+    /* ═══════════════════════════════════════════════════════════════════════
+     * MIPMAP BUFFER REUSE (Phase 2.2)
+     * Pre-allocate ping-pong buffers instead of allocating per mipmap level
+     * ═══════════════════════════════════════════════════════════════════════*/
+    int32_t mip1_size = (tile_size / 2) * (tile_size / 2) * 4;
+    int32_t mip2_size = (tile_size / 4) * (tile_size / 4) * 4;
+    
+    uint8_t* mip_buf_a = (mipmap_count > 1) ? (uint8_t*)malloc(mip1_size) : NULL;
+    uint8_t* mip_buf_b = (mipmap_count > 2) ? (uint8_t*)malloc(mip2_size) : NULL;
+    
     aodecode_image_t current = tile;
+    aodecode_image_t next = {0};
+    int use_buf_a = 1;
     
     for (int32_t mip = 0; mip < mipmap_count; mip++) {
         offset += aodds_compress(&current, format, dds_output + offset);
         
         if (mip < mipmap_count - 1 && current.width > 4) {
-            aodecode_image_t next = {0};
             next.width = current.width / 2;
             next.height = current.height / 2;
             next.stride = next.width * 4;
             next.channels = 4;
-            next.data = (uint8_t*)malloc(next.width * next.height * 4);
+            
+            /* Use pre-allocated ping-pong buffers */
+            if (use_buf_a && mip_buf_a) {
+                next.data = mip_buf_a;
+            } else if (!use_buf_a && mip_buf_b) {
+                next.data = mip_buf_b;
+            } else {
+                next.data = (uint8_t*)malloc(next.width * next.height * 4);
+            }
             
             if (next.data) {
                 aodds_reduce_half(&current, &next);
-                if (mip > 0) free(current.data);
                 current = next;
+                memset(&next, 0, sizeof(next));
+                use_buf_a = !use_buf_a;
             } else {
                 break;
             }
         }
     }
     
-    if (current.data != tile.data) free(current.data);
+    free(mip_buf_a);
+    free(mip_buf_b);
     free(tile.data);
     
     *bytes_written = offset;
@@ -961,33 +1228,564 @@ AODDS_API int32_t aodds_build_from_jpegs(
     uint32_t offset = aodds_write_header(dds_output, tile_size, tile_size, 
                                           mipmap_count, format);
     
+    /* ═══════════════════════════════════════════════════════════════════════
+     * MIPMAP BUFFER REUSE (Phase 2.2)
+     * Pre-allocate ping-pong buffers instead of allocating per mipmap level
+     * ═══════════════════════════════════════════════════════════════════════*/
+    int32_t mip1_size = (tile_size / 2) * (tile_size / 2) * 4;
+    int32_t mip2_size = (tile_size / 4) * (tile_size / 4) * 4;
+    
+    uint8_t* mip_buf_a = (mipmap_count > 1) ? (uint8_t*)malloc(mip1_size) : NULL;
+    uint8_t* mip_buf_b = (mipmap_count > 2) ? (uint8_t*)malloc(mip2_size) : NULL;
+    
     aodecode_image_t current = tile;
+    aodecode_image_t next = {0};
+    int use_buf_a = 1;
     
     for (int32_t mip = 0; mip < mipmap_count; mip++) {
         offset += aodds_compress(&current, format, dds_output + offset);
         
         if (mip < mipmap_count - 1 && current.width > 4) {
-            aodecode_image_t next = {0};
             next.width = current.width / 2;
             next.height = current.height / 2;
             next.stride = next.width * 4;
             next.channels = 4;
-            next.data = (uint8_t*)malloc(next.width * next.height * 4);
+            
+            /* Use pre-allocated ping-pong buffers */
+            if (use_buf_a && mip_buf_a) {
+                next.data = mip_buf_a;
+            } else if (!use_buf_a && mip_buf_b) {
+                next.data = mip_buf_b;
+            } else {
+                next.data = (uint8_t*)malloc(next.width * next.height * 4);
+            }
             
             if (next.data) {
                 aodds_reduce_half(&current, &next);
-                if (mip > 0) free(current.data);
                 current = next;
+                memset(&next, 0, sizeof(next));
+                use_buf_a = !use_buf_a;
             } else {
                 break;
             }
         }
     }
     
-    if (current.data != tile.data) free(current.data);
+    free(mip_buf_a);
+    free(mip_buf_b);
     free(tile.data);
     
     *bytes_written = offset;
+    return 1;
+}
+
+/*============================================================================
+ * Direct-to-File Pipeline: Build DDS and write directly to disk
+ * 
+ * PERFORMANCE OPTIMIZATION:
+ * This eliminates the ~65ms Python copy overhead by writing DDS data
+ * directly to the disk cache file. The flow becomes:
+ *   1. Decode JPEGs to RGBA (parallel, in C)
+ *   2. Compose tile image
+ *   3. For each mipmap: compress and fwrite to file
+ *   4. No Python involvement, no memory copy
+ * 
+ * ATOMICITY:
+ * Uses temp file + rename pattern to prevent corrupt files on crash.
+ *============================================================================*/
+
+AODDS_API int32_t aodds_build_from_jpegs_to_file(
+    const uint8_t** jpeg_data,
+    const uint32_t* jpeg_sizes,
+    int32_t chunk_count,
+    dds_format_t format,
+    uint8_t missing_r,
+    uint8_t missing_g,
+    uint8_t missing_b,
+    const char* output_path,
+    uint32_t* bytes_written,
+    aodecode_pool_t* pool
+) {
+    if (!jpeg_data || !jpeg_sizes || !output_path || !bytes_written || chunk_count <= 0) {
+        return 0;
+    }
+    
+    *bytes_written = 0;
+    
+    /* Calculate chunks per side (must be perfect square) */
+    int32_t chunks_per_side = (int32_t)sqrt((double)chunk_count);
+    if (chunks_per_side * chunks_per_side != chunk_count) {
+        return 0;
+    }
+    
+    int32_t tile_size = chunks_per_side * CHUNK_SIZE;
+    int32_t mipmap_count = aodds_calc_mipmap_count(tile_size, tile_size);
+    
+    /* Allocate chunk image array */
+    aodecode_image_t* chunks = (aodecode_image_t*)calloc(
+        chunk_count, sizeof(aodecode_image_t)
+    );
+    if (!chunks) {
+        return 0;
+    }
+    
+    /* Parallel decode all JPEGs (same as aodds_build_from_jpegs) */
+    int32_t decoded = 0;
+    
+#if AOPIPELINE_HAS_OPENMP
+    #pragma omp parallel reduction(+:decoded)
+    {
+        tjhandle tjh = tjInitDecompress();
+        if (tjh) {
+            #pragma omp for schedule(static)
+            for (int32_t i = 0; i < chunk_count; i++) {
+                if (!jpeg_data[i] || jpeg_sizes[i] == 0) {
+                    continue;
+                }
+                
+                int width, height, subsamp, colorspace;
+                if (tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
+                                        &width, &height, &subsamp, &colorspace) < 0) {
+                    continue;
+                }
+                
+                if (width != CHUNK_SIZE || height != CHUNK_SIZE) {
+                    continue;
+                }
+                
+                uint8_t* buffer;
+                int from_pool = 0;
+                if (pool) {
+                    buffer = aodecode_acquire_buffer(pool);
+                    from_pool = (buffer != NULL);
+                }
+                if (!from_pool) {
+                    buffer = (uint8_t*)malloc(CHUNK_SIZE * CHUNK_SIZE * 4);
+                }
+                
+                if (!buffer) continue;
+                
+                if (tjDecompress2(tjh, jpeg_data[i], jpeg_sizes[i],
+                                  buffer, width, 0, height,
+                                  TJPF_RGBA, TJFLAG_FASTDCT) < 0) {
+                    if (from_pool) {
+                        aodecode_release_buffer(pool, buffer);
+                    } else {
+                        free(buffer);
+                    }
+                    continue;
+                }
+                
+                chunks[i].data = buffer;
+                chunks[i].width = width;
+                chunks[i].height = height;
+                chunks[i].stride = width * 4;
+                chunks[i].channels = 4;
+                chunks[i].from_pool = from_pool;
+                decoded++;
+            }
+            tjDestroy(tjh);
+        }
+    }
+#else
+    /* Sequential fallback */
+    tjhandle tjh = tjInitDecompress();
+    if (tjh) {
+        for (int32_t i = 0; i < chunk_count; i++) {
+            if (!jpeg_data[i] || jpeg_sizes[i] == 0) continue;
+            
+            int width, height, subsamp, colorspace;
+            if (tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
+                                    &width, &height, &subsamp, &colorspace) < 0) {
+                continue;
+            }
+            
+            if (width != CHUNK_SIZE || height != CHUNK_SIZE) continue;
+            
+            uint8_t* buffer = (uint8_t*)malloc(CHUNK_SIZE * CHUNK_SIZE * 4);
+            if (!buffer) continue;
+            
+            if (tjDecompress2(tjh, jpeg_data[i], jpeg_sizes[i],
+                              buffer, width, 0, height,
+                              TJPF_RGBA, TJFLAG_FASTDCT) < 0) {
+                free(buffer);
+                continue;
+            }
+            
+            chunks[i].data = buffer;
+            chunks[i].width = width;
+            chunks[i].height = height;
+            chunks[i].stride = width * 4;
+            chunks[i].channels = 4;
+            chunks[i].from_pool = 0;
+            decoded++;
+        }
+        tjDestroy(tjh);
+    }
+#endif
+    
+    /* Allocate tile image */
+    aodecode_image_t tile = {0};
+    tile.width = tile_size;
+    tile.height = tile_size;
+    tile.stride = tile_size * 4;
+    tile.channels = 4;
+    tile.data = (uint8_t*)malloc(tile_size * tile_size * 4);
+    
+    if (!tile.data) {
+        for (int32_t i = 0; i < chunk_count; i++) {
+            aodecode_free_image(&chunks[i], pool);
+        }
+        free(chunks);
+        return 0;
+    }
+    
+    /* Fill with missing color and compose chunks */
+    aodds_fill_missing(chunks, chunks_per_side, &tile, missing_r, missing_g, missing_b);
+    aodds_compose_chunks(chunks, chunks_per_side, &tile);
+    
+    /* Free chunk images */
+    for (int32_t i = 0; i < chunk_count; i++) {
+        aodecode_free_image(&chunks[i], pool);
+    }
+    free(chunks);
+    
+    /* ═══════════════════════════════════════════════════════════════════════
+     * FILE OUTPUT: Write DDS directly to disk
+     * Uses temp file + rename for atomicity
+     * ═══════════════════════════════════════════════════════════════════════*/
+    
+    /* Create temp file path */
+    char temp_path[4096];
+    snprintf(temp_path, sizeof(temp_path), "%s.tmp", output_path);
+    
+    /* Open temp file for writing */
+    FILE* fp = fopen(temp_path, "wb");
+    if (!fp) {
+        free(tile.data);
+        return 0;
+    }
+    
+    /* Write DDS header */
+    uint8_t header[DDS_HEADER_SIZE];
+    aodds_write_header(header, tile_size, tile_size, mipmap_count, format);
+    if (fwrite(header, 1, DDS_HEADER_SIZE, fp) != DDS_HEADER_SIZE) {
+        fclose(fp);
+        remove(temp_path);
+        free(tile.data);
+        return 0;
+    }
+    
+    uint32_t total_written = DDS_HEADER_SIZE;
+    
+    /* Allocate compression buffer (largest mipmap size) */
+    uint32_t block_size = (format == DDS_FORMAT_BC1) ? 8 : 16;
+    uint32_t max_blocks_x = (tile_size + 3) / 4;
+    uint32_t max_blocks_y = (tile_size + 3) / 4;
+    uint32_t max_compressed_size = max_blocks_x * max_blocks_y * block_size;
+    uint8_t* compress_buffer = (uint8_t*)malloc(max_compressed_size);
+    
+    if (!compress_buffer) {
+        fclose(fp);
+        remove(temp_path);
+        free(tile.data);
+        return 0;
+    }
+    
+    /* ═══════════════════════════════════════════════════════════════════════
+     * MIPMAP BUFFER REUSE (Phase 2.2)
+     * Pre-allocate ping-pong buffers instead of allocating per mipmap level
+     * ═══════════════════════════════════════════════════════════════════════*/
+    int32_t mip1_size = (tile_size / 2) * (tile_size / 2) * 4;
+    int32_t mip2_size = (tile_size / 4) * (tile_size / 4) * 4;
+    
+    uint8_t* mip_buf_a = (mipmap_count > 1) ? (uint8_t*)malloc(mip1_size) : NULL;
+    uint8_t* mip_buf_b = (mipmap_count > 2) ? (uint8_t*)malloc(mip2_size) : NULL;
+    
+    /* Generate and write mipmaps */
+    aodecode_image_t current = tile;
+    aodecode_image_t next = {0};
+    int success = 1;
+    int use_buf_a = 1;
+    
+    for (int32_t mip = 0; mip < mipmap_count && success; mip++) {
+        /* Compress current mipmap to buffer */
+        uint32_t compressed_size = aodds_compress(&current, format, compress_buffer);
+        
+        /* Write compressed data to file */
+        if (fwrite(compress_buffer, 1, compressed_size, fp) != compressed_size) {
+            success = 0;
+            break;
+        }
+        total_written += compressed_size;
+        
+        /* Generate next mipmap level */
+        if (mip < mipmap_count - 1 && current.width > 4) {
+            next.width = current.width / 2;
+            next.height = current.height / 2;
+            next.stride = next.width * 4;
+            next.channels = 4;
+            
+            /* Use pre-allocated ping-pong buffers */
+            if (use_buf_a && mip_buf_a) {
+                next.data = mip_buf_a;
+            } else if (!use_buf_a && mip_buf_b) {
+                next.data = mip_buf_b;
+            } else {
+                next.data = (uint8_t*)malloc(next.width * next.height * 4);
+            }
+            
+            if (next.data) {
+                aodds_reduce_half(&current, &next);
+                current = next;
+                memset(&next, 0, sizeof(next));
+                use_buf_a = !use_buf_a;
+            } else {
+                success = 0;
+            }
+        }
+    }
+    
+    /* Cleanup - free ping-pong buffers and tile data */
+    free(compress_buffer);
+    free(mip_buf_a);
+    free(mip_buf_b);
+    free(tile.data);
+    fclose(fp);
+    
+    if (!success) {
+        remove(temp_path);
+        return 0;
+    }
+    
+    /* Atomic rename: temp file -> final path */
+#ifdef AOPIPELINE_WINDOWS
+    /* Windows: remove target first (rename fails if target exists) */
+    remove(output_path);
+#endif
+    if (rename(temp_path, output_path) != 0) {
+        remove(temp_path);
+        return 0;
+    }
+    
+    *bytes_written = total_written;
+    return 1;
+}
+
+/*============================================================================
+ * Native Direct-to-File: Build DDS from cache files and write to disk
+ * 
+ * PERFORMANCE OPTIMIZATION:
+ * Same as aodds_build_tile() but writes directly to disk instead of buffer.
+ * Eliminates ~65ms Python copy overhead for native mode predictive builds.
+ *============================================================================*/
+
+AODDS_API int32_t aodds_build_tile_to_file(
+    const char* cache_dir,
+    int32_t tile_row,
+    int32_t tile_col,
+    const char* maptype,
+    int32_t zoom,
+    int32_t chunks_per_side,
+    dds_format_t format,
+    uint8_t missing_r,
+    uint8_t missing_g,
+    uint8_t missing_b,
+    const char* output_path,
+    uint32_t* bytes_written,
+    aodecode_pool_t* pool
+) {
+    if (!cache_dir || !maptype || !output_path || !bytes_written || chunks_per_side <= 0) {
+        return 0;
+    }
+    
+    *bytes_written = 0;
+    
+    int32_t chunk_count = chunks_per_side * chunks_per_side;
+    int32_t tile_size = chunks_per_side * CHUNK_SIZE;
+    int32_t mipmap_count = aodds_calc_mipmap_count(tile_size, tile_size);
+    
+    /* ═══════════════════════════════════════════════════════════════════════
+     * PATH STRING OPTIMIZATION (Phase 2.1)
+     * Contiguous buffer instead of individual allocations
+     * ═══════════════════════════════════════════════════════════════════════*/
+    #define PATH_SLOT_SIZE 512
+    
+    char* path_buffer = (char*)malloc(chunk_count * PATH_SLOT_SIZE);
+    char** cache_paths = (char**)malloc(chunk_count * sizeof(char*));
+    
+    if (!path_buffer || !cache_paths) {
+        free(path_buffer);
+        free(cache_paths);
+        return 0;
+    }
+    
+    for (int32_t i = 0; i < chunk_count; i++) {
+        cache_paths[i] = path_buffer + (i * PATH_SLOT_SIZE);
+        
+        int32_t chunk_row = i / chunks_per_side;
+        int32_t chunk_col = i % chunks_per_side;
+        int32_t abs_col = tile_col * chunks_per_side + chunk_col;
+        int32_t abs_row = tile_row * chunks_per_side + chunk_row;
+        
+        snprintf(cache_paths[i], PATH_SLOT_SIZE, "%s/%d_%d_%d_%s.jpg",
+                 cache_dir, abs_col, abs_row, zoom, maptype);
+    }
+    
+    /* Decode all chunks from cache */
+    aodecode_image_t* chunks = (aodecode_image_t*)calloc(
+        chunk_count, sizeof(aodecode_image_t)
+    );
+    if (!chunks) {
+        free(path_buffer);
+        free(cache_paths);
+        return 0;
+    }
+    
+    aodecode_from_cache((const char**)cache_paths, chunk_count, chunks, pool, 0);
+    
+    /* Free path buffers */
+    free(path_buffer);
+    free(cache_paths);
+    
+    #undef PATH_SLOT_SIZE
+    
+    /* Allocate composed tile image */
+    aodecode_image_t tile = {0};
+    tile.width = tile_size;
+    tile.height = tile_size;
+    tile.stride = tile_size * 4;
+    tile.channels = 4;
+    tile.data = (uint8_t*)malloc(tile_size * tile_size * 4);
+    
+    if (!tile.data) {
+        for (int32_t i = 0; i < chunk_count; i++) {
+            aodecode_free_image(&chunks[i], pool);
+        }
+        free(chunks);
+        return 0;
+    }
+    
+    /* Fill with missing color and compose chunks */
+    memset(tile.data, 0, tile_size * tile_size * 4);
+    aodds_fill_missing(chunks, chunks_per_side, &tile, missing_r, missing_g, missing_b);
+    aodds_compose_chunks(chunks, chunks_per_side, &tile);
+    
+    /* Free chunk images */
+    for (int32_t i = 0; i < chunk_count; i++) {
+        aodecode_free_image(&chunks[i], pool);
+    }
+    free(chunks);
+    
+    /* ═══════════════════════════════════════════════════════════════════════
+     * FILE OUTPUT: Write DDS directly to disk with temp file + rename
+     * ═══════════════════════════════════════════════════════════════════════*/
+    
+    char temp_path[4096];
+    snprintf(temp_path, sizeof(temp_path), "%s.tmp", output_path);
+    
+    FILE* fp = fopen(temp_path, "wb");
+    if (!fp) {
+        free(tile.data);
+        return 0;
+    }
+    
+    /* Write DDS header */
+    uint8_t header[DDS_HEADER_SIZE];
+    aodds_write_header(header, tile_size, tile_size, mipmap_count, format);
+    if (fwrite(header, 1, DDS_HEADER_SIZE, fp) != DDS_HEADER_SIZE) {
+        fclose(fp);
+        remove(temp_path);
+        free(tile.data);
+        return 0;
+    }
+    
+    uint32_t total_written = DDS_HEADER_SIZE;
+    
+    /* Allocate compression buffer */
+    uint32_t block_size = (format == DDS_FORMAT_BC1) ? 8 : 16;
+    uint32_t max_blocks_x = (tile_size + 3) / 4;
+    uint32_t max_blocks_y = (tile_size + 3) / 4;
+    uint32_t max_compressed_size = max_blocks_x * max_blocks_y * block_size;
+    uint8_t* compress_buffer = (uint8_t*)malloc(max_compressed_size);
+    
+    if (!compress_buffer) {
+        fclose(fp);
+        remove(temp_path);
+        free(tile.data);
+        return 0;
+    }
+    
+    /* ═══════════════════════════════════════════════════════════════════════
+     * MIPMAP BUFFER REUSE (Phase 2.2)
+     * ═══════════════════════════════════════════════════════════════════════*/
+    int32_t mip1_size = (tile_size / 2) * (tile_size / 2) * 4;
+    int32_t mip2_size = (tile_size / 4) * (tile_size / 4) * 4;
+    
+    uint8_t* mip_buf_a = (mipmap_count > 1) ? (uint8_t*)malloc(mip1_size) : NULL;
+    uint8_t* mip_buf_b = (mipmap_count > 2) ? (uint8_t*)malloc(mip2_size) : NULL;
+    
+    aodecode_image_t current = tile;
+    aodecode_image_t next = {0};
+    int success = 1;
+    int use_buf_a = 1;
+    
+    for (int32_t mip = 0; mip < mipmap_count && success; mip++) {
+        uint32_t compressed_size = aodds_compress(&current, format, compress_buffer);
+        
+        if (fwrite(compress_buffer, 1, compressed_size, fp) != compressed_size) {
+            success = 0;
+            break;
+        }
+        total_written += compressed_size;
+        
+        if (mip < mipmap_count - 1 && current.width > 4) {
+            next.width = current.width / 2;
+            next.height = current.height / 2;
+            next.stride = next.width * 4;
+            next.channels = 4;
+            
+            if (use_buf_a && mip_buf_a) {
+                next.data = mip_buf_a;
+            } else if (!use_buf_a && mip_buf_b) {
+                next.data = mip_buf_b;
+            } else {
+                next.data = (uint8_t*)malloc(next.width * next.height * 4);
+            }
+            
+            if (next.data) {
+                aodds_reduce_half(&current, &next);
+                current = next;
+                memset(&next, 0, sizeof(next));
+                use_buf_a = !use_buf_a;
+            } else {
+                success = 0;
+            }
+        }
+    }
+    
+    /* Cleanup */
+    free(compress_buffer);
+    free(mip_buf_a);
+    free(mip_buf_b);
+    free(tile.data);
+    fclose(fp);
+    
+    if (!success) {
+        remove(temp_path);
+        return 0;
+    }
+    
+    /* Atomic rename */
+#ifdef AOPIPELINE_WINDOWS
+    remove(output_path);
+#endif
+    if (rename(temp_path, output_path) != 0) {
+        remove(temp_path);
+        return 0;
+    }
+    
+    *bytes_written = total_written;
     return 1;
 }
 
@@ -995,6 +1793,15 @@ AODDS_API const char* aodds_version(void) {
     aodds_init_ispc();
     
     static char version_buf[256];
+    const char* compressor_status;
+    if (!ispc_available) {
+        compressor_status = "STB (ISPC unavailable)";
+    } else if (force_fallback) {
+        compressor_status = "STB (forced)";
+    } else {
+        compressor_status = "ISPC";
+    }
+    
     snprintf(version_buf, sizeof(version_buf),
              "aodds " AODDS_VERSION
 #if AOPIPELINE_HAS_OPENMP
@@ -1002,7 +1809,7 @@ AODDS_API const char* aodds_version(void) {
 #else
              " (OpenMP disabled)"
 #endif
-             " [ISPC: %s]"
+             " [%s]"
 #ifdef AOPIPELINE_WINDOWS
              " [Windows]"
 #elif defined(AOPIPELINE_MACOS)
@@ -1010,7 +1817,7 @@ AODDS_API const char* aodds_version(void) {
 #else
              " [Linux]"
 #endif
-             , ispc_available ? "yes" : "fallback"
+             , compressor_status
     );
     
     return version_buf;

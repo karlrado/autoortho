@@ -168,11 +168,6 @@ prefetch_radius_nm = 40
 # When enabled, tiles are compressed to DDS in the background, eliminating stutters
 # when X-Plane loads new scenery areas. Falls back gracefully on cache miss.
 predictive_dds_enabled = True
-# Maximum memory for pre-built DDS cache in MB (128-2048)
-# Higher = more tiles cached, fewer stutters, more RAM used
-# Lower = fewer tiles cached, more potential stutters, less RAM used
-# Recommended: 256 (low RAM), 512 (balanced), 1024 (high RAM)
-predictive_dds_cache_mb = 512
 # Minimum interval between DDS builds in milliseconds (100-2000)
 # Rate limits background builds to prevent CPU spikes during flight
 # Lower = faster building, higher CPU usage
@@ -187,16 +182,53 @@ predictive_dds_build_interval_ms = 500
 #   - Pro: Faster prebuilds, no extra I/O
 #   - Con: Failed chunks show missing color instead of fallback data
 predictive_dds_use_fallbacks = True
-# Disk-based DDS cache size in MB (0 = disabled, 1024-16384 recommended)
-# This is an overflow cache for when memory cache is full
+# Disk cache size for pre-built DDS textures in MB (1024-16384)
+# Pre-built DDS files are stored on disk (SSD reads are ~1-2ms, fast enough)
+# The OS file cache naturally keeps hot files in RAM when memory is available
 # Uses temp directory, auto-cleaned on session end
-# Set to 0 to disable disk caching entirely (memory-only mode)
+# Recommended: 4096 (balanced), 8192 (large flights), 16384 (max capacity)
 ephemeral_dds_cache_mb = 4096
 # Maximum threads for native pipeline (0 = auto from CPU cores)
 # Controls parallelism for cache I/O, JPEG decoding, and DDS compression
 # Lower values reduce CPU usage but slow down DDS building
 # Set to 1 for single-threaded mode (lowest CPU, slowest builds)
 native_pipeline_threads = 0
+# Pipeline mode for DDS texture building
+# auto: Automatically select best mode for your platform (recommended)
+#       With buffer pool optimization, hybrid is fastest on all platforms
+#       (Python file reads are OS-cache optimized, 10ms vs 21ms for C)
+# native: Full native pipeline (C handles file I/O + decode + compress)
+#         Uses more threads, may be better for cold cache scenarios
+# hybrid: Python reads files, native decode + compress (recommended)
+#         Fastest with buffer pool, lower thread overhead
+# python: Pure Python fallback (slowest but most compatible)
+#         Use if native pipeline causes issues
+pipeline_mode = auto
+# Number of pre-allocated buffers for zero-copy DDS building (2-8)
+# Each buffer is ~11MB for 4096x4096 tiles
+# Higher = more memory usage, but less allocation overhead
+# Lower = less memory, but more allocation overhead per tile
+# Recommended: 4 (default), increase to 6-8 if you have 32GB+ RAM
+buffer_pool_size = 4
+# === LIVE AOPIPELINE SETTINGS ===
+# These control the optimized pipeline for live (on-demand) DDS builds when
+# X-Plane requests tiles that aren't in the predictive cache.
+#
+# Enable optimized aopipeline for live DDS builds (True/False)
+# When enabled, attempts to build entire tile with native pipeline (~5x faster)
+# when sufficient chunks are available. Falls back to progressive path on failure.
+# Recommended: True (enables fast path when chunks are cached/prefetched)
+live_aopipeline_enabled = True
+# Minimum ratio of chunks that must be available for aopipeline build (0.0-1.0)
+# 0.9 = 90%%, allows up to 10%% missing (filled with missing_color)
+# Lower values may show more missing chunks but reduce latency
+# Higher values ensure quality but may fall back more often
+# Recommended: 0.9 (balanced), 0.8 (faster), 0.95 (quality)
+live_aopipeline_min_chunk_ratio = 0.9
+# Maximum seconds to wait for missing chunk downloads during aopipeline attempt
+# This caps how long the fast path will wait for network before falling back
+# Recommended: 2.0 (fast), 3.0 (balanced), 5.0 (quality, slow network)
+live_aopipeline_max_download_wait = 2.0
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False

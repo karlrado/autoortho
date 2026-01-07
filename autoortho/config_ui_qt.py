@@ -963,14 +963,16 @@ class ConfigUI(QMainWindow):
         self.status_bar.showMessage("Ready")
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        # Use getattr() for all combo boxes as they may not exist during init
         if (
-            obj is self.maptype_combo
-            or obj is self.max_zoom_mode_combo
-            or obj is self.fallback_level_combo
-            or (not self.system == "darwin" and obj is self.compressor_combo)
-            or obj is self.format_combo
-            or obj is self.console_log_level_combo
-            or obj is self.file_log_level_combo
+            obj is getattr(self, 'maptype_combo', None)
+            or obj is getattr(self, 'max_zoom_mode_combo', None)
+            or obj is getattr(self, 'fallback_level_combo', None)
+            or (not self.system == "darwin" and obj is getattr(self, 'compressor_combo', None))
+            or obj is getattr(self, 'format_combo', None)
+            or obj is getattr(self, 'console_log_level_combo', None)
+            or obj is getattr(self, 'file_log_level_combo', None)
+            or obj is getattr(self, 'pipeline_mode_combo', None)
         ) and event.type() == QEvent.Type.Wheel:
             if not obj.hasFocus():
                 event.ignore()
@@ -2330,37 +2332,8 @@ class ConfigUI(QMainWindow):
         predictive_enable_layout.addStretch()
         autoortho_layout.addLayout(predictive_enable_layout)
         
-        # Cache size slider
-        cache_layout = QHBoxLayout()
-        self.predictive_cache_label = QLabel("Cache size:")
-        self.predictive_cache_label.setToolTip(
-            "Maximum memory for pre-built DDS tiles.\n"
-            "Higher = more tiles cached, fewer stutters, more RAM used\n"
-            "Lower = fewer tiles cached, more potential stutters\n\n"
-            "Recommended:\n"
-            "  • 256 MB - Low RAM systems\n"
-            "  • 512 MB - Balanced (default)\n"
-            "  • 1024 MB - High RAM, long flights\n"
-            "  • 2048 MB - Maximum caching"
-        )
-        cache_layout.addWidget(self.predictive_cache_label)
-        
-        self.predictive_cache_slider = ModernSlider(Qt.Orientation.Horizontal)
-        self.predictive_cache_slider.setRange(128, 2048)
-        self.predictive_cache_slider.setSingleStep(64)
-        self.predictive_cache_slider.setValue(
-            int(getattr(self.cfg.autoortho, 'predictive_dds_cache_mb', 512))
-        )
-        self.predictive_cache_slider.setObjectName('predictive_dds_cache_mb')
-        self.predictive_cache_value = QLabel(
-            f"{self.predictive_cache_slider.value()} MB"
-        )
-        self.predictive_cache_slider.valueChanged.connect(
-            lambda v: self.predictive_cache_value.setText(f"{v} MB")
-        )
-        cache_layout.addWidget(self.predictive_cache_slider)
-        cache_layout.addWidget(self.predictive_cache_value)
-        autoortho_layout.addLayout(cache_layout)
+        # Note: DDS cache is disk-only (ephemeral_dds_cache_mb in advanced settings)
+        # OS file cache naturally keeps hot files in RAM when memory is available
         
         # Build interval slider
         build_interval_layout = QHBoxLayout()
@@ -2422,6 +2395,100 @@ class ConfigUI(QMainWindow):
         fallbacks_layout.addWidget(self.predictive_use_fallbacks_check)
         fallbacks_layout.addStretch()
         autoortho_layout.addLayout(fallbacks_layout)
+        
+        autoortho_layout.addSpacing(10)
+        # ═══════════════════════════════════════════════════════════════════
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # NATIVE PIPELINE SECTION
+        # ═══════════════════════════════════════════════════════════════════
+        native_pipeline_header = QLabel("Native Pipeline")
+        native_pipeline_header.setStyleSheet("font-weight: bold; font-size: 12px; color: #8ab4f8; margin-top: 10px;")
+        autoortho_layout.addWidget(native_pipeline_header)
+        
+        native_pipeline_info = QLabel(
+            "Controls how DDS textures are built. Native code provides 3x faster compression."
+        )
+        native_pipeline_info.setStyleSheet("color: #888; font-size: 11px;")
+        native_pipeline_info.setWordWrap(True)
+        autoortho_layout.addWidget(native_pipeline_info)
+        
+        # Pipeline mode dropdown
+        pipeline_mode_layout = QHBoxLayout()
+        pipeline_mode_label = QLabel("Pipeline mode:")
+        pipeline_mode_label.setToolTip(
+            "Controls how DDS textures are built:\n\n"
+            "• Auto (Recommended): Automatically selects best mode for your platform\n"
+            "    - Windows → Native (C handles all I/O + decode + compress)\n"
+            "    - macOS/Linux → Hybrid (Python I/O + C decode/compress)\n\n"
+            "• Native: Full native pipeline - C code handles file I/O, JPEG decoding,\n"
+            "  and DXT compression. Fastest on Windows with many CPU cores.\n\n"
+            "• Hybrid: Python reads files, native code does decode + compress.\n"
+            "  Fastest on macOS/Linux due to better VFS caching.\n\n"
+            "• Python: Pure Python fallback. Slowest but most compatible.\n"
+            "  Use if native pipeline causes crashes or issues."
+        )
+        pipeline_mode_layout.addWidget(pipeline_mode_label)
+        
+        self.pipeline_mode_combo = QComboBox()
+        self.pipeline_mode_combo.installEventFilter(self)
+        self.pipeline_mode_combo.setFocusPolicy(Qt.StrongFocus)
+        self.pipeline_mode_combo.addItems(['auto', 'native', 'hybrid', 'python'])
+        current_pipeline_mode = str(getattr(self.cfg.autoortho, 'pipeline_mode', 'auto')).lower().strip()
+        if current_pipeline_mode not in ['auto', 'native', 'hybrid', 'python']:
+            current_pipeline_mode = 'auto'
+        self.pipeline_mode_combo.setCurrentText(current_pipeline_mode)
+        self.pipeline_mode_combo.setObjectName('pipeline_mode')
+        self.pipeline_mode_combo.setToolTip(
+            "Select DDS building pipeline mode:\n\n"
+            "• Auto (recommended): Uses hybrid with buffer pool optimization\n"
+            "  ~65ms per tile (Python file reads + native compression)\n\n"
+            "• Hybrid: Python reads files, native decode+compress\n"
+            "  Fastest with buffer pool, lower thread overhead\n\n"
+            "• Native: C handles all file I/O + decode + compress\n"
+            "  May be better for cold cache scenarios\n\n"
+            "• Python: Pure Python fallback (slowest)\n"
+            "  Use if native pipeline causes issues"
+        )
+        self.pipeline_mode_combo.currentTextChanged.connect(self._update_pipeline_controls)
+        pipeline_mode_layout.addWidget(self.pipeline_mode_combo)
+        pipeline_mode_layout.addStretch()
+        autoortho_layout.addLayout(pipeline_mode_layout)
+        
+        # Buffer pool size slider
+        buffer_pool_layout = QHBoxLayout()
+        self.buffer_pool_label = QLabel("Buffer pool size:")
+        self.buffer_pool_label.setToolTip(
+            "Number of pre-allocated buffers for zero-copy DDS building.\n\n"
+            "Each buffer is ~11MB for 4096x4096 tiles.\n"
+            "Buffers are reused to avoid memory allocation overhead.\n\n"
+            "• 2-3: Low memory systems (22-33 MB used)\n"
+            "• 4: Default, balanced (44 MB used)\n"
+            "• 6-8: High RAM systems, 32GB+ (66-88 MB used)\n\n"
+            "Higher values reduce allocation overhead when building\n"
+            "multiple tiles concurrently, but use more RAM.\n\n"
+            "Only applies to Native and Hybrid modes."
+        )
+        buffer_pool_layout.addWidget(self.buffer_pool_label)
+        
+        self.buffer_pool_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.buffer_pool_slider.setRange(2, 8)
+        buffer_pool_value = int(getattr(self.cfg.autoortho, 'buffer_pool_size', 4))
+        buffer_pool_value = max(2, min(8, buffer_pool_value))
+        self.buffer_pool_slider.setValue(buffer_pool_value)
+        self.buffer_pool_slider.setObjectName('buffer_pool_size')
+        self.buffer_pool_slider.setToolTip("Number of pre-allocated DDS buffers (2-8)")
+        
+        self.buffer_pool_value_label = QLabel(f"{buffer_pool_value} buffers (~{buffer_pool_value * 11}MB)")
+        self.buffer_pool_slider.valueChanged.connect(
+            lambda v: self.buffer_pool_value_label.setText(f"{v} buffers (~{v * 11}MB)")
+        )
+        buffer_pool_layout.addWidget(self.buffer_pool_slider)
+        buffer_pool_layout.addWidget(self.buffer_pool_value_label)
+        autoortho_layout.addLayout(buffer_pool_layout)
+        
+        # Initialize pipeline control states
+        self._update_pipeline_controls()
         
         autoortho_layout.addSpacing(10)
         # ═══════════════════════════════════════════════════════════════════
@@ -3545,15 +3612,36 @@ class ConfigUI(QMainWindow):
         
         enabled = prefetch_enabled and predictive_enabled
         
-        self.predictive_cache_slider.setEnabled(enabled)
-        self.predictive_cache_label.setEnabled(enabled)
-        self.predictive_cache_value.setEnabled(enabled)
-        
         self.predictive_interval_slider.setEnabled(enabled)
         self.predictive_interval_label.setEnabled(enabled)
         self.predictive_interval_value.setEnabled(enabled)
         
         self.predictive_use_fallbacks_check.setEnabled(enabled)
+
+    def _update_pipeline_controls(self):
+        """Update enabled state of pipeline controls based on pipeline mode."""
+        mode = self.pipeline_mode_combo.currentText().lower()
+        
+        # Buffer pool is only relevant for native/hybrid modes
+        buffer_pool_enabled = mode in ('auto', 'native', 'hybrid')
+        
+        self.buffer_pool_slider.setEnabled(buffer_pool_enabled)
+        self.buffer_pool_label.setEnabled(buffer_pool_enabled)
+        self.buffer_pool_value_label.setEnabled(buffer_pool_enabled)
+        
+        # Update styling for disabled state
+        disabled_style = "color: #666;"
+        enabled_style = ""
+        
+        self.buffer_pool_label.setStyleSheet(enabled_style if buffer_pool_enabled else disabled_style)
+        self.buffer_pool_value_label.setStyleSheet(enabled_style if buffer_pool_enabled else disabled_style)
+        
+        # Update tooltip to explain why disabled
+        if not buffer_pool_enabled:
+            self.buffer_pool_label.setToolTip(
+                "Buffer pool is only used in Native and Hybrid modes.\n"
+                "Select a different pipeline mode to configure this setting."
+            )
 
     def _init_dynamic_zoom_manager(self):
         """Initialize the dynamic zoom manager from config."""
@@ -4590,13 +4678,14 @@ class ConfigUI(QMainWindow):
             
             # Predictive DDS settings
             self.cfg.autoortho.predictive_dds_enabled = self.predictive_dds_enabled_check.isChecked()
-            self.cfg.autoortho.predictive_dds_cache_mb = str(
-                self.predictive_cache_slider.value()
-            )
             self.cfg.autoortho.predictive_dds_build_interval_ms = str(
                 self.predictive_interval_slider.value()
             )
             self.cfg.autoortho.predictive_dds_use_fallbacks = self.predictive_use_fallbacks_check.isChecked()
+            
+            # Native pipeline settings
+            self.cfg.autoortho.pipeline_mode = self.pipeline_mode_combo.currentText()
+            self.cfg.autoortho.buffer_pool_size = str(self.buffer_pool_slider.value())
             
             self.cfg.autoortho.fetch_threads = str(
                 self.fetch_threads_spinbox.value()

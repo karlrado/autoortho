@@ -297,6 +297,80 @@ AODDS_API int32_t aodds_build_from_jpegs(
 );
 
 /**
+ * Build DDS from pre-read JPEG data and write directly to file.
+ * 
+ * PERFORMANCE OPTIMIZATION for predictive DDS:
+ * This eliminates ~65ms Python copy overhead by writing DDS data
+ * directly to the disk cache file. Perfect for EphemeralDDSCache.
+ * 
+ * Uses temp file + rename for atomicity (no corrupt files on crash).
+ * 
+ * @param jpeg_data         Array of JPEG data pointers (NULL = missing chunk)
+ * @param jpeg_sizes        Array of JPEG data sizes (0 = missing chunk)
+ * @param chunk_count       Number of chunks (must be perfect square)
+ * @param format            Output compression format
+ * @param missing_r/g/b     Fill color for missing chunks
+ * @param output_path       Path to output DDS file (will be created/overwritten)
+ * @param bytes_written     Actual bytes written (output)
+ * @param pool              Optional buffer pool (may be NULL)
+ * 
+ * @return 1 on success, 0 on failure
+ * 
+ * Cross-platform: Uses standard C file I/O (fopen, fwrite, rename).
+ */
+AODDS_API int32_t aodds_build_from_jpegs_to_file(
+    const uint8_t** jpeg_data,
+    const uint32_t* jpeg_sizes,
+    int32_t chunk_count,
+    dds_format_t format,
+    uint8_t missing_r,
+    uint8_t missing_g,
+    uint8_t missing_b,
+    const char* output_path,
+    uint32_t* bytes_written,
+    aodecode_pool_t* pool
+);
+
+/**
+ * Build DDS from cache files and write directly to disk.
+ * 
+ * NATIVE MODE OPTIMIZATION for predictive DDS:
+ * Same as aodds_build_tile() but writes directly to disk instead of buffer.
+ * Eliminates ~65ms Python copy overhead.
+ * 
+ * Uses temp file + rename for atomicity.
+ * 
+ * @param cache_dir         Directory containing cached JPEGs
+ * @param tile_row          Tile row coordinate
+ * @param tile_col          Tile column coordinate
+ * @param maptype           Map source identifier (e.g., "BI")
+ * @param zoom              Zoom level
+ * @param chunks_per_side   Chunks per side (typically 16)
+ * @param format            Output compression format
+ * @param missing_r/g/b     Fill color for missing chunks
+ * @param output_path       Path to output DDS file
+ * @param bytes_written     Actual bytes written (output)
+ * @param pool              Optional buffer pool (may be NULL)
+ * 
+ * @return 1 on success, 0 on failure
+ */
+AODDS_API int32_t aodds_build_tile_to_file(
+    const char* cache_dir,
+    int32_t tile_row,
+    int32_t tile_col,
+    const char* maptype,
+    int32_t zoom,
+    int32_t chunks_per_side,
+    dds_format_t format,
+    uint8_t missing_r,
+    uint8_t missing_g,
+    uint8_t missing_b,
+    const char* output_path,
+    uint32_t* bytes_written,
+    aodecode_pool_t* pool
+);
+
+/**
  * Initialize the ISPC compression library.
  * 
  * This loads the ISPC texcomp dynamic library. Called automatically
@@ -305,6 +379,23 @@ AODDS_API int32_t aodds_build_from_jpegs(
  * @return 1 if ISPC loaded successfully, 0 if failed (fallback to stb_dxt)
  */
 AODDS_API int32_t aodds_init_ispc(void);
+
+/**
+ * Set whether to use ISPC compression or fallback (STB).
+ * 
+ * This allows respecting user configuration for compressor preference.
+ * When use_ispc=0, the fallback compressor is used even if ISPC is available.
+ * 
+ * @param use_ispc  1 to use ISPC (if available), 0 to force fallback
+ */
+AODDS_API void aodds_set_use_ispc(int32_t use_ispc);
+
+/**
+ * Get whether ISPC compression is currently active.
+ * 
+ * @return 1 if ISPC will be used, 0 if fallback will be used
+ */
+AODDS_API int32_t aodds_get_use_ispc(void);
 
 /**
  * Get version information for the aodds module.

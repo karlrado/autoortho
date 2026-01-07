@@ -1124,6 +1124,137 @@ def benchmark_component_availability():
     return all_available
 
 
+def benchmark_buffer_pool(chunks_per_side: int = 16, iterations: int = 5):
+    """
+    Benchmark buffer pool vs standard allocation for DDS building.
+    
+    This directly measures the benefit of pre-allocated numpy buffers:
+    - No allocation overhead (~15ms saved)
+    - No copy overhead when using memoryview (~65ms saved)
+    """
+    print(f"\n{'='*70}")
+    print(f"BUFFER POOL BENCHMARK ({chunks_per_side}x{chunks_per_side} = {chunks_per_side**2} chunks)")
+    print(f"{'='*70}")
+    print("  Pre-allocated numpy buffers vs per-call ctypes allocation")
+    
+    num_chunks = chunks_per_side * chunks_per_side
+    cache_dir, paths = create_test_cache_dir(num_chunks, use_realistic=True)
+    
+    try:
+        from autoortho.aopipeline import AoDDS
+        if not AoDDS.is_available():
+            print("  Native DDS: not available")
+            return
+        
+        if not hasattr(AoDDS, 'DDSBufferPool') or not hasattr(AoDDS, 'build_from_jpegs_to_buffer'):
+            print("  Buffer pool: not available (rebuild native library)")
+            return
+        
+        # Read all JPEGs into memory (simulating the hybrid approach)
+        jpeg_datas = []
+        for path in paths:
+            with open(path, 'rb') as f:
+                jpeg_datas.append(f.read())
+        
+        print(f"  JPEG data size: {sum(len(d) for d in jpeg_datas) / 1024:.1f} KB")
+        
+        # Warmup
+        for _ in range(2):
+            try:
+                AoDDS.build_from_jpegs(jpeg_datas, format="BC1")
+            except Exception:
+                pass
+        
+        # Benchmark 1: Standard allocation (per-call ctypes buffer)
+        print("\n  [1] Standard allocation (ctypes buffer per call)...")
+        standard_times = []
+        for _ in range(iterations):
+            start = time.perf_counter()
+            result = AoDDS.build_from_jpegs(jpeg_datas, format="BC1")
+            elapsed = time.perf_counter() - start
+            standard_times.append(elapsed)
+        
+        standard_avg = sum(standard_times) / len(standard_times) * 1000
+        print(f"      Standard: {standard_avg:.2f}ms avg ({len(result)} bytes)")
+        
+        # Benchmark 2: Buffer pool (pre-allocated numpy buffer)
+        print("\n  [2] Buffer pool (pre-allocated numpy, zero-copy build)...")
+        pool = AoDDS.DDSBufferPool(
+            buffer_size=AoDDS.DDSBufferPool.SIZE_4096x4096_BC1,
+            pool_size=2
+        )
+        
+        pool_times = []
+        pool_result = None
+        for _ in range(iterations):
+            buffer, buffer_id = pool.acquire()
+            try:
+                start = time.perf_counter()
+                pool_result = AoDDS.build_from_jpegs_to_buffer(
+                    buffer, jpeg_datas, format="BC1"
+                )
+                elapsed = time.perf_counter() - start
+                if pool_result.success:
+                    pool_times.append(elapsed)
+            finally:
+                pool.release(buffer_id)
+        
+        if pool_times:
+            pool_avg = sum(pool_times) / len(pool_times) * 1000
+            print(f"      Buffer pool: {pool_avg:.2f}ms avg ({pool_result.bytes_written} bytes)")
+        else:
+            print(f"      Buffer pool: FAILED - {pool_result.error if pool_result else 'No result'}")
+            return
+        
+        # Benchmark 3: Buffer pool with to_bytes() (measures copy overhead)
+        print("\n  [3] Buffer pool with to_bytes() (includes copy)...")
+        pool_copy_times = []
+        dds_bytes = b''
+        for _ in range(iterations):
+            buffer, buffer_id = pool.acquire()
+            try:
+                start = time.perf_counter()
+                copy_result = AoDDS.build_from_jpegs_to_buffer(
+                    buffer, jpeg_datas, format="BC1"
+                )
+                if copy_result.success:
+                    dds_bytes = copy_result.to_bytes()  # Force copy
+                    elapsed = time.perf_counter() - start
+                    pool_copy_times.append(elapsed)
+            finally:
+                pool.release(buffer_id)
+        
+        if pool_copy_times:
+            pool_copy_avg = sum(pool_copy_times) / len(pool_copy_times) * 1000
+            print(f"      Pool + copy: {pool_copy_avg:.2f}ms avg ({len(dds_bytes)} bytes)")
+        else:
+            print(f"      Pool + copy: FAILED")
+            return
+        
+        # Results summary
+        print(f"\n  Results:")
+        print(f"    Standard (alloc+build+copy):  {standard_avg:.2f}ms")
+        print(f"    Pool (build only):            {pool_avg:.2f}ms")
+        print(f"    Pool + copy:                  {pool_copy_avg:.2f}ms")
+        print()
+        print(f"    Allocation overhead:          {standard_avg - pool_copy_avg:.2f}ms")
+        print(f"    Copy overhead:                {pool_copy_avg - pool_avg:.2f}ms")
+        print(f"    Total savings (pool only):    {standard_avg - pool_avg:.2f}ms ({(1 - pool_avg/standard_avg)*100:.1f}%)")
+        
+        if standard_avg > pool_avg:
+            speedup = standard_avg / pool_avg
+            print(f"    Speedup:                      {speedup:.2f}x")
+        
+    except ImportError as e:
+        print(f"  Native DDS: not available ({e})")
+    except Exception as e:
+        print(f"  Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        cleanup_test_cache(cache_dir)
+
+
 def run_all_benchmarks(quick: bool = False):
     """Run all benchmarks."""
     import multiprocessing
@@ -1143,6 +1274,7 @@ def run_all_benchmarks(quick: bool = False):
         benchmark_jpeg_decode(num_jpegs=16, iterations=2)
         benchmark_dds_build(chunks_per_side=4, iterations=2)
         benchmark_hybrid_pipeline(chunks_per_side=4, iterations=2)
+        benchmark_buffer_pool(chunks_per_side=4, iterations=3)
         benchmark_bundle_format(chunks_per_side=4, iterations=2)
         benchmark_end_to_end(chunks_per_side=4, iterations=2)
     else:
@@ -1155,6 +1287,7 @@ def run_all_benchmarks(quick: bool = False):
         if all_available:
             benchmark_dds_large_tile(iterations=3)
             benchmark_hybrid_pipeline(chunks_per_side=16, iterations=3)
+            benchmark_buffer_pool(chunks_per_side=16, iterations=5)
             benchmark_bundle_format(chunks_per_side=16, iterations=3)
             benchmark_end_to_end(chunks_per_side=16, iterations=3)
     
