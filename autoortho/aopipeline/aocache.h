@@ -193,6 +193,17 @@ AOCACHE_API int32_t aocache_write_file_atomic(
  */
 AOCACHE_API const char* aocache_version(void);
 
+/**
+ * Warm up the thread pool to avoid creation overhead on first batch read.
+ * 
+ * Call this early in application startup (e.g., during module import).
+ * This pre-creates the OpenMP thread pool so subsequent batch reads
+ * don't pay the thread creation penalty.
+ * 
+ * @param num_threads  Number of threads to use (0 = auto-detect from CPU)
+ */
+AOCACHE_API void aocache_warmup_threads(int32_t num_threads);
+
 #ifdef __cplusplus
 }
 #endif

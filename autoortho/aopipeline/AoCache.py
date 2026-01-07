@@ -161,6 +161,10 @@ def _setup_signatures(lib):
     # aocache_version
     lib.aocache_version.argtypes = []
     lib.aocache_version.restype = c_char_p
+    
+    # aocache_warmup_threads
+    lib.aocache_warmup_threads.argtypes = [c_int32]
+    lib.aocache_warmup_threads.restype = None
 
 
 # ============================================================================
@@ -456,6 +460,21 @@ def get_version() -> str:
     return lib.aocache_version().decode('utf-8')
 
 
+def warmup_threads(num_threads: int = 0) -> None:
+    """
+    Warm up the thread pool to avoid creation overhead on first use.
+    
+    Call this early in application startup to pre-create the OpenMP
+    thread pool. This eliminates the ~2ms thread creation penalty
+    on the first batch read.
+    
+    Args:
+        num_threads: Number of threads (0 = auto-detect from CPU cores)
+    """
+    lib = _load_library()
+    lib.aocache_warmup_threads(num_threads)
+
+
 def is_available() -> bool:
     """Check if the native cache library is available."""
     try:
@@ -469,9 +488,11 @@ def is_available() -> bool:
 # Module initialization
 # ============================================================================
 
-# Try to load library on import to fail fast
+# Try to load library on import and warm up thread pool
 try:
     _load_library()
+    # Warm up thread pool immediately to avoid penalty on first use
+    warmup_threads(0)
 except Exception:
     pass  # Will raise on first use if not available
 

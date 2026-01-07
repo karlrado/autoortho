@@ -11,13 +11,22 @@
 #include <stdio.h>
 
 /* Version string */
-#define AOCACHE_VERSION "1.0.0"
+#define AOCACHE_VERSION "1.1.0"
 
-/* Threshold for using mmap vs standard read (64KB) */
-#define MMAP_THRESHOLD (64 * 1024)
+/* Threshold for using mmap vs standard read
+ * Raised to 1MB - cache files are typically <100KB and mmap has overhead
+ * for small files (TLB entries, page faults, unmap syscall) */
+#define MMAP_THRESHOLD (1024 * 1024)
 
 /* Maximum reasonable file size for cache files (100MB) */
 #define MAX_CACHE_FILE_SIZE (100 * 1024 * 1024)
+
+/* Threshold for switching between sequential and parallel mode
+ * Below this count, sequential is faster due to thread overhead */
+#define PARALLEL_THRESHOLD 32
+
+/* Thread pool warm-up flag */
+static volatile int _pool_warmed = 0;
 
 /*============================================================================
  * Platform-specific file operations
@@ -151,7 +160,8 @@ static int write_file_atomic_win32(const char* path, const uint8_t* data,
 #else /* POSIX */
 
 /**
- * POSIX implementation using mmap for large files, read() for small files
+ * POSIX implementation using mmap for large files, read() for small files.
+ * Uses posix_fadvise hints for better kernel prefetching on Linux.
  */
 static int read_file_posix(const char* path, uint8_t** out_data, 
                            uint32_t* out_len, char* error_buf) {
@@ -193,6 +203,12 @@ static int read_file_posix(const char* path, uint8_t** out_data,
     }
     
     uint32_t size = (uint32_t)st.st_size;
+    
+#ifdef AOPIPELINE_LINUX
+    /* Hint to kernel that we'll read sequentially - improves readahead */
+    posix_fadvise(fd, 0, size, POSIX_FADV_SEQUENTIAL);
+#endif
+    
     uint8_t* buffer = (uint8_t*)malloc(size);
     if (!buffer) {
         close(fd);
@@ -208,12 +224,17 @@ static int read_file_posix(const char* path, uint8_t** out_data,
             goto do_read;
         }
         
+#ifdef AOPIPELINE_LINUX
+        /* Tell kernel we'll access sequentially */
+        madvise(mapped, size, MADV_SEQUENTIAL);
+#endif
+        
         /* Copy from mmap to our buffer */
         memcpy(buffer, mapped, size);
         munmap(mapped, size);
     } else {
 do_read:
-        /* Standard read for small files */
+        /* Standard read for small files - most efficient for <1MB */
         size_t total_read = 0;
         while (total_read < size) {
             ssize_t n = read(fd, buffer + total_read, size - total_read);
@@ -227,6 +248,11 @@ do_read:
             total_read += n;
         }
     }
+    
+#ifdef AOPIPELINE_LINUX
+    /* Tell kernel we're done with this file - can drop from cache */
+    posix_fadvise(fd, 0, size, POSIX_FADV_DONTNEED);
+#endif
     
     close(fd);
     *out_data = buffer;
@@ -307,6 +333,77 @@ static int read_file_impl(const char* path, uint8_t** out_data,
  * Public API Implementation
  *============================================================================*/
 
+/**
+ * Warm up the thread pool once to avoid creation overhead on first use.
+ * Call this early in application startup.
+ */
+AOCACHE_API void aocache_warmup_threads(int32_t num_threads) {
+#if AOPIPELINE_HAS_OPENMP
+    if (_pool_warmed) return;
+    
+    if (num_threads > 0) {
+        omp_set_num_threads(num_threads);
+    }
+    
+    /* Force thread pool creation with a dummy parallel region */
+    volatile int dummy = 0;
+    #pragma omp parallel
+    {
+        dummy = omp_get_thread_num();
+    }
+    (void)dummy;
+    
+    _pool_warmed = 1;
+#else
+    (void)num_threads;
+#endif
+}
+
+/**
+ * Internal: Sequential batch read for small batches.
+ * Avoids OpenMP overhead when count < PARALLEL_THRESHOLD.
+ */
+static int32_t batch_read_sequential(
+    const char** paths,
+    int32_t count,
+    aocache_result_t* results,
+    int validate_jpeg
+) {
+    int32_t success_count = 0;
+    
+    for (int32_t i = 0; i < count; i++) {
+        results[i].data = NULL;
+        results[i].length = 0;
+        results[i].success = 0;
+        results[i].error[0] = '\0';
+        
+        if (!paths[i] || paths[i][0] == '\0') {
+            safe_strcpy(results[i].error, "Empty path", 64);
+            continue;
+        }
+        
+        uint8_t* data = NULL;
+        uint32_t len = 0;
+        
+        if (!read_file_impl(paths[i], &data, &len, results[i].error)) {
+            continue;
+        }
+        
+        if (validate_jpeg && !JPEG_SIGNATURE_VALID(data, len)) {
+            safe_strcpy(results[i].error, "Invalid JPEG signature", 64);
+            free(data);
+            continue;
+        }
+        
+        results[i].data = data;
+        results[i].length = len;
+        results[i].success = 1;
+        success_count++;
+    }
+    
+    return success_count;
+}
+
 AOCACHE_API int32_t aocache_batch_read(
     const char** paths,
     int32_t count,
@@ -317,15 +414,27 @@ AOCACHE_API int32_t aocache_batch_read(
         return 0;
     }
     
+    /* For small batches, sequential is faster (avoids thread overhead) */
+    if (count < PARALLEL_THRESHOLD) {
+        return batch_read_sequential(paths, count, results, 1);
+    }
+    
     int32_t success_count = 0;
     
 #if AOPIPELINE_HAS_OPENMP
+    /* Ensure thread pool is warmed up */
+    if (!_pool_warmed) {
+        aocache_warmup_threads(max_threads > 0 ? max_threads : 0);
+    }
+    
     if (max_threads > 0) {
         omp_set_num_threads(max_threads);
     }
 #endif
     
-#pragma omp parallel for reduction(+:success_count) schedule(dynamic, 4)
+    /* Use static scheduling for predictable workload (all files similar size)
+     * This has lower overhead than dynamic scheduling */
+#pragma omp parallel for reduction(+:success_count) schedule(static)
     for (int32_t i = 0; i < count; i++) {
         results[i].data = NULL;
         results[i].length = 0;
@@ -370,15 +479,25 @@ AOCACHE_API int32_t aocache_batch_read_raw(
         return 0;
     }
     
+    /* For small batches, sequential is faster (avoids thread overhead) */
+    if (count < PARALLEL_THRESHOLD) {
+        return batch_read_sequential(paths, count, results, 0);
+    }
+    
     int32_t success_count = 0;
     
 #if AOPIPELINE_HAS_OPENMP
+    /* Ensure thread pool is warmed up */
+    if (!_pool_warmed) {
+        aocache_warmup_threads(max_threads > 0 ? max_threads : 0);
+    }
+    
     if (max_threads > 0) {
         omp_set_num_threads(max_threads);
     }
 #endif
     
-#pragma omp parallel for reduction(+:success_count) schedule(dynamic, 4)
+#pragma omp parallel for reduction(+:success_count) schedule(static)
     for (int32_t i = 0; i < count; i++) {
         results[i].data = NULL;
         results[i].length = 0;
@@ -523,7 +642,7 @@ AOCACHE_API int32_t aocache_write_file_atomic(
 AOCACHE_API const char* aocache_version(void) {
     return "aocache " AOCACHE_VERSION 
 #if AOPIPELINE_HAS_OPENMP
-           " (OpenMP enabled)"
+           " (OpenMP, static sched, auto-threshold)"
 #else
            " (OpenMP disabled)"
 #endif
@@ -532,7 +651,7 @@ AOCACHE_API const char* aocache_version(void) {
 #elif defined(AOPIPELINE_MACOS)
            " [macOS]"
 #else
-           " [Linux]"
+           " [Linux+fadvise]"
 #endif
     ;
 }

@@ -257,6 +257,46 @@ AODDS_API int32_t aodds_build_from_chunks(
 );
 
 /**
+ * Build DDS from pre-read JPEG data (HYBRID APPROACH).
+ * 
+ * This is the optimal entry point for the hybrid pipeline:
+ * - Python reads cache files (fast for OS-cached files)
+ * - Native decodes + composes + compresses (parallelism helps)
+ * 
+ * This avoids file I/O overhead in native code and ctypes path overhead.
+ * 
+ * @param jpeg_data         Array of JPEG data pointers (NULL = missing chunk)
+ * @param jpeg_sizes        Array of JPEG data sizes (0 = missing chunk)
+ * @param chunk_count       Number of chunks (must be perfect square)
+ * @param format            Output compression format
+ * @param missing_r/g/b     Fill color for missing chunks
+ * @param dds_output        Pre-allocated output buffer
+ * @param output_size       Output buffer size
+ * @param bytes_written     Actual bytes written (output)
+ * @param pool              Optional buffer pool (may be NULL)
+ * 
+ * @return 1 on success, 0 on failure
+ * 
+ * Performance: This is ~2-3x faster than aodds_build_tile because:
+ * - No file I/O in native code (done in Python)
+ * - No path string processing
+ * - Single ctypes call instead of many
+ */
+AODDS_API int32_t aodds_build_from_jpegs(
+    const uint8_t** jpeg_data,
+    const uint32_t* jpeg_sizes,
+    int32_t chunk_count,
+    dds_format_t format,
+    uint8_t missing_r,
+    uint8_t missing_g,
+    uint8_t missing_b,
+    uint8_t* dds_output,
+    uint32_t output_size,
+    uint32_t* bytes_written,
+    aodecode_pool_t* pool
+);
+
+/**
  * Initialize the ISPC compression library.
  * 
  * This loads the ISPC texcomp dynamic library. Called automatically

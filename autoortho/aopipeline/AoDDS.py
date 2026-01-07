@@ -23,7 +23,7 @@ Usage:
 from ctypes import (
     CDLL, POINTER, Structure, c_void_p,
     c_char, c_char_p, c_int32, c_uint8, c_uint32, c_double,
-    byref, cast, create_string_buffer
+    byref, cast
 )
 import logging
 import os
@@ -384,6 +384,136 @@ def is_available() -> bool:
         return True
     except (ImportError, FileNotFoundError):
         return False
+
+
+# ============================================================================
+# Hybrid Pipeline: Python reads files, Native decodes + compresses
+# ============================================================================
+
+def build_from_jpegs(
+    jpeg_datas: list,
+    format: str = "BC1",
+    missing_color: Tuple[int, int, int] = (66, 77, 55),
+    pool: Optional[c_void_p] = None
+) -> bytes:
+    """
+    Build DDS from pre-read JPEG data (HYBRID APPROACH).
+    
+    This is the optimal entry point for high-performance tile building:
+    - Call this AFTER reading cache files in Python (which is fast)
+    - Native code handles decode + compose + compress (where parallelism helps)
+    
+    This avoids:
+    - File I/O overhead in native code
+    - ctypes path string overhead
+    - Thread overhead for small file reads
+    
+    Args:
+        jpeg_datas: List of JPEG bytes (None or b'' for missing chunks)
+                    Length must be a perfect square (16, 64, 256, etc.)
+        format: Compression format - "BC1" (DXT1) or "BC3" (DXT5)
+        missing_color: RGB tuple for missing chunks
+        pool: Optional buffer pool handle from AoDecode
+    
+    Returns:
+        Complete DDS file as bytes
+    
+    Raises:
+        RuntimeError: If DDS build fails
+        ValueError: If chunk_count is not a perfect square
+    
+    Example:
+        # Python reads files (fast for cached files)
+        jpeg_datas = []
+        for chunk in chunks:
+            try:
+                jpeg_datas.append(Path(chunk.cache_path).read_bytes())
+            except FileNotFoundError:
+                jpeg_datas.append(None)
+        
+        # Native builds DDS (parallel decode + compress)
+        dds_bytes = build_from_jpegs(jpeg_datas)
+    """
+    import math
+    
+    lib = _load_library()
+    chunk_count = len(jpeg_datas)
+    
+    if chunk_count == 0:
+        raise ValueError("No JPEG data provided")
+    
+    # Verify perfect square
+    chunks_per_side = int(math.sqrt(chunk_count))
+    if chunks_per_side * chunks_per_side != chunk_count:
+        raise ValueError(
+            f"chunk_count must be a perfect square, got {chunk_count}"
+        )
+    
+    # Calculate buffer size
+    tile_size = chunks_per_side * 256
+    fmt = FORMAT_BC1 if format.upper() in ("BC1", "DXT1") else FORMAT_BC3
+    dds_size = lib.aodds_calc_dds_size(tile_size, tile_size, 0, fmt)
+    
+    # Allocate output buffer
+    buffer = (c_uint8 * dds_size)()
+    
+    # Build arrays for C
+    # Create array of pointers to JPEG data
+    jpeg_ptrs = (POINTER(c_uint8) * chunk_count)()
+    jpeg_sizes = (c_uint32 * chunk_count)()
+    
+    # Keep references to prevent GC
+    jpeg_buffers = []
+    
+    for i, data in enumerate(jpeg_datas):
+        if data and len(data) > 0:
+            # Create a buffer and keep reference
+            buf = (c_uint8 * len(data)).from_buffer_copy(data)
+            jpeg_buffers.append(buf)
+            jpeg_ptrs[i] = cast(buf, POINTER(c_uint8))
+            jpeg_sizes[i] = len(data)
+        else:
+            jpeg_ptrs[i] = None
+            jpeg_sizes[i] = 0
+    
+    bytes_written = c_uint32()
+    pool_handle = pool if pool else None
+    
+    # Setup function signature if not already done
+    if not hasattr(lib, '_hybrid_setup_done'):
+        lib.aodds_build_from_jpegs.argtypes = [
+            POINTER(POINTER(c_uint8)),  # jpeg_data
+            POINTER(c_uint32),          # jpeg_sizes
+            c_int32,                    # chunk_count
+            c_int32,                    # format
+            c_uint8, c_uint8, c_uint8,  # missing color
+            POINTER(c_uint8),           # dds_output
+            c_uint32,                   # output_size
+            POINTER(c_uint32),          # bytes_written
+            c_void_p                    # pool
+        ]
+        lib.aodds_build_from_jpegs.restype = c_int32
+        lib._hybrid_setup_done = True
+    
+    # Call native function
+    success = lib.aodds_build_from_jpegs(
+        jpeg_ptrs,
+        jpeg_sizes,
+        chunk_count,
+        fmt,
+        missing_color[0],
+        missing_color[1],
+        missing_color[2],
+        cast(buffer, POINTER(c_uint8)),
+        dds_size,
+        byref(bytes_written),
+        pool_handle
+    )
+    
+    if not success:
+        raise RuntimeError("Failed to build DDS from JPEGs")
+    
+    return bytes(buffer[:bytes_written.value])
 
 
 # ============================================================================

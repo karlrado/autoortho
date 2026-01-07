@@ -53,6 +53,7 @@ extern "C" {
 #include "aocache.h"
 #include "aodecode.h"
 #include "aodds.h"
+#include "aobundle.h"
 
 /*============================================================================
  * Pipeline Statistics

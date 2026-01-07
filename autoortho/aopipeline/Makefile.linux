@@ -5,6 +5,7 @@
 # - AoCache: Parallel batch cache file I/O
 # - AoDecode: Parallel JPEG decoding with libturbojpeg
 # - AoDDS: Native DDS texture building
+# - AoBundle: Cache bundle format for consolidated I/O
 
 PKGROOT     := ..
 TJ_LIB      := ../aoimage/lib/linlibturbojpeg.a
@@ -20,7 +21,7 @@ CFLAGS      := -O3 -Wall -fPIC -fvisibility=hidden -fdiagnostics-color \
 LDFLAGS     := -shared -rdynamic -fopenmp
 
 # Source files (no HTTP - uses Python requests instead)
-SOURCES     := aocache.c aodecode.c aodds.c aopipeline.c
+SOURCES     := aocache.c aodecode.c aodds.c aobundle.c aopipeline.c
 OBJECTS     := $(SOURCES:.c=.o)
 
 .PHONY: all clean phase1 phase2 phase3
@@ -49,7 +50,10 @@ aodecode.o: aodecode.c aodecode.h aocache.h internal.h
 aodds.o: aodds.c aodds.h aodecode.h internal.h
 	$(CC) $(CFLAGS) -c aodds.c -o $@
 
-aopipeline.o: aopipeline.c aopipeline.h aocache.h aodecode.h aodds.h internal.h
+aobundle.o: aobundle.c aobundle.h aodds.h internal.h
+	$(CC) $(CFLAGS) -c aobundle.c -o $@
+
+aopipeline.o: aopipeline.c aopipeline.h aocache.h aodecode.h aodds.h aobundle.h internal.h
 	$(CC) $(CFLAGS) -c aopipeline.c -o $@
 
 # Full library with static turbojpeg

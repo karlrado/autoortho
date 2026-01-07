@@ -7,15 +7,18 @@ operations that bypass Python's GIL limitation:
 - AoCache: Parallel batch cache file I/O
 - AoDecode: Parallel JPEG decoding  
 - AoDDS: Native DDS texture building with ISPC compression
+- AoBundle: Cache bundle format for consolidated file I/O
 
-Usage:
-    from autoortho.aopipeline import AoCache, AoDDS
+Optimal Usage (Hybrid Pipeline):
+    from autoortho.aopipeline import AoDDS, AoBundle
     
-    if AoCache.is_available():
-        results = AoCache.batch_read_cache(paths)
+    # Option 1: Python reads files, native decodes
+    jpeg_datas = [Path(p).read_bytes() for p in chunk_paths]
+    dds_bytes = AoDDS.build_from_jpegs(jpeg_datas)
     
-    if AoDDS.is_available():
-        dds_bytes = AoDDS.build_tile_native(cache_dir, row, col, ...)
+    # Option 2: Bundle format (single file = fastest)
+    if AoBundle.bundle_exists(cache_dir, col, row, zoom, maptype):
+        dds_bytes = AoBundle.build_dds_from_bundle(bundle_path)
 """
 
 import logging
@@ -39,6 +42,7 @@ if sys.platform == 'win32':
 from . import AoCache
 from . import AoDecode
 from . import AoDDS
+from . import AoBundle
 
 
 def is_available() -> bool:
@@ -59,7 +63,12 @@ def get_available_components() -> list:
         components.append('decode')
     if AoDDS.is_available():
         components.append('dds')
+    if AoBundle.is_available():
+        components.append('bundle')
     return components
 
 
-__all__ = ['AoCache', 'AoDecode', 'AoDDS', 'is_available', 'get_available_components']
+__all__ = [
+    'AoCache', 'AoDecode', 'AoDDS', 'AoBundle',
+    'is_available', 'get_available_components'
+]
