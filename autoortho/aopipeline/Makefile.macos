@@ -23,7 +23,7 @@ OMP_LIB     ?= /opt/homebrew/opt/libomp/lib
 CFLAGS      := -O3 -Wall -fPIC -fvisibility=hidden -fdiagnostics-color \
                -arch $(ARCH) -mmacosx-version-min=$(MIN_MACOS) \
                -I$(TJ_INC) -I$(OMP_INC) -I../aoimage \
-               -Xpreprocessor -fopenmp
+               -Xpreprocessor -fopenmp -pthread
 
 LDFLAGS     := -dynamiclib -undefined dynamic_lookup \
                -arch $(ARCH) -mmacosx-version-min=$(MIN_MACOS) \

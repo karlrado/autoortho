@@ -1865,7 +1865,8 @@ class ConfigUI(QMainWindow):
         self.max_zoom_label = QLabel(f"{self.cfg.autoortho.max_zoom}")
         self.max_zoom_slider.valueChanged.connect(
             lambda v: (
-                self.validate_min_and_max_zoom("max")
+                self.validate_min_and_max_zoom("max"),
+                self._update_buffer_pool_label()
             )
         )
         fixed_max_zoom_row.addWidget(self.max_zoom_slider)
@@ -1923,7 +1924,8 @@ class ConfigUI(QMainWindow):
         self.max_zoom_near_airports_slider.valueChanged.connect(
             lambda v: (
                 self.max_zoom_near_airports_label.setText(f"{v}"),
-                self.validate_max_zoom_near_airports()
+                self.validate_max_zoom_near_airports(),
+                self._update_buffer_pool_label()
             )
         )
         max_zoom_near_airports_layout.addWidget(self.max_zoom_near_airports_slider)
@@ -2460,11 +2462,13 @@ class ConfigUI(QMainWindow):
         self.buffer_pool_label = QLabel("Buffer pool size:")
         self.buffer_pool_label.setToolTip(
             "Number of pre-allocated buffers for zero-copy DDS building.\n\n"
-            "Each buffer is ~11MB for 4096x4096 tiles.\n"
-            "Buffers are reused to avoid memory allocation overhead.\n\n"
-            "• 2-3: Low memory systems (22-33 MB used)\n"
-            "• 4: Default, balanced (44 MB used)\n"
-            "• 6-8: High RAM systems, 32GB+ (66-88 MB used)\n\n"
+            "Buffer size is calculated dynamically based on your settings:\n"
+            "• ~11MB per buffer for 4K textures (max_zoom ≤ 16)\n"
+            "• ~43MB per buffer for 8K textures (max_zoom > 16 or custom tiles)\n\n"
+            "Memory usage examples (4K / 8K modes):\n"
+            "• 2 buffers: 22MB / 86MB\n"
+            "• 4 buffers: 44MB / 172MB (default)\n"
+            "• 8 buffers: 88MB / 344MB\n\n"
             "Higher values reduce allocation overhead when building\n"
             "multiple tiles concurrently, but use more RAM.\n\n"
             "Only applies to Native and Hybrid modes."
@@ -2479,16 +2483,66 @@ class ConfigUI(QMainWindow):
         self.buffer_pool_slider.setObjectName('buffer_pool_size')
         self.buffer_pool_slider.setToolTip("Number of pre-allocated DDS buffers (2-8)")
         
-        self.buffer_pool_value_label = QLabel(f"{buffer_pool_value} buffers (~{buffer_pool_value * 11}MB)")
-        self.buffer_pool_slider.valueChanged.connect(
-            lambda v: self.buffer_pool_value_label.setText(f"{v} buffers (~{v * 11}MB)")
-        )
+        self.buffer_pool_value_label = QLabel("")
+        self._update_buffer_pool_label()
+        self.buffer_pool_slider.valueChanged.connect(lambda v: self._update_buffer_pool_label())
         buffer_pool_layout.addWidget(self.buffer_pool_slider)
         buffer_pool_layout.addWidget(self.buffer_pool_value_label)
         autoortho_layout.addLayout(buffer_pool_layout)
         
+        # --- Streaming Builder Settings ---
+        streaming_header = QLabel("Streaming Builder")
+        streaming_header.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        autoortho_layout.addWidget(streaming_header)
+        
+        # Streaming builder enabled checkbox
+        self.streaming_builder_enabled_check = QCheckBox("Enable streaming builder")
+        self.streaming_builder_enabled_check.setChecked(
+            getattr(self.cfg.autoortho, 'streaming_builder_enabled', True)
+        )
+        self.streaming_builder_enabled_check.setObjectName('streaming_builder_enabled')
+        self.streaming_builder_enabled_check.setToolTip(
+            "Enable streaming builder for incremental DDS generation.\n"
+            "When enabled, chunks are processed as they arrive with\n"
+            "parallel decode at finalize for ~20% faster performance.\n"
+            "Also enables full fallback support for missing chunks.\n"
+            "Recommended: Enabled (default)"
+        )
+        autoortho_layout.addWidget(self.streaming_builder_enabled_check)
+        
+        # Streaming builder pool size
+        streaming_pool_layout = QHBoxLayout()
+        self.streaming_pool_label = QLabel("Builder pool size:")
+        self.streaming_pool_label.setToolTip(
+            "Number of streaming builders in the pool.\n"
+            "Each builder handles one tile at a time.\n"
+            "Higher values allow more concurrent tile builds.\n"
+            "Recommended: 4 (default), increase to 6-8 for faster CPUs"
+        )
+        streaming_pool_layout.addWidget(self.streaming_pool_label)
+        
+        self.streaming_pool_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.streaming_pool_slider.setRange(2, 8)
+        streaming_pool_value = int(getattr(self.cfg.autoortho, 'streaming_builder_pool_size', 4))
+        streaming_pool_value = max(2, min(8, streaming_pool_value))
+        self.streaming_pool_slider.setValue(streaming_pool_value)
+        self.streaming_pool_slider.setObjectName('streaming_builder_pool_size')
+        self.streaming_pool_slider.setToolTip("Number of streaming builders in pool (2-8)")
+        
+        self.streaming_pool_value_label = QLabel(f"{streaming_pool_value} builders")
+        self.streaming_pool_slider.valueChanged.connect(
+            lambda v: self.streaming_pool_value_label.setText(f"{v} builders")
+        )
+        streaming_pool_layout.addWidget(self.streaming_pool_slider)
+        streaming_pool_layout.addWidget(self.streaming_pool_value_label)
+        autoortho_layout.addLayout(streaming_pool_layout)
+        
+        # Connect streaming builder enabled to update pool control state
+        self.streaming_builder_enabled_check.stateChanged.connect(self._update_streaming_builder_controls)
+        
         # Initialize pipeline control states
         self._update_pipeline_controls()
+        self._update_streaming_builder_controls()
         
         autoortho_layout.addSpacing(10)
         # ═══════════════════════════════════════════════════════════════════
@@ -3618,6 +3672,43 @@ class ConfigUI(QMainWindow):
         
         self.predictive_use_fallbacks_check.setEnabled(enabled)
 
+    def _update_buffer_pool_label(self):
+        """Update buffer pool label with current memory estimate based on zoom settings."""
+        if not hasattr(self, 'buffer_pool_slider') or not hasattr(self, 'buffer_pool_value_label'):
+            return
+        
+        pool_count = self.buffer_pool_slider.value()
+        
+        # Calculate buffer size based on current UI settings
+        try:
+            # Check current slider/combo values (not config, since user may have changed them)
+            max_zoom = self.max_zoom_slider.value() if hasattr(self, 'max_zoom_slider') else 16
+            max_zoom_airports = self.max_zoom_near_airports_slider.value() if hasattr(self, 'max_zoom_near_airports_slider') else 18
+            using_custom = self.using_custom_tiles_check.isChecked() if hasattr(self, 'using_custom_tiles_check') else False
+            is_dynamic = hasattr(self, 'max_zoom_mode_combo') and self.max_zoom_mode_combo.currentText() == "Dynamic"
+            
+            # For dynamic mode, check the manager's steps for max zoom
+            max_step_zoom = 16
+            max_step_zoom_airports = 18
+            if is_dynamic and hasattr(self, '_dynamic_zoom_manager'):
+                for step in self._dynamic_zoom_manager.get_steps():
+                    max_step_zoom = max(max_step_zoom, step.zoom_level)
+                    max_step_zoom_airports = max(max_step_zoom_airports, step.zoom_level_airports)
+            
+            # Determine if 8K needed
+            if using_custom:
+                buffer_mb = 43
+            elif is_dynamic:
+                needs_8k = (max_step_zoom > 16) or (max_step_zoom_airports > 18)
+                buffer_mb = 43 if needs_8k else 11
+            else:
+                needs_8k = (max_zoom > 16) or (max_zoom_airports > 18)
+                buffer_mb = 43 if needs_8k else 11
+        except Exception:
+            buffer_mb = 11  # Default to 4K estimate on error
+        
+        self.buffer_pool_value_label.setText(f"{pool_count} buffers (~{pool_count * buffer_mb}MB)")
+
     def _update_pipeline_controls(self):
         """Update enabled state of pipeline controls based on pipeline mode."""
         mode = self.pipeline_mode_combo.currentText().lower()
@@ -3642,6 +3733,21 @@ class ConfigUI(QMainWindow):
                 "Buffer pool is only used in Native and Hybrid modes.\n"
                 "Select a different pipeline mode to configure this setting."
             )
+
+    def _update_streaming_builder_controls(self, state=None):
+        """Update enabled state of streaming builder controls."""
+        enabled = self.streaming_builder_enabled_check.isChecked()
+        
+        self.streaming_pool_slider.setEnabled(enabled)
+        self.streaming_pool_label.setEnabled(enabled)
+        self.streaming_pool_value_label.setEnabled(enabled)
+        
+        # Update styling for disabled state
+        disabled_style = "color: #666;"
+        enabled_style = ""
+        
+        self.streaming_pool_label.setStyleSheet(enabled_style if enabled else disabled_style)
+        self.streaming_pool_value_label.setStyleSheet(enabled_style if enabled else disabled_style)
 
     def _init_dynamic_zoom_manager(self):
         """Initialize the dynamic zoom manager from config."""
@@ -3671,6 +3777,7 @@ class ConfigUI(QMainWindow):
             self._update_dynamic_summary()
         
         self._update_zoom_mode_visibility()
+        self._update_buffer_pool_label()
 
     def _update_zoom_mode_visibility(self):
         """Show/hide zoom controls based on selected mode."""
@@ -3692,6 +3799,7 @@ class ConfigUI(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._dynamic_zoom_manager = dialog.get_manager()
             self._update_dynamic_summary()
+            self._update_buffer_pool_label()
 
     def _update_dynamic_summary(self):
         """Update the summary label for dynamic zoom steps."""
@@ -4643,6 +4751,13 @@ class ConfigUI(QMainWindow):
             if hasattr(self, '_dynamic_zoom_manager'):
                 self.cfg.autoortho.dynamic_zoom_steps = self._dynamic_zoom_manager.save_to_config()
             
+            # Reset buffer pool so it will be recreated with correct size for new zoom settings
+            try:
+                from getortho import reset_dds_buffer_pool
+                reset_dds_buffer_pool()
+            except ImportError:
+                pass  # Module not loaded yet, pool will be created correctly on first use
+            
             self.cfg.autoortho.maxwait = str(
                 self.maxwait_slider.value() / 10.0
             )
@@ -4686,6 +4801,10 @@ class ConfigUI(QMainWindow):
             # Native pipeline settings
             self.cfg.autoortho.pipeline_mode = self.pipeline_mode_combo.currentText()
             self.cfg.autoortho.buffer_pool_size = str(self.buffer_pool_slider.value())
+            
+            # Streaming builder settings
+            self.cfg.autoortho.streaming_builder_enabled = self.streaming_builder_enabled_check.isChecked()
+            self.cfg.autoortho.streaming_builder_pool_size = str(self.streaming_pool_slider.value())
             
             self.cfg.autoortho.fetch_threads = str(
                 self.fetch_threads_spinbox.value()
@@ -4821,6 +4940,7 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.using_custom_tiles = True
 
         self.refresh_settings_tab()
+        self._update_buffer_pool_label()
 
     def apply_simheaven_compat(self, use_simheaven_overlay=False):
         """

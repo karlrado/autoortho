@@ -205,7 +205,10 @@ native_pipeline_threads = 0
 #         Use if native pipeline causes issues
 pipeline_mode = auto
 # Number of pre-allocated buffers for zero-copy DDS building (2-8)
-# Each buffer is ~11MB for 4096x4096 tiles
+# Buffer size is calculated dynamically based on your zoom settings:
+#   - ~11MB per buffer when max_zoom <= 16 and max_zoom_near_airports <= 18 (4K textures)
+#   - ~43MB per buffer when higher zoom levels are configured (8K textures)
+#   - ~43MB per buffer when using custom tiles (assumes worst case)
 # Higher = more memory usage, but less allocation overhead
 # Lower = less memory, but more allocation overhead per tile
 # Recommended: 4 (default), increase to 6-8 if you have 32GB+ RAM
@@ -229,6 +232,17 @@ live_aopipeline_min_chunk_ratio = 0.9
 # This caps how long the fast path will wait for network before falling back
 # Recommended: 2.0 (fast), 3.0 (balanced), 5.0 (quality, slow network)
 live_aopipeline_max_download_wait = 2.0
+# === STREAMING BUILDER SETTINGS ===
+# Enable streaming builder for incremental DDS generation (True/False)
+# When enabled, chunks are processed as they arrive rather than in batch.
+# This allows fallbacks to be applied during the build process.
+# Recommended: True (better fallback support), False for legacy behavior
+streaming_builder_enabled = True
+# Size of the streaming builder pool (2-8)
+# Each builder handles one tile at a time. Pool size determines
+# how many tiles can be built concurrently.
+# Recommended: 4 (default), increase to 6-8 for faster CPUs
+streaming_builder_pool_size = 4
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False

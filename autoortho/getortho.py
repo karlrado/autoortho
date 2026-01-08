@@ -321,11 +321,131 @@ _dds_buffer_pool = None
 _dds_buffer_pool_initialized = False
 
 
+def reset_dds_buffer_pool():
+    """
+    Reset the DDS buffer pool so it will be recreated on next access.
+    
+    Call this when zoom-related settings change (max_zoom, max_zoom_near_airports,
+    max_zoom_mode, dynamic_zoom_steps, or using_custom_tiles) to ensure the buffer
+    pool is sized correctly for the new configuration.
+    
+    The pool will be lazily recreated with the new settings on next use.
+    """
+    global _dds_buffer_pool, _dds_buffer_pool_initialized
+    
+    if _dds_buffer_pool is not None:
+        log.info("Resetting DDS buffer pool (zoom settings changed)")
+    
+    _dds_buffer_pool = None
+    _dds_buffer_pool_initialized = False
+
+
+def _calc_required_buffer_size():
+    """
+    Calculate the required DDS buffer size based on user configuration.
+    
+    For standard AutoOrtho scenery (using_custom_tiles=False):
+        - Fixed mode: Check if max_zoom/max_zoom_near_airports require 8K
+        - Dynamic mode: Parse dynamic_zoom_steps to find max configured zoom levels
+    
+    For custom tiles (using_custom_tiles=True):
+        - Unknown tile zoom levels, assume worst case (8K)
+    
+    8K buffers (~43MB) are needed when:
+        - max_zoom > 16 (ZL16 tiles building at ZL17)
+        - max_zoom_near_airports > 18 (ZL18 tiles building at ZL19)
+        - Any dynamic zoom step has zoom_level > 16 or zoom_level_airports > 18
+        - Custom tiles are enabled
+    
+    Returns:
+        Tuple of (buffer_size, size_name) where size_name is for logging
+    """
+    native = _get_native_dds()
+    if native is None or not hasattr(native, 'DDSBufferPool'):
+        return None, None
+    
+    # Default to 4K (16×16 chunks = 4096×4096)
+    SIZE_4K = native.DDSBufferPool.SIZE_4096x4096_BC1
+    SIZE_8K = native.DDSBufferPool.SIZE_8192x8192_BC1
+    
+    # Custom tiles: unknown zoom levels, assume worst case (8K)
+    using_custom_tiles = getattr(CFG.autoortho, 'using_custom_tiles', False)
+    if isinstance(using_custom_tiles, str):
+        using_custom_tiles = using_custom_tiles.lower() in ('true', '1', 'yes', 'on')
+    
+    if using_custom_tiles:
+        log.debug("Custom tiles enabled: using 8K buffer size (worst case)")
+        return SIZE_8K, "8K (custom tiles)"
+    
+    # Standard AutoOrtho scenery: calculate based on config
+    max_zoom_mode = str(getattr(CFG.autoortho, 'max_zoom_mode', 'fixed')).lower()
+    
+    if max_zoom_mode == "dynamic":
+        # Dynamic zoom mode: check the actual configured zoom steps
+        # Parse dynamic_zoom_steps to find maximum zoom levels
+        max_step_zoom = 16  # Default if no steps configured
+        max_step_zoom_airports = 18
+        
+        try:
+            steps_config = getattr(CFG.autoortho, 'dynamic_zoom_steps', [])
+            if steps_config and steps_config != "[]":
+                # Parse steps if it's a list of dicts
+                if isinstance(steps_config, list):
+                    for step in steps_config:
+                        if isinstance(step, dict):
+                            zoom = int(step.get('zoom_level', 16))
+                            zoom_airports = int(step.get('zoom_level_airports', 18))
+                            max_step_zoom = max(max_step_zoom, zoom)
+                            max_step_zoom_airports = max(max_step_zoom_airports, zoom_airports)
+        except Exception as e:
+            log.debug(f"Failed to parse dynamic_zoom_steps: {e}, assuming max ZL17")
+            max_step_zoom = 17  # Safe default for dynamic mode
+        
+        # Check if any step requires 8K
+        # ZL16 tiles can build at step zoom (up to ZL17 = 8K)
+        # ZL18 airport tiles can build at step zoom_airports (up to ZL19 = 8K)
+        needs_8k = (max_step_zoom > 16) or (max_step_zoom_airports > 18)
+        
+        if needs_8k:
+            log.debug(f"Dynamic zoom requires 8K buffers (max_step_zoom={max_step_zoom}, max_step_zoom_airports={max_step_zoom_airports})")
+            return SIZE_8K, f"8K (dynamic ZL{max(max_step_zoom, max_step_zoom_airports)})"
+        else:
+            log.debug(f"Dynamic zoom allows 4K buffers (max_step_zoom={max_step_zoom}, max_step_zoom_airports={max_step_zoom_airports})")
+            return SIZE_4K, "4K (dynamic)"
+    
+    # Fixed mode: check configured zoom levels
+    try:
+        max_zoom = int(getattr(CFG.autoortho, 'max_zoom', 16))
+        max_zoom_airports = int(getattr(CFG.autoortho, 'max_zoom_near_airports', 18))
+    except (ValueError, TypeError):
+        max_zoom = 16
+        max_zoom_airports = 18
+    
+    # Standard AutoOrtho has:
+    # - ZL16 tiles (regular scenery): can build at max_zoom (up to ZL17 = 8K)
+    # - ZL18 tiles (near airports): can build at max_zoom_near_airports (up to ZL19 = 8K)
+    #
+    # If max_zoom > 16, ZL16 tiles will build at ZL17 → 8K needed
+    # If max_zoom_airports > 18, ZL18 tiles will build at ZL19 → 8K needed
+    needs_8k = (max_zoom > 16) or (max_zoom_airports > 18)
+    
+    if needs_8k:
+        log.debug(f"Config requires 8K buffers (max_zoom={max_zoom}, max_zoom_airports={max_zoom_airports})")
+        return SIZE_8K, f"8K (ZL{max(max_zoom, max_zoom_airports)})"
+    else:
+        log.debug(f"Config allows 4K buffers (max_zoom={max_zoom}, max_zoom_airports={max_zoom_airports})")
+        return SIZE_4K, "4K"
+
+
 def _get_dds_buffer_pool():
     """
     Get or create the global DDS buffer pool.
     
     Pool size is configured via CFG.autoortho.buffer_pool_size (2-8).
+    Buffer size is calculated dynamically based on configuration:
+        - 4K (~11MB) when max_zoom <= 16 and max_zoom_near_airports <= 18
+        - 8K (~43MB) when higher zoom levels are configured or custom tiles enabled
+    
     Only created if pipeline mode is 'native' or 'hybrid'.
     
     Returns:
@@ -354,14 +474,20 @@ def _get_dds_buffer_pool():
             # Clamp to valid range (2-8)
             pool_size = max(2, min(8, pool_size))
             
-            buffer_size = native.DDSBufferPool.SIZE_4096x4096_BC1
+            # Calculate buffer size based on configuration
+            buffer_size, size_name = _calc_required_buffer_size()
+            if buffer_size is None:
+                log.debug("Could not determine buffer size, using default 4K")
+                buffer_size = native.DDSBufferPool.SIZE_4096x4096_BC1
+                size_name = "4K (default)"
+            
             _dds_buffer_pool = native.DDSBufferPool(
                 buffer_size=buffer_size,
                 pool_size=pool_size
             )
             
             total_mb = (pool_size * buffer_size) / (1024 * 1024)
-            log.info(f"DDS buffer pool: {pool_size} buffers × {buffer_size/1024/1024:.1f}MB = {total_mb:.1f}MB total")
+            log.info(f"DDS buffer pool: {pool_size} × {size_name} buffers ({buffer_size/1024/1024:.1f}MB each) = {total_mb:.1f}MB total")
     except Exception as e:
         log.debug(f"DDS buffer pool init failed: {e}")
     
@@ -3149,6 +3275,203 @@ class BackgroundDDSBuilder:
             self._build_tile_dds(tile)
             self._last_build_time = time.monotonic()
     
+    def _try_streaming_prefetch_build(self, tile, tile_id: str, build_start: float) -> bool:
+        """
+        Build DDS for prefetch using streaming builder with fallback support.
+        
+        Key difference from live: NO TIME BUDGET.
+        Takes as long as needed to apply all fallbacks for quality.
+        
+        Args:
+            tile: Tile to build
+            tile_id: Tile ID string
+            build_start: Monotonic time when build started
+        
+        Returns:
+            True if build succeeded, False to fall back to other methods
+        """
+        try:
+            from autoortho.aopipeline.AoDDS import get_default_builder_pool
+            from autoortho.aopipeline.fallback_resolver import FallbackResolver
+        except ImportError as e:
+            log.debug(f"BackgroundDDSBuilder: Streaming builder imports failed: {e}")
+            return False
+        
+        builder_pool = get_default_builder_pool()
+        if builder_pool is None:
+            log.debug(f"BackgroundDDSBuilder: Streaming builder pool not available")
+            return False
+        
+        # Get configuration
+        dxt_format = CFG.pydds.format.upper()
+        if dxt_format in ("DXT1", "BC1"):
+            dxt_format = "BC1"
+        else:
+            dxt_format = "BC3"
+        
+        missing_color = tuple(CFG.autoortho.missing_color[:3]) if hasattr(CFG.autoortho, 'missing_color') else (66, 77, 55)
+        
+        # Get fallback level - prefetch uses same settings as live
+        use_fallbacks = getattr(CFG.autoortho, 'predictive_dds_use_fallbacks', True)
+        if use_fallbacks:
+            fallback_level_str = str(getattr(CFG.autoortho, 'fallback_level', 'cache')).lower()
+            if fallback_level_str == 'none':
+                fallback_level = 0
+            elif fallback_level_str == 'full':
+                fallback_level = 2
+            else:
+                fallback_level = 1
+        else:
+            fallback_level = 0  # No fallbacks for prefetch if disabled
+        
+        # Create fallback resolver
+        resolver = FallbackResolver(
+            cache_dir=tile.cache_dir,
+            maptype=tile.maptype,
+            tile_col=tile.col,
+            tile_row=tile.row,
+            tile_zoom=tile.max_zoom,
+            fallback_level=fallback_level,
+            max_mipmap=tile.max_mipmap,
+            downloader=None  # Network fallback handled separately
+        )
+        
+        # Set available mipmap images for scaling fallback
+        resolver.set_mipmap_images(tile.imgs)
+        
+        # Acquire streaming builder (blocking OK for background thread)
+        config = {
+            'chunks_per_side': tile.chunks_per_row,
+            'format': dxt_format,
+            'missing_color': missing_color
+        }
+        
+        builder = builder_pool.acquire(config=config, timeout=30.0)
+        if not builder:
+            log.warning(f"BackgroundDDSBuilder: Failed to acquire streaming builder for {tile_id}")
+            return False
+        
+        # Setup transition tracking
+        tile._live_transition_event = threading.Event()
+        tile._active_streaming_builder = builder
+        
+        try:
+            # Get chunks for max zoom
+            chunks = tile.chunks.get(tile.max_zoom, [])
+            if not chunks:
+                log.debug(f"BackgroundDDSBuilder: No chunks for {tile_id}")
+                return False
+            
+            # Import fallback TimeBudget for use during transition
+            from autoortho.aopipeline.fallback_resolver import TimeBudget as FBTimeBudget
+            
+            # Phase 1: Batch add all ready chunks at once
+            ready_chunks = []
+            pending_indices = []
+            for i, chunk in enumerate(chunks):
+                if chunk.ready.is_set() and chunk.data:
+                    ready_chunks.append((i, chunk.data))
+                else:
+                    pending_indices.append(i)
+            
+            if ready_chunks:
+                builder.add_chunks_batch(ready_chunks)
+            
+            # Phase 2: Process remaining chunks with transition handling
+            # Key difference from live: NO initial time budget, but may get one on transition
+            for i in pending_indices:
+                chunk = chunks[i]
+                
+                # === TRANSITION CHECK ===
+                # If tile became live, use its time budget for remaining work
+                time_budget = tile._tile_time_budget if tile._is_live else None
+                
+                if tile._is_live and time_budget and time_budget.exhausted:
+                    # Budget exhausted - mark remaining as missing
+                    builder.mark_missing(i)
+                    continue
+                
+                # Wait for chunk - but check for live transition periodically
+                while not chunk.ready.is_set():
+                    # Short wait to allow transition detection
+                    chunk.ready.wait(timeout=0.1)
+                    
+                    # Check for live transition
+                    if tile._is_live:
+                        time_budget = tile._tile_time_budget
+                        if time_budget and time_budget.exhausted:
+                            break  # Budget exhausted, move on
+                
+                # Determine fallback budget (None if prefetching, from tile if live)
+                fb_budget = None
+                if tile._is_live and time_budget and not time_budget.exhausted:
+                    remaining = time_budget.remaining
+                    if remaining > 0:
+                        fb_budget = FBTimeBudget(remaining)
+                
+                if chunk.data:
+                    if not builder.add_chunk(i, chunk.data):
+                        # Decode failed - try fallback
+                        chunk_col = tile.col + (i % tile.chunks_per_row)
+                        chunk_row = tile.row + (i // tile.chunks_per_row)
+                        
+                        fallback_rgba = resolver.resolve(
+                            chunk_col, chunk_row, tile.max_zoom,
+                            target_mipmap=0,
+                            time_budget=fb_budget
+                        )
+                        
+                        if fallback_rgba:
+                            builder.add_fallback_image(i, fallback_rgba)
+                        else:
+                            builder.mark_missing(i)
+                else:
+                    # Chunk failed to download - apply full fallback chain
+                    chunk_col = tile.col + (i % tile.chunks_per_row)
+                    chunk_row = tile.row + (i // tile.chunks_per_row)
+                    
+                    fallback_rgba = resolver.resolve(
+                        chunk_col, chunk_row, tile.max_zoom,
+                        target_mipmap=0,
+                        time_budget=fb_budget
+                    )
+                    
+                    if fallback_rgba:
+                        builder.add_fallback_image(i, fallback_rgba)
+                    else:
+                        builder.mark_missing(i)
+            
+            # Finalize directly to disk (optimal for prefetch cache)
+            if hasattr(self._prebuilt_cache, 'path_for'):
+                output_path = self._prebuilt_cache.path_for(tile_id)
+                success, bytes_written = builder.finalize_to_file(output_path)
+                
+                if success and bytes_written >= 128:
+                    if hasattr(self._prebuilt_cache, 'register_file'):
+                        self._prebuilt_cache.register_file(tile_id, bytes_written)
+                    
+                    build_time = (time.monotonic() - build_start) * 1000
+                    status = builder.get_status()
+                    self._builds_completed += 1
+                    log.debug(f"BackgroundDDSBuilder: Streaming built {tile_id} in {build_time:.0f}ms "
+                              f"(decoded={status['chunks_decoded']}, fallback={status['chunks_fallback']}, "
+                              f"missing={status['chunks_missing']})")
+                    bump('prebuilt_dds_builds_streaming')
+                    return True
+            
+            log.debug(f"BackgroundDDSBuilder: Streaming finalize failed for {tile_id}")
+            return False
+            
+        except Exception as e:
+            log.debug(f"BackgroundDDSBuilder: Streaming build failed for {tile_id}: {e}")
+            return False
+        
+        finally:
+            # Clear transition tracking
+            tile._active_streaming_builder = None
+            tile._live_transition_event = None
+            builder.release()
+
     def _build_tile_dds(self, tile) -> None:
         """
         Build DDS for a single tile and store in prebuilt cache.
@@ -3174,6 +3497,18 @@ class BackgroundDDSBuilder:
         build_start = time.monotonic()
         mipmap_images = []  # Track images for cleanup
         lock_acquired = False
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # TRY STREAMING BUILDER FIRST (if enabled)
+        # ═══════════════════════════════════════════════════════════════════════
+        # Streaming builder allows:
+        # - Incremental chunk processing as they download
+        # - Full fallback chain support (disk cache, mipmap scaling)
+        # - No time budget for prefetch (takes as long as needed for quality)
+        # ═══════════════════════════════════════════════════════════════════════
+        if getattr(CFG.autoortho, 'streaming_builder_enabled', True):
+            if self._try_streaming_prefetch_build(tile, tile_id, build_start):
+                return
         
         # ═══════════════════════════════════════════════════════════════════════
         # TRY OPTIMAL HYBRID DDS BUILDING FIRST
@@ -4213,6 +4548,13 @@ class Tile(object):
         # This prevents repeated attempts - if aopipeline fails once, use progressive path
         # Reset when tile is closed for potential reuse
         self._aopipeline_attempted = False
+        
+        # === PREFETCH-TO-LIVE TRANSITION TRACKING ===
+        # When X-Plane requests a tile that's being prefetched, we transition
+        # to "live" mode: apply time budget, boost chunk priorities
+        self._is_live = False                           # True when X-Plane requests via FUSE
+        self._live_transition_event = None              # Event to signal transition
+        self._active_streaming_builder = None           # Reference for transition coordination
 
         #self.tile_condition = threading.Condition()
         if min_zoom:
@@ -4615,6 +4957,274 @@ class Tile(object):
         
         return build_success
 
+    def _try_streaming_aopipeline_build(self, time_budget=None) -> bool:
+        """
+        Build DDS using streaming aopipeline with fallback integration.
+        
+        This is the new streaming builder approach that:
+        1. Accepts chunks incrementally as they download
+        2. Applies user-configured fallbacks for missing chunks
+        3. Uses the same logic for both live and prefetch paths
+        
+        Flow:
+        1. Acquire streaming builder from pool
+        2. Submit download requests for all chunks
+        3. As chunks complete:
+           a. If success: add_chunk with JPEG data
+           b. If fail: resolve fallback, add_fallback_image or mark_missing
+        4. When all chunks processed OR budget exhausted: finalize
+        
+        Args:
+            time_budget: Optional TimeBudget to limit processing time
+        
+        Returns:
+            True if build succeeded, False to fall back to progressive path
+        """
+        build_start = time.monotonic()
+        
+        # Check if streaming builder is enabled
+        if not getattr(CFG.autoortho, 'streaming_builder_enabled', True):
+            return False
+        
+        # Check if native DDS module is available
+        try:
+            from autoortho.aopipeline.AoDDS import get_default_builder_pool, get_default_pool
+            from autoortho.aopipeline.fallback_resolver import FallbackResolver, TimeBudget as FBTimeBudget
+        except ImportError as e:
+            log.debug(f"_try_streaming_aopipeline_build: Imports not available: {e}")
+            return False
+        
+        builder_pool = get_default_builder_pool()
+        if builder_pool is None:
+            log.debug(f"_try_streaming_aopipeline_build: Builder pool not available")
+            return False
+        
+        # Get configuration
+        fallback_level = self._get_fallback_level()
+        dxt_format = CFG.pydds.format.upper()
+        if dxt_format in ("DXT1", "BC1"):
+            dxt_format = "BC1"
+        else:
+            dxt_format = "BC3"
+        
+        missing_color = tuple(CFG.autoortho.missing_color[:3]) if hasattr(CFG.autoortho, 'missing_color') else (66, 77, 55)
+        
+        # Create fallback resolver
+        resolver = FallbackResolver(
+            cache_dir=self.cache_dir,
+            maptype=self.maptype,
+            tile_col=self.col,
+            tile_row=self.row,
+            tile_zoom=self.max_zoom,
+            fallback_level=fallback_level,
+            max_mipmap=self.max_mipmap,
+            downloader=None  # Network fallback handled separately
+        )
+        
+        # Set available mipmap images for scaling fallback
+        resolver.set_mipmap_images(self.imgs)
+        
+        # Acquire streaming builder from pool
+        config = {
+            'chunks_per_side': self.chunks_per_row,
+            'format': dxt_format,
+            'missing_color': missing_color
+        }
+        
+        builder = builder_pool.acquire(config=config, timeout=0.1)
+        if not builder:
+            log.debug(f"_try_streaming_aopipeline_build: Builder pool exhausted")
+            bump('streaming_builder_pool_exhausted')
+            return False
+        
+        try:
+            # Ensure chunks are created for target zoom
+            self._create_chunks(self.max_zoom)
+            chunks = self.chunks.get(self.max_zoom, [])
+            
+            if not chunks:
+                log.debug(f"_try_streaming_aopipeline_build: No chunks for {self.id}")
+                return False
+            
+            # Track pending chunks for download
+            pending_fallbacks = []
+            max_wait = float(getattr(CFG.autoortho, 'live_aopipeline_max_download_wait', 2.0))
+            
+            # Phase 1: Collect and batch-add ready chunks
+            ready_chunks = []
+            for i, chunk in enumerate(chunks):
+                if chunk.ready.is_set() and chunk.data:
+                    ready_chunks.append((i, chunk.data))
+                else:
+                    # Queue for download if not already
+                    if not chunk.in_queue and not chunk.in_flight:
+                        chunk.priority = 0  # High priority for live
+                        chunk_getter.submit(chunk)
+                    pending_fallbacks.append((i, chunk))
+            
+            # Batch add all ready chunks in single C call
+            if ready_chunks:
+                builder.add_chunks_batch(ready_chunks)
+            
+            # Phase 2: Wait for downloads with budget, resolve fallbacks
+            iteration = 0
+            max_iterations = 50  # Safety limit
+            
+            while pending_fallbacks and iteration < max_iterations:
+                iteration += 1
+                remaining = list(pending_fallbacks)
+                pending_fallbacks.clear()
+                
+                for i, chunk in remaining:
+                    # Check time budget
+                    if time_budget and time_budget.exhausted:
+                        # Mark remaining as missing
+                        builder.mark_missing(i)
+                        continue
+                    
+                    # Wait briefly for chunk
+                    wait_time = min(0.05, max_wait / len(remaining)) if remaining else 0.05
+                    if chunk.ready.wait(timeout=wait_time):
+                        if chunk.data:
+                            if builder.add_chunk(i, chunk.data):
+                                continue
+                            # Decode failed, try fallback
+                    
+                    # Chunk failed or timed out - try fallbacks
+                    chunk_col = self.col + (i % self.chunks_per_row)
+                    chunk_row = self.row + (i // self.chunks_per_row)
+                    
+                    # Create fallback time budget if main budget provided
+                    fb_budget = None
+                    if time_budget:
+                        fb_remaining = time_budget.remaining
+                        if fb_remaining > 0:
+                            fb_budget = FBTimeBudget(fb_remaining)
+                    
+                    fallback_rgba = resolver.resolve(
+                        chunk_col, chunk_row, self.max_zoom,
+                        target_mipmap=0,
+                        time_budget=fb_budget
+                    )
+                    
+                    if fallback_rgba:
+                        builder.add_fallback_image(i, fallback_rgba)
+                    elif time_budget and time_budget.exhausted:
+                        builder.mark_missing(i)
+                    elif chunk.ready.is_set():
+                        # Chunk finished but no data and no fallback
+                        builder.mark_missing(i)
+                    else:
+                        # Still downloading, try again
+                        pending_fallbacks.append((i, chunk))
+                
+                # Check if we've exceeded total wait time
+                elapsed = time.monotonic() - build_start
+                if elapsed > max_wait:
+                    # Mark remaining as missing
+                    for i, chunk in pending_fallbacks:
+                        builder.mark_missing(i)
+                    pending_fallbacks.clear()
+                    break
+            
+            # Mark any remaining as missing
+            for i, chunk in pending_fallbacks:
+                builder.mark_missing(i)
+            
+            # Finalize: acquire DDS buffer and build
+            pool = _get_dds_buffer_pool()
+            if pool is None:
+                log.debug(f"_try_streaming_aopipeline_build: DDS buffer pool not available")
+                return False
+            
+            acquired = pool.try_acquire()
+            if not acquired:
+                log.debug(f"_try_streaming_aopipeline_build: DDS buffer pool exhausted")
+                bump('streaming_dds_pool_exhausted')
+                return False
+            
+            buffer, buffer_id = acquired
+            try:
+                result = builder.finalize(buffer)
+                if result.success and result.bytes_written >= 128:
+                    dds_bytes = bytes(buffer[:result.bytes_written])
+                    if self._populate_dds_from_prebuilt(dds_bytes):
+                        build_time = (time.monotonic() - build_start) * 1000
+                        status = builder.get_status()
+                        log.debug(f"_try_streaming_aopipeline_build: SUCCESS for {self.id} - "
+                                  f"{result.bytes_written} bytes in {build_time:.0f}ms "
+                                  f"(decoded={status['chunks_decoded']}, fallback={status['chunks_fallback']}, "
+                                  f"missing={status['chunks_missing']})")
+                        bump('streaming_builder_success')
+                        return True
+                
+                log.debug(f"_try_streaming_aopipeline_build: Finalize failed for {self.id}")
+                bump('streaming_builder_finalize_failed')
+                return False
+                
+            finally:
+                pool.release(buffer_id)
+        
+        except Exception as e:
+            log.debug(f"_try_streaming_aopipeline_build: Exception for {self.id}: {e}")
+            bump('streaming_builder_exception')
+            return False
+        
+        finally:
+            builder.release()
+
+    def _get_fallback_level(self) -> int:
+        """
+        Get numeric fallback level from config.
+        
+        Returns:
+            0 = none (no fallbacks)
+            1 = cache (disk cache + mipmap scaling)  
+            2 = full (all fallbacks including network)
+        """
+        level_str = str(getattr(CFG.autoortho, 'fallback_level', 'cache')).lower()
+        if level_str == 'none':
+            return 0
+        elif level_str == 'full':
+            return 2
+        else:  # 'cache' or default
+            return 1
+
+    def mark_live(self, time_budget=None) -> None:
+        """
+        Mark tile as live (X-Plane requested via FUSE).
+        
+        Triggers transition from prefetch to live mode:
+        - Sets _is_live flag
+        - Applies time budget to remaining work
+        - Boosts priority of any in-flight chunk downloads
+        - Signals transition event for waiting prefetch thread
+        
+        Args:
+            time_budget: Optional TimeBudget to apply
+        """
+        if self._is_live:
+            return  # Already live
+        
+        self._is_live = True
+        
+        # Store time budget for remaining work
+        if time_budget is not None:
+            self._tile_time_budget = time_budget
+        
+        # Boost priority of any in-flight chunk downloads
+        chunks = self.chunks.get(self.max_zoom, [])
+        for chunk in chunks:
+            if hasattr(chunk, 'priority') and (hasattr(chunk, 'in_flight') or hasattr(chunk, 'in_queue')):
+                if getattr(chunk, 'in_flight', False) or getattr(chunk, 'in_queue', False):
+                    chunk.priority = 0  # Highest priority
+        
+        # Signal transition to any waiting prefetch thread
+        if self._live_transition_event is not None:
+            self._live_transition_event.set()
+        
+        log.debug(f"Tile {self.id} transitioned to LIVE mode")
+
     def _get_quick_zoom(self, quick_zoom=0, min_zoom=None):
         """Calculate tile parameters for the given zoom level.
         
@@ -4754,6 +5364,34 @@ class Tile(object):
             else:
                 bump('prebuilt_cache_miss')
         # ═══════════════════════════════════════════════════════════════════
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # PREFETCH-TO-LIVE TRANSITION: Check if tile is being prebuilt
+        # ═══════════════════════════════════════════════════════════════════
+        # If BackgroundDDSBuilder is currently processing this tile, trigger
+        # transition to live mode: apply time budget and boost priorities.
+        if self._active_streaming_builder is not None and not self._is_live:
+            # Create time budget for live request
+            if self._tile_time_budget is None:
+                budget_seconds = float(getattr(CFG.autoortho, 'tile_time_budget', 120.0))
+                self._tile_time_budget = TimeBudget(budget_seconds)
+            
+            # Trigger transition (boosts priorities, applies budget)
+            self.mark_live(self._tile_time_budget)
+            
+            # Wait briefly for prefetch to complete with boosted priority
+            if self._live_transition_event is not None:
+                wait_time = min(self._tile_time_budget.remaining, 2.0)
+                if self._live_transition_event.wait(timeout=wait_time):
+                    # Prefetch completed - check if cache was populated
+                    if prebuilt_dds_cache is not None:
+                        prebuilt_bytes = prebuilt_dds_cache.get(self.id)
+                        if prebuilt_bytes is not None:
+                            if self._populate_dds_from_prebuilt(prebuilt_bytes):
+                                log.debug(f"GET_BYTES: Prebuilt cache HIT after transition for {self.id}")
+                                bump('prebuilt_cache_hit_after_transition')
+                                return True
+        # ═══════════════════════════════════════════════════════════════════
 
         mipmap = self.find_mipmap_pos(offset)
         log.debug(f"Get_bytes for mipmap {mipmap} ...")
@@ -4792,6 +5430,13 @@ class Tile(object):
                     # Create budget just for chunk collection phase
                     aopipeline_budget = TimeBudget(3.0)  # 3s for collection + build
                 
+                # Try streaming builder first if enabled, then fall back to batch builder
+                if getattr(CFG.autoortho, 'streaming_builder_enabled', True):
+                    if self._try_streaming_aopipeline_build(time_budget=aopipeline_budget):
+                        log.debug(f"GET_BYTES: streaming builder succeeded for {self.id}")
+                        return True
+                
+                # Fall back to batch aopipeline
                 if self._try_aopipeline_build(time_budget=aopipeline_budget):
                     # Success! All mipmaps now populated
                     log.debug(f"GET_BYTES: aopipeline build succeeded for {self.id}")
@@ -6505,6 +7150,9 @@ class Tile(object):
         self._tile_time_budget = None
         self.first_request_time = None
         self._completion_reported = False
+        self._is_live = False
+        self._live_transition_event = None
+        self._active_streaming_builder = None
 
 
 class TileCacher(object):

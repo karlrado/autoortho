@@ -404,6 +404,274 @@ AODDS_API int32_t aodds_get_use_ispc(void);
  */
 AODDS_API const char* aodds_version(void);
 
+/* ============================================================================
+ * STREAMING TILE BUILDER API
+ * ============================================================================
+ * The streaming builder allows incremental chunk feeding with fallback support.
+ * Chunks can be added as they download, with the final DDS generated when
+ * all chunks are processed (or marked as missing).
+ * 
+ * Usage:
+ *   1. Create builder with aodds_builder_create()
+ *   2. Add chunks as they become available:
+ *      - aodds_builder_add_chunk() for JPEG data
+ *      - aodds_builder_add_fallback_image() for pre-decoded fallbacks
+ *      - aodds_builder_mark_missing() when all fallbacks exhausted
+ *   3. Finalize with aodds_builder_finalize() or aodds_builder_finalize_to_file()
+ *   4. Reset with aodds_builder_reset() for reuse, or destroy
+ * ============================================================================*/
+
+/**
+ * Chunk status values for streaming builder.
+ */
+typedef enum {
+    CHUNK_STATUS_EMPTY = 0,          /**< Not yet received */
+    CHUNK_STATUS_PENDING_DECODE = 1, /**< JPEG stored, awaiting parallel decode at finalize */
+    CHUNK_STATUS_JPEG = 2,           /**< Received as JPEG, decoded */
+    CHUNK_STATUS_FALLBACK = 3,       /**< Received as pre-decoded fallback */
+    CHUNK_STATUS_MISSING = 4         /**< Marked as missing, will use missing_color */
+} aodds_chunk_status_t;
+
+/**
+ * Streaming builder configuration.
+ */
+typedef struct {
+    int32_t chunks_per_side;    /**< Chunks per side (typically 16) */
+    dds_format_t format;        /**< Output compression format (BC1/BC3) */
+    uint8_t missing_r;          /**< Fallback color R component */
+    uint8_t missing_g;          /**< Fallback color G component */
+    uint8_t missing_b;          /**< Fallback color B component */
+} aodds_builder_config_t;
+
+/**
+ * Streaming builder status for monitoring progress.
+ */
+typedef struct {
+    int32_t chunks_total;       /**< Total chunks expected (chunks_per_side^2) */
+    int32_t chunks_received;    /**< Chunks added (JPEG, fallback, or marked missing) */
+    int32_t chunks_decoded;     /**< Successfully decoded JPEGs */
+    int32_t chunks_failed;      /**< JPEG decode failures (will use missing_color) */
+    int32_t chunks_fallback;    /**< Chunks using fallback images */
+    int32_t chunks_missing;     /**< Chunks marked as missing */
+} aodds_builder_status_t;
+
+/**
+ * Opaque handle to a streaming tile builder.
+ * Created with aodds_builder_create(), destroyed with aodds_builder_destroy().
+ */
+typedef struct aodds_builder_s aodds_builder_t;
+
+/* ========== BUILDER LIFECYCLE ========== */
+
+/**
+ * Create a new streaming tile builder.
+ * 
+ * The builder maintains internal state as chunks are added incrementally.
+ * All memory is pre-allocated based on config->chunks_per_side.
+ * 
+ * @param config        Builder configuration (copied, caller can free)
+ * @param decode_pool   Optional decode buffer pool (may be NULL)
+ * 
+ * @return New builder handle, or NULL on failure
+ * 
+ * Thread Safety: Can be called from any thread.
+ */
+AODDS_API aodds_builder_t* aodds_builder_create(
+    const aodds_builder_config_t* config,
+    aodecode_pool_t* decode_pool
+);
+
+/**
+ * Reset builder for reuse (pooling support).
+ * 
+ * Clears all chunk data and status, but keeps memory allocations.
+ * More efficient than destroy + create for pooled builders.
+ * 
+ * @param builder   Builder to reset
+ * @param config    New configuration (may differ from original)
+ * 
+ * Thread Safety: NOT thread-safe. Ensure no other operations in progress.
+ */
+AODDS_API void aodds_builder_reset(
+    aodds_builder_t* builder,
+    const aodds_builder_config_t* config
+);
+
+/**
+ * Destroy builder and free all resources.
+ * 
+ * @param builder   Builder to destroy (NULL is safe)
+ * 
+ * Thread Safety: NOT thread-safe. Ensure no other operations in progress.
+ */
+AODDS_API void aodds_builder_destroy(aodds_builder_t* builder);
+
+/* ========== CHUNK FEEDING (Thread-Safe) ========== */
+
+/**
+ * Add a JPEG chunk for decoding.
+ * 
+ * The JPEG data is copied internally and decoded immediately.
+ * If decode fails, the chunk is marked as failed (will use missing_color).
+ * 
+ * @param builder       Target builder
+ * @param chunk_index   Chunk index in row-major order (0 to chunks_per_side^2 - 1)
+ * @param jpeg_data     JPEG bytes (copied internally)
+ * @param jpeg_size     Size of JPEG data in bytes
+ * 
+ * @return 1 on success (decode OK), 0 on failure (invalid index, already set, or decode failed)
+ * 
+ * Thread Safety: Thread-safe. Multiple threads can add chunks simultaneously.
+ */
+AODDS_API int32_t aodds_builder_add_chunk(
+    aodds_builder_t* builder,
+    int32_t chunk_index,
+    const uint8_t* jpeg_data,
+    uint32_t jpeg_size
+);
+
+/**
+ * Add multiple JPEG chunks in a single call (batch API).
+ * 
+ * More efficient than calling add_chunk() repeatedly due to reduced
+ * Python/C crossing overhead. All chunks are stored for deferred
+ * parallel decode at finalize time.
+ * 
+ * @param builder       Target builder
+ * @param count         Number of chunks to add
+ * @param indices       Array of chunk indices (count elements)
+ * @param jpeg_data     Array of JPEG data pointers (count elements)
+ * @param jpeg_sizes    Array of JPEG sizes (count elements)
+ * 
+ * @return Number of chunks successfully added
+ * 
+ * Thread Safety: Thread-safe.
+ */
+AODDS_API int32_t aodds_builder_add_chunks_batch(
+    aodds_builder_t* builder,
+    int32_t count,
+    const int32_t* indices,
+    const uint8_t** jpeg_data,
+    const uint32_t* jpeg_sizes
+);
+
+/**
+ * Add a pre-decoded fallback image for a chunk.
+ * 
+ * Used when Python has resolved a fallback (disk cache, mipmap scale, network).
+ * The RGBA data is copied internally.
+ * 
+ * @param builder       Target builder
+ * @param chunk_index   Chunk index in row-major order
+ * @param rgba_data     RGBA pixel data (width * height * 4 bytes, copied)
+ * @param width         Image width (must be 256)
+ * @param height        Image height (must be 256)
+ * 
+ * @return 1 on success, 0 on failure (invalid index, already set, invalid dimensions)
+ * 
+ * Thread Safety: Thread-safe. Multiple threads can add chunks simultaneously.
+ */
+AODDS_API int32_t aodds_builder_add_fallback_image(
+    aodds_builder_t* builder,
+    int32_t chunk_index,
+    const uint8_t* rgba_data,
+    int32_t width,
+    int32_t height
+);
+
+/**
+ * Mark a chunk as permanently missing.
+ * 
+ * Call this when all fallbacks have been exhausted for a chunk.
+ * The chunk position will be filled with missing_color during finalization.
+ * 
+ * @param builder       Target builder
+ * @param chunk_index   Chunk index in row-major order
+ * 
+ * Thread Safety: Thread-safe.
+ */
+AODDS_API void aodds_builder_mark_missing(
+    aodds_builder_t* builder,
+    int32_t chunk_index
+);
+
+/* ========== STATUS QUERY ========== */
+
+/**
+ * Get current builder status.
+ * 
+ * @param builder   Source builder
+ * @param status    Output status structure
+ * 
+ * Thread Safety: Thread-safe. Can be called while chunks are being added.
+ */
+AODDS_API void aodds_builder_get_status(
+    const aodds_builder_t* builder,
+    aodds_builder_status_t* status
+);
+
+/**
+ * Check if all chunks have been processed.
+ * 
+ * A chunk is "processed" if it has been added (JPEG or fallback) or marked missing.
+ * 
+ * @param builder   Source builder
+ * 
+ * @return 1 if all chunks processed, 0 if some chunks still pending
+ * 
+ * Thread Safety: Thread-safe.
+ */
+AODDS_API int32_t aodds_builder_is_complete(const aodds_builder_t* builder);
+
+/* ========== FINALIZATION ========== */
+
+/**
+ * Finalize the tile and write DDS to buffer.
+ * 
+ * This performs the final steps:
+ * 1. Fill missing chunk positions with missing_color
+ * 2. Compose all chunks into full tile image
+ * 3. Generate all mipmap levels
+ * 4. Compress with BC1/BC3
+ * 5. Write complete DDS to output buffer
+ * 
+ * @param builder       Source builder
+ * @param dds_output    Pre-allocated output buffer
+ * @param output_size   Size of output buffer
+ * @param bytes_written Actual bytes written (output)
+ * 
+ * @return 1 on success, 0 on failure
+ * 
+ * Thread Safety: NOT thread-safe with add_chunk/add_fallback_image.
+ *                Ensure all chunk operations complete before calling.
+ */
+AODDS_API int32_t aodds_builder_finalize(
+    aodds_builder_t* builder,
+    uint8_t* dds_output,
+    uint32_t output_size,
+    uint32_t* bytes_written
+);
+
+/**
+ * Finalize the tile and write DDS directly to file.
+ * 
+ * Zero-copy optimization for prefetch cache. Uses temp file + rename
+ * for atomicity.
+ * 
+ * @param builder       Source builder
+ * @param output_path   Path to output DDS file (will be created/overwritten)
+ * @param bytes_written Actual bytes written (output)
+ * 
+ * @return 1 on success, 0 on failure
+ * 
+ * Thread Safety: NOT thread-safe with add_chunk/add_fallback_image.
+ */
+AODDS_API int32_t aodds_builder_finalize_to_file(
+    aodds_builder_t* builder,
+    const char* output_path,
+    uint32_t* bytes_written
+);
+
 #ifdef __cplusplus
 }
 #endif

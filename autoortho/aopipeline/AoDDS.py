@@ -29,11 +29,15 @@ import logging
 import os
 import sys
 import threading
-from typing import Optional, Tuple, NamedTuple, Union
+from typing import Optional, Tuple, NamedTuple, Union, List
 
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+# Format constants (match dds_format_t in aodds.h)
+FORMAT_BC1 = 0  # DXT1
+FORMAT_BC3 = 1  # DXT5
 
 
 # ============================================================================
@@ -66,6 +70,7 @@ class DDSBufferPool:
     # Standard DDS sizes for common tile configurations
     # These include DDS header (128 bytes) + all mipmaps + safety margin
     # Values calculated from aodds_calc_dds_size() + 1KB padding for safety
+    SIZE_8192x8192_BC1 = 44_740_000  # 32x32 chunks, BC1 format with mipmaps (~42.67 MB)
     SIZE_4096x4096_BC1 = 11_186_000  # 16x16 chunks, BC1 format with mipmaps (~10.67 MB)
     SIZE_2048x2048_BC1 = 2_797_500   # 8x8 chunks, BC1 format with mipmaps (~2.67 MB)
     SIZE_1024x1024_BC1 = 700_000     # 4x4 chunks, BC1 format with mipmaps (~0.67 MB)
@@ -200,6 +205,570 @@ def get_default_pool() -> DDSBufferPool:
             if _default_pool is None:
                 _default_pool = DDSBufferPool()
     return _default_pool
+
+# ============================================================================
+# Streaming Builder Structures
+# ============================================================================
+
+class BuilderConfig(Structure):
+    """
+    Builder configuration structure.
+    Maps to aodds_builder_config_t in C.
+    """
+    _fields_ = [
+        ('chunks_per_side', c_int32),
+        ('format', c_int32),
+        ('missing_r', c_uint8),
+        ('missing_g', c_uint8),
+        ('missing_b', c_uint8),
+    ]
+
+
+class BuilderStatus(Structure):
+    """
+    Builder status structure for monitoring progress.
+    Maps to aodds_builder_status_t in C.
+    """
+    _fields_ = [
+        ('chunks_total', c_int32),
+        ('chunks_received', c_int32),
+        ('chunks_decoded', c_int32),
+        ('chunks_failed', c_int32),
+        ('chunks_fallback', c_int32),
+        ('chunks_missing', c_int32),
+    ]
+
+
+class StreamingBuilderResult(NamedTuple):
+    """Result from StreamingBuilder.finalize()."""
+    success: bool
+    bytes_written: int
+    error: str = ""
+
+
+class StreamingBuilder:
+    """
+    Wrapper around native aodds_builder_t.
+    
+    Manages incremental chunk feeding and finalization for streaming DDS builds.
+    Chunks can be added as they become available (JPEG data, fallback images,
+    or marked as missing), and the final DDS is generated when finalize() is called.
+    
+    Usage:
+        # Create builder via pool
+        builder = builder_pool.acquire(config)
+        
+        # Add chunks as they arrive
+        for idx, jpeg_bytes in chunks:
+            builder.add_chunk(idx, jpeg_bytes)
+        
+        # Add fallback images for missing chunks
+        for idx, rgba_data in fallbacks:
+            builder.add_fallback_image(idx, rgba_data)
+        
+        # Mark remaining chunks as missing
+        for idx in missing_indices:
+            builder.mark_missing(idx)
+        
+        # Finalize and get DDS
+        buffer = pool.acquire_buffer()
+        result = builder.finalize(buffer)
+        
+        # Return builder to pool
+        builder.release()
+    """
+    
+    def __init__(self, handle: c_void_p, pool_ref: 'StreamingBuilderPool', 
+                 lib, config: BuilderConfig):
+        self._handle = handle
+        self._pool_ref = pool_ref
+        self._lib = lib
+        self._config = config
+        self._finalized = False
+        self._released = False
+    
+    def add_chunk(self, index: int, jpeg_data: bytes) -> bool:
+        """
+        Add JPEG data for a chunk.
+        
+        The JPEG data is stored for deferred parallel decode at finalize time.
+        This enables faster throughput by decoding all chunks in parallel with OpenMP.
+        
+        Args:
+            index: Chunk index in row-major order (0 to chunks_per_side^2 - 1)
+            jpeg_data: JPEG bytes
+            
+        Returns:
+            True if chunk was stored, False if failed or chunk already set
+            
+        Thread Safety: Thread-safe - multiple threads can add chunks.
+        """
+        if self._released:
+            raise RuntimeError("StreamingBuilder has been released")
+        
+        if not jpeg_data:
+            return False
+        
+        jpeg_ptr = cast(jpeg_data, POINTER(c_uint8))
+        result = self._lib.aodds_builder_add_chunk(
+            self._handle,
+            c_int32(index),
+            jpeg_ptr,
+            c_uint32(len(jpeg_data))
+        )
+        return bool(result)
+    
+    def add_chunks_batch(self, chunks: List[Tuple[int, bytes]]) -> int:
+        """
+        Add multiple JPEG chunks in a single native call.
+        
+        More efficient than calling add_chunk() repeatedly due to reduced
+        Python/C crossing overhead. Chunks are stored for deferred parallel
+        decode at finalize time.
+        
+        Args:
+            chunks: List of (index, jpeg_bytes) tuples
+            
+        Returns:
+            Number of chunks successfully added
+            
+        Thread Safety: Thread-safe.
+        """
+        if self._released:
+            raise RuntimeError("StreamingBuilder has been released")
+        
+        if not chunks:
+            return 0
+        
+        count = len(chunks)
+        
+        # Build arrays for C call
+        indices = (c_int32 * count)()
+        jpeg_ptrs = (c_void_p * count)()
+        jpeg_sizes = (c_uint32 * count)()
+        
+        # Keep references to prevent GC during call
+        jpeg_buffers = []
+        
+        for i, (idx, jpeg_data) in enumerate(chunks):
+            indices[i] = idx
+            jpeg_sizes[i] = len(jpeg_data) if jpeg_data else 0
+            
+            if jpeg_data:
+                # Create ctypes buffer from bytes
+                buf = (c_uint8 * len(jpeg_data)).from_buffer_copy(jpeg_data)
+                jpeg_buffers.append(buf)
+                jpeg_ptrs[i] = cast(buf, c_void_p).value
+            else:
+                jpeg_ptrs[i] = None
+        
+        result = self._lib.aodds_builder_add_chunks_batch(
+            self._handle,
+            c_int32(count),
+            indices,
+            cast(jpeg_ptrs, POINTER(c_void_p)),
+            jpeg_sizes
+        )
+        
+        return result
+    
+    def add_fallback_image(self, index: int, rgba_data: bytes,
+                           width: int = 256, height: int = 256) -> bool:
+        """
+        Add a pre-decoded fallback image for a chunk.
+        
+        Used when Python has resolved a fallback (disk cache, mipmap scale, network).
+        
+        Args:
+            index: Chunk index in row-major order
+            rgba_data: RGBA pixel data (width * height * 4 bytes)
+            width: Image width (must be 256)
+            height: Image height (must be 256)
+            
+        Returns:
+            True on success, False on failure
+            
+        Thread Safety: Thread-safe.
+        """
+        if self._released:
+            raise RuntimeError("StreamingBuilder has been released")
+        
+        if not rgba_data or len(rgba_data) != width * height * 4:
+            return False
+        
+        rgba_ptr = cast(rgba_data, POINTER(c_uint8))
+        result = self._lib.aodds_builder_add_fallback_image(
+            self._handle,
+            c_int32(index),
+            rgba_ptr,
+            c_int32(width),
+            c_int32(height)
+        )
+        return bool(result)
+    
+    def mark_missing(self, index: int) -> None:
+        """
+        Mark a chunk as permanently missing.
+        
+        Call this when all fallbacks have been exhausted. The chunk position
+        will be filled with missing_color during finalization.
+        
+        Args:
+            index: Chunk index in row-major order
+            
+        Thread Safety: Thread-safe.
+        """
+        if self._released:
+            raise RuntimeError("StreamingBuilder has been released")
+        
+        self._lib.aodds_builder_mark_missing(self._handle, c_int32(index))
+    
+    def get_status(self) -> dict:
+        """
+        Get current builder status.
+        
+        Returns:
+            Dictionary with status fields:
+            - chunks_total: Total chunks expected
+            - chunks_received: Chunks added or marked
+            - chunks_decoded: Successfully decoded JPEGs
+            - chunks_failed: JPEG decode failures
+            - chunks_fallback: Chunks using fallback images
+            - chunks_missing: Chunks marked as missing
+            
+        Thread Safety: Thread-safe.
+        """
+        if self._released:
+            raise RuntimeError("StreamingBuilder has been released")
+        
+        status = BuilderStatus()
+        self._lib.aodds_builder_get_status(self._handle, byref(status))
+        return {
+            'chunks_total': status.chunks_total,
+            'chunks_received': status.chunks_received,
+            'chunks_decoded': status.chunks_decoded,
+            'chunks_failed': status.chunks_failed,
+            'chunks_fallback': status.chunks_fallback,
+            'chunks_missing': status.chunks_missing,
+        }
+    
+    def is_complete(self) -> bool:
+        """
+        Check if all chunks have been processed.
+        
+        Returns:
+            True if all chunks are added/marked, False otherwise
+            
+        Thread Safety: Thread-safe.
+        """
+        if self._released:
+            raise RuntimeError("StreamingBuilder has been released")
+        
+        return bool(self._lib.aodds_builder_is_complete(self._handle))
+    
+    def finalize(self, buffer: np.ndarray) -> StreamingBuilderResult:
+        """
+        Finalize and write DDS to buffer.
+        
+        Performs:
+        1. Fill missing chunks with missing_color
+        2. Compose all chunks into tile
+        3. Generate all mipmap levels
+        4. Compress with BC1/BC3
+        5. Write complete DDS to buffer
+        
+        Args:
+            buffer: Pre-allocated numpy buffer (use DDSBufferPool)
+            
+        Returns:
+            StreamingBuilderResult with success status and bytes_written
+            
+        Thread Safety: NOT thread-safe with add_chunk. Ensure all adding complete.
+        """
+        if self._released:
+            raise RuntimeError("StreamingBuilder has been released")
+        if self._finalized:
+            raise RuntimeError("StreamingBuilder already finalized")
+        
+        bytes_written = c_uint32()
+        buffer_ptr = buffer.ctypes.data_as(POINTER(c_uint8))
+        
+        result = self._lib.aodds_builder_finalize(
+            self._handle,
+            buffer_ptr,
+            c_uint32(len(buffer)),
+            byref(bytes_written)
+        )
+        
+        self._finalized = True
+        
+        if result:
+            return StreamingBuilderResult(
+                success=True,
+                bytes_written=bytes_written.value
+            )
+        else:
+            return StreamingBuilderResult(
+                success=False,
+                bytes_written=0,
+                error="Failed to finalize DDS"
+            )
+    
+    def finalize_to_file(self, output_path: str) -> Tuple[bool, int]:
+        """
+        Finalize and write DDS directly to file.
+        
+        Zero-copy optimization for prefetch cache.
+        
+        Args:
+            output_path: Path to output DDS file
+            
+        Returns:
+            Tuple of (success, bytes_written)
+            
+        Thread Safety: NOT thread-safe with add_chunk.
+        """
+        if self._released:
+            raise RuntimeError("StreamingBuilder has been released")
+        if self._finalized:
+            raise RuntimeError("StreamingBuilder already finalized")
+        
+        bytes_written = c_uint32()
+        output_path_bytes = output_path.encode('utf-8')
+        
+        result = self._lib.aodds_builder_finalize_to_file(
+            self._handle,
+            output_path_bytes,
+            byref(bytes_written)
+        )
+        
+        self._finalized = True
+        
+        return bool(result), bytes_written.value
+    
+    def release(self) -> None:
+        """
+        Return builder to pool for reuse.
+        
+        Must be called when done with the builder (use try/finally).
+        """
+        if not self._released and self._pool_ref is not None:
+            self._pool_ref._return_builder(self._handle)
+            self._released = True
+            self._handle = None
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+        return False
+
+
+class StreamingBuilderPool:
+    """
+    Pool of reusable StreamingBuilder instances.
+    
+    Reduces allocation overhead for high-frequency tile builds by reusing
+    native builder instances.
+    
+    Usage:
+        pool = StreamingBuilderPool(pool_size=4)
+        
+        # Acquire builder
+        builder = pool.acquire(config={'chunks_per_side': 16, 'format': 'BC1'})
+        
+        try:
+            # Use builder...
+            pass
+        finally:
+            builder.release()
+        
+        # Or use context manager
+        with pool.acquire(config) as builder:
+            # Use builder...
+            pass
+    """
+    
+    def __init__(self, pool_size: int = 4, decode_pool: c_void_p = None):
+        """
+        Create a streaming builder pool.
+        
+        Args:
+            pool_size: Number of builders to pre-allocate
+            decode_pool: Optional native decode buffer pool (aodecode_pool_t*)
+        """
+        self._pool_size = pool_size
+        self._decode_pool = decode_pool
+        self._lock = threading.Lock()
+        self._available: list = []
+        self._lib = None
+        self._initialized = False
+        
+        log.debug(f"StreamingBuilderPool: created with pool_size={pool_size}")
+    
+    def _ensure_initialized(self):
+        """Lazy initialization of native library and function signatures."""
+        if self._initialized:
+            return
+        
+        with self._lock:
+            if self._initialized:
+                return
+            
+            self._lib = _load_library()
+            
+            # Setup builder function signatures
+            self._lib.aodds_builder_create.argtypes = [
+                POINTER(BuilderConfig), c_void_p
+            ]
+            self._lib.aodds_builder_create.restype = c_void_p
+            
+            self._lib.aodds_builder_reset.argtypes = [
+                c_void_p, POINTER(BuilderConfig)
+            ]
+            self._lib.aodds_builder_reset.restype = None
+            
+            self._lib.aodds_builder_destroy.argtypes = [c_void_p]
+            self._lib.aodds_builder_destroy.restype = None
+            
+            self._lib.aodds_builder_add_chunk.argtypes = [
+                c_void_p, c_int32, POINTER(c_uint8), c_uint32
+            ]
+            self._lib.aodds_builder_add_chunk.restype = c_int32
+            
+            # Batch API for adding multiple chunks in one call
+            self._lib.aodds_builder_add_chunks_batch.argtypes = [
+                c_void_p,           # builder
+                c_int32,            # count
+                POINTER(c_int32),   # indices array
+                POINTER(c_void_p),  # jpeg_data array (array of pointers)
+                POINTER(c_uint32),  # jpeg_sizes array
+            ]
+            self._lib.aodds_builder_add_chunks_batch.restype = c_int32
+            
+            self._lib.aodds_builder_add_fallback_image.argtypes = [
+                c_void_p, c_int32, POINTER(c_uint8), c_int32, c_int32
+            ]
+            self._lib.aodds_builder_add_fallback_image.restype = c_int32
+            
+            self._lib.aodds_builder_mark_missing.argtypes = [c_void_p, c_int32]
+            self._lib.aodds_builder_mark_missing.restype = None
+            
+            self._lib.aodds_builder_get_status.argtypes = [
+                c_void_p, POINTER(BuilderStatus)
+            ]
+            self._lib.aodds_builder_get_status.restype = None
+            
+            self._lib.aodds_builder_is_complete.argtypes = [c_void_p]
+            self._lib.aodds_builder_is_complete.restype = c_int32
+            
+            self._lib.aodds_builder_finalize.argtypes = [
+                c_void_p, POINTER(c_uint8), c_uint32, POINTER(c_uint32)
+            ]
+            self._lib.aodds_builder_finalize.restype = c_int32
+            
+            self._lib.aodds_builder_finalize_to_file.argtypes = [
+                c_void_p, c_char_p, POINTER(c_uint32)
+            ]
+            self._lib.aodds_builder_finalize_to_file.restype = c_int32
+            
+            self._initialized = True
+    
+    def acquire(self, config: dict, timeout: float = 5.0) -> Optional[StreamingBuilder]:
+        """
+        Acquire a builder from the pool.
+        
+        Args:
+            config: Builder configuration dict:
+                - chunks_per_side: int (typically 16)
+                - format: str ("BC1" or "BC3")
+                - missing_color: tuple of (r, g, b) bytes
+            timeout: Maximum wait time in seconds
+            
+        Returns:
+            StreamingBuilder instance, or None if pool exhausted
+        """
+        self._ensure_initialized()
+        
+        # Build config structure
+        fmt = FORMAT_BC1 if config.get('format', 'BC1').upper() in ('BC1', 'DXT1') else FORMAT_BC3
+        missing_color = config.get('missing_color', (128, 128, 128))
+        
+        c_config = BuilderConfig(
+            chunks_per_side=config.get('chunks_per_side', 16),
+            format=fmt,
+            missing_r=missing_color[0],
+            missing_g=missing_color[1],
+            missing_b=missing_color[2],
+        )
+        
+        import time
+        start = time.monotonic()
+        
+        while True:
+            with self._lock:
+                if self._available:
+                    handle = self._available.pop()
+                    # Reset builder with new config
+                    self._lib.aodds_builder_reset(handle, byref(c_config))
+                    return StreamingBuilder(handle, self, self._lib, c_config)
+            
+            # Pool exhausted - try to create new if under limit
+            with self._lock:
+                current_count = len(self._available) + self._pool_size - len(self._available)
+                if current_count < self._pool_size * 2:
+                    # Create new builder
+                    handle = self._lib.aodds_builder_create(
+                        byref(c_config), self._decode_pool
+                    )
+                    if handle:
+                        return StreamingBuilder(handle, self, self._lib, c_config)
+            
+            if time.monotonic() - start > timeout:
+                log.warning(f"StreamingBuilderPool: timeout waiting for builder")
+                return None
+            
+            time.sleep(0.001)
+    
+    def _return_builder(self, handle: c_void_p) -> None:
+        """Return a builder handle to the pool."""
+        with self._lock:
+            self._available.append(handle)
+    
+    def close(self) -> None:
+        """Destroy all builders in the pool."""
+        with self._lock:
+            for handle in self._available:
+                self._lib.aodds_builder_destroy(handle)
+            self._available.clear()
+    
+    @property
+    def available_count(self) -> int:
+        """Number of builders currently available."""
+        with self._lock:
+            return len(self._available)
+
+
+# Global streaming builder pool (lazily initialized)
+_default_builder_pool: Optional[StreamingBuilderPool] = None
+_default_builder_pool_lock = threading.Lock()
+
+
+def get_default_builder_pool() -> StreamingBuilderPool:
+    """
+    Get or create the default global streaming builder pool.
+    
+    Returns:
+        The default StreamingBuilderPool instance
+    """
+    global _default_builder_pool
+    if _default_builder_pool is None:
+        with _default_builder_pool_lock:
+            if _default_builder_pool is None:
+                _default_builder_pool = StreamingBuilderPool()
+    return _default_builder_pool
+
 
 # ============================================================================
 # Library Loading
@@ -399,11 +968,6 @@ class BufferBuildResult(NamedTuple):
         This incurs a copy (~65ms for 10MB) but the data is then independent.
         """
         return bytes(self.buffer[:self.bytes_written])
-
-
-# Format constants
-FORMAT_BC1 = 0  # DXT1
-FORMAT_BC3 = 1  # DXT5
 
 
 # ============================================================================

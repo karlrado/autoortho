@@ -1789,6 +1789,877 @@ AODDS_API int32_t aodds_build_tile_to_file(
     return 1;
 }
 
+/*============================================================================
+ * STREAMING TILE BUILDER IMPLEMENTATION
+ *============================================================================*/
+
+/**
+ * Internal structure for streaming tile builder.
+ */
+struct aodds_builder_s {
+    /* Configuration */
+    aodds_builder_config_t config;
+    int32_t chunk_count;  /* chunks_per_side^2 */
+    
+    /* Chunk storage - decoded images */
+    aodecode_image_t* chunks;  /* Array of chunk_count images */
+    uint8_t* chunk_status;     /* Array of aodds_chunk_status_t values */
+    
+    /* Deferred JPEG storage for parallel decode at finalize */
+    uint8_t** jpeg_buffers;     /* Array of JPEG byte buffers (NULL if decoded or missing) */
+    uint32_t* jpeg_sizes;       /* Array of JPEG sizes */
+    uint32_t jpeg_storage_size; /* Allocated size of jpeg arrays */
+    
+    /* Thread safety */
+#ifdef AOPIPELINE_WINDOWS
+    CRITICAL_SECTION lock;
+#else
+    pthread_mutex_t lock;
+#endif
+    int lock_initialized;
+    
+    /* Tile composition buffer (allocated on first finalize) */
+    aodecode_image_t tile_image;
+    int tile_allocated;
+    
+    /* Compression work buffers (allocated on first finalize, reused) */
+    uint8_t* compress_buffer;       /* BC1/BC3 compression output */
+    uint32_t compress_buffer_size;  /* Current allocated size */
+    
+    /* Mipmap reduction buffers (ping-pong pattern) */
+    uint8_t* mip_buf_a;             /* First mipmap buffer */
+    uint8_t* mip_buf_b;             /* Second mipmap buffer */
+    uint32_t mip_buf_a_size;        /* Allocated size of mip_buf_a */
+    uint32_t mip_buf_b_size;        /* Allocated size of mip_buf_b */
+    
+    /* Decode pool reference */
+    aodecode_pool_t* pool;
+    
+    /* Statistics */
+    aodds_builder_status_t status;
+};
+
+/* Helper: Initialize lock */
+static void builder_init_lock(aodds_builder_t* builder) {
+    if (builder->lock_initialized) return;
+#ifdef AOPIPELINE_WINDOWS
+    InitializeCriticalSection(&builder->lock);
+#else
+    pthread_mutex_init(&builder->lock, NULL);
+#endif
+    builder->lock_initialized = 1;
+}
+
+/* Helper: Lock the builder */
+static void builder_lock(aodds_builder_t* builder) {
+#ifdef AOPIPELINE_WINDOWS
+    EnterCriticalSection(&builder->lock);
+#else
+    pthread_mutex_lock(&builder->lock);
+#endif
+}
+
+/* Helper: Unlock the builder */
+static void builder_unlock(aodds_builder_t* builder) {
+#ifdef AOPIPELINE_WINDOWS
+    LeaveCriticalSection(&builder->lock);
+#else
+    pthread_mutex_unlock(&builder->lock);
+#endif
+}
+
+/* Helper: Destroy lock */
+static void builder_destroy_lock(aodds_builder_t* builder) {
+    if (!builder->lock_initialized) return;
+#ifdef AOPIPELINE_WINDOWS
+    DeleteCriticalSection(&builder->lock);
+#else
+    pthread_mutex_destroy(&builder->lock);
+#endif
+    builder->lock_initialized = 0;
+}
+
+AODDS_API aodds_builder_t* aodds_builder_create(
+    const aodds_builder_config_t* config,
+    aodecode_pool_t* decode_pool
+) {
+    if (!config || config->chunks_per_side <= 0) {
+        return NULL;
+    }
+    
+    aodds_builder_t* builder = (aodds_builder_t*)calloc(1, sizeof(aodds_builder_t));
+    if (!builder) {
+        return NULL;
+    }
+    
+    /* Copy configuration */
+    builder->config = *config;
+    builder->chunk_count = config->chunks_per_side * config->chunks_per_side;
+    builder->pool = decode_pool;
+    
+    /* Allocate chunk storage */
+    builder->chunks = (aodecode_image_t*)calloc(builder->chunk_count, sizeof(aodecode_image_t));
+    builder->chunk_status = (uint8_t*)calloc(builder->chunk_count, sizeof(uint8_t));
+    
+    if (!builder->chunks || !builder->chunk_status) {
+        free(builder->chunks);
+        free(builder->chunk_status);
+        free(builder);
+        return NULL;
+    }
+    
+    /* Allocate JPEG storage arrays for deferred decode */
+    builder->jpeg_buffers = (uint8_t**)calloc(builder->chunk_count, sizeof(uint8_t*));
+    builder->jpeg_sizes = (uint32_t*)calloc(builder->chunk_count, sizeof(uint32_t));
+    builder->jpeg_storage_size = builder->chunk_count;
+    
+    if (!builder->jpeg_buffers || !builder->jpeg_sizes) {
+        free(builder->jpeg_buffers);
+        free(builder->jpeg_sizes);
+        free(builder->chunks);
+        free(builder->chunk_status);
+        free(builder);
+        return NULL;
+    }
+    
+    /* Initialize lock */
+    builder_init_lock(builder);
+    
+    /* Initialize work buffers (lazy allocation on first finalize) */
+    builder->compress_buffer = NULL;
+    builder->compress_buffer_size = 0;
+    builder->mip_buf_a = NULL;
+    builder->mip_buf_b = NULL;
+    builder->mip_buf_a_size = 0;
+    builder->mip_buf_b_size = 0;
+    
+    /* Initialize status */
+    builder->status.chunks_total = builder->chunk_count;
+    builder->status.chunks_received = 0;
+    builder->status.chunks_decoded = 0;
+    builder->status.chunks_failed = 0;
+    builder->status.chunks_fallback = 0;
+    builder->status.chunks_missing = 0;
+    
+    return builder;
+}
+
+AODDS_API void aodds_builder_reset(
+    aodds_builder_t* builder,
+    const aodds_builder_config_t* config
+) {
+    if (!builder || !config) {
+        return;
+    }
+    
+    builder_lock(builder);
+    
+    int32_t new_chunk_count = config->chunks_per_side * config->chunks_per_side;
+    int32_t new_tile_size = config->chunks_per_side * CHUNK_SIZE;
+    int32_t old_tile_size = builder->config.chunks_per_side * CHUNK_SIZE;
+    
+    /* Free existing chunk data and any pending JPEG buffers */
+    for (int32_t i = 0; i < builder->chunk_count; i++) {
+        if (builder->chunks[i].data) {
+            aodecode_free_image(&builder->chunks[i], builder->pool);
+        }
+        /* Free any deferred JPEG data */
+        if (builder->jpeg_buffers && builder->jpeg_buffers[i]) {
+            free(builder->jpeg_buffers[i]);
+            builder->jpeg_buffers[i] = NULL;
+        }
+        if (builder->jpeg_sizes) {
+            builder->jpeg_sizes[i] = 0;
+        }
+    }
+    
+    /* Free tile image if tile size changed */
+    if (builder->tile_allocated && new_tile_size != old_tile_size) {
+        if (builder->tile_image.data) {
+            free(builder->tile_image.data);
+            builder->tile_image.data = NULL;
+        }
+        builder->tile_allocated = 0;
+        memset(&builder->tile_image, 0, sizeof(builder->tile_image));
+    }
+    
+    /* Free work buffers if tile size increased (they'll be reallocated in finalize)
+     * If tile size decreased or unchanged, keep existing buffers for reuse */
+    if (new_tile_size > old_tile_size) {
+        free(builder->compress_buffer);
+        builder->compress_buffer = NULL;
+        builder->compress_buffer_size = 0;
+        
+        free(builder->mip_buf_a);
+        free(builder->mip_buf_b);
+        builder->mip_buf_a = NULL;
+        builder->mip_buf_b = NULL;
+        builder->mip_buf_a_size = 0;
+        builder->mip_buf_b_size = 0;
+    }
+    
+    /* Reallocate if chunk count changed */
+    if (new_chunk_count != builder->chunk_count) {
+        free(builder->chunks);
+        free(builder->chunk_status);
+        free(builder->jpeg_buffers);
+        free(builder->jpeg_sizes);
+        
+        builder->chunks = (aodecode_image_t*)calloc(new_chunk_count, sizeof(aodecode_image_t));
+        builder->chunk_status = (uint8_t*)calloc(new_chunk_count, sizeof(uint8_t));
+        builder->jpeg_buffers = (uint8_t**)calloc(new_chunk_count, sizeof(uint8_t*));
+        builder->jpeg_sizes = (uint32_t*)calloc(new_chunk_count, sizeof(uint32_t));
+        builder->jpeg_storage_size = new_chunk_count;
+        
+        if (!builder->chunks || !builder->chunk_status || 
+            !builder->jpeg_buffers || !builder->jpeg_sizes) {
+            /* Allocation failed - leave builder in invalid state */
+            builder->chunk_count = 0;
+            builder_unlock(builder);
+            return;
+        }
+    } else {
+        /* Just clear existing arrays */
+        memset(builder->chunks, 0, new_chunk_count * sizeof(aodecode_image_t));
+        memset(builder->chunk_status, 0, new_chunk_count * sizeof(uint8_t));
+        memset(builder->jpeg_buffers, 0, new_chunk_count * sizeof(uint8_t*));
+        memset(builder->jpeg_sizes, 0, new_chunk_count * sizeof(uint32_t));
+    }
+    
+    /* Update configuration */
+    builder->config = *config;
+    builder->chunk_count = new_chunk_count;
+    
+    /* Reset status */
+    builder->status.chunks_total = new_chunk_count;
+    builder->status.chunks_received = 0;
+    builder->status.chunks_decoded = 0;
+    builder->status.chunks_failed = 0;
+    builder->status.chunks_fallback = 0;
+    builder->status.chunks_missing = 0;
+    
+    builder_unlock(builder);
+}
+
+AODDS_API void aodds_builder_destroy(aodds_builder_t* builder) {
+    if (!builder) {
+        return;
+    }
+    
+    /* Free chunk data and any pending JPEG buffers */
+    for (int32_t i = 0; i < builder->chunk_count; i++) {
+        if (builder->chunks[i].data) {
+            aodecode_free_image(&builder->chunks[i], builder->pool);
+        }
+        if (builder->jpeg_buffers && builder->jpeg_buffers[i]) {
+            free(builder->jpeg_buffers[i]);
+        }
+    }
+    
+    free(builder->chunks);
+    free(builder->chunk_status);
+    free(builder->jpeg_buffers);
+    free(builder->jpeg_sizes);
+    
+    /* Free tile image if allocated */
+    if (builder->tile_allocated && builder->tile_image.data) {
+        free(builder->tile_image.data);
+    }
+    
+    /* Free work buffers */
+    free(builder->compress_buffer);
+    free(builder->mip_buf_a);
+    free(builder->mip_buf_b);
+    
+    /* Destroy lock */
+    builder_destroy_lock(builder);
+    
+    free(builder);
+}
+
+AODDS_API int32_t aodds_builder_add_chunk(
+    aodds_builder_t* builder,
+    int32_t chunk_index,
+    const uint8_t* jpeg_data,
+    uint32_t jpeg_size
+) {
+    if (!builder || !jpeg_data || jpeg_size == 0) {
+        return 0;
+    }
+    
+    if (chunk_index < 0 || chunk_index >= builder->chunk_count) {
+        return 0;
+    }
+    
+    builder_lock(builder);
+    
+    /* Check if already set */
+    if (builder->chunk_status[chunk_index] != CHUNK_STATUS_EMPTY) {
+        builder_unlock(builder);
+        return 0;
+    }
+    
+    /* Allocate JPEG buffer and copy data for deferred decode */
+    uint8_t* jpeg_copy = (uint8_t*)malloc(jpeg_size);
+    if (!jpeg_copy) {
+        builder_unlock(builder);
+        return 0;
+    }
+    memcpy(jpeg_copy, jpeg_data, jpeg_size);
+    
+    /* Store for parallel decode at finalize time */
+    builder->jpeg_buffers[chunk_index] = jpeg_copy;
+    builder->jpeg_sizes[chunk_index] = jpeg_size;
+    builder->chunk_status[chunk_index] = CHUNK_STATUS_PENDING_DECODE;
+    builder->status.chunks_received++;
+    
+    builder_unlock(builder);
+    return 1;
+}
+
+AODDS_API int32_t aodds_builder_add_chunks_batch(
+    aodds_builder_t* builder,
+    int32_t count,
+    const int32_t* indices,
+    const uint8_t** jpeg_data,
+    const uint32_t* jpeg_sizes
+) {
+    if (!builder || !indices || !jpeg_data || !jpeg_sizes || count <= 0) {
+        return 0;
+    }
+    
+    int32_t added = 0;
+    
+    builder_lock(builder);
+    
+    for (int32_t i = 0; i < count; i++) {
+        int32_t idx = indices[i];
+        
+        /* Validate index */
+        if (idx < 0 || idx >= builder->chunk_count) {
+            continue;
+        }
+        
+        /* Skip if already set */
+        if (builder->chunk_status[idx] != CHUNK_STATUS_EMPTY) {
+            continue;
+        }
+        
+        /* Skip empty data */
+        if (!jpeg_data[i] || jpeg_sizes[i] == 0) {
+            continue;
+        }
+        
+        /* Allocate and copy JPEG for deferred decode */
+        uint8_t* jpeg_copy = (uint8_t*)malloc(jpeg_sizes[i]);
+        if (!jpeg_copy) {
+            continue;
+        }
+        memcpy(jpeg_copy, jpeg_data[i], jpeg_sizes[i]);
+        
+        /* Store for parallel decode at finalize */
+        builder->jpeg_buffers[idx] = jpeg_copy;
+        builder->jpeg_sizes[idx] = jpeg_sizes[i];
+        builder->chunk_status[idx] = CHUNK_STATUS_PENDING_DECODE;
+        builder->status.chunks_received++;
+        added++;
+    }
+    
+    builder_unlock(builder);
+    return added;
+}
+
+AODDS_API int32_t aodds_builder_add_fallback_image(
+    aodds_builder_t* builder,
+    int32_t chunk_index,
+    const uint8_t* rgba_data,
+    int32_t width,
+    int32_t height
+) {
+    if (!builder || !rgba_data) {
+        return 0;
+    }
+    
+    if (chunk_index < 0 || chunk_index >= builder->chunk_count) {
+        return 0;
+    }
+    
+    /* Validate dimensions */
+    if (width != CHUNK_WIDTH || height != CHUNK_HEIGHT) {
+        return 0;
+    }
+    
+    builder_lock(builder);
+    
+    /* Check if already set */
+    if (builder->chunk_status[chunk_index] != CHUNK_STATUS_EMPTY) {
+        builder_unlock(builder);
+        return 0;
+    }
+    
+    /* Allocate and copy image data */
+    uint8_t* data = NULL;
+    if (builder->pool) {
+        data = aodecode_acquire_buffer(builder->pool);
+    }
+    if (!data) {
+        data = (uint8_t*)malloc(CHUNK_BUFFER_SIZE);
+    }
+    
+    if (!data) {
+        builder_unlock(builder);
+        return 0;
+    }
+    
+    memcpy(data, rgba_data, CHUNK_BUFFER_SIZE);
+    
+    builder->chunks[chunk_index].data = data;
+    builder->chunks[chunk_index].width = width;
+    builder->chunks[chunk_index].height = height;
+    builder->chunks[chunk_index].stride = width * 4;
+    builder->chunks[chunk_index].channels = 4;
+    builder->chunks[chunk_index].from_pool = (builder->pool != NULL);
+    
+    builder->chunk_status[chunk_index] = CHUNK_STATUS_FALLBACK;
+    builder->status.chunks_received++;
+    builder->status.chunks_fallback++;
+    
+    builder_unlock(builder);
+    return 1;
+}
+
+AODDS_API void aodds_builder_mark_missing(
+    aodds_builder_t* builder,
+    int32_t chunk_index
+) {
+    if (!builder) {
+        return;
+    }
+    
+    if (chunk_index < 0 || chunk_index >= builder->chunk_count) {
+        return;
+    }
+    
+    builder_lock(builder);
+    
+    /* Only mark if not already set */
+    if (builder->chunk_status[chunk_index] == CHUNK_STATUS_EMPTY) {
+        builder->chunk_status[chunk_index] = CHUNK_STATUS_MISSING;
+        builder->status.chunks_received++;
+        builder->status.chunks_missing++;
+    }
+    
+    builder_unlock(builder);
+}
+
+AODDS_API void aodds_builder_get_status(
+    const aodds_builder_t* builder,
+    aodds_builder_status_t* status
+) {
+    if (!builder || !status) {
+        return;
+    }
+    
+    /* Cast away const for locking (status read is thread-safe) */
+    aodds_builder_t* b = (aodds_builder_t*)builder;
+    builder_lock(b);
+    *status = builder->status;
+    builder_unlock(b);
+}
+
+AODDS_API int32_t aodds_builder_is_complete(const aodds_builder_t* builder) {
+    if (!builder) {
+        return 0;
+    }
+    
+    aodds_builder_t* b = (aodds_builder_t*)builder;
+    builder_lock(b);
+    int32_t complete = (builder->status.chunks_received >= builder->status.chunks_total);
+    builder_unlock(b);
+    return complete;
+}
+
+AODDS_API int32_t aodds_builder_finalize(
+    aodds_builder_t* builder,
+    uint8_t* dds_output,
+    uint32_t output_size,
+    uint32_t* bytes_written
+) {
+    if (!builder || !dds_output || !bytes_written) {
+        return 0;
+    }
+    
+    int32_t chunks_per_side = builder->config.chunks_per_side;
+    int32_t tile_size = chunks_per_side * CHUNK_SIZE;
+    int32_t mipmap_count = aodds_calc_mipmap_count(tile_size, tile_size);
+    
+    uint32_t required_size = aodds_calc_dds_size(tile_size, tile_size, mipmap_count, builder->config.format);
+    if (output_size < required_size) {
+        return 0;
+    }
+    
+    /* Allocate tile image if not already */
+    if (!builder->tile_allocated) {
+        builder->tile_image.width = tile_size;
+        builder->tile_image.height = tile_size;
+        builder->tile_image.stride = tile_size * 4;
+        builder->tile_image.channels = 4;
+        builder->tile_image.data = (uint8_t*)malloc(tile_size * tile_size * 4);
+        if (!builder->tile_image.data) {
+            return 0;
+        }
+        builder->tile_allocated = 1;
+    }
+    
+    /* ═══════════════════════════════════════════════════════════════════════
+     * PARALLEL DECODE: Decode all pending JPEGs at once using OpenMP
+     * This is the key performance optimization - 8 threads decode ~32 chunks each
+     * instead of 256 sequential decodes during add_chunk() calls.
+     * ═══════════════════════════════════════════════════════════════════════ */
+    int32_t pending_count = 0;
+    int32_t decode_success_count = 0;
+    int32_t decode_fail_count = 0;
+    
+    /* Count pending chunks first */
+    for (int32_t i = 0; i < builder->chunk_count; i++) {
+        if (builder->chunk_status[i] == CHUNK_STATUS_PENDING_DECODE) {
+            pending_count++;
+        }
+    }
+    
+    if (pending_count > 0) {
+        /* Parallel decode all pending JPEGs */
+        #pragma omp parallel for schedule(dynamic, 4) reduction(+:decode_success_count, decode_fail_count)
+        for (int32_t i = 0; i < builder->chunk_count; i++) {
+            if (builder->chunk_status[i] == CHUNK_STATUS_PENDING_DECODE) {
+                aodecode_image_t decoded = {0};
+                int32_t success = aodecode_single(
+                    builder->jpeg_buffers[i],
+                    builder->jpeg_sizes[i],
+                    &decoded,
+                    builder->pool  /* Pool is thread-safe */
+                );
+                
+                if (success && decoded.data) {
+                    builder->chunks[i] = decoded;
+                    builder->chunk_status[i] = CHUNK_STATUS_JPEG;
+                    decode_success_count++;
+                } else {
+                    builder->chunk_status[i] = CHUNK_STATUS_MISSING;
+                    decode_fail_count++;
+                }
+                
+                /* Free JPEG buffer after decode - no longer needed */
+                free(builder->jpeg_buffers[i]);
+                builder->jpeg_buffers[i] = NULL;
+                builder->jpeg_sizes[i] = 0;
+            }
+        }
+        
+        /* Update stats after parallel region */
+        builder->status.chunks_decoded += decode_success_count;
+        builder->status.chunks_failed += decode_fail_count;
+        builder->status.chunks_missing += decode_fail_count;
+    }
+    
+    /* Fill missing chunks with color and compose */
+    aodds_fill_missing(builder->chunks, chunks_per_side, &builder->tile_image,
+                       builder->config.missing_r, builder->config.missing_g, builder->config.missing_b);
+    aodds_compose_chunks(builder->chunks, chunks_per_side, &builder->tile_image);
+    
+    /* Write DDS header */
+    int32_t header_written = aodds_write_header(dds_output, tile_size, tile_size, 
+                                                 mipmap_count, builder->config.format);
+    if (header_written != DDS_HEADER_SIZE) {
+        return 0;
+    }
+    
+    uint32_t total_written = DDS_HEADER_SIZE;
+    uint8_t* output_ptr = dds_output + DDS_HEADER_SIZE;
+    
+    /* Block size for compression size calculations */
+    uint32_t block_size = (builder->config.format == DDS_FORMAT_BC1) ? 8 : 16;
+    
+    /* Ensure mipmap buffers are allocated and large enough (persistent in builder) */
+    int32_t mip1_size = (tile_size / 2) * (tile_size / 2) * 4;
+    int32_t mip2_size = (tile_size / 4) * (tile_size / 4) * 4;
+    
+    if (mipmap_count > 1) {
+        if (builder->mip_buf_a_size < (uint32_t)mip1_size) {
+            free(builder->mip_buf_a);
+            builder->mip_buf_a = (uint8_t*)malloc(mip1_size);
+            builder->mip_buf_a_size = builder->mip_buf_a ? mip1_size : 0;
+        }
+    }
+    if (mipmap_count > 2) {
+        if (builder->mip_buf_b_size < (uint32_t)mip2_size) {
+            free(builder->mip_buf_b);
+            builder->mip_buf_b = (uint8_t*)malloc(mip2_size);
+            builder->mip_buf_b_size = builder->mip_buf_b ? mip2_size : 0;
+        }
+    }
+    
+    /* Local pointers for compatibility with existing code flow */
+    uint8_t* mip_buf_a = builder->mip_buf_a;
+    uint8_t* mip_buf_b = builder->mip_buf_b;
+    
+    aodecode_image_t current = builder->tile_image;
+    aodecode_image_t next = {0};
+    int success = 1;
+    int use_buf_a = 1;
+    
+    for (int32_t mip = 0; mip < mipmap_count && success; mip++) {
+        /* Calculate expected compressed size before compression */
+        uint32_t blocks_x = (current.width + 3) / 4;
+        uint32_t blocks_y = (current.height + 3) / 4;
+        uint32_t expected_size = blocks_x * blocks_y * block_size;
+        
+        if (total_written + expected_size > output_size) {
+            success = 0;
+            break;
+        }
+        
+        /* Compress directly to output buffer - no temp buffer needed */
+        uint32_t compressed_size = aodds_compress(&current, builder->config.format, output_ptr);
+        output_ptr += compressed_size;
+        total_written += compressed_size;
+        
+        if (mip < mipmap_count - 1 && current.width > 4) {
+            next.width = current.width / 2;
+            next.height = current.height / 2;
+            next.stride = next.width * 4;
+            next.channels = 4;
+            
+            if (use_buf_a && mip_buf_a) {
+                next.data = mip_buf_a;
+            } else if (!use_buf_a && mip_buf_b) {
+                next.data = mip_buf_b;
+            } else {
+                next.data = (uint8_t*)malloc(next.width * next.height * 4);
+            }
+            
+            if (next.data) {
+                aodds_reduce_half(&current, &next);
+                current = next;
+                memset(&next, 0, sizeof(next));
+                use_buf_a = !use_buf_a;
+            } else {
+                success = 0;
+            }
+        }
+    }
+    
+    /* No cleanup needed - buffers are persistent in builder struct */
+    
+    if (success) {
+        *bytes_written = total_written;
+    }
+    
+    return success;
+}
+
+AODDS_API int32_t aodds_builder_finalize_to_file(
+    aodds_builder_t* builder,
+    const char* output_path,
+    uint32_t* bytes_written
+) {
+    if (!builder || !output_path || !bytes_written) {
+        return 0;
+    }
+    
+    int32_t chunks_per_side = builder->config.chunks_per_side;
+    int32_t tile_size = chunks_per_side * CHUNK_SIZE;
+    int32_t mipmap_count = aodds_calc_mipmap_count(tile_size, tile_size);
+    
+    /* Allocate tile image if not already */
+    if (!builder->tile_allocated) {
+        builder->tile_image.width = tile_size;
+        builder->tile_image.height = tile_size;
+        builder->tile_image.stride = tile_size * 4;
+        builder->tile_image.channels = 4;
+        builder->tile_image.data = (uint8_t*)malloc(tile_size * tile_size * 4);
+        if (!builder->tile_image.data) {
+            return 0;
+        }
+        builder->tile_allocated = 1;
+    }
+    
+    /* ═══════════════════════════════════════════════════════════════════════
+     * PARALLEL DECODE: Decode all pending JPEGs at once using OpenMP
+     * ═══════════════════════════════════════════════════════════════════════ */
+    int32_t pending_count = 0;
+    int32_t decode_success_count = 0;
+    int32_t decode_fail_count = 0;
+    
+    for (int32_t i = 0; i < builder->chunk_count; i++) {
+        if (builder->chunk_status[i] == CHUNK_STATUS_PENDING_DECODE) {
+            pending_count++;
+        }
+    }
+    
+    if (pending_count > 0) {
+        #pragma omp parallel for schedule(dynamic, 4) reduction(+:decode_success_count, decode_fail_count)
+        for (int32_t i = 0; i < builder->chunk_count; i++) {
+            if (builder->chunk_status[i] == CHUNK_STATUS_PENDING_DECODE) {
+                aodecode_image_t decoded = {0};
+                int32_t success = aodecode_single(
+                    builder->jpeg_buffers[i],
+                    builder->jpeg_sizes[i],
+                    &decoded,
+                    builder->pool
+                );
+                
+                if (success && decoded.data) {
+                    builder->chunks[i] = decoded;
+                    builder->chunk_status[i] = CHUNK_STATUS_JPEG;
+                    decode_success_count++;
+                } else {
+                    builder->chunk_status[i] = CHUNK_STATUS_MISSING;
+                    decode_fail_count++;
+                }
+                
+                free(builder->jpeg_buffers[i]);
+                builder->jpeg_buffers[i] = NULL;
+                builder->jpeg_sizes[i] = 0;
+            }
+        }
+        
+        builder->status.chunks_decoded += decode_success_count;
+        builder->status.chunks_failed += decode_fail_count;
+        builder->status.chunks_missing += decode_fail_count;
+    }
+    
+    /* Fill missing chunks with color and compose */
+    aodds_fill_missing(builder->chunks, chunks_per_side, &builder->tile_image,
+                       builder->config.missing_r, builder->config.missing_g, builder->config.missing_b);
+    aodds_compose_chunks(builder->chunks, chunks_per_side, &builder->tile_image);
+    
+    /* Create temp file path */
+    char temp_path[4096];
+    snprintf(temp_path, sizeof(temp_path), "%s.tmp", output_path);
+    
+    /* Open temp file */
+    FILE* fp = fopen(temp_path, "wb");
+    if (!fp) {
+        return 0;
+    }
+    
+    /* Write DDS header */
+    uint8_t header[DDS_HEADER_SIZE];
+    aodds_write_header(header, tile_size, tile_size, mipmap_count, builder->config.format);
+    
+    if (fwrite(header, 1, DDS_HEADER_SIZE, fp) != DDS_HEADER_SIZE) {
+        fclose(fp);
+        remove(temp_path);
+        return 0;
+    }
+    
+    uint32_t total_written = DDS_HEADER_SIZE;
+    
+    /* Block size for compression size calculations */
+    uint32_t block_size = (builder->config.format == DDS_FORMAT_BC1) ? 8 : 16;
+    uint32_t max_blocks_x = (tile_size + 3) / 4;
+    uint32_t max_blocks_y = (tile_size + 3) / 4;
+    uint32_t max_compressed_size = max_blocks_x * max_blocks_y * block_size;
+    
+    /* Ensure compression buffer is allocated and large enough (still needed for file writes) */
+    if (builder->compress_buffer_size < max_compressed_size) {
+        free(builder->compress_buffer);
+        builder->compress_buffer = (uint8_t*)malloc(max_compressed_size);
+        builder->compress_buffer_size = builder->compress_buffer ? max_compressed_size : 0;
+    }
+    
+    if (!builder->compress_buffer) {
+        fclose(fp);
+        remove(temp_path);
+        return 0;
+    }
+    
+    uint8_t* compress_buffer = builder->compress_buffer;
+    
+    /* Ensure mipmap buffers are allocated and large enough (persistent in builder) */
+    int32_t mip1_size = (tile_size / 2) * (tile_size / 2) * 4;
+    int32_t mip2_size = (tile_size / 4) * (tile_size / 4) * 4;
+    
+    if (mipmap_count > 1) {
+        if (builder->mip_buf_a_size < (uint32_t)mip1_size) {
+            free(builder->mip_buf_a);
+            builder->mip_buf_a = (uint8_t*)malloc(mip1_size);
+            builder->mip_buf_a_size = builder->mip_buf_a ? mip1_size : 0;
+        }
+    }
+    if (mipmap_count > 2) {
+        if (builder->mip_buf_b_size < (uint32_t)mip2_size) {
+            free(builder->mip_buf_b);
+            builder->mip_buf_b = (uint8_t*)malloc(mip2_size);
+            builder->mip_buf_b_size = builder->mip_buf_b ? mip2_size : 0;
+        }
+    }
+    
+    /* Local pointers for compatibility with existing code flow */
+    uint8_t* mip_buf_a = builder->mip_buf_a;
+    uint8_t* mip_buf_b = builder->mip_buf_b;
+    
+    aodecode_image_t current = builder->tile_image;
+    aodecode_image_t next = {0};
+    int success = 1;
+    int use_buf_a = 1;
+    
+    for (int32_t mip = 0; mip < mipmap_count && success; mip++) {
+        uint32_t compressed_size = aodds_compress(&current, builder->config.format, compress_buffer);
+        
+        if (fwrite(compress_buffer, 1, compressed_size, fp) != compressed_size) {
+            success = 0;
+            break;
+        }
+        total_written += compressed_size;
+        
+        if (mip < mipmap_count - 1 && current.width > 4) {
+            next.width = current.width / 2;
+            next.height = current.height / 2;
+            next.stride = next.width * 4;
+            next.channels = 4;
+            
+            if (use_buf_a && mip_buf_a) {
+                next.data = mip_buf_a;
+            } else if (!use_buf_a && mip_buf_b) {
+                next.data = mip_buf_b;
+            } else {
+                next.data = (uint8_t*)malloc(next.width * next.height * 4);
+            }
+            
+            if (next.data) {
+                aodds_reduce_half(&current, &next);
+                current = next;
+                memset(&next, 0, sizeof(next));
+                use_buf_a = !use_buf_a;
+            } else {
+                success = 0;
+            }
+        }
+    }
+    
+    /* No cleanup needed - buffers are persistent in builder struct */
+    fclose(fp);
+    
+    if (!success) {
+        remove(temp_path);
+        return 0;
+    }
+    
+    /* Atomic rename */
+#ifdef AOPIPELINE_WINDOWS
+    remove(output_path);
+#endif
+    if (rename(temp_path, output_path) != 0) {
+        remove(temp_path);
+        return 0;
+    }
+    
+    *bytes_written = total_written;
+    return 1;
+}
+
 AODDS_API const char* aodds_version(void) {
     aodds_init_ispc();
     

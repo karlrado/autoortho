@@ -16,9 +16,9 @@ LD          := gcc
 
 CFLAGS      := -O3 -Wall -fPIC -fvisibility=hidden -fdiagnostics-color \
                -I../aoimage \
-               -fopenmp
+               -fopenmp -pthread
 
-LDFLAGS     := -shared -rdynamic -fopenmp
+LDFLAGS     := -shared -rdynamic -fopenmp -pthread
 
 # Source files (no HTTP - uses Python requests instead)
 SOURCES     := aocache.c aodecode.c aodds.c aobundle.c aopipeline.c
