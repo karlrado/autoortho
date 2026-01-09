@@ -286,6 +286,7 @@ def get_pipeline_mode() -> str:
     elif config_mode == PIPELINE_MODE_NATIVE:
         if native_available:
             selected = PIPELINE_MODE_NATIVE
+            log.info(f"Pipeline mode: native (explicitly configured)")
         else:
             selected = PIPELINE_MODE_PYTHON
             log.warning(f"Pipeline mode 'native' requested but unavailable, using 'python'")
@@ -293,6 +294,7 @@ def get_pipeline_mode() -> str:
     elif config_mode == PIPELINE_MODE_HYBRID:
         if hybrid_available:
             selected = PIPELINE_MODE_HYBRID
+            log.info(f"Pipeline mode: hybrid (explicitly configured)")
         elif native_available:
             selected = PIPELINE_MODE_NATIVE
             log.warning(f"Pipeline mode 'hybrid' requested but unavailable, using 'native'")
@@ -316,9 +318,17 @@ def get_pipeline_mode() -> str:
     return _pipeline_mode
 
 
-# Global buffer pool for zero-copy DDS building
+# Global buffer pool for zero-copy DDS building (live tiles)
 _dds_buffer_pool = None
 _dds_buffer_pool_initialized = False
+
+# Separate buffer pool for prefetch tiles (avoids contention with live tiles)
+_prefetch_buffer_pool = None
+_prefetch_buffer_pool_initialized = False
+
+# Tile queue manager for bank-queue style processing
+_tile_queue_manager = None
+_tile_queue_initialized = False
 
 
 def reset_dds_buffer_pool():
@@ -332,12 +342,25 @@ def reset_dds_buffer_pool():
     The pool will be lazily recreated with the new settings on next use.
     """
     global _dds_buffer_pool, _dds_buffer_pool_initialized
+    global _prefetch_buffer_pool, _prefetch_buffer_pool_initialized
+    global _tile_queue_manager, _tile_queue_initialized
     
     if _dds_buffer_pool is not None:
         log.info("Resetting DDS buffer pool (zoom settings changed)")
     
     _dds_buffer_pool = None
     _dds_buffer_pool_initialized = False
+    _prefetch_buffer_pool = None
+    _prefetch_buffer_pool_initialized = False
+    
+    # Shutdown tile queue if it was initialized
+    if _tile_queue_manager is not None:
+        try:
+            _tile_queue_manager.shutdown()
+        except Exception as e:
+            log.debug(f"Error shutting down tile queue: {e}")
+    _tile_queue_manager = None
+    _tile_queue_initialized = False
 
 
 def _calc_required_buffer_size():
@@ -472,7 +495,7 @@ def _get_dds_buffer_pool():
                 pool_size = 4
             
             # Clamp to valid range (2-8)
-            pool_size = max(2, min(8, pool_size))
+            pool_size = max(2, min(64, pool_size))
             
             # Calculate buffer size based on configuration
             buffer_size, size_name = _calc_required_buffer_size()
@@ -492,6 +515,81 @@ def _get_dds_buffer_pool():
         log.debug(f"DDS buffer pool init failed: {e}")
     
     return _dds_buffer_pool
+
+
+def _get_prefetch_buffer_pool():
+    """
+    Get or create the prefetch buffer pool.
+    
+    This is a SEPARATE pool from the main DDS buffer pool, ensuring that
+    prefetch (background) work doesn't compete with live tile requests.
+    
+    Pool size is configured via CFG.autoortho.prefetch_buffer_pool_size (1-4).
+    
+    Returns:
+        DDSBufferPool instance, or None if unavailable/disabled
+    """
+    global _prefetch_buffer_pool, _prefetch_buffer_pool_initialized
+    if _prefetch_buffer_pool_initialized:
+        return _prefetch_buffer_pool
+    _prefetch_buffer_pool_initialized = True
+    
+    # Only create pool for native/hybrid modes
+    mode = get_pipeline_mode()
+    if mode == PIPELINE_MODE_PYTHON:
+        log.debug("Prefetch buffer pool not needed for python pipeline mode")
+        return None
+    
+    try:
+        native = _get_native_dds()
+        if native is not None and hasattr(native, 'DDSBufferPool'):
+            # Get pool size from config with validation
+            try:
+                pool_size = int(getattr(CFG.autoortho, 'prefetch_buffer_pool_size', 2))
+            except (ValueError, TypeError):
+                pool_size = 2
+            
+            # Clamp to valid range (1-4)
+            pool_size = max(1, min(4, pool_size))
+            
+            # Use same buffer size as main pool
+            buffer_size, size_name = _calc_required_buffer_size()
+            if buffer_size is None:
+                log.debug("Could not determine buffer size, using default 4K")
+                buffer_size = native.DDSBufferPool.SIZE_4096x4096_BC1
+                size_name = "4K (default)"
+            
+            _prefetch_buffer_pool = native.DDSBufferPool(
+                buffer_size=buffer_size,
+                pool_size=pool_size
+            )
+            
+            total_mb = (pool_size * buffer_size) / (1024 * 1024)
+            log.info(f"Prefetch buffer pool: {pool_size} × {size_name} buffers ({buffer_size/1024/1024:.1f}MB each) = {total_mb:.1f}MB total")
+    except Exception as e:
+        log.debug(f"Prefetch buffer pool init failed: {e}")
+    
+    return _prefetch_buffer_pool
+
+
+def _is_tile_queue_enabled() -> bool:
+    """Check if tile queue system is enabled in config."""
+    try:
+        enabled = getattr(CFG.autoortho, 'tile_queue_enabled', True)
+        if isinstance(enabled, str):
+            return enabled.lower() in ('true', '1', 'yes', 'on')
+        return bool(enabled)
+    except Exception:
+        return True  # Default to enabled
+
+
+def _get_tile_queue_max_size() -> int:
+    """Get the max queue size from config."""
+    try:
+        max_size = int(getattr(CFG.autoortho, 'tile_queue_max_size', 100))
+        return max(10, min(500, max_size))
+    except Exception:
+        return 100
 
 
 def _build_dds_hybrid(chunks: list, dxt_format: str,
@@ -3675,13 +3773,33 @@ class BackgroundDDSBuilder:
                 # ═══════════════════════════════════════════════════════════════
                 # NATIVE BUFFER POOL PATH (Phase 3 fallback)
                 # ═══════════════════════════════════════════════════════════════
-                # Uses pre-allocated buffer pool to avoid per-call allocation
+                # Uses PREFETCH buffer pool (separate from live pool) to avoid
+                # prefetch work competing with live tile requests.
+                # When tile queue is enabled, waits for a buffer (bank-queue style).
                 # ═══════════════════════════════════════════════════════════════
-                pool = _get_dds_buffer_pool()
+                pool = _get_prefetch_buffer_pool()
                 if pool is not None and hasattr(native_dds, 'build_tile_to_buffer'):
-                    acquired = pool.try_acquire()
-                    if acquired:
-                        buffer, buffer_id = acquired
+                    if _is_tile_queue_enabled():
+                        # BLOCKING ACQUIRE: Wait for buffer (separate prefetch queue)
+                        wait_start = time.monotonic()
+                        try:
+                            buffer, buffer_id = pool.acquire(timeout=60.0)  # Longer timeout for prefetch
+                            wait_time_ms = (time.monotonic() - wait_start) * 1000
+                            if wait_time_ms > 10:
+                                bump('prefetch_queue_wait_count')
+                        except TimeoutError:
+                            log.debug(f"BackgroundDDSBuilder: Prefetch queue timeout for {tile_id}")
+                            bump('prefetch_queue_timeout')
+                            pool = None  # Fall through to legacy path
+                    else:
+                        # NON-BLOCKING ACQUIRE: Original behavior
+                        acquired = pool.try_acquire()
+                        if not acquired:
+                            pool = None  # Fall through to legacy path
+                        else:
+                            buffer, buffer_id = acquired
+                
+                if pool is not None:
                         try:
                             result = native_dds.build_tile_to_buffer(
                                 buffer,
@@ -4524,6 +4642,11 @@ class Tile(object):
         self.bytes_read = 0
         self.lowest_offset = 99999999
         
+        # Track if tile was pre-populated by aopipeline (all mipmaps built at once)
+        # When True, the "bytes_read" warning is not applicable because X-Plane
+        # may only need small mipmaps even though we populated everything
+        self._prepopulated = False
+        
         # Track when this tile was first requested for accurate tile creation time stats
         self.first_request_time = None
         # Track if tile completion has been reported (to avoid double-counting)
@@ -4555,6 +4678,13 @@ class Tile(object):
         self._is_live = False                           # True when X-Plane requests via FUSE
         self._live_transition_event = None              # Event to signal transition
         self._active_streaming_builder = None           # Reference for transition coordination
+        
+        # === BATCH-TO-STREAMING DATA REUSE ===
+        # When batch aopipeline collects data but fails (ratio below threshold),
+        # store the collected data for streaming builder to reuse
+        self._last_collected_jpegs = None               # List of JPEG bytes (None for missing)
+        self._last_collected_ratio = None               # Ratio of available chunks
+        self._last_collected_missing = None             # List of missing chunk indices
 
         #self.tile_condition = threading.Condition()
         if min_zoom:
@@ -4662,27 +4792,28 @@ class Tile(object):
 
     def _collect_chunk_jpegs(self, zoom: int, time_budget=None,
                               min_available_ratio: float = 0.9,
-                              max_download_wait: float = 2.0):
+                              return_partial: bool = False):
         """
         Collect JPEG data from chunks for aopipeline build.
         
         This method efficiently gathers JPEG data from chunks using a two-phase approach:
         1. INSTANT: Check already-ready chunks (in memory or disk cache)
-        2. BUDGET-LIMITED: Quick-download missing chunks if time allows
+        2. BUDGET-LIMITED: Download missing chunks using FULL remaining time_budget
         
         This is the data gathering phase for aopipeline integration. It separates
         the I/O concern from the build concern for cleaner architecture.
         
         Args:
             zoom: Zoom level to collect chunks for
-            time_budget: Optional TimeBudget for download phase
+            time_budget: TimeBudget for download phase - uses FULL remaining time
             min_available_ratio: Minimum ratio of chunks needed (0.0-1.0)
                                  Default 0.9 = 90% chunks required
-            max_download_wait: Maximum seconds to wait for downloads (caps budget)
+            return_partial: If True, always return collected data even if below threshold
+                           If False (default), return None when threshold not met
         
         Returns:
-            List of JPEG bytes (None for missing chunks) if ratio met
-            None if insufficient chunks available
+            List of JPEG bytes (None for missing chunks) if ratio met or return_partial=True
+            None if insufficient chunks available and return_partial=False
         
         Thread Safety:
             - Chunk.data access uses GIL-protected reference copy
@@ -4706,9 +4837,11 @@ class Tile(object):
         # ═══════════════════════════════════════════════════════════════════════
         # Check chunks that are either:
         # - Already in memory (prefetched or previously downloaded)
-        # - In disk cache (check and load if found)
+        # - In disk cache (use BATCH reading for ~50x faster I/O)
         # This phase has zero network latency.
         
+        # First pass: collect chunks already in memory
+        need_cache_read_indices = []
         for i, chunk in enumerate(chunks):
             # TOCTOU safety: capture reference atomically (GIL protects this)
             chunk_data = chunk.data
@@ -4718,13 +4851,38 @@ class Tile(object):
                 jpeg_datas[i] = chunk_data
                 available_count += 1
             elif not chunk.ready.is_set():
-                # Not ready - try disk cache
-                if chunk.get_cache():
-                    # get_cache() sets chunk.data and chunk.ready if found
-                    chunk_data = chunk.data
-                    if chunk_data:
-                        jpeg_datas[i] = chunk_data
+                # Not ready - need to check disk cache
+                need_cache_read_indices.append(i)
+        
+        # BATCH CACHE READ: Read all missing chunks in parallel using native code
+        # This is ~50x faster than individual get_cache() calls (1 batch vs 256 syscalls)
+        if need_cache_read_indices:
+            cache_paths = [chunks[i].cache_path for i in need_cache_read_indices]
+            cached_data = _batch_read_cache_files(cache_paths)
+            
+            if cached_data:
+                # Apply batch-read data to chunks
+                for i in need_cache_read_indices:
+                    chunk = chunks[i]
+                    if chunk.cache_path in cached_data:
+                        data = cached_data[chunk.cache_path]
+                        # Update chunk state (same as get_cache() would do)
+                        chunk.set_cached_data(data)
+                        jpeg_datas[i] = data
                         available_count += 1
+                        bump('chunk_hit')
+                
+                log.debug(f"_collect_chunk_jpegs: Batch cache read - "
+                         f"{len(cached_data)}/{len(cache_paths)} hits")
+            else:
+                # Batch read failed or unavailable - fall back to individual reads
+                for i in need_cache_read_indices:
+                    chunk = chunks[i]
+                    if chunk.get_cache():
+                        chunk_data = chunk.data
+                        if chunk_data:
+                            jpeg_datas[i] = chunk_data
+                            available_count += 1
         
         # Check if we already have enough from instant phase
         ratio = available_count / total_chunks
@@ -4737,19 +4895,23 @@ class Tile(object):
                   f"chunks ({ratio*100:.0f}%), need {min_available_ratio*100:.0f}%")
         
         # ═══════════════════════════════════════════════════════════════════════
-        # PHASE 2: Quick parallel download of missing chunks (BUDGET-LIMITED)
+        # PHASE 2: Download missing chunks using FULL remaining budget
         # ═══════════════════════════════════════════════════════════════════════
-        # For chunks not in cache, submit download requests and wait briefly.
-        # This phase is limited by time_budget to avoid blocking FUSE too long.
+        # For chunks not in cache, submit download requests and wait.
+        # Uses the FULL remaining time_budget to maximize chunk collection.
+        # This ensures batch aopipeline gets maximum opportunity to reach threshold.
         
-        # Determine download wait time
+        # Determine download wait time - use FULL remaining budget
         if time_budget and not time_budget.exhausted:
-            wait_time = min(time_budget.remaining, max_download_wait)
+            wait_time = time_budget.remaining
         else:
-            wait_time = max_download_wait
+            # No budget - use a reasonable default
+            wait_time = 5.0
         
         if wait_time <= 0:
             log.debug(f"_collect_chunk_jpegs: No time for Phase 2 downloads")
+            if return_partial:
+                return jpeg_datas  # Return what we have
             return None
         
         # Find missing chunk indices
@@ -4802,12 +4964,23 @@ class Tile(object):
                       f"{available_count}/{total_chunks} ({ratio*100:.0f}%)")
             return jpeg_datas
         
-        log.debug(f"_collect_chunk_jpegs: Insufficient chunks - "
+        log.debug(f"_collect_chunk_jpegs: Threshold not met - "
                   f"{available_count}/{total_chunks} ({ratio*100:.0f}%), "
                   f"below {min_available_ratio*100:.0f}% threshold")
+        
+        # Store collected data for potential reuse by streaming builder
+        # Even though ratio is below threshold, this data is still valuable
+        self._last_collected_jpegs = jpeg_datas
+        self._last_collected_ratio = ratio
+        self._last_collected_missing = [i for i, d in enumerate(jpeg_datas) if d is None]
+        
+        # If return_partial requested, return what we collected (for build-as-is mode)
+        if return_partial:
+            return jpeg_datas
+        
         return None
 
-    def _try_aopipeline_build(self, time_budget=None) -> bool:
+    def _try_aopipeline_build(self, time_budget=None, force_build_partial: bool = False) -> bool:
         """
         Attempt to build entire DDS using optimized aopipeline.
         
@@ -4816,14 +4989,24 @@ class Tile(object):
         the progressive pydds path.
         
         Strategy:
-        1. Collect JPEG data from already-ready chunks + quick downloads
-        2. If ≥90% chunks available, build with aopipeline using buffer pool
+        1. Collect JPEG data using FULL remaining time_budget
+        2. If threshold met OR force_build_partial=True: build with aopipeline
         3. Populate all mipmap buffers from result
-        4. Return True on success, False to trigger progressive fallback
+        4. Return True on success, False to trigger streaming/fallback path
+        
+        Flow when fallbacks are disabled:
+        - Collects chunks for full tile_time_budget
+        - Builds with whatever is collected (fills missing with missing_color)
+        - No handoff to streaming pipeline
+        
+        Flow when fallbacks are enabled:
+        - Collects chunks for full tile_time_budget
+        - If threshold met: builds directly
+        - If threshold not met: returns False, streaming pipeline handles fallbacks
         
         Performance:
         - Success path: ~55-65ms (vs ~331ms for progressive)
-        - Failure path: ~0-2ms overhead, then progressive path runs
+        - Failure path: ~0-2ms overhead, then streaming path runs
         
         Thread Safety:
         - Caller should hold tile lock (or ensure single-threaded access)
@@ -4831,11 +5014,13 @@ class Tile(object):
         - Native build releases GIL during C execution
         
         Args:
-            time_budget: Optional TimeBudget to limit download wait time
+            time_budget: TimeBudget - uses FULL remaining time for chunk collection
+            force_build_partial: If True, build with whatever chunks are available
+                                even if below threshold (for fallbacks-disabled mode)
         
         Returns:
             True if aopipeline build succeeded (all mipmaps populated)
-            False if should fall back to progressive path
+            False if should fall back to streaming/progressive path
         """
         build_start = time.monotonic()
         
@@ -4866,33 +5051,64 @@ class Tile(object):
             return False
         
         # ═══════════════════════════════════════════════════════════════════════
-        # STEP 1: Collect JPEG data from chunks
+        # STEP 1: Collect JPEG data from chunks using FULL remaining budget
         # ═══════════════════════════════════════════════════════════════════════
-        # Get config for minimum chunk ratio
+        # Uses the entire remaining time_budget to maximize chunk collection.
+        # If force_build_partial is True, we'll build with whatever we get.
         min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 0.9))
-        max_wait = float(getattr(CFG.autoortho, 'live_aopipeline_max_download_wait', 2.0))
         
         jpeg_datas = self._collect_chunk_jpegs(
             self.max_zoom,
             time_budget=time_budget,
             min_available_ratio=min_ratio,
-            max_download_wait=max_wait
+            return_partial=force_build_partial  # Return data even if below threshold
         )
         
         if jpeg_datas is None:
-            log.debug(f"_try_aopipeline_build: Insufficient chunks for {self.id}")
+            # Threshold not met and not forcing partial build
+            log.debug(f"_try_aopipeline_build: Threshold not met for {self.id}, "
+                      f"deferring to streaming pipeline for fallbacks")
             return False
         
         # ═══════════════════════════════════════════════════════════════════════
-        # STEP 2: Acquire buffer from pool (non-blocking)
+        # STEP 2: Acquire buffer from pool
         # ═══════════════════════════════════════════════════════════════════════
-        acquired = pool.try_acquire()
-        if not acquired:
-            log.debug(f"_try_aopipeline_build: Buffer pool exhausted for {self.id}")
-            bump('live_aopipeline_pool_exhausted')
-            return False
-        
-        buffer, buffer_id = acquired
+        # When tile queue is enabled, wait for a buffer (bank-queue style).
+        # This prevents fallback to the slower Python pipeline by waiting for
+        # a pool slot to free up. When disabled, use non-blocking acquire.
+        # ═══════════════════════════════════════════════════════════════════════
+        if _is_tile_queue_enabled():
+            # BLOCKING ACQUIRE: Wait for a buffer slot (bank-queue style)
+            # Tiles naturally queue up waiting for buffers
+            wait_start = time.monotonic()
+            try:
+                # Get timeout from remaining time budget or use default
+                if time_budget is not None and hasattr(time_budget, 'remaining'):
+                    acquire_timeout = max(1.0, time_budget.remaining)
+                else:
+                    acquire_timeout = 30.0  # Default 30s timeout
+                
+                buffer, buffer_id = pool.acquire(timeout=acquire_timeout)
+                
+                # Track queue wait time
+                wait_time_ms = (time.monotonic() - wait_start) * 1000
+                if wait_time_ms > 10:  # Only track significant waits
+                    bump('live_queue_wait_count')
+                    log.debug(f"_try_aopipeline_build: Waited {wait_time_ms:.0f}ms for buffer for {self.id}")
+                
+            except TimeoutError:
+                wait_time_ms = (time.monotonic() - wait_start) * 1000
+                log.debug(f"_try_aopipeline_build: Queue timeout after {wait_time_ms:.0f}ms for {self.id}")
+                bump('live_queue_timeout')
+                return False
+        else:
+            # NON-BLOCKING ACQUIRE: Original behavior (falls back to Python on exhaustion)
+            acquired = pool.try_acquire()
+            if not acquired:
+                log.debug(f"_try_aopipeline_build: Buffer pool exhausted for {self.id}")
+                bump('live_aopipeline_pool_exhausted')
+                return False
+            buffer, buffer_id = acquired
         build_success = False
         
         try:
@@ -5024,18 +5240,52 @@ class Tile(object):
         # Set available mipmap images for scaling fallback
         resolver.set_mipmap_images(self.imgs)
         
+        # ═══════════════════════════════════════════════════════════════════════
+        # OPTIMIZATION: Reuse data collected by batch aopipeline
+        # ═══════════════════════════════════════════════════════════════════════
+        # Check for pre-collected data BEFORE acquiring builder so we can set nocopy_mode
+        pre_collected = getattr(self, '_last_collected_jpegs', None)
+        pre_collected_missing = getattr(self, '_last_collected_missing', None)
+        use_precollected = (pre_collected is not None and pre_collected_missing is not None)
+        
         # Acquire streaming builder from pool
+        # Enable nocopy_mode when using pre-collected data for zero-copy optimization
         config = {
             'chunks_per_side': self.chunks_per_row,
             'format': dxt_format,
-            'missing_color': missing_color
+            'missing_color': missing_color,
+            'nocopy_mode': use_precollected,  # Zero-copy when we hold JPEG refs
         }
         
-        builder = builder_pool.acquire(config=config, timeout=0.1)
-        if not builder:
-            log.debug(f"_try_streaming_aopipeline_build: Builder pool exhausted")
-            bump('streaming_builder_pool_exhausted')
-            return False
+        # When tile queue is enabled, wait for builder (bank-queue style)
+        if _is_tile_queue_enabled():
+            # Use remaining time budget as timeout, or default
+            if time_budget is not None and hasattr(time_budget, 'remaining'):
+                builder_timeout = max(1.0, time_budget.remaining)
+            else:
+                builder_timeout = 30.0
+            
+            wait_start = time.monotonic()
+            builder = builder_pool.acquire(config=config, timeout=builder_timeout)
+            if not builder:
+                wait_time_ms = (time.monotonic() - wait_start) * 1000
+                log.debug(f"_try_streaming_aopipeline_build: Builder pool timeout after {wait_time_ms:.0f}ms")
+                bump('streaming_builder_queue_timeout')
+                return False
+            
+            wait_time_ms = (time.monotonic() - wait_start) * 1000
+            if wait_time_ms > 10:
+                bump('streaming_builder_queue_wait_count')
+        else:
+            # Non-blocking acquire (original behavior)
+            builder = builder_pool.acquire(config=config, timeout=0.1)
+            if not builder:
+                log.debug(f"_try_streaming_aopipeline_build: Builder pool exhausted")
+                bump('streaming_builder_pool_exhausted')
+                return False
+        
+        # Keep references alive for zero-copy mode (cleared after finalize)
+        jpeg_refs_for_nocopy = []
         
         try:
             # Ensure chunks are created for target zoom
@@ -5046,53 +5296,83 @@ class Tile(object):
                 log.debug(f"_try_streaming_aopipeline_build: No chunks for {self.id}")
                 return False
             
-            # Track pending chunks for download
-            pending_fallbacks = []
-            max_wait = float(getattr(CFG.autoortho, 'live_aopipeline_max_download_wait', 2.0))
+            # Streaming builder now uses time_budget for download waits (not deprecated max_download_wait)
+            # Default to 5s if no budget provided
+            if time_budget and not time_budget.exhausted:
+                max_wait = time_budget.remaining
+            else:
+                max_wait = 5.0
             
-            # Phase 1: Collect and batch-add ready chunks
-            ready_chunks = []
-            for i, chunk in enumerate(chunks):
-                if chunk.ready.is_set() and chunk.data:
-                    ready_chunks.append((i, chunk.data))
-                else:
-                    # Queue for download if not already
-                    if not chunk.in_queue and not chunk.in_flight:
-                        chunk.priority = 0  # High priority for live
-                        chunk_getter.submit(chunk)
-                    pending_fallbacks.append((i, chunk))
-            
-            # Batch add all ready chunks in single C call
-            if ready_chunks:
-                builder.add_chunks_batch(ready_chunks)
-            
-            # Phase 2: Wait for downloads with budget, resolve fallbacks
-            iteration = 0
-            max_iterations = 50  # Safety limit
-            
-            while pending_fallbacks and iteration < max_iterations:
-                iteration += 1
-                remaining = list(pending_fallbacks)
-                pending_fallbacks.clear()
+            if use_precollected:
+                # Use pre-collected data from batch attempt
+                log.debug(f"_try_streaming_aopipeline_build: Reusing {len(pre_collected) - len(pre_collected_missing)} "
+                          f"chunks from batch collection (missing: {len(pre_collected_missing)})")
                 
-                for i, chunk in remaining:
-                    # Check time budget
+                # ZERO-COPY: Batch add all ready chunks using nocopy mode
+                # C stores pointers directly, we keep references in jpeg_refs_for_nocopy
+                ready_chunks = [(i, data) for i, data in enumerate(pre_collected) if data is not None]
+                if ready_chunks:
+                    builder.add_chunks_batch_nocopy(ready_chunks, jpeg_refs_for_nocopy)
+                
+                # Use pre-computed missing indices
+                pending_indices = list(pre_collected_missing)
+                
+                # Clear the cached data (used once)
+                self._last_collected_jpegs = None
+                self._last_collected_missing = None
+                self._last_collected_ratio = None
+            else:
+                # No pre-collected data - collect from scratch
+                pending_indices = []
+                ready_chunks = []
+                for i, chunk in enumerate(chunks):
+                    if chunk.ready.is_set() and chunk.data:
+                        ready_chunks.append((i, chunk.data))
+                    else:
+                        # Queue for download if not already
+                        if not chunk.in_queue and not chunk.in_flight:
+                            chunk.priority = 0  # High priority for live
+                            chunk_getter.submit(chunk)
+                        pending_indices.append(i)
+                
+                # Batch add all ready chunks in single C call
+                if ready_chunks:
+                    builder.add_chunks_batch(ready_chunks)
+            
+            # Phase 2: Wait for pending downloads, then collect results
+            # Single wait with reasonable timeout - much more efficient than iterating
+            if pending_indices:
+                # Wait for all pending chunks with a single timeout
+                wait_deadline = time.monotonic() + max_wait
+                for i in pending_indices:
+                    remaining_wait = max(0.01, wait_deadline - time.monotonic())
+                    chunks[i].ready.wait(timeout=remaining_wait)
                     if time_budget and time_budget.exhausted:
-                        # Mark remaining as missing
-                        builder.mark_missing(i)
-                        continue
-                    
-                    # Wait briefly for chunk
-                    wait_time = min(0.05, max_wait / len(remaining)) if remaining else 0.05
-                    if chunk.ready.wait(timeout=wait_time):
-                        if chunk.data:
-                            if builder.add_chunk(i, chunk.data):
-                                continue
-                            # Decode failed, try fallback
-                    
-                    # Chunk failed or timed out - try fallbacks
-                    chunk_col = self.col + (i % self.chunks_per_row)
-                    chunk_row = self.row + (i // self.chunks_per_row)
+                        break  # Budget exhausted, stop waiting
+            
+            # Phase 3: Process all pending chunks - batch add successful, collect failures
+            newly_ready = []
+            failed_indices = []
+            for i in pending_indices:
+                chunk = chunks[i]
+                if chunk.ready.is_set() and chunk.data:
+                    newly_ready.append((i, chunk.data))
+                else:
+                    failed_indices.append(i)
+            
+            # Batch add newly-ready chunks
+            if newly_ready:
+                builder.add_chunks_batch(newly_ready)
+            
+            # Phase 4: Resolve fallbacks for failed chunks
+            # Use ThreadPoolExecutor for parallel disk I/O and image operations
+            if failed_indices and not (time_budget and time_budget.exhausted):
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                
+                def resolve_fallback(idx):
+                    """Resolve fallback for a single chunk - can run in parallel."""
+                    chunk_col = self.col + (idx % self.chunks_per_row)
+                    chunk_row = self.row + (idx // self.chunks_per_row)
                     
                     # Create fallback time budget if main budget provided
                     fb_budget = None
@@ -5101,35 +5381,55 @@ class Tile(object):
                         if fb_remaining > 0:
                             fb_budget = FBTimeBudget(fb_remaining)
                     
-                    fallback_rgba = resolver.resolve(
+                    rgba = resolver.resolve(
                         chunk_col, chunk_row, self.max_zoom,
                         target_mipmap=0,
                         time_budget=fb_budget
                     )
-                    
-                    if fallback_rgba:
-                        builder.add_fallback_image(i, fallback_rgba)
-                    elif time_budget and time_budget.exhausted:
-                        builder.mark_missing(i)
-                    elif chunk.ready.is_set():
-                        # Chunk finished but no data and no fallback
-                        builder.mark_missing(i)
-                    else:
-                        # Still downloading, try again
-                        pending_fallbacks.append((i, chunk))
+                    return idx, rgba
                 
-                # Check if we've exceeded total wait time
-                elapsed = time.monotonic() - build_start
-                if elapsed > max_wait:
-                    # Mark remaining as missing
-                    for i, chunk in pending_fallbacks:
+                # Limit parallelism to avoid overwhelming disk I/O
+                max_workers = min(8, len(failed_indices))
+                fallback_results = []
+                
+                try:
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = {executor.submit(resolve_fallback, i): i for i in failed_indices}
+                        
+                        # Collect results with timeout
+                        deadline = time.monotonic() + max(1.0, max_wait)
+                        for future in as_completed(futures, timeout=max(0.1, deadline - time.monotonic())):
+                            try:
+                                idx, rgba = future.result(timeout=0.1)
+                                fallback_results.append((idx, rgba))
+                            except Exception:
+                                # Fallback failed, will be marked missing
+                                idx = futures[future]
+                                fallback_results.append((idx, None))
+                            
+                            if time_budget and time_budget.exhausted:
+                                break
+                except Exception:
+                    # Timeout or other error - mark remaining as missing
+                    pass
+                
+                # Apply fallback results to builder
+                resolved_indices = set()
+                for idx, rgba in fallback_results:
+                    resolved_indices.add(idx)
+                    if rgba:
+                        builder.add_fallback_image(idx, rgba)
+                    else:
+                        builder.mark_missing(idx)
+                
+                # Mark unresolved chunks as missing
+                for i in failed_indices:
+                    if i not in resolved_indices:
                         builder.mark_missing(i)
-                    pending_fallbacks.clear()
-                    break
-            
-            # Mark any remaining as missing
-            for i, chunk in pending_fallbacks:
-                builder.mark_missing(i)
+            elif failed_indices:
+                # Budget exhausted - mark all failed as missing
+                for i in failed_indices:
+                    builder.mark_missing(i)
             
             # Finalize: acquire DDS buffer and build
             pool = _get_dds_buffer_pool()
@@ -5137,13 +5437,33 @@ class Tile(object):
                 log.debug(f"_try_streaming_aopipeline_build: DDS buffer pool not available")
                 return False
             
-            acquired = pool.try_acquire()
-            if not acquired:
-                log.debug(f"_try_streaming_aopipeline_build: DDS buffer pool exhausted")
-                bump('streaming_dds_pool_exhausted')
-                return False
-            
-            buffer, buffer_id = acquired
+            # When tile queue is enabled, wait for buffer (bank-queue style)
+            if _is_tile_queue_enabled():
+                wait_start = time.monotonic()
+                try:
+                    # Use remaining time budget as timeout
+                    if time_budget is not None and hasattr(time_budget, 'remaining'):
+                        acquire_timeout = max(1.0, time_budget.remaining)
+                    else:
+                        acquire_timeout = 30.0
+                    
+                    buffer, buffer_id = pool.acquire(timeout=acquire_timeout)
+                    
+                    wait_time_ms = (time.monotonic() - wait_start) * 1000
+                    if wait_time_ms > 10:
+                        bump('streaming_queue_wait_count')
+                
+                except TimeoutError:
+                    log.debug(f"_try_streaming_aopipeline_build: Queue timeout for {self.id}")
+                    bump('streaming_queue_timeout')
+                    return False
+            else:
+                acquired = pool.try_acquire()
+                if not acquired:
+                    log.debug(f"_try_streaming_aopipeline_build: DDS buffer pool exhausted")
+                    bump('streaming_dds_pool_exhausted')
+                    return False
+                buffer, buffer_id = acquired
             try:
                 result = builder.finalize(buffer)
                 if result.success and result.bytes_written >= 128:
@@ -5294,6 +5614,12 @@ class Tile(object):
         This copies the prebuilt DDS data into the tile's DDS structure
         so that subsequent reads work correctly without re-checking the cache.
         
+        Note: Native aopipeline generates mipmaps down to 4×4 (the minimum DDS
+        block size), while Python pydds.DDS creates structures down to 1×1.
+        For an 8K tile, this means native produces 12 mipmaps but Python expects 14.
+        We propagate the smallest mipmap's data to trailing mipmaps to match
+        what pydds.gen_mipmaps() does.
+        
         Args:
             prebuilt_bytes: Complete DDS file as bytes (including 128-byte header)
             
@@ -5309,14 +5635,28 @@ class Tile(object):
         try:
             # The prebuilt bytes include the 128-byte DDS header followed by mipmap data
             # We need to populate each mipmap's databuffer
+            last_valid_mm_data = None
+            last_valid_mm_idx = -1
+            
             for mm in self.dds.mipmap_list:
                 if mm.startpos >= len(prebuilt_bytes):
-                    # Prebuilt data doesn't include this mipmap - leave it for on-demand build
+                    # Prebuilt data doesn't include this mipmap
+                    # Propagate last valid mipmap data to this and all remaining mipmaps
+                    # This matches pydds.gen_mipmaps() behavior for trailing mipmaps
+                    if last_valid_mm_data is not None:
+                        for trailing_mm in self.dds.mipmap_list[mm.idx:]:
+                            trailing_mm.databuffer = BytesIO(initial_bytes=last_valid_mm_data)
+                            trailing_mm.retrieved = True
                     break
                 
                 # Extract this mipmap's data from the prebuilt buffer
                 mm_end = min(mm.endpos, len(prebuilt_bytes))
                 if mm_end <= mm.startpos:
+                    # No data for this mipmap - propagate last valid
+                    if last_valid_mm_data is not None:
+                        for trailing_mm in self.dds.mipmap_list[mm.idx:]:
+                            trailing_mm.databuffer = BytesIO(initial_bytes=last_valid_mm_data)
+                            trailing_mm.retrieved = True
                     break
                     
                 mm_data = prebuilt_bytes[mm.startpos:mm_end]
@@ -5324,8 +5664,14 @@ class Tile(object):
                 # Store in the mipmap's databuffer
                 mm.databuffer = BytesIO(initial_bytes=mm_data)
                 mm.retrieved = True
+                
+                # Track last valid mipmap data for propagation to trailing mipmaps
+                last_valid_mm_data = mm_data
+                last_valid_mm_idx = mm.idx
             
-            log.debug(f"Populated DDS from prebuilt cache for {self}")
+            log.debug(f"Populated DDS from prebuilt cache for {self} (last_mm={last_valid_mm_idx})")
+            # Mark as prepopulated so bytes_read warning doesn't trigger
+            self._prepopulated = True
             return True
             
         except Exception as e:
@@ -5424,27 +5770,64 @@ class Tile(object):
             
             try:
                 # Create time budget for aopipeline attempt
-                # Use tile budget if exists, otherwise create a temporary one
+                # Use tile budget if exists, otherwise create from config
                 aopipeline_budget = self._tile_time_budget
                 if aopipeline_budget is None:
-                    # Create budget just for chunk collection phase
-                    aopipeline_budget = TimeBudget(3.0)  # 3s for collection + build
+                    # Create budget from user's tile_time_budget setting
+                    budget_seconds = float(getattr(CFG.autoortho, 'tile_time_budget', 180.0))
+                    aopipeline_budget = TimeBudget(budget_seconds)
+                    self._tile_time_budget = aopipeline_budget  # Store for later use
                 
-                # Try streaming builder first if enabled, then fall back to batch builder
-                if getattr(CFG.autoortho, 'streaming_builder_enabled', True):
-                    if self._try_streaming_aopipeline_build(time_budget=aopipeline_budget):
-                        log.debug(f"GET_BYTES: streaming builder succeeded for {self.id}")
+                # ═══════════════════════════════════════════════════════════════
+                # AOPIPELINE FLOW:
+                # ═══════════════════════════════════════════════════════════════
+                # 1. Batch aopipeline uses FULL tile_time_budget for chunk collection
+                # 2. If threshold met: build directly (fast path)
+                # 3. If threshold NOT met:
+                #    - Fallbacks DISABLED: build as-is with missing_color
+                #    - Fallbacks ENABLED: hand to streaming with fallback_timeout budget
+                # ═══════════════════════════════════════════════════════════════
+                
+                # Check fallback configuration
+                fallback_level = self._get_fallback_level()
+                fallbacks_enabled = fallback_level > 0  # 0 = none, 1 = cache, 2 = full
+                
+                if fallbacks_enabled:
+                    # FALLBACKS ENABLED: Try batch, then streaming for fallback resolution
+                    
+                    # Try batch aopipeline (uses full tile_time_budget)
+                    if self._try_aopipeline_build(time_budget=aopipeline_budget, force_build_partial=False):
+                        log.debug(f"GET_BYTES: batch aopipeline succeeded for {self.id}")
                         return True
-                
-                # Fall back to batch aopipeline
-                if self._try_aopipeline_build(time_budget=aopipeline_budget):
-                    # Success! All mipmaps now populated
-                    log.debug(f"GET_BYTES: aopipeline build succeeded for {self.id}")
-                    return True
-                else:
-                    # Failed - continue to progressive path
+                    
+                    # Batch didn't reach threshold - use streaming as fallback route
+                    # Give streaming a NEW budget based on fallback_timeout
+                    if getattr(CFG.autoortho, 'streaming_builder_enabled', True):
+                        fallback_timeout = float(getattr(CFG.autoortho, 'fallback_timeout', 30.0))
+                        streaming_budget = TimeBudget(fallback_timeout)
+                        log.debug(f"GET_BYTES: batch threshold not met, using streaming with "
+                                  f"fallback_timeout={fallback_timeout}s for {self.id}")
+                        
+                        if self._try_streaming_aopipeline_build(time_budget=streaming_budget):
+                            log.debug(f"GET_BYTES: streaming builder succeeded for {self.id}")
+                            return True
+                    
+                    # Both failed - continue to progressive path
                     log.debug(f"GET_BYTES: aopipeline build failed, using progressive path for {self.id}")
                     bump('live_aopipeline_fallback')
+                    
+                else:
+                    # FALLBACKS DISABLED: Build with whatever batch collects
+                    # force_build_partial=True means build even if threshold not met
+                    
+                    if self._try_aopipeline_build(time_budget=aopipeline_budget, force_build_partial=True):
+                        log.debug(f"GET_BYTES: batch aopipeline (no fallbacks) succeeded for {self.id}")
+                        return True
+                    
+                    # Build failed (shouldn't happen with force_build_partial, but handle it)
+                    log.debug(f"GET_BYTES: batch aopipeline failed even with force_build_partial for {self.id}")
+                    bump('live_aopipeline_force_failed')
+                    
             except Exception as e:
                 log.debug(f"GET_BYTES: aopipeline exception: {e}, using progressive path")
                 bump('live_aopipeline_exception')
@@ -7057,6 +7440,10 @@ class Tile(object):
 
     def should_close(self):
         if self.dds.mipmap_list[0].retrieved:
+            # Skip bytes_read check for prepopulated tiles - X-Plane may only need small mipmaps
+            # even though we populated all mipmaps via aopipeline
+            if self._prepopulated:
+                return True
             if self.bytes_read < self.dds.mipmap_list[0].length:
                 log.warning(f"TILE: {self} retrieved mipmap 0, but only read {self.bytes_read}. Lowest offset: {self.lowest_offset}")
                 return False
@@ -7076,7 +7463,8 @@ class Tile(object):
             return
 
         # Log mipmap retrieval status (safely check dds first)
-        if self.dds is not None:
+        # Skip for prepopulated tiles - X-Plane may only need small mipmaps
+        if self.dds is not None and not self._prepopulated:
             try:
                 if self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
                     if self.bytes_read < self.dds.mipmap_list[0].length:

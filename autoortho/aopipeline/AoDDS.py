@@ -221,6 +221,7 @@ class BuilderConfig(Structure):
         ('missing_r', c_uint8),
         ('missing_g', c_uint8),
         ('missing_b', c_uint8),
+        ('nocopy_mode', c_uint8),  # 1 = zero-copy mode (Python owns JPEG memory)
     ]
 
 
@@ -286,6 +287,7 @@ class StreamingBuilder:
         self._config = config
         self._finalized = False
         self._released = False
+        self._jpeg_refs = []  # Keep JPEG references alive for zero-copy mode
     
     def add_chunk(self, index: int, jpeg_data: bytes) -> bool:
         """
@@ -347,18 +349,19 @@ class StreamingBuilder:
         jpeg_ptrs = (c_void_p * count)()
         jpeg_sizes = (c_uint32 * count)()
         
-        # Keep references to prevent GC during call
-        jpeg_buffers = []
+        # Keep references to bytes objects to prevent GC during call
+        # (No copy needed - cast directly to pointer, bytes are immutable
+        # and CPython doesn't move objects in memory)
+        jpeg_refs = []
         
         for i, (idx, jpeg_data) in enumerate(chunks):
             indices[i] = idx
             jpeg_sizes[i] = len(jpeg_data) if jpeg_data else 0
             
             if jpeg_data:
-                # Create ctypes buffer from bytes
-                buf = (c_uint8 * len(jpeg_data)).from_buffer_copy(jpeg_data)
-                jpeg_buffers.append(buf)
-                jpeg_ptrs[i] = cast(buf, c_void_p).value
+                # Keep reference alive and cast directly - NO COPY
+                jpeg_refs.append(jpeg_data)
+                jpeg_ptrs[i] = cast(jpeg_data, c_void_p).value
             else:
                 jpeg_ptrs[i] = None
         
@@ -369,6 +372,74 @@ class StreamingBuilder:
             cast(jpeg_ptrs, POINTER(c_void_p)),
             jpeg_sizes
         )
+        
+        return result
+    
+    def add_chunks_batch_nocopy(self, chunks: list, jpeg_refs_out: list = None) -> int:
+        """
+        Add multiple JPEG chunks in a single call using ZERO-COPY mode.
+        
+        ZERO-COPY: C stores pointers directly without copying. The caller MUST
+        ensure that the JPEG bytes objects remain alive until finalize() completes.
+        
+        This is faster than add_chunks_batch when Python already holds references
+        that outlive the builder (e.g., chunk.data held by Tile objects).
+        
+        Args:
+            chunks: List of (index, jpeg_bytes) tuples
+            jpeg_refs_out: Optional list to append JPEG byte references to
+                           (for caller to maintain references until finalize)
+            
+        Returns:
+            Number of chunks successfully added
+            
+        Thread Safety: Thread-safe.
+        
+        WARNING: Memory safety is caller's responsibility! If any bytes object
+        is garbage collected before finalize(), C will read freed memory.
+        """
+        if self._released:
+            raise RuntimeError("StreamingBuilder has been released")
+        
+        if not chunks:
+            return 0
+        
+        count = len(chunks)
+        
+        # Build arrays for C call
+        indices = (c_int32 * count)()
+        jpeg_ptrs = (c_void_p * count)()
+        jpeg_sizes = (c_uint32 * count)()
+        
+        # CRITICAL: Keep references alive! Either caller provides list,
+        # or we store internally
+        refs = jpeg_refs_out if jpeg_refs_out is not None else []
+        
+        for i, (idx, jpeg_data) in enumerate(chunks):
+            indices[i] = idx
+            jpeg_sizes[i] = len(jpeg_data) if jpeg_data else 0
+            
+            if jpeg_data:
+                # Keep reference and cast directly to pointer
+                refs.append(jpeg_data)
+                jpeg_ptrs[i] = cast(jpeg_data, c_void_p).value
+            else:
+                jpeg_ptrs[i] = None
+        
+        # Call the nocopy version - C stores pointers without copying
+        result = self._lib.aodds_builder_add_chunks_batch_nocopy(
+            self._handle,
+            c_int32(count),
+            indices,
+            cast(jpeg_ptrs, POINTER(c_void_p)),
+            jpeg_sizes
+        )
+        
+        # If no external list provided, store internally to keep alive
+        if jpeg_refs_out is None and refs:
+            if not hasattr(self, '_jpeg_refs'):
+                self._jpeg_refs = []
+            self._jpeg_refs.extend(refs)
         
         return result
     
@@ -556,6 +627,8 @@ class StreamingBuilder:
             self._pool_ref._return_builder(self._handle)
             self._released = True
             self._handle = None
+            # Clear JPEG refs now that finalize has completed
+            self._jpeg_refs.clear()
     
     def __enter__(self):
         return self
@@ -647,6 +720,16 @@ class StreamingBuilderPool:
             ]
             self._lib.aodds_builder_add_chunks_batch.restype = c_int32
             
+            # Zero-copy batch API - C stores pointers only, caller owns memory
+            self._lib.aodds_builder_add_chunks_batch_nocopy.argtypes = [
+                c_void_p,           # builder
+                c_int32,            # count
+                POINTER(c_int32),   # indices array
+                POINTER(c_void_p),  # jpeg_data array (array of pointers)
+                POINTER(c_uint32),  # jpeg_sizes array
+            ]
+            self._lib.aodds_builder_add_chunks_batch_nocopy.restype = c_int32
+            
             self._lib.aodds_builder_add_fallback_image.argtypes = [
                 c_void_p, c_int32, POINTER(c_uint8), c_int32, c_int32
             ]
@@ -694,6 +777,7 @@ class StreamingBuilderPool:
         # Build config structure
         fmt = FORMAT_BC1 if config.get('format', 'BC1').upper() in ('BC1', 'DXT1') else FORMAT_BC3
         missing_color = config.get('missing_color', (128, 128, 128))
+        nocopy_mode = 1 if config.get('nocopy_mode', False) else 0
         
         c_config = BuilderConfig(
             chunks_per_side=config.get('chunks_per_side', 16),
@@ -701,6 +785,7 @@ class StreamingBuilderPool:
             missing_r=missing_color[0],
             missing_g=missing_color[1],
             missing_b=missing_color[2],
+            nocopy_mode=nocopy_mode,
         )
         
         import time
@@ -1368,15 +1453,16 @@ def build_from_jpegs(
     jpeg_ptrs = (POINTER(c_uint8) * chunk_count)()
     jpeg_sizes = (c_uint32 * chunk_count)()
     
-    # Keep references to prevent GC
-    jpeg_buffers = []
+    # Keep references to bytes objects to prevent GC during call
+    # (No copy needed - cast directly to pointer, bytes are immutable
+    # and CPython doesn't move objects in memory)
+    jpeg_refs = []
     
     for i, data in enumerate(jpeg_datas):
         if data and len(data) > 0:
-            # Create a buffer and keep reference
-            buf = (c_uint8 * len(data)).from_buffer_copy(data)
-            jpeg_buffers.append(buf)
-            jpeg_ptrs[i] = cast(buf, POINTER(c_uint8))
+            # Keep reference alive and cast directly - NO COPY
+            jpeg_refs.append(data)
+            jpeg_ptrs[i] = cast(data, POINTER(c_uint8))
             jpeg_sizes[i] = len(data)
         else:
             jpeg_ptrs[i] = None
@@ -1505,13 +1591,16 @@ def build_from_jpegs_to_buffer(
     # Build arrays for C
     jpeg_ptrs = (POINTER(c_uint8) * chunk_count)()
     jpeg_sizes = (c_uint32 * chunk_count)()
-    jpeg_buffers = []  # Keep references to prevent GC
+    # Keep references to bytes objects to prevent GC during call
+    # (No copy needed - cast directly to pointer, bytes are immutable
+    # and CPython doesn't move objects in memory)
+    jpeg_refs = []
     
     for i, data in enumerate(jpeg_datas):
         if data and len(data) > 0:
-            buf = (c_uint8 * len(data)).from_buffer_copy(data)
-            jpeg_buffers.append(buf)
-            jpeg_ptrs[i] = cast(buf, POINTER(c_uint8))
+            # Keep reference alive and cast directly - NO COPY
+            jpeg_refs.append(data)
+            jpeg_ptrs[i] = cast(data, POINTER(c_uint8))
             jpeg_sizes[i] = len(data)
         else:
             jpeg_ptrs[i] = None
@@ -1651,13 +1740,16 @@ def build_from_jpegs_to_file(
     # Build arrays for C
     jpeg_ptrs = (POINTER(c_uint8) * chunk_count)()
     jpeg_sizes = (c_uint32 * chunk_count)()
-    jpeg_buffers = []  # Keep references to prevent GC
+    # Keep references to bytes objects to prevent GC during call
+    # (No copy needed - cast directly to pointer, bytes are immutable
+    # and CPython doesn't move objects in memory)
+    jpeg_refs = []
     
     for i, data in enumerate(jpeg_datas):
         if data and len(data) > 0:
-            buf = (c_uint8 * len(data)).from_buffer_copy(data)
-            jpeg_buffers.append(buf)
-            jpeg_ptrs[i] = cast(buf, POINTER(c_uint8))
+            # Keep reference alive and cast directly - NO COPY
+            jpeg_refs.append(data)
+            jpeg_ptrs[i] = cast(data, POINTER(c_uint8))
             jpeg_sizes[i] = len(data)
         else:
             jpeg_ptrs[i] = None

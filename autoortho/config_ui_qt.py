@@ -2476,12 +2476,12 @@ class ConfigUI(QMainWindow):
         buffer_pool_layout.addWidget(self.buffer_pool_label)
         
         self.buffer_pool_slider = ModernSlider(Qt.Orientation.Horizontal)
-        self.buffer_pool_slider.setRange(2, 8)
+        self.buffer_pool_slider.setRange(2, 64)
         buffer_pool_value = int(getattr(self.cfg.autoortho, 'buffer_pool_size', 4))
         buffer_pool_value = max(2, min(8, buffer_pool_value))
         self.buffer_pool_slider.setValue(buffer_pool_value)
         self.buffer_pool_slider.setObjectName('buffer_pool_size')
-        self.buffer_pool_slider.setToolTip("Number of pre-allocated DDS buffers (2-8)")
+        self.buffer_pool_slider.setToolTip("Number of pre-allocated DDS buffers (2-64)")
         
         self.buffer_pool_value_label = QLabel("")
         self._update_buffer_pool_label()
@@ -2522,12 +2522,12 @@ class ConfigUI(QMainWindow):
         streaming_pool_layout.addWidget(self.streaming_pool_label)
         
         self.streaming_pool_slider = ModernSlider(Qt.Orientation.Horizontal)
-        self.streaming_pool_slider.setRange(2, 8)
+        self.streaming_pool_slider.setRange(2, 64)
         streaming_pool_value = int(getattr(self.cfg.autoortho, 'streaming_builder_pool_size', 4))
         streaming_pool_value = max(2, min(8, streaming_pool_value))
         self.streaming_pool_slider.setValue(streaming_pool_value)
         self.streaming_pool_slider.setObjectName('streaming_builder_pool_size')
-        self.streaming_pool_slider.setToolTip("Number of streaming builders in pool (2-8)")
+        self.streaming_pool_slider.setToolTip("Number of streaming builders in pool (2-64)")
         
         self.streaming_pool_value_label = QLabel(f"{streaming_pool_value} builders")
         self.streaming_pool_slider.valueChanged.connect(
@@ -2543,6 +2543,63 @@ class ConfigUI(QMainWindow):
         # Initialize pipeline control states
         self._update_pipeline_controls()
         self._update_streaming_builder_controls()
+        
+        autoortho_layout.addSpacing(10)
+        
+        # --- Tile Queue Settings ---
+        queue_header = QLabel("Tile Queue")
+        queue_header.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        autoortho_layout.addWidget(queue_header)
+        
+        # Tile queue enabled checkbox
+        self.tile_queue_enabled_check = QCheckBox("Enable tile queue (bank-queue style)")
+        self.tile_queue_enabled_check.setChecked(
+            getattr(self.cfg.autoortho, 'tile_queue_enabled', True)
+        )
+        self.tile_queue_enabled_check.setObjectName('tile_queue_enabled')
+        self.tile_queue_enabled_check.setToolTip(
+            "When enabled, tiles wait for buffer pool slots instead of\n"
+            "falling back to the slower Python pipeline.\n\n"
+            "This provides more consistent performance by ensuring\n"
+            "all tile builds use the fast native pipeline.\n\n"
+            "Recommended: Enabled (default)"
+        )
+        autoortho_layout.addWidget(self.tile_queue_enabled_check)
+        
+        # Prefetch buffer pool size
+        prefetch_pool_layout = QHBoxLayout()
+        self.prefetch_pool_label = QLabel("Prefetch buffer pool size:")
+        self.prefetch_pool_label.setToolTip(
+            "Number of buffers in the SEPARATE prefetch pool.\n\n"
+            "Prefetch tiles use their own pool to avoid competing\n"
+            "with live tile requests from X-Plane.\n\n"
+            "Memory usage: Same per-buffer as main pool (11-43MB each)\n"
+            "• 1 buffer: 11MB / 43MB (minimal)\n"
+            "• 2 buffers: 22MB / 86MB (default)\n"
+            "• 4 buffers: 44MB / 172MB (fast prefetch)\n\n"
+            "Recommended: 2 (default), increase to 3-4 if you have extra RAM"
+        )
+        prefetch_pool_layout.addWidget(self.prefetch_pool_label)
+        
+        self.prefetch_pool_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.prefetch_pool_slider.setRange(1, 4)
+        prefetch_pool_value = int(getattr(self.cfg.autoortho, 'prefetch_buffer_pool_size', 2))
+        prefetch_pool_value = max(1, min(4, prefetch_pool_value))
+        self.prefetch_pool_slider.setValue(prefetch_pool_value)
+        self.prefetch_pool_slider.setObjectName('prefetch_buffer_pool_size')
+        self.prefetch_pool_slider.setToolTip("Number of prefetch buffers (1-4)")
+        
+        self.prefetch_pool_value_label = QLabel(f"{prefetch_pool_value} buffers")
+        self.prefetch_pool_slider.valueChanged.connect(
+            lambda v: self.prefetch_pool_value_label.setText(f"{v} buffers")
+        )
+        prefetch_pool_layout.addWidget(self.prefetch_pool_slider)
+        prefetch_pool_layout.addWidget(self.prefetch_pool_value_label)
+        autoortho_layout.addLayout(prefetch_pool_layout)
+        
+        # Connect tile queue enabled to update prefetch pool control state
+        self.tile_queue_enabled_check.stateChanged.connect(self._update_tile_queue_controls)
+        self._update_tile_queue_controls()
         
         autoortho_layout.addSpacing(10)
         # ═══════════════════════════════════════════════════════════════════
@@ -3749,6 +3806,27 @@ class ConfigUI(QMainWindow):
         self.streaming_pool_label.setStyleSheet(enabled_style if enabled else disabled_style)
         self.streaming_pool_value_label.setStyleSheet(enabled_style if enabled else disabled_style)
 
+    def _update_tile_queue_controls(self, state=None):
+        """Update enabled state of tile queue controls."""
+        enabled = self.tile_queue_enabled_check.isChecked()
+        
+        self.prefetch_pool_slider.setEnabled(enabled)
+        self.prefetch_pool_label.setEnabled(enabled)
+        self.prefetch_pool_value_label.setEnabled(enabled)
+        
+        # Update styling for disabled state
+        disabled_style = "color: #666;"
+        enabled_style = ""
+        
+        self.prefetch_pool_label.setStyleSheet(enabled_style if enabled else disabled_style)
+        self.prefetch_pool_value_label.setStyleSheet(enabled_style if enabled else disabled_style)
+        
+        if not enabled:
+            self.prefetch_pool_label.setToolTip(
+                "Prefetch pool is only used when tile queue is enabled.\n"
+                "Enable the tile queue to configure this setting."
+            )
+
     def _init_dynamic_zoom_manager(self):
         """Initialize the dynamic zoom manager from config."""
         self._dynamic_zoom_manager = DynamicZoomManager()
@@ -4805,6 +4883,10 @@ class ConfigUI(QMainWindow):
             # Streaming builder settings
             self.cfg.autoortho.streaming_builder_enabled = self.streaming_builder_enabled_check.isChecked()
             self.cfg.autoortho.streaming_builder_pool_size = str(self.streaming_pool_slider.value())
+            
+            # Tile queue settings
+            self.cfg.autoortho.tile_queue_enabled = self.tile_queue_enabled_check.isChecked()
+            self.cfg.autoortho.prefetch_buffer_pool_size = str(self.prefetch_pool_slider.value())
             
             self.cfg.autoortho.fetch_threads = str(
                 self.fetch_threads_spinbox.value()

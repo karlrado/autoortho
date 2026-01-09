@@ -204,7 +204,7 @@ native_pipeline_threads = 0
 # python: Pure Python fallback (slowest but most compatible)
 #         Use if native pipeline causes issues
 pipeline_mode = auto
-# Number of pre-allocated buffers for zero-copy DDS building (2-8)
+# Number of pre-allocated buffers for zero-copy DDS building (2-64)
 # Buffer size is calculated dynamically based on your zoom settings:
 #   - ~11MB per buffer when max_zoom <= 16 and max_zoom_near_airports <= 18 (4K textures)
 #   - ~43MB per buffer when higher zoom levels are configured (8K textures)
@@ -228,27 +228,44 @@ live_aopipeline_enabled = True
 # Higher values ensure quality but may fall back more often
 # Recommended: 0.9 (balanced), 0.8 (faster), 0.95 (quality)
 live_aopipeline_min_chunk_ratio = 0.9
-# Maximum seconds to wait for missing chunk downloads during aopipeline attempt
-# This caps how long the fast path will wait for network before falling back
-# Recommended: 2.0 (fast), 3.0 (balanced), 5.0 (quality, slow network)
-live_aopipeline_max_download_wait = 2.0
 # === STREAMING BUILDER SETTINGS ===
 # Enable streaming builder for incremental DDS generation (True/False)
 # When enabled, chunks are processed as they arrive rather than in batch.
 # This allows fallbacks to be applied during the build process.
 # Recommended: True (better fallback support), False for legacy behavior
 streaming_builder_enabled = True
-# Size of the streaming builder pool (2-8)
+# Size of the streaming builder pool (2-64)
 # Each builder handles one tile at a time. Pool size determines
 # how many tiles can be built concurrently.
-# Recommended: 4 (default), increase to 6-8 for faster CPUs
+# Recommended: 4 (default), increase to 8-16 for faster CPUs, up to 64 for high-end systems
 streaming_builder_pool_size = 4
+# === TILE QUEUE SETTINGS ===
+# When all buffer pool slots are busy, tiles wait in a queue instead of
+# falling back to the slower Python pipeline. This ensures consistent
+# performance and prevents resource contention.
+#
+# Enable tile queue system (True/False)
+# When enabled, tiles wait for pool slots instead of Python fallback
+# Recommended: True for consistent performance
+tile_queue_enabled = True
+# Number of buffers in the prefetch buffer pool (1-4)
+# Prefetch tiles use a separate pool to avoid competing with live tiles.
+# Lower values = less memory, but prefetch may queue up more
+# Higher values = more memory, faster prefetch processing
+# Memory usage: Same per-buffer size as main pool (11-43MB each)
+# Recommended: 2 (default), increase to 3-4 if you have extra RAM
+prefetch_buffer_pool_size = 2
+# Maximum tiles that can wait in each queue (10-500)
+# If queue is full, additional tiles are rejected
+# Higher = more tiles can wait, but uses more memory for tracking
+# Recommended: 100 (default)
+tile_queue_max_size = 100
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False
 # Using custom generated Ortho4XP tiles along with AutoOrtho.
 using_custom_tiles = False
-# Color used for missing textures.
+# Color used for missing textures. an
 missing_color = [66, 77, 55]
 
 [pydds]

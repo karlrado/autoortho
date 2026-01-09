@@ -1808,6 +1808,7 @@ struct aodds_builder_s {
     /* Deferred JPEG storage for parallel decode at finalize */
     uint8_t** jpeg_buffers;     /* Array of JPEG byte buffers (NULL if decoded or missing) */
     uint32_t* jpeg_sizes;       /* Array of JPEG sizes */
+    uint8_t* jpeg_owned;        /* Array: 1 = C owns (must free), 0 = Python owns (don't free) */
     uint32_t jpeg_storage_size; /* Allocated size of jpeg arrays */
     
     /* Thread safety */
@@ -1911,11 +1912,13 @@ AODDS_API aodds_builder_t* aodds_builder_create(
     /* Allocate JPEG storage arrays for deferred decode */
     builder->jpeg_buffers = (uint8_t**)calloc(builder->chunk_count, sizeof(uint8_t*));
     builder->jpeg_sizes = (uint32_t*)calloc(builder->chunk_count, sizeof(uint32_t));
+    builder->jpeg_owned = (uint8_t*)calloc(builder->chunk_count, sizeof(uint8_t));
     builder->jpeg_storage_size = builder->chunk_count;
     
-    if (!builder->jpeg_buffers || !builder->jpeg_sizes) {
+    if (!builder->jpeg_buffers || !builder->jpeg_sizes || !builder->jpeg_owned) {
         free(builder->jpeg_buffers);
         free(builder->jpeg_sizes);
+        free(builder->jpeg_owned);
         free(builder->chunks);
         free(builder->chunk_status);
         free(builder);
@@ -1963,13 +1966,18 @@ AODDS_API void aodds_builder_reset(
         if (builder->chunks[i].data) {
             aodecode_free_image(&builder->chunks[i], builder->pool);
         }
-        /* Free any deferred JPEG data */
+        /* Free any deferred JPEG data - ONLY if C owns it (not zero-copy) */
         if (builder->jpeg_buffers && builder->jpeg_buffers[i]) {
-            free(builder->jpeg_buffers[i]);
+            if (builder->jpeg_owned && builder->jpeg_owned[i]) {
+                free(builder->jpeg_buffers[i]);
+            }
             builder->jpeg_buffers[i] = NULL;
         }
         if (builder->jpeg_sizes) {
             builder->jpeg_sizes[i] = 0;
+        }
+        if (builder->jpeg_owned) {
+            builder->jpeg_owned[i] = 0;
         }
     }
     
@@ -2004,15 +2012,17 @@ AODDS_API void aodds_builder_reset(
         free(builder->chunk_status);
         free(builder->jpeg_buffers);
         free(builder->jpeg_sizes);
+        free(builder->jpeg_owned);
         
         builder->chunks = (aodecode_image_t*)calloc(new_chunk_count, sizeof(aodecode_image_t));
         builder->chunk_status = (uint8_t*)calloc(new_chunk_count, sizeof(uint8_t));
         builder->jpeg_buffers = (uint8_t**)calloc(new_chunk_count, sizeof(uint8_t*));
         builder->jpeg_sizes = (uint32_t*)calloc(new_chunk_count, sizeof(uint32_t));
+        builder->jpeg_owned = (uint8_t*)calloc(new_chunk_count, sizeof(uint8_t));
         builder->jpeg_storage_size = new_chunk_count;
         
         if (!builder->chunks || !builder->chunk_status || 
-            !builder->jpeg_buffers || !builder->jpeg_sizes) {
+            !builder->jpeg_buffers || !builder->jpeg_sizes || !builder->jpeg_owned) {
             /* Allocation failed - leave builder in invalid state */
             builder->chunk_count = 0;
             builder_unlock(builder);
@@ -2024,6 +2034,7 @@ AODDS_API void aodds_builder_reset(
         memset(builder->chunk_status, 0, new_chunk_count * sizeof(uint8_t));
         memset(builder->jpeg_buffers, 0, new_chunk_count * sizeof(uint8_t*));
         memset(builder->jpeg_sizes, 0, new_chunk_count * sizeof(uint32_t));
+        memset(builder->jpeg_owned, 0, new_chunk_count * sizeof(uint8_t));
     }
     
     /* Update configuration */
@@ -2051,8 +2062,11 @@ AODDS_API void aodds_builder_destroy(aodds_builder_t* builder) {
         if (builder->chunks[i].data) {
             aodecode_free_image(&builder->chunks[i], builder->pool);
         }
+        /* Only free JPEG buffers if C owns them (not zero-copy) */
         if (builder->jpeg_buffers && builder->jpeg_buffers[i]) {
-            free(builder->jpeg_buffers[i]);
+            if (builder->jpeg_owned && builder->jpeg_owned[i]) {
+                free(builder->jpeg_buffers[i]);
+            }
         }
     }
     
@@ -2060,6 +2074,7 @@ AODDS_API void aodds_builder_destroy(aodds_builder_t* builder) {
     free(builder->chunk_status);
     free(builder->jpeg_buffers);
     free(builder->jpeg_sizes);
+    free(builder->jpeg_owned);
     
     /* Free tile image if allocated */
     if (builder->tile_allocated && builder->tile_image.data) {
@@ -2110,6 +2125,7 @@ AODDS_API int32_t aodds_builder_add_chunk(
     /* Store for parallel decode at finalize time */
     builder->jpeg_buffers[chunk_index] = jpeg_copy;
     builder->jpeg_sizes[chunk_index] = jpeg_size;
+    builder->jpeg_owned[chunk_index] = 1;  /* C owns this buffer - must free */
     builder->chunk_status[chunk_index] = CHUNK_STATUS_PENDING_DECODE;
     builder->status.chunks_received++;
     
@@ -2160,6 +2176,57 @@ AODDS_API int32_t aodds_builder_add_chunks_batch(
         /* Store for parallel decode at finalize */
         builder->jpeg_buffers[idx] = jpeg_copy;
         builder->jpeg_sizes[idx] = jpeg_sizes[i];
+        builder->jpeg_owned[idx] = 1;  /* C owns this buffer - must free */
+        builder->chunk_status[idx] = CHUNK_STATUS_PENDING_DECODE;
+        builder->status.chunks_received++;
+        added++;
+    }
+    
+    builder_unlock(builder);
+    return added;
+}
+
+/**
+ * ZERO-COPY: Add multiple JPEG chunks without copying data.
+ * Stores pointers directly - caller must guarantee data lifetime until finalize().
+ */
+AODDS_API int32_t aodds_builder_add_chunks_batch_nocopy(
+    aodds_builder_t* builder,
+    int32_t count,
+    const int32_t* indices,
+    const uint8_t** jpeg_data,
+    const uint32_t* jpeg_sizes
+) {
+    if (!builder || !indices || !jpeg_data || !jpeg_sizes || count <= 0) {
+        return 0;
+    }
+    
+    int32_t added = 0;
+    
+    builder_lock(builder);
+    
+    for (int32_t i = 0; i < count; i++) {
+        int32_t idx = indices[i];
+        
+        /* Validate index */
+        if (idx < 0 || idx >= builder->chunk_count) {
+            continue;
+        }
+        
+        /* Skip if already set */
+        if (builder->chunk_status[idx] != CHUNK_STATUS_EMPTY) {
+            continue;
+        }
+        
+        /* Skip empty data */
+        if (!jpeg_data[i] || jpeg_sizes[i] == 0) {
+            continue;
+        }
+        
+        /* ZERO-COPY: Store pointer directly, no malloc/memcpy */
+        builder->jpeg_buffers[idx] = (uint8_t*)jpeg_data[i];  /* Cast away const - we won't modify */
+        builder->jpeg_sizes[idx] = jpeg_sizes[i];
+        builder->jpeg_owned[idx] = 0;  /* Python owns this buffer - do NOT free */
         builder->chunk_status[idx] = CHUNK_STATUS_PENDING_DECODE;
         builder->status.chunks_received++;
         added++;
@@ -2332,6 +2399,13 @@ AODDS_API int32_t aodds_builder_finalize(
         #pragma omp parallel for schedule(dynamic, 4) reduction(+:decode_success_count, decode_fail_count)
         for (int32_t i = 0; i < builder->chunk_count; i++) {
             if (builder->chunk_status[i] == CHUNK_STATUS_PENDING_DECODE) {
+                /* Defensive null check (zero-copy mode safety) */
+                if (!builder->jpeg_buffers[i] || builder->jpeg_sizes[i] == 0) {
+                    builder->chunk_status[i] = CHUNK_STATUS_MISSING;
+                    decode_fail_count++;
+                    continue;
+                }
+                
                 aodecode_image_t decoded = {0};
                 int32_t success = aodecode_single(
                     builder->jpeg_buffers[i],
@@ -2349,10 +2423,13 @@ AODDS_API int32_t aodds_builder_finalize(
                     decode_fail_count++;
                 }
                 
-                /* Free JPEG buffer after decode - no longer needed */
-                free(builder->jpeg_buffers[i]);
+                /* Free JPEG buffer after decode - ONLY if C owns it (not zero-copy) */
+                if (builder->jpeg_owned[i]) {
+                    free(builder->jpeg_buffers[i]);
+                }
                 builder->jpeg_buffers[i] = NULL;
                 builder->jpeg_sizes[i] = 0;
+                builder->jpeg_owned[i] = 0;
             }
         }
         
@@ -2501,6 +2578,13 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
         #pragma omp parallel for schedule(dynamic, 4) reduction(+:decode_success_count, decode_fail_count)
         for (int32_t i = 0; i < builder->chunk_count; i++) {
             if (builder->chunk_status[i] == CHUNK_STATUS_PENDING_DECODE) {
+                /* Defensive null check (zero-copy mode safety) */
+                if (!builder->jpeg_buffers[i] || builder->jpeg_sizes[i] == 0) {
+                    builder->chunk_status[i] = CHUNK_STATUS_MISSING;
+                    decode_fail_count++;
+                    continue;
+                }
+                
                 aodecode_image_t decoded = {0};
                 int32_t success = aodecode_single(
                     builder->jpeg_buffers[i],
@@ -2518,9 +2602,13 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
                     decode_fail_count++;
                 }
                 
-                free(builder->jpeg_buffers[i]);
+                /* Free JPEG buffer after decode - ONLY if C owns it (not zero-copy) */
+                if (builder->jpeg_owned[i]) {
+                    free(builder->jpeg_buffers[i]);
+                }
                 builder->jpeg_buffers[i] = NULL;
                 builder->jpeg_sizes[i] = 0;
+                builder->jpeg_owned[i] = 0;
             }
         }
         

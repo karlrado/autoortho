@@ -441,6 +441,8 @@ typedef struct {
     uint8_t missing_r;          /**< Fallback color R component */
     uint8_t missing_g;          /**< Fallback color G component */
     uint8_t missing_b;          /**< Fallback color B component */
+    uint8_t nocopy_mode;        /**< Zero-copy mode: 0=C copies JPEG data (default), 
+                                     1=C stores pointers only (caller owns memory) */
 } aodds_builder_config_t;
 
 /**
@@ -548,6 +550,35 @@ AODDS_API int32_t aodds_builder_add_chunk(
  * Thread Safety: Thread-safe.
  */
 AODDS_API int32_t aodds_builder_add_chunks_batch(
+    aodds_builder_t* builder,
+    int32_t count,
+    const int32_t* indices,
+    const uint8_t** jpeg_data,
+    const uint32_t* jpeg_sizes
+);
+
+/**
+ * Add multiple JPEG chunks WITHOUT copying data (zero-copy mode).
+ * 
+ * ZERO-COPY: C stores pointers directly, does NOT allocate or copy.
+ * CALLER MUST guarantee JPEG data remains valid until finalize() completes.
+ * 
+ * Use this for optimal performance when Python holds references that
+ * outlive the builder operation (e.g., chunk.data held by Tile objects).
+ * 
+ * Memory safety: C will NOT free these pointers at finalize() or reset().
+ * 
+ * @param builder       Target builder
+ * @param count         Number of chunks to add
+ * @param indices       Array of chunk indices (count elements)
+ * @param jpeg_data     Array of JPEG data pointers (count elements) - NOT COPIED
+ * @param jpeg_sizes    Array of JPEG sizes (count elements)
+ * 
+ * @return Number of chunks successfully added
+ * 
+ * Thread Safety: Thread-safe.
+ */
+AODDS_API int32_t aodds_builder_add_chunks_batch_nocopy(
     aodds_builder_t* builder,
     int32_t count,
     const int32_t* indices,
