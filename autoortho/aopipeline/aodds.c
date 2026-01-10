@@ -121,12 +121,12 @@ AODDS_API int32_t aodds_init_ispc(void) {
     lib_subdir = "linux";
 #endif
     
-    char module_path[4096] = {0};
     char module_dir[4096] = {0};
     char lib_path[4096] = {0};
     
 #ifdef AOPIPELINE_WINDOWS
     /* Get path to this DLL (aopipeline.dll) */
+    char module_path[4096] = {0};
     HMODULE self_module = NULL;
     GetModuleHandleExA(
         GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,

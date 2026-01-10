@@ -233,8 +233,7 @@ static int read_file_posix(const char* path, uint8_t** out_data,
         memcpy(buffer, mapped, size);
         munmap(mapped, size);
     } else {
-do_read:
-        /* Standard read for small files - most efficient for <1MB */
+do_read:;  /* Empty statement required before declaration (C99/C11 compatibility) */
         size_t total_read = 0;
         while (total_read < size) {
             ssize_t n = read(fd, buffer + total_read, size - total_read);

@@ -318,6 +318,172 @@ def get_pipeline_mode() -> str:
     return _pipeline_mode
 
 
+# ============================================================================
+# BUNDLE DDS BUILDING (Mode Dispatcher)
+# ============================================================================
+# Builds DDS from AOB2 bundle files using the appropriate pipeline mode.
+# ============================================================================
+
+def _build_tile_dds_from_bundle(
+    tile,
+    bundle_path: str,
+    target_zoom: int,
+    dxt_format: str = "BC1",
+    missing_color: Tuple[int, int, int] = (66, 77, 55),
+    chunks_per_side: int = 16
+) -> Optional[bytes]:
+    """
+    Build DDS from an AOB2 bundle file using the appropriate pipeline mode.
+    
+    This is the mode dispatcher that routes to native, hybrid, or pure Python
+    implementations based on current pipeline mode and availability.
+    
+    Args:
+        tile: Tile object (for metadata)
+        bundle_path: Path to AOB2 bundle file
+        target_zoom: Target zoom level
+        dxt_format: "BC1" or "BC3"
+        missing_color: RGB tuple for missing chunks
+        chunks_per_side: Chunks per side (typically 16)
+    
+    Returns:
+        DDS bytes if successful, None on failure
+    """
+    mode = get_pipeline_mode()
+    
+    # Try native mode (C reads bundle + builds DDS)
+    if mode == PIPELINE_MODE_NATIVE:
+        result = _build_dds_native_from_bundle(bundle_path, target_zoom, dxt_format, missing_color, chunks_per_side)
+        if result is not None:
+            return result
+        # Fall through to hybrid
+    
+    # Try hybrid mode (Python reads bundle, C decodes + compresses)
+    if mode in (PIPELINE_MODE_NATIVE, PIPELINE_MODE_HYBRID):
+        result = _build_dds_hybrid_from_bundle(bundle_path, target_zoom, dxt_format, missing_color, chunks_per_side)
+        if result is not None:
+            return result
+        # Fall through to pure Python
+    
+    # Pure Python mode
+    return _build_dds_python_from_bundle(bundle_path, target_zoom, dxt_format, missing_color, chunks_per_side)
+
+
+def _build_dds_native_from_bundle(
+    bundle_path: str,
+    target_zoom: int,
+    dxt_format: str,
+    missing_color: Tuple[int, int, int],
+    chunks_per_side: int
+) -> Optional[bytes]:
+    """Build DDS using native C code for bundle I/O and DDS building."""
+    try:
+        try:
+            from autoortho.aopipeline import AoBundle2
+        except ImportError:
+            from aopipeline import AoBundle2
+        
+        if not AoBundle2.is_available():
+            return None
+        
+        return AoBundle2.build_dds(
+            bundle_path=bundle_path,
+            target_zoom=target_zoom,
+            format=dxt_format,
+            missing_color=missing_color,
+            chunks_per_side=chunks_per_side
+        )
+    except Exception as e:
+        log.debug(f"Native bundle DDS build failed: {e}")
+        return None
+
+
+def _build_dds_hybrid_from_bundle(
+    bundle_path: str,
+    target_zoom: int,
+    dxt_format: str,
+    missing_color: Tuple[int, int, int],
+    chunks_per_side: int
+) -> Optional[bytes]:
+    """Build DDS: Python reads bundle, C decodes and compresses."""
+    try:
+        try:
+            from autoortho.aopipeline import AoBundle2, AoDDS
+        except ImportError:
+            from aopipeline import AoBundle2, AoDDS
+        
+        # Python reads bundle
+        bundle = AoBundle2.Bundle2Python(bundle_path)
+        jpeg_datas = bundle.get_all_chunks(target_zoom)
+        
+        if not jpeg_datas:
+            return None
+        
+        # Check if native DDS is available
+        native = _get_native_dds()
+        if native is None or not hasattr(native, 'build_from_jpegs'):
+            return None
+        
+        # C builds DDS from JPEG array
+        return native.build_from_jpegs(
+            jpeg_datas=jpeg_datas,
+            format=dxt_format,
+            missing_color=missing_color
+        )
+    except Exception as e:
+        log.debug(f"Hybrid bundle DDS build failed: {e}")
+        return None
+
+
+def _build_dds_python_from_bundle(
+    bundle_path: str,
+    target_zoom: int,
+    dxt_format: str,
+    missing_color: Tuple[int, int, int],
+    chunks_per_side: int
+) -> Optional[bytes]:
+    """Build DDS using pure Python (no native dependencies)."""
+    try:
+        try:
+            from autoortho.aopipeline import AoBundle2
+        except ImportError:
+            from aopipeline import AoBundle2
+        
+        # Read bundle with Python
+        bundle = AoBundle2.Bundle2Python(bundle_path)
+        jpeg_datas = bundle.get_all_chunks(target_zoom)
+        
+        if not jpeg_datas:
+            return None
+        
+        # Compose image using AoImage
+        tile_size = chunks_per_side * 256
+        chunk_size = 256
+        
+        base_img = AoImage.new("RGBA", (tile_size, tile_size), missing_color + (255,))
+        
+        for i, jpeg_data in enumerate(jpeg_datas):
+            if jpeg_data is not None:
+                try:
+                    chunk_img = AoImage.load_from_memory(jpeg_data)
+                    if chunk_img:
+                        x = (i % chunks_per_side) * chunk_size
+                        y = (i // chunks_per_side) * chunk_size
+                        base_img.paste(chunk_img, x, y)
+                except Exception:
+                    pass  # Use missing color for failed decodes
+        
+        # Build DDS using pydds
+        dds_format = 0 if dxt_format == "BC1" else 1  # BC1=0, BC3=1
+        dds = pydds.DDS(tile_size, tile_size, dxt_format=dds_format)
+        dds.gen_mipmaps(base_img)
+        return dds.read(dds.total_size)
+        
+    except Exception as e:
+        log.debug(f"Python bundle DDS build failed: {e}")
+        return None
+
+
 # Global buffer pool for zero-copy DDS building (live tiles)
 _dds_buffer_pool = None
 _dds_buffer_pool_initialized = False
@@ -3380,6 +3546,8 @@ class BackgroundDDSBuilder:
         Key difference from live: NO TIME BUDGET.
         Takes as long as needed to apply all fallbacks for quality.
         
+        Priority: Bundle build (fastest) > Streaming build (with fallbacks)
+        
         Args:
             tile: Tile to build
             tile_id: Tile ID string
@@ -3388,6 +3556,17 @@ class BackgroundDDSBuilder:
         Returns:
             True if build succeeded, False to fall back to other methods
         """
+        # Try bundle-first path (much faster than streaming build)
+        try:
+            dds_bytes = self._try_build_from_bundle(tile, tile_id)
+            if dds_bytes is not None:
+                elapsed = (time.monotonic() - build_start) * 1000
+                log.debug(f"BackgroundDDSBuilder: Built {tile_id} from bundle in {elapsed:.0f}ms")
+                return self._store_dds_result(tile, tile_id, dds_bytes, build_start)
+        except Exception as e:
+            log.debug(f"BackgroundDDSBuilder: Bundle build failed for {tile_id}: {e}")
+        
+        # Fall through to streaming build
         try:
             from autoortho.aopipeline.AoDDS import get_default_builder_pool
             from autoortho.aopipeline.fallback_resolver import FallbackResolver
@@ -3569,6 +3748,98 @@ class BackgroundDDSBuilder:
             tile._active_streaming_builder = None
             tile._live_transition_event = None
             builder.release()
+
+    def _try_build_from_bundle(self, tile, tile_id: str) -> Optional[bytes]:
+        """
+        Try to build DDS directly from an AOB2 bundle file.
+        
+        This is the fastest path when a bundle exists:
+        - Single file read instead of 256+
+        - Memory-mapped for zero-copy access
+        - Native parallel JPEG decode + DXT compress
+        
+        Args:
+            tile: Tile to build
+            tile_id: Tile ID string
+        
+        Returns:
+            DDS bytes if successful, None if bundle not available
+        """
+        try:
+            # Handle imports for both frozen (PyInstaller) and direct Python execution
+            try:
+                from autoortho.utils.bundle_paths import get_bundle2_path
+                from autoortho.aopipeline import AoBundle2
+            except ImportError:
+                from utils.bundle_paths import get_bundle2_path
+                from aopipeline import AoBundle2
+            
+            # Check if bundle exists
+            bundle_path = get_bundle2_path(tile.cache_dir, tile.row, tile.col, tile.maptype, tile.max_zoom)
+            if not os.path.exists(bundle_path):
+                return None
+            
+            # Get configuration
+            dxt_format = CFG.pydds.format.upper()
+            if dxt_format in ("DXT1", "BC1"):
+                dxt_format = "BC1"
+            else:
+                dxt_format = "BC3"
+            
+            missing_color = tuple(CFG.autoortho.missing_color[:3]) if hasattr(CFG.autoortho, 'missing_color') else (66, 77, 55)
+            
+            # Build DDS from bundle using mode dispatcher
+            return _build_tile_dds_from_bundle(
+                tile=tile,
+                bundle_path=bundle_path,
+                target_zoom=tile.max_zoom,
+                dxt_format=dxt_format,
+                missing_color=missing_color,
+                chunks_per_side=tile.chunks_per_row
+            )
+            
+        except Exception as e:
+            log.debug(f"BackgroundDDSBuilder: Bundle build failed: {e}")
+            return None
+
+    def _store_dds_result(self, tile, tile_id: str, dds_bytes: bytes, build_start: float) -> bool:
+        """
+        Store DDS build result in prebuilt cache.
+        
+        Args:
+            tile: Tile that was built
+            tile_id: Tile ID string
+            dds_bytes: DDS data
+            build_start: Build start time for metrics
+        
+        Returns:
+            True if stored successfully
+        """
+        if not dds_bytes or len(dds_bytes) < 128:
+            return False
+        
+        try:
+            if hasattr(self._prebuilt_cache, 'path_for'):
+                output_path = self._prebuilt_cache.path_for(tile_id)
+                
+                # Write DDS to disk atomically
+                temp_path = output_path + f'.tmp.{os.getpid()}'
+                with open(temp_path, 'wb') as f:
+                    f.write(dds_bytes)
+                os.rename(temp_path, output_path)
+                
+                if hasattr(self._prebuilt_cache, 'register_file'):
+                    self._prebuilt_cache.register_file(tile_id, len(dds_bytes))
+                
+                build_time = (time.monotonic() - build_start) * 1000
+                self._builds_completed += 1
+                log.debug(f"BackgroundDDSBuilder: Bundle built {tile_id} in {build_time:.0f}ms")
+                bump('prebuilt_dds_builds_bundle')
+                return True
+        except Exception as e:
+            log.debug(f"BackgroundDDSBuilder: Failed to store DDS for {tile_id}: {e}")
+        
+        return False
 
     def _build_tile_dds(self, tile) -> None:
         """
@@ -4048,14 +4319,30 @@ prebuilt_dds_cache: Optional[PrebuiltDDSCache] = None
 background_dds_builder: Optional[BackgroundDDSBuilder] = None
 tile_completion_tracker: Optional[TileCompletionTracker] = None
 
+# Bundle consolidator for AOB2 format (consolidates JPEGs into bundles)
+_bundle_consolidator = None
+
 
 def _on_tile_complete_callback(tile_id: str, tile) -> None:
     """
     Callback invoked when all chunks for a tile have been downloaded.
-    Submits the tile to the background DDS builder.
+    Submits the tile to the background DDS builder and schedules bundle consolidation.
     """
     if background_dds_builder is not None:
         background_dds_builder.submit(tile)
+    
+    # Schedule bundle consolidation in background
+    if _bundle_consolidator is not None and tile is not None:
+        try:
+            _bundle_consolidator.schedule(
+                row=tile.row,
+                col=tile.col,
+                maptype=tile.maptype,
+                zoom=tile.max_zoom,
+                priority=0  # HIGH priority for user-visible tiles
+            )
+        except Exception as e:
+            log.debug(f"Failed to schedule bundle consolidation for {tile_id}: {e}")
 
 
 def start_predictive_dds(tile_cacher=None) -> None:
@@ -4076,7 +4363,7 @@ def start_predictive_dds(tile_cacher=None) -> None:
     Args:
         tile_cacher: TileCacher instance (for future use)
     """
-    global prebuilt_dds_cache, background_dds_builder, tile_completion_tracker
+    global prebuilt_dds_cache, background_dds_builder, tile_completion_tracker, _bundle_consolidator
     
     # Check if enabled
     enabled = getattr(CFG.autoortho, 'predictive_dds_enabled', True)
@@ -4109,6 +4396,32 @@ def start_predictive_dds(tile_cacher=None) -> None:
         on_tile_complete=_on_tile_complete_callback
     )
     
+    # Initialize bundle consolidator for AOB2 format
+    bundle_consolidation_enabled = getattr(CFG.autoortho, 'bundle_consolidation_enabled', True)
+    if isinstance(bundle_consolidation_enabled, str):
+        bundle_consolidation_enabled = bundle_consolidation_enabled.lower() in ('true', '1', 'yes', 'on')
+    
+    if bundle_consolidation_enabled:
+        try:
+            # Handle imports for both frozen (PyInstaller) and direct Python execution
+            try:
+                from autoortho.aopipeline.bundle_consolidator import BundleConsolidator
+            except ImportError:
+                from aopipeline.bundle_consolidator import BundleConsolidator
+            
+            cache_dir = CFG.paths.cache_dir
+            _bundle_consolidator = BundleConsolidator(
+                cache_dir=cache_dir,
+                delete_jpegs=True,  # Remove individual JPEGs after consolidation
+                max_workers=1,       # Single worker to avoid disk contention
+                enabled=True
+            )
+            log.info("Bundle consolidation enabled (AOB2 format)")
+        except ImportError as e:
+            log.debug(f"Bundle consolidator not available: {e}")
+        except Exception as e:
+            log.warning(f"Failed to initialize bundle consolidator: {e}")
+    
     # Start the builder thread
     background_dds_builder.start()
     
@@ -4118,7 +4431,18 @@ def start_predictive_dds(tile_cacher=None) -> None:
 
 def stop_predictive_dds() -> None:
     """Stop the predictive DDS generation system and cleanup disk cache."""
-    global background_dds_builder, tile_completion_tracker, prebuilt_dds_cache
+    global background_dds_builder, tile_completion_tracker, prebuilt_dds_cache, _bundle_consolidator
+    
+    # Shutdown bundle consolidator first (let pending consolidations complete)
+    if _bundle_consolidator is not None:
+        try:
+            stats = _bundle_consolidator.get_stats()
+            _bundle_consolidator.shutdown(wait=True)
+            log.info(f"Bundle consolidator: {stats['bundles_created']} bundles created, "
+                    f"{stats['jpegs_consolidated']} JPEGs consolidated")
+        except Exception as e:
+            log.warning(f"Error shutting down bundle consolidator: {e}")
+        _bundle_consolidator = None
     
     if background_dds_builder is not None:
         stats = background_dds_builder.stats
@@ -4762,6 +5086,17 @@ class Tile(object):
         if not self.chunks.get(zoom):
             self.chunks[zoom] = []
             log.debug(f"Creating chunks for zoom {zoom}: {width}x{height} grid starting at ({col},{row})")
+            
+            # Try bundle-first read (AOB2 format - much faster than individual files)
+            bundle_loaded = False
+            try:
+                bundle_loaded = self._try_load_from_bundle(col, row, width, height, zoom)
+            except Exception as e:
+                log.debug(f"Bundle read failed for {self.id} at zoom {zoom}: {e}")
+            
+            if bundle_loaded:
+                log.debug(f"Loaded {len(self.chunks[zoom])} chunks from bundle for zoom {zoom}")
+                return
 
             # Check if native batch cache reading is available
             native_cache = _get_native_cache()
@@ -4789,6 +5124,76 @@ class Tile(object):
                         log.debug(f"Native batch cache read: {hits}/{len(paths)} hits for zoom {zoom}")
         else:
             log.debug(f"Reusing existing {len(self.chunks[zoom])} chunks for zoom {zoom}")
+
+    def _try_load_from_bundle(self, col: int, row: int, width: int, height: int, zoom: int) -> bool:
+        """
+        Try to load chunks from an AOB2 bundle file.
+        
+        Bundle loading is much faster than individual file reads because:
+        - Single file open instead of 256+ opens
+        - Sequential read for optimal disk I/O
+        - Memory-mappable for zero-copy access
+        
+        Args:
+            col, row: Starting chunk coordinates
+            width, height: Chunk grid dimensions
+            zoom: Zoom level
+        
+        Returns:
+            True if bundle was loaded successfully, False otherwise
+        """
+        try:
+            # Handle imports for both frozen (PyInstaller) and direct Python execution
+            try:
+                from autoortho.utils.bundle_paths import get_bundle2_path, bundle_exists
+                from autoortho.aopipeline import AoBundle2
+            except ImportError:
+                from utils.bundle_paths import get_bundle2_path, bundle_exists
+                from aopipeline import AoBundle2
+            
+            # Check if bundle exists
+            bundle_path = get_bundle2_path(self.cache_dir, self.row, self.col, self.maptype, zoom)
+            if not os.path.exists(bundle_path):
+                return False
+            
+            # Open bundle and read chunks
+            bundle = AoBundle2.Bundle2Python(bundle_path)
+            
+            # Check if bundle has this zoom level
+            if not bundle.has_zoom(zoom):
+                return False
+            
+            # Get all chunk data from bundle
+            jpeg_datas = bundle.get_all_chunks(zoom)
+            expected_count = width * height
+            
+            if len(jpeg_datas) != expected_count:
+                log.debug(f"Bundle chunk count mismatch: {len(jpeg_datas)} vs expected {expected_count}")
+                return False
+            
+            # Create chunks with data from bundle
+            chunk_idx = 0
+            for r in range(row, row + height):
+                for c in range(col, col + width):
+                    chunk = Chunk(c, r, self.maptype, zoom, cache_dir=self.cache_dir,
+                                  tile_id=self.id, skip_cache_check=True)
+                    
+                    # Set cached data if available
+                    jpeg_data = jpeg_datas[chunk_idx]
+                    if jpeg_data is not None:
+                        chunk.set_cached_data(jpeg_data)
+                    
+                    self.chunks[zoom].append(chunk)
+                    chunk_idx += 1
+            
+            return True
+            
+        except ImportError:
+            # Bundle modules not available
+            return False
+        except Exception as e:
+            log.debug(f"Failed to load from bundle: {e}")
+            return False
 
     def _collect_chunk_jpegs(self, zoom: int, time_budget=None,
                               min_available_ratio: float = 0.9,
