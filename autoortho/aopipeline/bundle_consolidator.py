@@ -47,12 +47,20 @@ class ConsolidationPriority(IntEnum):
 class ConsolidationTask:
     """A consolidation task with priority ordering."""
     priority: int
-    row: int = field(compare=False)
-    col: int = field(compare=False)
+    row: int = field(compare=False)  # Chunk grid origin row (at zoom level)
+    col: int = field(compare=False)  # Chunk grid origin col (at zoom level)
     maptype: str = field(compare=False)
-    zoom: int = field(compare=False)
+    zoom: int = field(compare=False)  # Chunk zoom level (effective_zoom)
     timestamp: float = field(default_factory=time.time, compare=False)
     chunks_per_side: int = field(default=16, compare=False)
+    # Optional: JPEG data passed directly (avoids disk read)
+    # List of bytes or None for each chunk position
+    jpeg_datas: Optional[List[Optional[bytes]]] = field(default=None, compare=False)
+    # Tile ID coordinates for bundle path (at tilename_zoom)
+    # If None, falls back to using row/col/zoom (legacy behavior)
+    tile_row: Optional[int] = field(default=None, compare=False)
+    tile_col: Optional[int] = field(default=None, compare=False)
+    tile_zoom: Optional[int] = field(default=None, compare=False)
 
 
 class BundleConsolidator:
@@ -68,7 +76,9 @@ class BundleConsolidator:
     
     # Default configuration
     DEFAULT_WORKERS = 1
-    DEBOUNCE_DELAY_MS = 100  # Wait this long after last chunk before consolidating
+    DEBOUNCE_DELAY_MS = 500  # Wait 500ms after scheduling (cache writes are now synchronous)
+    RETRY_DELAY_MS = 500  # Retry delay if no files found (fallback for edge cases)
+    MAX_RETRIES = 1  # Single retry for edge cases (sync writes should make this rare)
     COMPACTION_CHECK_INTERVAL = 300  # Check for compaction every 5 minutes
     COMPACTION_THRESHOLD = 0.30  # 30% garbage triggers compaction
     
@@ -120,6 +130,8 @@ class BundleConsolidator:
             'jpegs_consolidated': 0,
             'bytes_saved': 0,
             'errors': 0,
+            'in_memory_consolidations': 0,  # Used in-memory data (no disk read)
+            'disk_read_consolidations': 0,  # Had to read from disk
         }
         self._stats_lock = threading.Lock()
         
@@ -142,6 +154,9 @@ class BundleConsolidator:
         """Main worker loop - processes consolidation tasks."""
         log.debug("Bundle consolidator worker started")
         
+        # Track retry counts per tile
+        retry_counts: Dict[str, int] = {}
+        
         while not self._shutdown_event.is_set():
             try:
                 # Get task with timeout to allow periodic shutdown check
@@ -150,9 +165,10 @@ class BundleConsolidator:
                 except queue.Empty:
                     continue
                 
+                tile_key = self._get_tile_key(task.row, task.col, task.maptype)
+                
                 # Check debounce - wait if more chunks might be coming
                 with self._debounce_lock:
-                    tile_key = self._get_tile_key(task.row, task.col, task.maptype)
                     last_chunk = self._last_chunk_time.get(tile_key, 0)
                     
                     # If chunk arrived recently, requeue with delay
@@ -163,19 +179,41 @@ class BundleConsolidator:
                         time.sleep(0.05)  # Brief sleep to avoid busy loop
                         continue
                 
+                # Get retry count for this tile
+                retry_count = retry_counts.get(tile_key, 0)
+                
                 # Process the task
                 try:
-                    self._consolidate_tile(task)
+                    success = self._consolidate_tile(task, retry_count)
+                    
+                    if not success and retry_count < self.MAX_RETRIES:
+                        # Retry - wait for async writes to complete
+                        # IMPORTANT: Clear jpeg_datas before retry to avoid memory bloat
+                        # (retry will read from disk anyway since in-memory failed)
+                        task.jpeg_datas = None
+                        retry_counts[tile_key] = retry_count + 1
+                        time.sleep(self.RETRY_DELAY_MS / 1000.0)
+                        self._task_queue.put(task)  # Requeue for retry
+                        continue  # Don't remove from pending yet
+                    
+                    # Done with this tile (success or max retries reached)
+                    retry_counts.pop(tile_key, None)
+                    
                 except Exception as e:
                     log.error(f"Error consolidating tile {tile_key}: {e}")
                     with self._stats_lock:
                         self._stats['errors'] += 1
                     if self._on_error:
                         self._on_error(tile_key, e)
-                finally:
-                    # Remove from pending
-                    with self._pending_lock:
-                        self._pending.pop(tile_key, None)
+                    retry_counts.pop(tile_key, None)
+                
+                # CRITICAL: Free memory immediately after processing
+                # With 300k+ JPEGs/session, holding references causes memory bloat
+                task.jpeg_datas = None
+                
+                # Remove from pending
+                with self._pending_lock:
+                    self._pending.pop(tile_key, None)
                     
             except Exception as e:
                 log.exception(f"Unexpected error in consolidator worker: {e}")
@@ -193,18 +231,29 @@ class BundleConsolidator:
         maptype: str,
         zoom: int,
         priority: ConsolidationPriority = ConsolidationPriority.NORMAL,
-        chunks_per_side: int = 16
+        chunks_per_side: int = 16,
+        jpeg_datas: Optional[List[Optional[bytes]]] = None,
+        tile_row: Optional[int] = None,
+        tile_col: Optional[int] = None,
+        tile_zoom: Optional[int] = None
     ) -> bool:
         """
         Schedule tile for bundle consolidation.
         
         Args:
-            row: Tile row
-            col: Tile column
+            row: Chunk grid origin row (at zoom level)
+            col: Chunk grid origin col (at zoom level)
             maptype: Map type identifier
-            zoom: Zoom level
+            zoom: Zoom level of the chunks
             priority: Task priority
             chunks_per_side: Chunks per side
+            jpeg_datas: Optional list of JPEG bytes for each chunk position.
+                        If provided, consolidator uses this data directly (no disk read).
+                        If None, consolidator reads from cache files on disk.
+                        Length must be chunks_per_side * chunks_per_side.
+            tile_row: Tile ID row at tilename_zoom (for bundle path)
+            tile_col: Tile ID col at tilename_zoom (for bundle path)
+            tile_zoom: Tile's tilename_zoom (for bundle path)
         
         Returns:
             True if scheduled, False if consolidation disabled or already pending
@@ -212,7 +261,10 @@ class BundleConsolidator:
         if not self.enabled:
             return False
         
-        tile_key = self._get_tile_key(row, col, maptype)
+        # Use tile_row/tile_col for the tile key if provided, otherwise use chunk row/col
+        key_row = tile_row if tile_row is not None else row
+        key_col = tile_col if tile_col is not None else col
+        tile_key = self._get_tile_key(key_row, key_col, maptype)
         
         with self._pending_lock:
             # Skip if already pending
@@ -221,16 +273,21 @@ class BundleConsolidator:
                 existing = self._pending[tile_key]
                 if priority < existing.priority:
                     existing.priority = priority
+                # Don't replace jpeg_datas - first submission wins
                 return False
             
-            # Create task
+            # Create task with optional in-memory JPEG data
             task = ConsolidationTask(
                 priority=priority,
                 row=row,
                 col=col,
                 maptype=maptype,
                 zoom=zoom,
-                chunks_per_side=chunks_per_side
+                chunks_per_side=chunks_per_side,
+                jpeg_datas=jpeg_datas,
+                tile_row=tile_row,
+                tile_col=tile_col,
+                tile_zoom=tile_zoom
             )
             
             self._pending[tile_key] = task
@@ -248,55 +305,104 @@ class BundleConsolidator:
         with self._debounce_lock:
             self._last_chunk_time[tile_key] = time.time()
     
-    def _consolidate_tile(self, task: ConsolidationTask):
+    def _consolidate_tile(self, task: ConsolidationTask, retry_count: int = 0) -> bool:
         """
         Actual consolidation work.
         
-        1. Collect all JPEGs for tile
+        1. Use in-memory JPEG data if provided, otherwise read from disk
         2. Create/update bundle atomically
         3. Verify bundle integrity
         4. Delete source JPEGs if configured
+        
+        CRITICAL: Bundle paths are based on TILE ID coordinates (tile_row, tile_col at tile_zoom),
+        NOT the chunk grid coordinates (task.row, task.col at task.zoom)!
+        This ensures bundles can be found when looking up by tile ID.
+        
+        Returns:
+            True if consolidation succeeded or should not retry
+            False if no JPEGs found and should retry
         """
-        from ..utils.bundle_paths import get_bundle2_path, ensure_bundle2_dir
-        from . import AoBundle2
+        # Handle imports for both frozen (PyInstaller) and direct Python execution
+        try:
+            from autoortho.utils.bundle_paths import get_bundle2_path, ensure_bundle2_dir
+            from autoortho.aopipeline import AoBundle2
+        except ImportError:
+            from utils.bundle_paths import get_bundle2_path, ensure_bundle2_dir
+            from aopipeline import AoBundle2
         
-        tile_key = self._get_tile_key(task.row, task.col, task.maptype)
-        log.debug(f"Consolidating tile {tile_key} at ZL{task.zoom}")
+        # Use tile ID coordinates for bundle path if provided, otherwise fall back to chunk coords
+        path_row = task.tile_row if task.tile_row is not None else task.row
+        path_col = task.tile_col if task.tile_col is not None else task.col
+        path_zoom = task.tile_zoom if task.tile_zoom is not None else task.zoom
         
+        tile_key = self._get_tile_key(path_row, path_col, task.maptype)
         chunk_count = task.chunks_per_side * task.chunks_per_side
         
-        # Collect JPEGs
-        jpeg_datas: List[Optional[bytes]] = []
-        jpeg_paths: List[Optional[str]] = []
+        # Determine if we have in-memory data or need to read from disk
+        use_memory_data = (task.jpeg_datas is not None and 
+                          len(task.jpeg_datas) == chunk_count)
         
+        if use_memory_data:
+            # FAST PATH: Use in-memory JPEG data (avoids 256 disk reads per tile)
+            jpeg_datas = task.jpeg_datas
+            log.debug(f"Consolidating tile {tile_key} at ZL{task.zoom} (in-memory data)")
+            with self._stats_lock:
+                self._stats['in_memory_consolidations'] += 1
+        else:
+            # FALLBACK PATH: Read from disk cache files
+            log.debug(f"Consolidating tile {tile_key} at ZL{task.zoom} (disk read, attempt {retry_count + 1})")
+            with self._stats_lock:
+                self._stats['disk_read_consolidations'] += 1
+            jpeg_datas = []
+            
+            for i in range(chunk_count):
+                chunk_row = i // task.chunks_per_side
+                chunk_col = i % task.chunks_per_side
+                # task.col/row ARE the starting coordinates of the chunk grid (scaled coords)
+                abs_col = task.col + chunk_col
+                abs_row = task.row + chunk_row
+                
+                path = os.path.join(
+                    self.cache_dir, 
+                    f"{abs_col}_{abs_row}_{task.zoom}_{task.maptype}.jpg"
+                )
+                
+                try:
+                    with open(path, 'rb') as f:
+                        jpeg_datas.append(f.read())
+                except FileNotFoundError:
+                    jpeg_datas.append(None)
+        
+        # Build paths list for deletion (always needed, even with in-memory data)
+        jpeg_paths: List[Optional[str]] = []
         for i in range(chunk_count):
             chunk_row = i // task.chunks_per_side
             chunk_col = i % task.chunks_per_side
-            abs_col = task.col * task.chunks_per_side + chunk_col
-            abs_row = task.row * task.chunks_per_side + chunk_row
-            
+            abs_col = task.col + chunk_col
+            abs_row = task.row + chunk_row
             path = os.path.join(
-                self.cache_dir, 
+                self.cache_dir,
                 f"{abs_col}_{abs_row}_{task.zoom}_{task.maptype}.jpg"
             )
-            
-            try:
-                with open(path, 'rb') as f:
-                    jpeg_datas.append(f.read())
-                jpeg_paths.append(path)
-            except FileNotFoundError:
-                jpeg_datas.append(None)
-                jpeg_paths.append(None)
+            jpeg_paths.append(path if jpeg_datas[i] is not None else None)
         
         # Count valid chunks
         valid_count = sum(1 for d in jpeg_datas if d is not None)
         if valid_count == 0:
-            log.debug(f"No JPEGs found for tile {tile_key}, skipping consolidation")
-            return
+            if not use_memory_data and retry_count < self.MAX_RETRIES:
+                log.debug(f"No JPEGs found for tile {tile_key} at ZL{task.zoom}, will retry. "
+                         f"First path: {self.cache_dir}/{task.col}_{task.row}_{task.zoom}_{task.maptype}.jpg")
+                return False  # Signal to retry
+            else:
+                log.debug(f"No JPEGs found for tile {tile_key} (in-memory={use_memory_data}), giving up.")
+                return True  # Don't retry anymore
         
-        # Ensure bundle directory exists
-        bundle_dir = ensure_bundle2_dir(self.cache_dir, task.row, task.col, task.zoom)
-        bundle_path = get_bundle2_path(self.cache_dir, task.row, task.col, task.maptype, task.zoom)
+        log.debug(f"Found {valid_count}/{chunk_count} JPEGs for tile {tile_key} at ZL{task.zoom}")
+        
+        # CRITICAL: Use tile ID coordinates (path_row, path_col, path_zoom) for bundle path,
+        # NOT chunk grid coordinates! This ensures bundles match tile ID naming.
+        bundle_dir = ensure_bundle2_dir(self.cache_dir, path_row, path_col, path_zoom)
+        bundle_path = get_bundle2_path(self.cache_dir, path_row, path_col, task.maptype, path_zoom)
         
         # Check if bundle exists (update vs create)
         bundle_exists = os.path.exists(bundle_path)
@@ -341,12 +447,24 @@ class BundleConsolidator:
         if self.delete_jpegs:
             for path in jpeg_paths:
                 if path:
-                    try:
-                        os.remove(path)
-                    except FileNotFoundError:
-                        pass
-                    except Exception as e:
-                        log.warning(f"Failed to delete {path}: {e}")
+                    # Retry deletion with small delays to handle Windows file locking
+                    # WinError 32 occurs when another thread still has the file open
+                    max_delete_attempts = 3
+                    for attempt in range(max_delete_attempts):
+                        try:
+                            os.remove(path)
+                            break  # Success
+                        except FileNotFoundError:
+                            break  # Already deleted, that's fine
+                        except PermissionError as e:
+                            # WinError 32: File in use by another process
+                            if attempt < max_delete_attempts - 1:
+                                time.sleep(0.1 * (attempt + 1))  # 100ms, 200ms delays
+                            else:
+                                log.debug(f"Could not delete {path} after {max_delete_attempts} attempts: {e}")
+                        except Exception as e:
+                            log.warning(f"Failed to delete {path}: {e}")
+                            break
         
         # Update stats
         with self._stats_lock:
@@ -361,6 +479,7 @@ class BundleConsolidator:
             self._on_bundle_created(tile_key, bundle_path)
         
         log.debug(f"Consolidated {valid_count} JPEGs into bundle for {tile_key}")
+        return True  # Success
     
     def get_stats(self) -> dict:
         """Get consolidation statistics."""
@@ -499,8 +618,13 @@ class CompactionWorker:
     
     def _check_and_compact(self):
         """Check all bundles and compact if needed."""
-        from ..utils.bundle_paths import enumerate_bundles
-        from . import AoBundle2
+        # Handle imports for both frozen (PyInstaller) and direct Python execution
+        try:
+            from autoortho.utils.bundle_paths import enumerate_bundles
+            from autoortho.aopipeline import AoBundle2
+        except ImportError:
+            from utils.bundle_paths import enumerate_bundles
+            from aopipeline import AoBundle2
         
         bundles = enumerate_bundles(self.cache_dir)
         

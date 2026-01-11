@@ -690,21 +690,29 @@ def create_bundle_python(
     Create a bundle using pure Python (fallback).
     
     Same as create_bundle but doesn't require native library.
+    
+    Note: tile_row and tile_col are the starting coordinates of the chunk grid,
+    NOT tile indices. Chunks are at (tile_col + offset, tile_row + offset).
     """
     if output_path is None:
-        from ..utils.bundle_paths import get_bundle2_path, ensure_bundle2_dir
+        # Handle imports for both frozen (PyInstaller) and direct Python execution
+        try:
+            from autoortho.utils.bundle_paths import get_bundle2_path, ensure_bundle2_dir
+        except ImportError:
+            from utils.bundle_paths import get_bundle2_path, ensure_bundle2_dir
         ensure_bundle2_dir(cache_dir, tile_row, tile_col, zoom)
         output_path = get_bundle2_path(cache_dir, tile_row, tile_col, maptype, zoom)
     
     chunk_count = chunks_per_side * chunks_per_side
     
     # Read all JPEG files
+    # tile_row/tile_col ARE the starting coordinates of the chunk grid
     jpeg_datas = []
     for i in range(chunk_count):
         chunk_row_offset = i // chunks_per_side
         chunk_col_offset = i % chunks_per_side
-        abs_col = tile_col * chunks_per_side + chunk_col_offset
-        abs_row = tile_row * chunks_per_side + chunk_row_offset
+        abs_col = tile_col + chunk_col_offset
+        abs_row = tile_row + chunk_row_offset
         
         path = os.path.join(cache_dir, f"{abs_col}_{abs_row}_{zoom}_{maptype}.jpg")
         try:

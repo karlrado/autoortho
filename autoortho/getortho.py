@@ -3774,10 +3774,14 @@ class BackgroundDDSBuilder:
                 from utils.bundle_paths import get_bundle2_path
                 from aopipeline import AoBundle2
             
-            # Check if bundle exists
-            bundle_path = get_bundle2_path(tile.cache_dir, tile.row, tile.col, tile.maptype, tile.max_zoom)
+            # CRITICAL: Use TILE ID coordinates (tile.row, tile.col at tilename_zoom) for bundle path!
+            # Bundles are named after the tile ID, NOT the scaled chunk coordinates.
+            bundle_path = get_bundle2_path(tile.cache_dir, tile.row, tile.col, tile.maptype, tile.tilename_zoom)
             if not os.path.exists(bundle_path):
                 return None
+            
+            # Get chunk grid dimensions for max_zoom (used for DDS building)
+            _, _, width, height, effective_zoom, _ = tile._get_quick_zoom(tile.max_zoom)
             
             # Get configuration
             dxt_format = CFG.pydds.format.upper()
@@ -3792,10 +3796,10 @@ class BackgroundDDSBuilder:
             return _build_tile_dds_from_bundle(
                 tile=tile,
                 bundle_path=bundle_path,
-                target_zoom=tile.max_zoom,
+                target_zoom=effective_zoom,
                 dxt_format=dxt_format,
                 missing_color=missing_color,
-                chunks_per_side=tile.chunks_per_row
+                chunks_per_side=width  # Use scaled width (chunks_per_side for this zoom level)
             )
             
         except Exception as e:
@@ -4323,6 +4327,121 @@ tile_completion_tracker: Optional[TileCompletionTracker] = None
 _bundle_consolidator = None
 
 
+def schedule_bundle_consolidation(tile, priority: int = 0, jpeg_datas: list = None, zoom: int = None) -> bool:
+    """
+    Schedule bundle consolidation for a tile after successful build.
+    
+    This is called from ALL tile build paths (live, streaming, prefetch) to
+    ensure JPEGs are consolidated into bundles for faster future access.
+    
+    CRITICAL: Bundle paths are based on TILE ID coordinates (tile.row, tile.col at tilename_zoom),
+    NOT the scaled chunk coordinates! This ensures bundles can be found when looking up by tile ID.
+    
+    The bundle stores chunks at their respective zoom levels internally.
+    
+    PERFORMANCE OPTIMIZATION:
+    When jpeg_datas is provided, the consolidator uses in-memory data directly,
+    avoiding disk reads per tile.
+    
+    Args:
+        tile: The tile that was successfully built
+        priority: Consolidation priority (0=HIGH for live, 1=NORMAL for prefetch)
+        jpeg_datas: Optional list of JPEG bytes for each chunk. If provided,
+                    consolidator uses this data directly instead of reading from disk.
+        zoom: Specific zoom level to consolidate. If None, consolidates max_zoom only.
+    
+    Returns:
+        True if scheduled successfully, False otherwise
+    """
+    if _bundle_consolidator is None or tile is None:
+        return False
+    
+    try:
+        # Determine which zoom level to consolidate
+        if zoom is None:
+            target_zoom = tile.max_zoom
+        else:
+            target_zoom = zoom
+        
+        # Get chunk grid dimensions for the target zoom level
+        # This gives us the scaled coordinates where chunks are stored
+        chunk_col, chunk_row, width, height, effective_zoom, _ = tile._get_quick_zoom(target_zoom)
+        
+        # Calculate chunks_per_side from scaled dimensions
+        chunks_per_side = width  # Assuming square tiles (width == height)
+        
+        # CRITICAL: Bundle path uses TILE ID coordinates (tile.row, tile.col at tilename_zoom)
+        # NOT the scaled chunk coordinates! This ensures we can find the bundle when looking up by tile ID.
+        # The consolidator needs:
+        # - tile_row, tile_col: for bundle path (at tilename_zoom)
+        # - tilename_zoom: for bundle path directory structure
+        # - chunk_row, chunk_col: where chunks are stored (at effective_zoom)
+        # - effective_zoom: the actual zoom level of the chunks
+        _bundle_consolidator.schedule(
+            row=chunk_row,  # Chunk grid origin row
+            col=chunk_col,  # Chunk grid origin col
+            maptype=tile.maptype,
+            zoom=effective_zoom,
+            priority=priority,
+            chunks_per_side=chunks_per_side,
+            jpeg_datas=jpeg_datas,
+            # NEW: Pass tile ID coordinates for bundle path
+            tile_row=tile.row,
+            tile_col=tile.col,
+            tile_zoom=tile.tilename_zoom
+        )
+        bump('bundle_consolidation_scheduled')
+        if jpeg_datas:
+            bump('bundle_consolidation_in_memory')
+        return True
+    except Exception as e:
+        log.debug(f"Failed to schedule bundle consolidation for tile {tile.row},{tile.col} at zoom {zoom}: {e}")
+        return False
+
+
+def schedule_bundle_consolidation_all_zooms(tile, priority: int = 0) -> int:
+    """
+    Schedule bundle consolidation for ALL zoom levels of a tile.
+    
+    A DDS tile uses chunks at multiple zoom levels for different mipmaps:
+    - Mipmap 0: max_zoom (e.g., ZL17) - 16×16 chunks
+    - Mipmap 1: max_zoom-1 (e.g., ZL16) - 8×8 chunks
+    - Mipmap 2: max_zoom-2 (e.g., ZL15) - 4×4 chunks
+    - etc., down to min_zoom
+    
+    This function schedules consolidation for each zoom level that has cached chunks.
+    
+    Args:
+        tile: The tile to consolidate
+        priority: Consolidation priority
+    
+    Returns:
+        Number of zoom levels scheduled for consolidation
+    """
+    if _bundle_consolidator is None or tile is None:
+        return 0
+    
+    scheduled = 0
+    
+    # Consolidate all zoom levels from max_zoom down to min_zoom
+    for mipmap in range(tile.max_mipmap + 1):
+        zoom = tile.max_zoom - mipmap
+        if zoom < tile.min_zoom:
+            break
+        
+        # Get chunks for this zoom level if they exist
+        zoom_chunks = tile.chunks.get(zoom, [])
+        if zoom_chunks:
+            # Collect JPEG data from in-memory chunks if available
+            jpeg_datas = [chunk.data if hasattr(chunk, 'data') and chunk.data else None 
+                          for chunk in zoom_chunks]
+            
+            if schedule_bundle_consolidation(tile, priority=priority, jpeg_datas=jpeg_datas, zoom=zoom):
+                scheduled += 1
+    
+    return scheduled
+
+
 def _on_tile_complete_callback(tile_id: str, tile) -> None:
     """
     Callback invoked when all chunks for a tile have been downloaded.
@@ -4331,18 +4450,20 @@ def _on_tile_complete_callback(tile_id: str, tile) -> None:
     if background_dds_builder is not None:
         background_dds_builder.submit(tile)
     
-    # Schedule bundle consolidation in background
-    if _bundle_consolidator is not None and tile is not None:
-        try:
-            _bundle_consolidator.schedule(
-                row=tile.row,
-                col=tile.col,
-                maptype=tile.maptype,
-                zoom=tile.max_zoom,
-                priority=0  # HIGH priority for user-visible tiles
-            )
-        except Exception as e:
-            log.debug(f"Failed to schedule bundle consolidation for {tile_id}: {e}")
+    # Schedule bundle consolidation for ALL zoom levels of this tile
+    # A tile has chunks at multiple zoom levels (for different mipmaps):
+    # - max_zoom: 16×16 chunks for mipmap 0
+    # - max_zoom-1: 8×8 chunks for mipmap 1
+    # - etc.
+    #
+    # Each zoom level needs to be consolidated separately with its correct
+    # coordinates and chunk count.
+    try:
+        scheduled = schedule_bundle_consolidation_all_zooms(tile, priority=1)  # Lower priority for prefetch
+        if scheduled > 0:
+            log.debug(f"Scheduled bundle consolidation for {scheduled} zoom levels of tile {tile_id}")
+    except Exception as e:
+        log.debug(f"Failed to schedule bundle consolidation for tile {tile_id}: {e}")
 
 
 def start_predictive_dds(tile_cacher=None) -> None:
@@ -4416,11 +4537,13 @@ def start_predictive_dds(tile_cacher=None) -> None:
                 max_workers=1,       # Single worker to avoid disk contention
                 enabled=True
             )
-            log.info("Bundle consolidation enabled (AOB2 format)")
+            log.info(f"Bundle consolidation enabled (AOB2 format) - bundles saved to {cache_dir}/bundles/")
         except ImportError as e:
-            log.debug(f"Bundle consolidator not available: {e}")
+            log.info(f"Bundle consolidator not available (import failed): {e}")
         except Exception as e:
             log.warning(f"Failed to initialize bundle consolidator: {e}")
+    else:
+        log.info("Bundle consolidation disabled by config")
     
     # Start the builder thread
     background_dds_builder.start()
@@ -4878,9 +5001,18 @@ class Chunk(object):
 
         self.fetchtime = time.monotonic() - self.starttime
 
-        # OPTIMIZATION: Signal ready BEFORE cache write
-        # The chunk data is already in memory (self.data), so we can mark it
-        # as ready immediately. Cache writes are for future requests only.
+        # SYNC CACHE WRITE: Write to disk BEFORE signaling ready
+        # This ensures files are on disk for:
+        # 1. Bundle consolidation (which reads files immediately after tile build)
+        # 2. Native C batch_read_cache (which needs files to exist)
+        # 3. Future session restarts (cache persistence)
+        #
+        # Performance impact: ~1-5ms per chunk on SSD, ~10-50ms on HDD
+        # For a 256-chunk tile on SSD: +0.3-1.3 seconds total (1-3% overhead)
+        # This is acceptable given the correctness benefits.
+        self.save_cache()
+        
+        # Now signal ready - tile can start building, files are guaranteed on disk
         self.ready.set()
         
         # Track slow downloads for visibility in stats
@@ -4900,14 +5032,6 @@ class Chunk(object):
                 tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
         except Exception:
             pass  # Never block downloads
-        
-        # Submit cache write asynchronously - fire and forget
-        # This prevents disk I/O from blocking the download worker thread
-        try:
-            _cache_write_executor.submit(_async_cache_write, self)
-        except RuntimeError:
-            # Executor shut down (program exiting), write synchronously as fallback
-            self.save_cache()
         
         return True
 
@@ -5095,8 +5219,14 @@ class Tile(object):
                 log.debug(f"Bundle read failed for {self.id} at zoom {zoom}: {e}")
             
             if bundle_loaded:
+                # Track bundle hits for monitoring cache effectiveness
+                bump('bundle_cache_hit')
+                bump('bundle_chunks_loaded', len(self.chunks[zoom]))
                 log.debug(f"Loaded {len(self.chunks[zoom])} chunks from bundle for zoom {zoom}")
                 return
+            else:
+                # Track bundle misses to monitor cache effectiveness
+                bump('bundle_cache_miss')
 
             # Check if native batch cache reading is available
             native_cache = _get_native_cache()
@@ -5123,7 +5253,21 @@ class Tile(object):
                     if hits > 0:
                         log.debug(f"Native batch cache read: {hits}/{len(paths)} hits for zoom {zoom}")
         else:
-            log.debug(f"Reusing existing {len(self.chunks[zoom])} chunks for zoom {zoom}")
+            # Chunks exist - check if they have data
+            existing_chunks = self.chunks[zoom]
+            chunks_without_data = sum(1 for c in existing_chunks if not c.data)
+            
+            if chunks_without_data > len(existing_chunks) * 0.5:  # More than 50% missing data
+                # Try loading from bundle - JPEGs may have been deleted after consolidation
+                col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(quick_zoom, min_zoom)
+                try:
+                    if self._reload_chunks_from_bundle(zoom):
+                        log.debug(f"Reloaded {len(existing_chunks)} chunks from bundle for zoom {zoom}")
+                        return
+                except Exception as e:
+                    log.debug(f"Bundle reload failed for {self.id} at zoom {zoom}: {e}")
+            
+            log.debug(f"Reusing existing {len(existing_chunks)} chunks for zoom {zoom}")
 
     def _try_load_from_bundle(self, col: int, row: int, width: int, height: int, zoom: int) -> bool:
         """
@@ -5135,7 +5279,7 @@ class Tile(object):
         - Memory-mappable for zero-copy access
         
         Args:
-            col, row: Starting chunk coordinates
+            col, row: Starting chunk coordinates (SCALED for the target zoom level)
             width, height: Chunk grid dimensions
             zoom: Zoom level
         
@@ -5151,8 +5295,10 @@ class Tile(object):
                 from utils.bundle_paths import get_bundle2_path, bundle_exists
                 from aopipeline import AoBundle2
             
-            # Check if bundle exists
-            bundle_path = get_bundle2_path(self.cache_dir, self.row, self.col, self.maptype, zoom)
+            # CRITICAL: Use TILE ID coordinates (self.row, self.col at tilename_zoom) for bundle path!
+            # Bundles are named after the tile ID, NOT the scaled chunk coordinates.
+            # The bundle stores chunks at their respective zoom levels internally.
+            bundle_path = get_bundle2_path(self.cache_dir, self.row, self.col, self.maptype, self.tilename_zoom)
             if not os.path.exists(bundle_path):
                 return False
             
@@ -5193,6 +5339,76 @@ class Tile(object):
             return False
         except Exception as e:
             log.debug(f"Failed to load from bundle: {e}")
+            return False
+
+    def _reload_chunks_from_bundle(self, zoom: int) -> bool:
+        """
+        Reload existing chunks' data from an AOB2 bundle.
+        
+        This is called when chunks exist but their data has been cleared (memory management)
+        AND the original JPEG files were deleted by bundle consolidation. The bundle
+        contains the consolidated data we need.
+        
+        Args:
+            zoom: Zoom level to reload chunks for
+        
+        Returns:
+            True if bundle data was loaded into existing chunks, False otherwise
+        """
+        try:
+            # Handle imports for both frozen (PyInstaller) and direct Python execution
+            try:
+                from autoortho.utils.bundle_paths import get_bundle2_path
+                from autoortho.aopipeline import AoBundle2
+            except ImportError:
+                from utils.bundle_paths import get_bundle2_path
+                from aopipeline import AoBundle2
+            
+            existing_chunks = self.chunks.get(zoom, [])
+            if not existing_chunks:
+                return False
+            
+            # Use TILE ID coordinates for bundle path (same as _try_load_from_bundle)
+            bundle_path = get_bundle2_path(self.cache_dir, self.row, self.col, self.maptype, self.tilename_zoom)
+            if not os.path.exists(bundle_path):
+                bump('bundle_cache_miss')
+                return False
+            
+            # Open bundle and read chunks
+            bundle = AoBundle2.Bundle2Python(bundle_path)
+            
+            # Check if bundle has this zoom level
+            if not bundle.has_zoom(zoom):
+                bump('bundle_cache_miss')
+                return False
+            
+            # Get all chunk data from bundle
+            jpeg_datas = bundle.get_all_chunks(zoom)
+            
+            if len(jpeg_datas) != len(existing_chunks):
+                log.debug(f"Bundle chunk count mismatch during reload: {len(jpeg_datas)} vs {len(existing_chunks)}")
+                return False
+            
+            # Reload data into existing chunks
+            reloaded = 0
+            for i, chunk in enumerate(existing_chunks):
+                jpeg_data = jpeg_datas[i]
+                if jpeg_data is not None and not chunk.data:
+                    chunk.set_cached_data(jpeg_data)
+                    reloaded += 1
+            
+            if reloaded > 0:
+                bump('bundle_cache_hit')
+                bump('bundle_chunks_loaded', reloaded)
+                log.debug(f"Reloaded {reloaded} chunks from bundle for zoom {zoom}")
+                return True
+            
+            return False
+            
+        except ImportError:
+            return False
+        except Exception as e:
+            log.debug(f"Failed to reload from bundle: {e}")
             return False
 
     def _collect_chunk_jpegs(self, zoom: int, time_budget=None,
@@ -5298,6 +5514,28 @@ class Tile(object):
         
         log.debug(f"_collect_chunk_jpegs: Phase 1 - {available_count}/{total_chunks} "
                   f"chunks ({ratio*100:.0f}%), need {min_available_ratio*100:.0f}%")
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # PHASE 1.5: Try bundle reload (instant, no network)
+        # ═══════════════════════════════════════════════════════════════════════
+        # If cache files are missing (deleted after consolidation), try loading
+        # from the AOB2 bundle. This avoids unnecessary re-downloads.
+        if available_count < total_chunks * min_available_ratio:
+            try:
+                if self._reload_chunks_from_bundle(zoom):
+                    # Re-check available chunks after bundle reload
+                    for i, chunk in enumerate(chunks):
+                        if jpeg_datas[i] is None and chunk.data:
+                            jpeg_datas[i] = chunk.data
+                            available_count += 1
+                    
+                    ratio = available_count / total_chunks
+                    if ratio >= min_available_ratio:
+                        log.debug(f"_collect_chunk_jpegs: Bundle reload sufficient - "
+                                  f"{available_count}/{total_chunks} chunks ({ratio*100:.0f}%)")
+                        return jpeg_datas
+            except Exception as e:
+                log.debug(f"_collect_chunk_jpegs: Bundle reload failed: {e}")
         
         # ═══════════════════════════════════════════════════════════════════════
         # PHASE 2: Download missing chunks using FULL remaining budget
@@ -5566,6 +5804,10 @@ class Tile(object):
                       f"{result.bytes_written} bytes in {build_time:.0f}ms")
             build_success = True
             bump('live_aopipeline_success')
+            
+            # Schedule bundle consolidation for ALL zoom levels
+            # This consolidates max_zoom with in-memory data and lower zoom levels from disk
+            schedule_bundle_consolidation_all_zooms(self, priority=0)
             
         except Exception as e:
             log.debug(f"_try_aopipeline_build: Exception for {self.id}: {e}")
@@ -5881,6 +6123,10 @@ class Tile(object):
                                   f"(decoded={status['chunks_decoded']}, fallback={status['chunks_fallback']}, "
                                   f"missing={status['chunks_missing']})")
                         bump('streaming_builder_success')
+                        
+                        # Schedule bundle consolidation for ALL zoom levels
+                        # This consolidates max_zoom with in-memory data and lower zoom levels from disk
+                        schedule_bundle_consolidation_all_zooms(self, priority=0)
                         return True
                 
                 log.debug(f"_try_streaming_aopipeline_build: Finalize failed for {self.id}")
@@ -5959,10 +6205,31 @@ class Tile(object):
             
         Returns:
             Tuple of (col, row, width, height, zoom, zoom_diff)
+            
+        Note: Coordinates are ALWAYS scaled based on the difference between
+        tilename_zoom and the effective zoom level. This ensures chunks are
+        created at the correct geographic location regardless of zoom level.
         """
-        # Handle simple case: no quick zoom specified
+        # Handle simple case: no quick zoom specified (use max_zoom)
         if not quick_zoom:
-            return (self.col, self.row, self.width, self.height, self.max_zoom, 0)
+            # Still need to scale coordinates if tilename_zoom != max_zoom
+            # E.g., a ZL18 tile (.ter file) building at max_zoom=17 needs coords scaled by 2
+            tilename_zoom_diff = self.tilename_zoom - self.max_zoom
+            if tilename_zoom_diff == 0:
+                # No scaling needed - common fast path
+                return (self.col, self.row, self.width, self.height, self.max_zoom, 0)
+            else:
+                # Scale coordinates for zoom level difference
+                def scale_by_zoom_diff(value, diff):
+                    if diff >= 0:
+                        return value >> diff
+                    else:
+                        return value << (-diff)
+                scaled_col = scale_by_zoom_diff(self.col, tilename_zoom_diff)
+                scaled_row = scale_by_zoom_diff(self.row, tilename_zoom_diff)
+                scaled_width = max(1, scale_by_zoom_diff(self.width, tilename_zoom_diff))
+                scaled_height = max(1, scale_by_zoom_diff(self.height, tilename_zoom_diff))
+                return (scaled_col, scaled_row, scaled_width, scaled_height, self.max_zoom, 0)
         
         quick_zoom = int(quick_zoom)
         
