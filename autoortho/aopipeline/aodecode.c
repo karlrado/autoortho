@@ -199,6 +199,158 @@ AODECODE_API void aodecode_pool_stats(
 }
 
 /*============================================================================
+ * Persistent TurboJPEG Decoder Pool
+ *============================================================================
+ * Maintains a pool of persistent TurboJPEG decoder handles, one per OpenMP
+ * thread. This eliminates the overhead of creating/destroying handles in
+ * each parallel decode loop (~0.15ms per thread per call).
+ *
+ * Thread Safety:
+ * - Initialization uses mutex for thread-safe lazy init
+ * - Each thread accesses only its own slot (indexed by omp_get_thread_num())
+ * - Cleanup should only be called during shutdown
+ */
+
+/* Persistent TurboJPEG decoder handles - one per OpenMP thread */
+static tjhandle g_persistent_decoders[MAX_OMP_THREADS] = {NULL};
+static int g_decoders_initialized = 0;
+
+/* Mutex for thread-safe initialization */
+#ifdef AOPIPELINE_WINDOWS
+static CRITICAL_SECTION g_decoder_cs;
+static int g_decoder_cs_initialized = 0;
+
+static void ensure_decoder_cs_init(void) {
+    if (!g_decoder_cs_initialized) {
+        InitializeCriticalSection(&g_decoder_cs);
+        g_decoder_cs_initialized = 1;
+    }
+}
+#define DECODER_LOCK() do { ensure_decoder_cs_init(); EnterCriticalSection(&g_decoder_cs); } while(0)
+#define DECODER_UNLOCK() LeaveCriticalSection(&g_decoder_cs)
+#else
+static pthread_mutex_t g_decoder_mutex = PTHREAD_MUTEX_INITIALIZER;
+#define DECODER_LOCK() pthread_mutex_lock(&g_decoder_mutex)
+#define DECODER_UNLOCK() pthread_mutex_unlock(&g_decoder_mutex)
+#endif
+
+/**
+ * Get or create a persistent decoder for the current thread.
+ * 
+ * Returns the persistent decoder if available, or creates a new one
+ * if this is the first call from this thread.
+ * 
+ * Falls back to creating a non-persistent handle if thread ID is out
+ * of range - caller must check and destroy these with is_persistent_decoder().
+ */
+static tjhandle get_thread_decoder(void) {
+#if AOPIPELINE_HAS_OPENMP
+    int tid = omp_get_thread_num();
+    if (tid >= 0 && tid < MAX_OMP_THREADS) {
+        if (!g_persistent_decoders[tid]) {
+            /* Double-checked locking for thread-safe lazy init */
+            DECODER_LOCK();
+            if (!g_persistent_decoders[tid]) {
+                g_persistent_decoders[tid] = tjInitDecompress();
+            }
+            DECODER_UNLOCK();
+        }
+        return g_persistent_decoders[tid];
+    }
+#endif
+    /* Fallback for non-OpenMP or thread ID overflow - caller must destroy */
+    return tjInitDecompress();
+}
+
+/**
+ * Check if a decoder handle is from the persistent pool.
+ * 
+ * Returns 1 if the handle is persistent (don't destroy it),
+ * 0 if it was created as a fallback (caller should destroy).
+ */
+static int is_persistent_decoder(tjhandle tjh) {
+    if (!tjh) return 0;
+#if AOPIPELINE_HAS_OPENMP
+    for (int i = 0; i < MAX_OMP_THREADS; i++) {
+        if (g_persistent_decoders[i] == tjh) return 1;
+    }
+#endif
+    return 0;
+}
+
+AODECODE_API void aodecode_init_persistent_decoders(void) {
+    if (g_decoders_initialized) return;
+    
+    DECODER_LOCK();
+    if (!g_decoders_initialized) {
+#if AOPIPELINE_HAS_OPENMP
+        /* Initialize in parallel to create one handle per thread */
+        #pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            if (tid >= 0 && tid < MAX_OMP_THREADS) {
+                if (!g_persistent_decoders[tid]) {
+                    g_persistent_decoders[tid] = tjInitDecompress();
+                }
+            }
+        }
+#else
+        /* Single-threaded: just init one decoder */
+        if (!g_persistent_decoders[0]) {
+            g_persistent_decoders[0] = tjInitDecompress();
+        }
+#endif
+        g_decoders_initialized = 1;
+    }
+    DECODER_UNLOCK();
+}
+
+AODECODE_API void aodecode_cleanup_persistent_decoders(void) {
+    DECODER_LOCK();
+    for (int i = 0; i < MAX_OMP_THREADS; i++) {
+        if (g_persistent_decoders[i]) {
+            tjDestroy(g_persistent_decoders[i]);
+            g_persistent_decoders[i] = NULL;
+        }
+    }
+    g_decoders_initialized = 0;
+    DECODER_UNLOCK();
+}
+
+AODECODE_API void* aodecode_get_thread_decoder(void) {
+    return (void*)get_thread_decoder();
+}
+
+AODECODE_API int aodecode_is_persistent_decoder(void* tjh) {
+    return is_persistent_decoder((tjhandle)tjh);
+}
+
+AODECODE_API void aodecode_warmup_full(aodecode_pool_t* pool) {
+    /* Initialize persistent decoders first */
+    aodecode_init_persistent_decoders();
+    
+    /* Pre-fault pool memory if provided */
+    if (pool && pool->memory && pool->count > 0) {
+        volatile uint8_t dummy = 0;
+        size_t stride = CHUNK_RGBA_BYTES;
+        for (int32_t i = 0; i < pool->count; i++) {
+            /* Touch first byte of each buffer to fault pages into RAM */
+            dummy += pool->memory[i * stride];
+        }
+        (void)dummy;  /* Suppress unused warning */
+    }
+    
+#if AOPIPELINE_HAS_OPENMP
+    /* Force OpenMP runtime initialization by running a trivial parallel region */
+    #pragma omp parallel
+    {
+        volatile int tid = omp_get_thread_num();
+        (void)tid;  /* Suppress unused warning */
+    }
+#endif
+}
+
+/*============================================================================
  * JPEG Decoding Implementation
  *============================================================================*/
 
@@ -305,8 +457,10 @@ AODECODE_API int32_t aodecode_batch(
     
 #pragma omp parallel reduction(+:success_count)
     {
-        /* Each thread gets its own turbojpeg handle */
-        tjhandle tjh = tjInitDecompress();
+        /* Get persistent decoder for this thread (or create fallback) */
+        tjhandle tjh = get_thread_decoder();
+        int is_persistent = is_persistent_decoder(tjh);
+        
         if (!tjh) {
             /* Thread can't decode - skip all its work */
         } else {
@@ -338,7 +492,10 @@ AODECODE_API int32_t aodecode_batch(
                 }
             }
             
-            tjDestroy(tjh);
+            /* Only destroy non-persistent handles */
+            if (!is_persistent) {
+                tjDestroy(tjh);
+            }
         }
     }
     
@@ -372,7 +529,10 @@ AODECODE_API int32_t aodecode_from_cache(
     
 #pragma omp parallel reduction(+:success_count)
     {
-        tjhandle tjh = tjInitDecompress();
+        /* Get persistent decoder for this thread (or create fallback) */
+        tjhandle tjh = get_thread_decoder();
+        int is_persistent = is_persistent_decoder(tjh);
+        
         if (tjh) {
 #pragma omp for schedule(dynamic, 4)
             for (int32_t i = 0; i < count; i++) {
@@ -399,7 +559,10 @@ AODECODE_API int32_t aodecode_from_cache(
                 }
             }
             
-            tjDestroy(tjh);
+            /* Only destroy non-persistent handles */
+            if (!is_persistent) {
+                tjDestroy(tjh);
+            }
         }
     }
     
@@ -426,14 +589,20 @@ AODECODE_API int32_t aodecode_single(
     image->channels = 0;
     image->from_pool = 0;
     
-    tjhandle tjh = tjInitDecompress();
+    /* Get persistent decoder (or create fallback) */
+    tjhandle tjh = get_thread_decoder();
+    int is_persistent = is_persistent_decoder(tjh);
+    
     if (!tjh) return 0;
     
     char error[64];
     int result = decode_jpeg_internal(tjh, jpeg_data, jpeg_length, 
                                        image, pool, error);
     
-    tjDestroy(tjh);
+    /* Only destroy non-persistent handles */
+    if (!is_persistent) {
+        tjDestroy(tjh);
+    }
     return result;
 }
 

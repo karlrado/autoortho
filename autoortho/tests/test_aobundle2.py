@@ -207,24 +207,27 @@ class TestBundlePaths:
             maptype="BI", zoom=16
         )
         
-        # Should contain bundle directory structure
+        # Should contain bundle directory structure with maptype as folder
         assert "bundles" in path
         assert path.endswith(".aob2")
-        assert "100_200_BI.aob2" in path
+        assert "100_200.aob2" in path
+        assert "/BI/" in path or "\\BI\\" in path  # maptype is now a folder
     
     def test_get_bundle2_filename(self):
         """Test bundle filename generation."""
         from autoortho.utils.bundle_paths import get_bundle2_filename
         
-        filename = get_bundle2_filename(row=123, col=456, maptype="EOX")
-        assert filename == "123_456_EOX.aob2"
+        # Maptype is no longer in filename - it's in the parent directory
+        filename = get_bundle2_filename(row=123, col=456)
+        assert filename == "123_456.aob2"
     
     def test_parse_bundle_filename(self):
         """Test bundle filename parsing."""
         from autoortho.utils.bundle_paths import parse_bundle_filename
         
-        result = parse_bundle_filename("123_456_BI.aob2")
-        assert result == (123, 456, "BI")
+        # Maptype is no longer in filename - it's in the parent directory
+        result = parse_bundle_filename("123_456.aob2")
+        assert result == (123, 456)
         
         result = parse_bundle_filename("invalid")
         assert result is None

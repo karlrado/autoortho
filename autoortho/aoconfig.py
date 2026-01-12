@@ -16,8 +16,10 @@ import logging
 log = logging.getLogger(__name__)
 
 class SectionParser(object):
-    true = ['true','1', 'yes', 'on']
-    false = ['false', '0', 'no', 'off']
+    # Note: '0' and '1' are NOT treated as booleans to avoid corrupting numeric settings
+    # Settings like native_pipeline_threads=0 should stay as integers, not become False
+    true = ['true', 'yes', 'on']
+    false = ['false', 'no', 'off']
 
     def __init__(self, /, **kwargs):
         for k, v in kwargs.items():
@@ -25,21 +27,52 @@ class SectionParser(object):
             sv = '' if v is None else str(v)
             s = sv.strip()
 
-            # Detect booleans
-            if s.lower() in self.true:
-                parsed_val = True
-            elif s.lower() in self.false:
-                parsed_val = False
-            # Detect list
-            elif s.startswith('[') and s.endswith(']'):
+            # Detect list first (before other parsing)
+            if s.startswith('[') and s.endswith(']'):
                 try:
                     parsed_val = ast.literal_eval(s)
                 except Exception:
+                    parsed_val = s
+            # Detect booleans (text-only, not '0'/'1' to avoid corrupting numbers)
+            elif s.lower() in self.true:
+                parsed_val = True
+            elif s.lower() in self.false:
+                parsed_val = False
+            # Try to parse as integer
+            elif s.lstrip('-').isdigit():
+                try:
+                    parsed_val = int(s)
+                except ValueError:
+                    parsed_val = s
+            # Try to parse as float
+            elif self._is_float(s):
+                try:
+                    parsed_val = float(s)
+                except ValueError:
                     parsed_val = s
             else:
                 parsed_val = s
 
             self.__dict__.update({k: parsed_val})
+    
+    @staticmethod
+    def _is_float(s):
+        """Check if string looks like a float (contains decimal point or scientific notation)."""
+        if not s:
+            return False
+        # Remove leading minus sign for checking
+        s_check = s.lstrip('-')
+        # Must contain at least one digit
+        if not any(c.isdigit() for c in s_check):
+            return False
+        # Check for float patterns: decimal point or scientific notation
+        if '.' in s_check or 'e' in s_check.lower():
+            try:
+                float(s)
+                return True
+            except ValueError:
+                return False
+        return False
 
     def __repr__(self):
         items = (f"{k}={v!r}" for k, v in self.__dict__.items())
@@ -174,6 +207,11 @@ predictive_dds_enabled = True
 # Higher = slower building, lower CPU usage
 # Recommended: 250 (fast CPU), 500 (balanced), 1000 (low-end CPU)
 predictive_dds_build_interval_ms = 500
+# Number of parallel background builder workers for prefetch DDS builds (1-8)
+# Higher values = faster prefetch throughput, but more CPU usage during flight
+# Lower values = less CPU impact, slower prefetch
+# Recommended: 2 (balanced), 4 (fast CPU), 1 (low-end CPU or battery saving)
+background_builder_workers = 2
 # Apply fallbacks when pre-building DDS (True/False)
 # True (default): Apply same fallback logic as live requests (cache search, lower zoom, etc.)
 #   - Pro: Prebuilt tiles have best possible quality with fallbacks for failed chunks
@@ -244,18 +282,13 @@ streaming_builder_pool_size = 4
 # falling back to the slower Python pipeline. This ensures consistent
 # performance and prevents resource contention.
 #
-# Enable tile queue system (True/False)
-# When enabled, tiles wait for pool slots instead of Python fallback
+# Enable tile queue system with priority (True/False)
+# When enabled, tiles wait for pool slots using a priority queue:
+# - Live tiles (X-Plane requests) = "premium clients", served first
+# - Prefetch tiles = low priority, served when system is idle
 # Recommended: True for consistent performance
 tile_queue_enabled = True
-# Number of buffers in the prefetch buffer pool (1-4)
-# Prefetch tiles use a separate pool to avoid competing with live tiles.
-# Lower values = less memory, but prefetch may queue up more
-# Higher values = more memory, faster prefetch processing
-# Memory usage: Same per-buffer size as main pool (11-43MB each)
-# Recommended: 2 (default), increase to 3-4 if you have extra RAM
-prefetch_buffer_pool_size = 2
-# Maximum tiles that can wait in each queue (10-500)
+# Maximum tiles that can wait in queue (10-500)
 # If queue is full, additional tiles are rejected
 # Higher = more tiles can wait, but uses more memory for tracking
 # Recommended: 100 (default)

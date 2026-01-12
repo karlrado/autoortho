@@ -34,14 +34,20 @@ from ctypes import (
     CDLL, POINTER, Structure, byref, cast, c_float, c_int64,
     c_int32, c_uint8, c_uint16, c_uint32, c_uint64, c_char_p, c_void_p, c_size_t
 )
+from collections import OrderedDict
 from enum import IntFlag
+from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, NamedTuple
+import logging
+import mmap
 import os
 import struct
 import sys
 import threading
 import time
+
+log = logging.getLogger(__name__)
 
 # ============================================================================
 # Constants
@@ -57,6 +63,63 @@ BUNDLE2_COMPACTION_THRESHOLD = 0.30
 
 FORMAT_BC1 = 0  # DXT1, no alpha
 FORMAT_BC3 = 1  # DXT5, with alpha
+
+# I/O optimization: buffer size for efficient large writes
+BUNDLE2_WRITE_BUFFER_SIZE = 256 * 1024  # 256KB
+
+
+def _preallocate_file(f, size: int) -> bool:
+    """
+    Pre-allocate file size for more efficient writes.
+    
+    This hints to the filesystem to allocate contiguous blocks,
+    reducing fragmentation and improving write performance.
+    
+    Args:
+        f: Open file object in write mode
+        size: Target file size in bytes
+        
+    Returns:
+        True if successful, False otherwise (non-fatal).
+    """
+    if size <= 0:
+        return False
+    
+    try:
+        fd = f.fileno()
+    except (OSError, AttributeError):
+        return False
+    
+    try:
+        # Linux: posix_fallocate is most efficient - actually allocates blocks
+        if sys.platform.startswith('linux'):
+            try:
+                os.posix_fallocate(fd, 0, size)
+                return True
+            except (OSError, AttributeError):
+                pass
+        
+        # Windows: seek to end and write a byte, then seek back
+        if sys.platform == 'win32':
+            try:
+                f.seek(size - 1)
+                f.write(b'\x00')
+                f.seek(0)
+                return True
+            except OSError:
+                pass
+        else:
+            # POSIX fallback (macOS, others): ftruncate
+            try:
+                os.ftruncate(fd, size)
+                f.seek(0)
+                return True
+            except (OSError, AttributeError):
+                pass
+    except Exception:
+        pass
+    
+    return False  # Non-fatal
 
 
 class BundleFlags(IntFlag):
@@ -75,6 +138,150 @@ class ChunkFlags(IntFlag):
     PLACEHOLDER = 0x0002
     UPSCALED = 0x0004
     GARBAGE = 0x0080
+
+
+# ============================================================================
+# Bundle Metadata Cache (LRU)
+# ============================================================================
+# Caches parsed bundle metadata (header + zoom table + chunk indices) across
+# Bundle2Python instances. This avoids redundant parsing when the same bundle
+# is accessed multiple times.
+
+class BundleMetadata(NamedTuple):
+    """Cached bundle metadata (header + zoom table + chunk indices)."""
+    header: dict
+    maptype: str
+    zoom_table: list
+    chunk_indices: dict
+    file_size: int
+
+
+class BundleMetadataCache:
+    """
+    Thread-safe LRU cache for bundle metadata.
+    
+    Caches parsed headers, zoom tables, and chunk indices keyed by (path, mtime).
+    Invalidates automatically when file modification time changes.
+    
+    Performance: Avoids re-parsing ~500 bytes of metadata per bundle open.
+    For hot paths accessing the same bundles repeatedly, this eliminates
+    redundant I/O and struct unpacking.
+    """
+    
+    def __init__(self, maxsize: int = 128):
+        """
+        Create metadata cache.
+        
+        Args:
+            maxsize: Maximum number of bundle metadata entries to cache
+        """
+        self._maxsize = maxsize
+        self._cache: OrderedDict[Tuple[str, float], BundleMetadata] = OrderedDict()
+        self._lock = threading.Lock()
+        self._hits = 0
+        self._misses = 0
+    
+    def get(self, path: str) -> Optional[BundleMetadata]:
+        """
+        Get cached metadata for a bundle.
+        
+        Args:
+            path: Path to bundle file
+            
+        Returns:
+            Cached BundleMetadata if valid cache entry exists, None otherwise
+        """
+        try:
+            mtime = os.path.getmtime(path)
+            file_size = os.path.getsize(path)
+        except OSError:
+            return None
+        
+        cache_key = (path, mtime)
+        
+        with self._lock:
+            if cache_key in self._cache:
+                # Verify file size matches (cheap corruption check)
+                metadata = self._cache[cache_key]
+                if metadata.file_size == file_size:
+                    # Move to end (most recently used)
+                    self._cache.move_to_end(cache_key)
+                    self._hits += 1
+                    return metadata
+                else:
+                    # File size changed - invalidate
+                    del self._cache[cache_key]
+            
+            self._misses += 1
+            return None
+    
+    def put(self, path: str, metadata: BundleMetadata) -> None:
+        """
+        Cache metadata for a bundle.
+        
+        Args:
+            path: Path to bundle file
+            metadata: Parsed metadata to cache
+        """
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return
+        
+        cache_key = (path, mtime)
+        
+        with self._lock:
+            # Remove if already exists (will re-add at end)
+            if cache_key in self._cache:
+                del self._cache[cache_key]
+            
+            self._cache[cache_key] = metadata
+            
+            # Evict oldest if over capacity
+            while len(self._cache) > self._maxsize:
+                self._cache.popitem(last=False)
+    
+    def invalidate(self, path: str) -> None:
+        """
+        Invalidate all cached entries for a path.
+        
+        Args:
+            path: Path to bundle file
+        """
+        with self._lock:
+            # Remove all entries for this path (regardless of mtime)
+            keys_to_remove = [k for k in self._cache if k[0] == path]
+            for k in keys_to_remove:
+                del self._cache[k]
+    
+    def clear(self) -> None:
+        """Clear all cached entries."""
+        with self._lock:
+            self._cache.clear()
+            self._hits = 0
+            self._misses = 0
+    
+    def get_stats(self) -> dict:
+        """Get cache statistics."""
+        with self._lock:
+            total = self._hits + self._misses
+            hit_rate = self._hits / total if total > 0 else 0.0
+            return {
+                'size': len(self._cache),
+                'maxsize': self._maxsize,
+                'hits': self._hits,
+                'misses': self._misses,
+                'hit_rate': hit_rate,
+            }
+
+
+# Global metadata cache (shared across all Bundle2Python instances)
+_metadata_cache = BundleMetadataCache(maxsize=128)
+
+
+def get_metadata_cache() -> BundleMetadataCache:
+    """Get the global bundle metadata cache."""
+    return _metadata_cache
 
 
 # ============================================================================
@@ -259,7 +466,7 @@ def create_bundle(
     
     if output_path is None:
         from ..utils.bundle_paths import get_bundle2_path, ensure_bundle2_dir
-        ensure_bundle2_dir(cache_dir, tile_row, tile_col, zoom)
+        ensure_bundle2_dir(cache_dir, tile_row, tile_col, zoom, maptype)
         output_path = get_bundle2_path(cache_dir, tile_row, tile_col, maptype, zoom)
     
     # Ensure parent directory exists
@@ -464,12 +671,140 @@ def get_version() -> str:
 
 
 # ============================================================================
+# Header-Only Quick Access Functions
+# ============================================================================
+# These functions read only the bundle header and zoom table (~200 bytes)
+# without loading the entire file, making them ~1000x faster for large bundles.
+
+def has_zoom_quick(bundle_path: str, zoom: int) -> bool:
+    """
+    Check if a bundle has a specific zoom level WITHOUT loading the entire file.
+    
+    Reads only the header (~64 bytes) and zoom table (~12 bytes per zoom level),
+    making this ~1000x faster than opening a full Bundle2Python for large bundles.
+    
+    Args:
+        bundle_path: Path to bundle file
+        zoom: Zoom level to check
+    
+    Returns:
+        True if bundle exists and contains the specified zoom level
+        False if bundle doesn't exist, is invalid, or doesn't have the zoom
+    """
+    try:
+        with open(bundle_path, 'rb') as f:
+            # Read header (64 bytes)
+            header_data = f.read(BUNDLE2_HEADER_SIZE)
+            if len(header_data) < BUNDLE2_HEADER_SIZE:
+                return False
+            
+            # Parse minimum header fields (first 22 bytes)
+            header_fmt = '<I H H i i H H H H'
+            try:
+                (magic, version, flags, tile_row, tile_col,
+                 maptype_len, zoom_count, min_zoom, max_zoom) = \
+                    struct.unpack(header_fmt, header_data[:22])
+            except struct.error:
+                return False
+            
+            # Validate magic
+            if magic != BUNDLE2_MAGIC:
+                return False
+            
+            # Quick range check (avoids reading zoom table if obviously out of range)
+            if zoom < min_zoom or zoom > max_zoom:
+                return False
+            
+            # If only one zoom level and range check passed, it must be this zoom
+            if zoom_count == 1 and min_zoom == max_zoom == zoom:
+                return True
+            
+            # Read zoom table entries
+            maptype_padded = (maptype_len + 7) & ~7
+            zoom_table_offset = BUNDLE2_HEADER_SIZE + maptype_padded
+            
+            f.seek(zoom_table_offset)
+            
+            zoom_entry_size = 12  # struct.calcsize('<H H I I')
+            zoom_table_data = f.read(zoom_count * zoom_entry_size)
+            
+            if len(zoom_table_data) < zoom_count * zoom_entry_size:
+                return False
+            
+            # Check each zoom entry
+            for i in range(zoom_count):
+                offset = i * zoom_entry_size
+                entry_zoom = struct.unpack('<H', zoom_table_data[offset:offset + 2])[0]
+                if entry_zoom == zoom:
+                    return True
+            
+            return False
+            
+    except (OSError, IOError, struct.error):
+        return False
+
+
+def get_bundle_zoom_levels_quick(bundle_path: str) -> List[int]:
+    """
+    Get list of zoom levels in a bundle WITHOUT loading the entire file.
+    
+    Args:
+        bundle_path: Path to bundle file
+    
+    Returns:
+        List of zoom levels, or empty list if bundle invalid
+    """
+    try:
+        with open(bundle_path, 'rb') as f:
+            # Read header
+            header_data = f.read(BUNDLE2_HEADER_SIZE)
+            if len(header_data) < BUNDLE2_HEADER_SIZE:
+                return []
+            
+            header_fmt = '<I H H i i H H H H'
+            try:
+                (magic, version, flags, tile_row, tile_col,
+                 maptype_len, zoom_count, min_zoom, max_zoom) = \
+                    struct.unpack(header_fmt, header_data[:22])
+            except struct.error:
+                return []
+            
+            if magic != BUNDLE2_MAGIC:
+                return []
+            
+            # Read zoom table
+            maptype_padded = (maptype_len + 7) & ~7
+            zoom_table_offset = BUNDLE2_HEADER_SIZE + maptype_padded
+            
+            f.seek(zoom_table_offset)
+            zoom_entry_size = 12
+            zoom_table_data = f.read(zoom_count * zoom_entry_size)
+            
+            zooms = []
+            for i in range(zoom_count):
+                offset = i * zoom_entry_size
+                if offset + 2 <= len(zoom_table_data):
+                    entry_zoom = struct.unpack('<H', zoom_table_data[offset:offset + 2])[0]
+                    zooms.append(entry_zoom)
+            
+            return zooms
+            
+    except (OSError, IOError, struct.error):
+        return []
+
+
+# ============================================================================
 # Pure Python Bundle Reader (Fallback)
 # ============================================================================
 
 class Bundle2Python:
     """
-    Pure Python bundle reader for AOB2 format.
+    Pure Python bundle reader for AOB2 format using memory-mapped I/O.
+    
+    Memory-mapped access provides:
+    - Lazy loading: only accessed pages are read from disk
+    - OS-managed caching: efficient memory usage via page cache
+    - Zero-copy access: slice operations return views, not copies
     
     This class provides read-only access to AOB2 bundles without requiring
     the native library. Useful for testing and as a fallback.
@@ -478,32 +813,80 @@ class Bundle2Python:
         bundle = Bundle2Python("/path/to/bundle.aob2")
         jpeg_data = bundle.get_chunk(zoom=16, index=0)
         all_jpegs = bundle.get_all_chunks(zoom=16)
+        bundle.close()  # Or use as context manager
+        
+        # Context manager usage (recommended):
+        with Bundle2Python("/path/to/bundle.aob2") as bundle:
+            jpeg_data = bundle.get_chunk(zoom=16, index=0)
     """
     
-    def __init__(self, path: str):
-        """Open a bundle file for reading."""
+    def __init__(self, path: str, use_metadata_cache: bool = True):
+        """
+        Open a bundle file for reading.
+        
+        Args:
+            path: Path to bundle file
+            use_metadata_cache: If True, use global metadata cache for faster opens
+        """
         self.path = path
-        self._data = None
+        self._file = None
+        self._mmap = None
         self._header = None
         self._maptype = None
         self._zoom_table = []
         self._chunk_indices = {}
+        self._use_metadata_cache = use_metadata_cache
         
-        self._load()
+        self._open()
     
-    def _load(self):
-        """Load and parse the bundle file."""
-        with open(self.path, 'rb') as f:
-            self._data = f.read()
+    def _open(self):
+        """Open file and create memory map."""
+        self._file = open(self.path, 'rb')
+        try:
+            # Create read-only memory map
+            # length=0 maps entire file
+            self._mmap = mmap.mmap(
+                self._file.fileno(),
+                length=0,
+                access=mmap.ACCESS_READ
+            )
+        except (ValueError, OSError) as e:
+            # Fallback for empty files or mmap failure
+            self._file.close()
+            self._file = None
+            raise ValueError(f"Cannot mmap bundle: {e}")
         
+        # Try to use cached metadata first
+        if self._use_metadata_cache:
+            cached = _metadata_cache.get(self.path)
+            if cached is not None:
+                # Use cached metadata (avoids re-parsing)
+                self._header = cached.header
+                self._maptype = cached.maptype
+                self._zoom_table = cached.zoom_table
+                self._chunk_indices = cached.chunk_indices
+                return
+        
+        # Parse metadata fresh
         self._parse_header()
         self._parse_zoom_table()
         self._parse_chunk_indices()
+        
+        # Cache the parsed metadata
+        if self._use_metadata_cache:
+            metadata = BundleMetadata(
+                header=self._header,
+                maptype=self._maptype,
+                zoom_table=self._zoom_table,
+                chunk_indices=self._chunk_indices,
+                file_size=len(self._mmap)
+            )
+            _metadata_cache.put(self.path, metadata)
     
     def _parse_header(self):
-        """Parse the 64-byte header."""
-        if len(self._data) < BUNDLE2_HEADER_SIZE:
-            raise ValueError(f"File too small for header: {len(self._data)}")
+        """Parse the 64-byte header from mmap."""
+        if len(self._mmap) < BUNDLE2_HEADER_SIZE:
+            raise ValueError(f"File too small for header: {len(self._mmap)}")
         
         # Header format (64 bytes):
         # uint32 magic, uint16 version, uint16 flags,
@@ -512,9 +895,9 @@ class Bundle2Python:
         # uint16 min_zoom, uint16 max_zoom,
         # uint32 total_chunks, uint32 data_section_offset,
         # uint32 garbage_bytes, uint64 last_modified,
-        # uint32 checksum, 12 bytes reserved
-        header_fmt = '<I H H i i H H H H I I I Q I 12s'
-        header_data = struct.unpack(header_fmt, self._data[:BUNDLE2_HEADER_SIZE])
+        # uint32 checksum, 16 bytes reserved
+        header_fmt = '<I H H i i H H H H I I I Q I 16s'
+        header_data = struct.unpack(header_fmt, self._mmap[:BUNDLE2_HEADER_SIZE])
         
         magic = header_data[0]
         if magic != BUNDLE2_MAGIC:
@@ -540,10 +923,10 @@ class Bundle2Python:
         # Parse maptype
         maptype_offset = BUNDLE2_HEADER_SIZE
         maptype_len = self._header['maptype_len']
-        self._maptype = self._data[maptype_offset:maptype_offset + maptype_len].decode('utf-8')
+        self._maptype = self._mmap[maptype_offset:maptype_offset + maptype_len].decode('utf-8')
     
     def _parse_zoom_table(self):
-        """Parse the zoom level table."""
+        """Parse the zoom level table from mmap."""
         maptype_padded = (self._header['maptype_len'] + 7) & ~7
         zoom_table_offset = BUNDLE2_HEADER_SIZE + maptype_padded
         
@@ -554,7 +937,8 @@ class Bundle2Python:
         
         for i in range(self._header['zoom_count']):
             offset = zoom_table_offset + i * zoom_entry_size
-            entry_data = struct.unpack(zoom_entry_fmt, self._data[offset:offset + zoom_entry_size])
+            entry_data = struct.unpack(zoom_entry_fmt, 
+                                       self._mmap[offset:offset + zoom_entry_size])
             
             self._zoom_table.append({
                 'zoom_level': entry_data[0],
@@ -564,7 +948,7 @@ class Bundle2Python:
             })
     
     def _parse_chunk_indices(self):
-        """Parse chunk indices for all zoom levels."""
+        """Parse chunk indices for all zoom levels from mmap."""
         # Each chunk index entry is 16 bytes:
         # uint32 data_offset, uint32 size, uint16 flags, uint16 quality, uint32 timestamp
         chunk_entry_fmt = '<I I H H I'
@@ -576,7 +960,8 @@ class Bundle2Python:
             
             for i in range(zoom_entry['chunk_count']):
                 offset = zoom_entry['index_offset'] + i * chunk_entry_size
-                entry_data = struct.unpack(chunk_entry_fmt, self._data[offset:offset + chunk_entry_size])
+                entry_data = struct.unpack(chunk_entry_fmt,
+                                          self._mmap[offset:offset + chunk_entry_size])
                 
                 indices.append({
                     'data_offset': entry_data[0],
@@ -603,6 +988,18 @@ class Bundle2Python:
         """Get list of available zoom levels."""
         return [z['zoom_level'] for z in self._zoom_table]
     
+    @property
+    def file_size(self) -> int:
+        """Get the bundle file size in bytes."""
+        if self._mmap is not None:
+            return len(self._mmap)
+        return 0
+    
+    @property
+    def is_open(self) -> bool:
+        """Check if bundle is still open."""
+        return self._mmap is not None and not self._mmap.closed
+    
     def has_zoom(self, zoom: int) -> bool:
         """Check if bundle has data for a zoom level."""
         return zoom in self._chunk_indices
@@ -616,6 +1013,9 @@ class Bundle2Python:
     def get_chunk(self, zoom: int, index: int) -> Optional[bytes]:
         """
         Get JPEG data for a specific chunk.
+        
+        Returns bytes (copy of data) for safety when passing to external code.
+        For zero-copy access within controlled scope, use get_chunk_view().
         
         Args:
             zoom: Zoom level
@@ -640,7 +1040,41 @@ class Bundle2Python:
         data_start = self._header['data_section_offset'] + entry['data_offset']
         data_end = data_start + entry['size']
         
-        return self._data[data_start:data_end]
+        # Return bytes copy (safe for external use)
+        return bytes(self._mmap[data_start:data_end])
+    
+    def get_chunk_view(self, zoom: int, index: int) -> Optional[memoryview]:
+        """
+        Get zero-copy memoryview of chunk data.
+        
+        WARNING: The returned memoryview is only valid while the bundle is open!
+        Use this only when you control the lifetime and need maximum performance.
+        
+        Args:
+            zoom: Zoom level
+            index: Chunk index
+        
+        Returns:
+            memoryview of JPEG data, or None if chunk is missing
+        """
+        if zoom not in self._chunk_indices:
+            return None
+        
+        indices = self._chunk_indices[zoom]
+        if index < 0 or index >= len(indices):
+            return None
+        
+        entry = indices[index]
+        
+        # Check if valid data
+        if entry['size'] == 0 or (entry['flags'] & ChunkFlags.GARBAGE):
+            return None
+        
+        data_start = self._header['data_section_offset'] + entry['data_offset']
+        data_end = data_start + entry['size']
+        
+        # Return memoryview (zero-copy, but only valid while mmap exists)
+        return memoryview(self._mmap)[data_start:data_end]
     
     def get_all_chunks(self, zoom: int) -> List[Optional[bytes]]:
         """
@@ -657,6 +1091,44 @@ class Bundle2Python:
         
         return [self.get_chunk(zoom, i) for i in range(len(self._chunk_indices[zoom]))]
     
+    def close(self, invalidate_cache: bool = False):
+        """
+        Close the bundle and release resources.
+        
+        Args:
+            invalidate_cache: If True, invalidate cached metadata for this path
+                             (use when bundle file might have been modified)
+        """
+        if self._mmap is not None:
+            try:
+                self._mmap.close()
+            except Exception:
+                pass
+            self._mmap = None
+        
+        if self._file is not None:
+            try:
+                self._file.close()
+            except Exception:
+                pass
+            self._file = None
+        
+        if invalidate_cache:
+            _metadata_cache.invalidate(self.path)
+    
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - ensures cleanup."""
+        self.close()
+        return False
+    
+    def __del__(self):
+        """Destructor - cleanup if not explicitly closed."""
+        self.close()
+    
     def get_chunk_info(self, zoom: int, index: int) -> Optional[dict]:
         """Get metadata for a specific chunk."""
         if zoom not in self._chunk_indices:
@@ -667,10 +1139,6 @@ class Bundle2Python:
             return None
         
         return indices[index].copy()
-    
-    def close(self):
-        """Release memory (optional - called for compatibility)."""
-        self._data = None
 
 
 # ============================================================================
@@ -700,7 +1168,7 @@ def create_bundle_python(
             from autoortho.utils.bundle_paths import get_bundle2_path, ensure_bundle2_dir
         except ImportError:
             from utils.bundle_paths import get_bundle2_path, ensure_bundle2_dir
-        ensure_bundle2_dir(cache_dir, tile_row, tile_col, zoom)
+        ensure_bundle2_dir(cache_dir, tile_row, tile_col, zoom, maptype)
         output_path = get_bundle2_path(cache_dir, tile_row, tile_col, maptype, zoom)
     
     chunk_count = chunks_per_side * chunks_per_side
@@ -785,9 +1253,9 @@ def create_bundle_from_data_python(
                 'timestamp': timestamp,
             })
     
-    # Build header
+    # Build header (64 bytes - reserved is 16 bytes to match BUNDLE2_HEADER_SIZE)
     header = struct.pack(
-        '<I H H i i H H H H I I I Q I 12s',
+        '<I H H i i H H H H I I I Q I 16s',
         BUNDLE2_MAGIC,              # magic
         BUNDLE2_VERSION,            # version
         BundleFlags.MUTABLE,        # flags
@@ -802,15 +1270,15 @@ def create_bundle_from_data_python(
         0,                          # garbage_bytes
         int(time.time()),           # last_modified
         0,                          # checksum (placeholder)
-        b'\x00' * 12                # reserved
+        b'\x00' * 16                # reserved (16 bytes to make header 64 bytes)
     )
     
     # Calculate checksum (on header with checksum=0)
     checksum = _crc32_python(header)
     
-    # Rebuild header with correct checksum
+    # Rebuild header with correct checksum (64 bytes total)
     header = struct.pack(
-        '<I H H i i H H H H I I I Q I 12s',
+        '<I H H i i H H H H I I I Q I 16s',
         BUNDLE2_MAGIC,
         BUNDLE2_VERSION,
         BundleFlags.MUTABLE,
@@ -825,7 +1293,7 @@ def create_bundle_from_data_python(
         0,
         int(time.time()),
         checksum,
-        b'\x00' * 12
+        b'\x00' * 16
     )
     
     # Build zoom table entry
@@ -849,19 +1317,267 @@ def create_bundle_from_data_python(
             entry['timestamp']
         )
     
+    # Build complete buffer for single write (reduces syscall overhead)
+    buffer = bytearray()
+    buffer.extend(header)
+    buffer.extend(maptype_bytes)
+    buffer.extend(b'\x00' * (maptype_padded_len - len(maptype_bytes)))
+    buffer.extend(zoom_entry)
+    buffer.extend(index_data)
+    for data in data_parts:
+        buffer.extend(data)
+    
     # Ensure parent directory exists
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
-    # Write atomically
+    # Write atomically with 256KB buffer and file preallocation
     temp_path = output_path + f'.tmp.{os.getpid()}'
-    with open(temp_path, 'wb') as f:
-        f.write(header)
-        f.write(maptype_bytes)
-        f.write(b'\x00' * (maptype_padded_len - len(maptype_bytes)))
-        f.write(zoom_entry)
-        f.write(index_data)
-        for data in data_parts:
-            f.write(data)
+    with open(temp_path, 'wb', buffering=BUNDLE2_WRITE_BUFFER_SIZE) as f:
+        _preallocate_file(f, len(buffer))
+        f.write(buffer)
+    
+    os.rename(temp_path, output_path)
+    return output_path
+
+
+def update_bundle_with_zoom(
+    bundle_path: str,
+    new_zoom: int,
+    new_jpeg_datas: List[Optional[bytes]],
+    new_chunks_per_side: int
+) -> str:
+    """
+    Update an existing bundle by adding a new zoom level.
+    
+    This preserves existing zoom levels and adds the new one.
+    If the zoom level already exists, it is replaced.
+    
+    Args:
+        bundle_path: Path to existing bundle
+        new_zoom: Zoom level to add
+        new_jpeg_datas: JPEG data for the new zoom level
+        new_chunks_per_side: Chunks per side for the new zoom level
+    
+    Returns:
+        Path to the updated bundle
+    """
+    import math
+    
+    # Invalidate any cached metadata for this bundle since we're modifying it
+    _metadata_cache.invalidate(bundle_path)
+    
+    # Read existing bundle
+    existing = Bundle2Python(bundle_path, use_metadata_cache=False)
+    header = existing.header
+    
+    # Collect all zoom level data (existing + new)
+    zoom_data = {}  # {zoom: {'chunks_per_side': n, 'jpeg_datas': [...]}}
+    
+    # Get existing zoom levels
+    for zoom in existing.zoom_levels:
+        chunk_count = existing.get_chunk_count(zoom)
+        chunks_per_side = int(math.sqrt(chunk_count))
+        jpeg_datas = existing.get_all_chunks(zoom)
+        zoom_data[zoom] = {
+            'chunks_per_side': chunks_per_side,
+            'jpeg_datas': jpeg_datas
+        }
+    
+    # Add or replace new zoom level
+    zoom_data[new_zoom] = {
+        'chunks_per_side': new_chunks_per_side,
+        'jpeg_datas': new_jpeg_datas
+    }
+    
+    # Write combined bundle
+    return create_multi_zoom_bundle(
+        header['tile_row'],
+        header['tile_col'],
+        existing.maptype,
+        zoom_data,
+        bundle_path
+    )
+
+
+def create_multi_zoom_bundle(
+    tile_row: int,
+    tile_col: int,
+    maptype: str,
+    zoom_data: dict,  # {zoom: {'chunks_per_side': n, 'jpeg_datas': [...]}}
+    output_path: str
+) -> str:
+    """
+    Create a bundle with multiple zoom levels.
+    
+    Args:
+        tile_row, tile_col: Tile coordinates
+        maptype: Map source identifier
+        zoom_data: Dict mapping zoom level to chunks_per_side and jpeg_datas
+        output_path: Output bundle path
+    
+    Returns:
+        Path to the created bundle
+    """
+    if not zoom_data:
+        raise ValueError("zoom_data cannot be empty")
+    
+    zoom_levels = sorted(zoom_data.keys())
+    min_zoom = min(zoom_levels)
+    max_zoom = max(zoom_levels)
+    zoom_count = len(zoom_levels)
+    
+    # Prepare maptype
+    maptype_bytes = maptype.encode('utf-8')[:BUNDLE2_MAX_MAPTYPE - 1]
+    maptype_padded_len = (len(maptype_bytes) + 7) & ~7
+    
+    # Calculate layout
+    # Header: 64 bytes
+    # Maptype: padded to 8 bytes
+    # Zoom table: 12 bytes x zoom_count
+    # Chunk indices: 16 bytes x total_chunks (sum across all zooms)
+    # Data section: variable
+    
+    zoom_table_offset = BUNDLE2_HEADER_SIZE + maptype_padded_len
+    
+    # Process each zoom level to calculate offsets
+    total_chunks = 0
+    zoom_entries = []
+    all_chunk_entries = []
+    all_data_parts = []
+    current_data_offset = 0
+    timestamp = int(time.time())
+    
+    index_start_offset = zoom_table_offset + 12 * zoom_count
+    current_index_offset = index_start_offset
+    
+    for zoom in zoom_levels:
+        zd = zoom_data[zoom]
+        chunks_per_side = zd['chunks_per_side']
+        jpeg_datas = zd['jpeg_datas']
+        chunk_count = len(jpeg_datas)
+        
+        total_chunks += chunk_count
+        
+        # Store zoom entry info
+        zoom_entries.append({
+            'zoom': zoom,
+            'chunks_per_side': chunks_per_side,
+            'index_offset': current_index_offset,
+            'chunk_count': chunk_count
+        })
+        
+        # Process chunks for this zoom
+        for jpeg in jpeg_datas:
+            if jpeg:
+                all_chunk_entries.append({
+                    'data_offset': current_data_offset,
+                    'size': len(jpeg),
+                    'flags': ChunkFlags.VALID,
+                    'quality': 0,
+                    'timestamp': timestamp,
+                })
+                all_data_parts.append(jpeg)
+                current_data_offset += len(jpeg)
+            else:
+                all_chunk_entries.append({
+                    'data_offset': 0,
+                    'size': 0,
+                    'flags': ChunkFlags.MISSING,
+                    'quality': 0,
+                    'timestamp': timestamp,
+                })
+        
+        current_index_offset += chunk_count * 16
+    
+    data_section_offset = current_index_offset
+    
+    # Adjust data_offset in chunk entries (relative to data section)
+    # They're already relative from 0, which is correct
+    
+    # Build header
+    header = struct.pack(
+        '<I H H i i H H H H I I I Q I 16s',
+        BUNDLE2_MAGIC,
+        BUNDLE2_VERSION,
+        BundleFlags.MUTABLE,
+        tile_row,
+        tile_col,
+        len(maptype_bytes),
+        zoom_count,
+        min_zoom,
+        max_zoom,
+        total_chunks,
+        data_section_offset,
+        0,  # garbage_bytes
+        timestamp,
+        0,  # checksum placeholder
+        b'\x00' * 16
+    )
+    
+    # Calculate checksum
+    checksum = _crc32_python(header)
+    
+    # Rebuild header with checksum
+    header = struct.pack(
+        '<I H H i i H H H H I I I Q I 16s',
+        BUNDLE2_MAGIC,
+        BUNDLE2_VERSION,
+        BundleFlags.MUTABLE,
+        tile_row,
+        tile_col,
+        len(maptype_bytes),
+        zoom_count,
+        min_zoom,
+        max_zoom,
+        total_chunks,
+        data_section_offset,
+        0,
+        timestamp,
+        checksum,
+        b'\x00' * 16
+    )
+    
+    # Build zoom table
+    zoom_table_data = b''
+    for ze in zoom_entries:
+        zoom_table_data += struct.pack(
+            '<H H I I',
+            ze['zoom'],
+            ze['chunks_per_side'],
+            ze['index_offset'],
+            ze['chunk_count']
+        )
+    
+    # Build chunk indices
+    index_data = b''
+    for entry in all_chunk_entries:
+        index_data += struct.pack(
+            '<I I H H I',
+            entry['data_offset'],
+            entry['size'],
+            entry['flags'],
+            entry['quality'],
+            entry['timestamp']
+        )
+    
+    # Build complete buffer for single write (reduces syscall overhead)
+    buffer = bytearray()
+    buffer.extend(header)
+    buffer.extend(maptype_bytes)
+    buffer.extend(b'\x00' * (maptype_padded_len - len(maptype_bytes)))
+    buffer.extend(zoom_table_data)
+    buffer.extend(index_data)
+    for data in all_data_parts:
+        buffer.extend(data)
+    
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    # Write atomically with 256KB buffer and file preallocation
+    temp_path = output_path + f'.tmp.{os.getpid()}'
+    with open(temp_path, 'wb', buffering=BUNDLE2_WRITE_BUFFER_SIZE) as f:
+        _preallocate_file(f, len(buffer))
+        f.write(buffer)
     
     os.rename(temp_path, output_path)
     return output_path
@@ -879,7 +1595,10 @@ def _crc32_python(data: bytes) -> int:
 
 class Bundle2:
     """
-    Thread-safe wrapper for AOB2 bundle operations.
+    Thread-safe wrapper for AOB2 bundle operations with reader caching.
+    
+    Caches the Bundle2Python reader and invalidates on file modification,
+    eliminating redundant file opens for sequential access patterns.
     
     Provides both native and pure Python implementations with automatic
     fallback to Python when native is not available.
@@ -897,31 +1616,72 @@ class Bundle2:
         self.path = path
         self._use_native = use_native and is_available()
         self._lock = threading.Lock()
-        self._python_bundle = None
+        self._cached_reader: Optional[Bundle2Python] = None
+        self._cached_mtime: Optional[float] = None
         
         if create and not os.path.exists(path):
             # Would need tile info to create - not implemented here
             raise ValueError("Cannot create bundle without tile info; use create_bundle()")
+    
+    def _get_reader(self) -> Bundle2Python:
+        """
+        Get or create cached reader, refreshing if file was modified.
         
-        if not self._use_native:
-            self._python_bundle = Bundle2Python(path)
+        Thread-safe: uses lock to prevent race conditions.
+        """
+        try:
+            current_mtime = os.path.getmtime(self.path)
+        except OSError:
+            current_mtime = None
+        
+        with self._lock:
+            # Check if we need to refresh the reader
+            needs_refresh = (
+                self._cached_reader is None or
+                not self._cached_reader.is_open or
+                self._cached_mtime != current_mtime
+            )
+            
+            if needs_refresh:
+                # Close old reader if exists
+                if self._cached_reader is not None:
+                    try:
+                        self._cached_reader.close()
+                    except Exception:
+                        pass
+                
+                # Create new reader
+                self._cached_reader = Bundle2Python(self.path)
+                self._cached_mtime = current_mtime
+            
+            return self._cached_reader
     
     def get_chunk(self, zoom: int, index: int) -> Optional[bytes]:
         """Get JPEG data for a specific chunk."""
-        if self._use_native:
-            # Native implementation reads on demand
-            bundle = Bundle2Python(self.path)
-            return bundle.get_chunk(zoom, index)
-        else:
-            return self._python_bundle.get_chunk(zoom, index)
+        return self._get_reader().get_chunk(zoom, index)
     
     def get_all_chunks(self, zoom: int) -> List[Optional[bytes]]:
         """Get all chunk data for a zoom level."""
-        if self._use_native:
-            bundle = Bundle2Python(self.path)
-            return bundle.get_all_chunks(zoom)
-        else:
-            return self._python_bundle.get_all_chunks(zoom)
+        return self._get_reader().get_all_chunks(zoom)
+    
+    def has_zoom(self, zoom: int) -> bool:
+        """Check if bundle has data for a zoom level."""
+        return self._get_reader().has_zoom(zoom)
+    
+    @property
+    def zoom_levels(self) -> List[int]:
+        """Get list of available zoom levels."""
+        return self._get_reader().zoom_levels
+    
+    @property
+    def header(self) -> dict:
+        """Get header information."""
+        return self._get_reader().header
+    
+    @property
+    def maptype(self) -> str:
+        """Get map type."""
+        return self._get_reader().maptype
     
     def build_dds(
         self,
@@ -936,11 +1696,32 @@ class Bundle2:
         else:
             raise NotImplementedError("Pure Python DDS building not implemented in Bundle2")
     
+    def invalidate_cache(self):
+        """Force reader cache invalidation (e.g., after external modification)."""
+        with self._lock:
+            if self._cached_reader is not None:
+                try:
+                    self._cached_reader.close(invalidate_cache=True)
+                except Exception:
+                    pass
+                self._cached_reader = None
+                self._cached_mtime = None
+            else:
+                # Even without a cached reader, invalidate global metadata cache
+                _metadata_cache.invalidate(self.path)
+    
     def close(self):
-        """Close the bundle."""
-        if self._python_bundle:
-            self._python_bundle.close()
-            self._python_bundle = None
+        """Close the bundle and release cached reader."""
+        self.invalidate_cache()
+    
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - ensures cleanup."""
+        self.close()
+        return False
 
 
 # ============================================================================

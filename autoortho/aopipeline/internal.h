@@ -81,6 +81,26 @@ static inline void safe_strcpy(char* dest, const char* src, size_t dest_size) {
 /* Thread-local error message buffer size */
 #define ERROR_MSG_SIZE 256
 
+/* ============================================================================
+ * Thread-Local Storage (TLS) for Persistent Resources
+ * ============================================================================
+ * Used for maintaining per-thread resources like TurboJPEG handles that are
+ * expensive to create/destroy. TLS ensures each OpenMP thread has its own
+ * instance without synchronization overhead.
+ */
+#if defined(__GNUC__)
+  /* GCC/Clang/MinGW - use __thread */
+  #define TLS_VAR __thread
+#elif defined(_MSC_VER)
+  /* MSVC - use __declspec(thread) */
+  #define TLS_VAR __declspec(thread)
+#else
+  #define TLS_VAR  /* Fallback: no TLS, will use array indexing */
+#endif
+
+/* Maximum OpenMP threads we support for persistent resource pools */
+#define MAX_OMP_THREADS 64
+
 /* Note: aopipeline_stats_t is defined in aopipeline.h */
 
 #endif /* AOPIPELINE_INTERNAL_H */

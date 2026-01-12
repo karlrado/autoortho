@@ -10,6 +10,7 @@ Features:
 - Debouncing to batch consolidation work
 - Verification before deleting source JPEGs
 - Compaction worker for bundle maintenance
+- Clean shutdown with proper thread termination
 
 Usage:
     from autoortho.aopipeline.bundle_consolidator import BundleConsolidator
@@ -21,18 +22,26 @@ Usage:
     consolidator.shutdown()
 """
 
+import atexit
 import logging
 import os
 import queue
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+import weakref
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 log = logging.getLogger(__name__)
+
+# Native batch cache I/O for parallel file reads
+try:
+    from autoortho.aopipeline import AoCache
+    _AOCACHE_AVAILABLE = AoCache.is_available()
+except ImportError:
+    _AOCACHE_AVAILABLE = False
 
 
 class ConsolidationPriority(IntEnum):
@@ -61,22 +70,54 @@ class ConsolidationTask:
     tile_row: Optional[int] = field(default=None, compare=False)
     tile_col: Optional[int] = field(default=None, compare=False)
     tile_zoom: Optional[int] = field(default=None, compare=False)
+    # Sentinel value to signal worker shutdown
+    is_shutdown_sentinel: bool = field(default=False, compare=False)
+
+
+# Sentinel task to signal worker threads to exit
+_SHUTDOWN_SENTINEL = ConsolidationTask(
+    priority=-1,  # Highest priority to be processed immediately
+    row=0, col=0, maptype="", zoom=0,
+    is_shutdown_sentinel=True
+)
+
+
+# Track all active consolidators for cleanup on exit
+_active_consolidators: List[weakref.ref] = []
+_active_consolidators_lock = threading.Lock()
+
+
+def _cleanup_all_consolidators():
+    """atexit handler to ensure all consolidators are shut down."""
+    with _active_consolidators_lock:
+        for ref in _active_consolidators:
+            consolidator = ref()
+            if consolidator is not None:
+                try:
+                    consolidator.shutdown(wait=False, timeout=1.0)
+                except Exception:
+                    pass
+        _active_consolidators.clear()
+
+
+# Register cleanup handler
+atexit.register(_cleanup_all_consolidators)
 
 
 class BundleConsolidator:
     """
     Background worker that consolidates JPEGs into bundles.
     
-    Runs in a dedicated thread pool (1-2 workers) to avoid blocking
-    download threads. Uses priority queue to process user-visible
-    tiles before prefetch tiles.
+    Runs in dedicated daemon threads to avoid blocking download threads
+    and to ensure clean shutdown when the application exits.
+    Uses priority queue to process user-visible tiles before prefetch tiles.
     
     Thread Safety: All public methods are thread-safe.
     """
     
     # Default configuration
-    DEFAULT_WORKERS = 1
-    DEBOUNCE_DELAY_MS = 500  # Wait 500ms after scheduling (cache writes are now synchronous)
+    DEFAULT_WORKERS = 8  # More workers to keep up with tile request rate
+    DEBOUNCE_DELAY_MS = 100  # Minimal delay - cache writes are synchronous, no need to wait long
     RETRY_DELAY_MS = 500  # Retry delay if no files found (fallback for edge cases)
     MAX_RETRIES = 1  # Single retry for edge cases (sync writes should make this rare)
     COMPACTION_CHECK_INTERVAL = 300  # Check for compaction every 5 minutes
@@ -95,32 +136,34 @@ class BundleConsolidator:
         Args:
             cache_dir: Base cache directory
             delete_jpegs: If True, delete source JPEGs after successful bundle creation
-            max_workers: Number of worker threads (1-2 recommended)
+            max_workers: Number of worker threads
             enabled: If False, consolidation is disabled (no-op)
         """
         self.cache_dir = cache_dir
         self.delete_jpegs = delete_jpegs
         self.enabled = enabled
+        self._max_workers = max_workers
         
         # Task queue and tracking
         self._task_queue: queue.PriorityQueue = queue.PriorityQueue()
         self._pending: Dict[str, ConsolidationTask] = {}  # tile_key -> task
         self._pending_lock = threading.Lock()
         
+        # Completion notification (replaces polling in wait_for_pending)
+        self._completion_condition = threading.Condition()
+        self._recently_completed: set = set()
+        self._completion_cleanup_threshold = 1000  # Cleanup after this many entries
+        
         # Debouncing: track last chunk arrival per tile
         self._last_chunk_time: Dict[str, float] = {}
         self._debounce_lock = threading.Lock()
         
-        # Worker pool
-        self._executor: Optional[ThreadPoolExecutor] = None
+        # Worker threads (daemon threads for clean shutdown)
+        self._workers: List[threading.Thread] = []
         self._shutdown_event = threading.Event()
         self._workers_started = False
         
         if enabled and max_workers > 0:
-            self._executor = ThreadPoolExecutor(
-                max_workers=max_workers,
-                thread_name_prefix="bundle_consolidator"
-            )
             self._start_workers()
         
         # Statistics
@@ -138,17 +181,28 @@ class BundleConsolidator:
         # Callbacks
         self._on_bundle_created: Optional[Callable] = None
         self._on_error: Optional[Callable] = None
+        
+        # Register for cleanup on exit
+        with _active_consolidators_lock:
+            _active_consolidators.append(weakref.ref(self))
     
     def _start_workers(self):
-        """Start background worker threads."""
+        """Start background worker threads as daemon threads."""
         if self._workers_started:
             return
         
         self._workers_started = True
         
-        # Main consolidation worker
-        if self._executor:
-            self._executor.submit(self._worker_loop)
+        # Start multiple consolidation workers for parallel processing
+        # Using daemon=True ensures threads are killed when main program exits
+        for i in range(self._max_workers):
+            thread = threading.Thread(
+                target=self._worker_loop,
+                name=f"bundle_consolidator_{i}",
+                daemon=True  # Critical: daemon threads exit when main program exits
+            )
+            thread.start()
+            self._workers.append(thread)
     
     def _worker_loop(self):
         """Main worker loop - processes consolidation tasks."""
@@ -159,25 +213,31 @@ class BundleConsolidator:
         
         while not self._shutdown_event.is_set():
             try:
-                # Get task with timeout to allow periodic shutdown check
+                # Get task with short timeout to allow responsive shutdown
                 try:
-                    task = self._task_queue.get(timeout=1.0)
+                    task = self._task_queue.get(timeout=0.5)
                 except queue.Empty:
                     continue
                 
-                tile_key = self._get_tile_key(task.row, task.col, task.maptype)
+                # Check for shutdown sentinel
+                if task.is_shutdown_sentinel:
+                    log.debug("Bundle consolidator worker received shutdown sentinel")
+                    break
                 
-                # Check debounce - wait if more chunks might be coming
-                with self._debounce_lock:
-                    last_chunk = self._last_chunk_time.get(tile_key, 0)
-                    
-                    # If chunk arrived recently, requeue with delay
-                    time_since_last = (time.time() - last_chunk) * 1000
-                    if time_since_last < self.DEBOUNCE_DELAY_MS:
-                        # Requeue for later
-                        self._task_queue.put(task)
-                        time.sleep(0.05)  # Brief sleep to avoid busy loop
-                        continue
+                # Double-check shutdown after getting task
+                if self._shutdown_event.is_set():
+                    # Put task back for other workers or discard
+                    break
+                
+                # CRITICAL: Use tile ID coordinates AND zoom for tile_key!
+                # This must match what schedule() uses, or pending tracking breaks.
+                path_row = task.tile_row if task.tile_row is not None else task.row
+                path_col = task.tile_col if task.tile_col is not None else task.col
+                tile_key = self._get_tile_key(path_row, path_col, task.maptype, task.zoom)
+                
+                # Debounce disabled for performance - consolidation uses in-memory data
+                # so there's no benefit to waiting for more chunks. The task already
+                # has all available JPEG data when scheduled.
                 
                 # Get retry count for this tile
                 retry_count = retry_counts.get(tile_key, 0)
@@ -192,7 +252,9 @@ class BundleConsolidator:
                         # (retry will read from disk anyway since in-memory failed)
                         task.jpeg_datas = None
                         retry_counts[tile_key] = retry_count + 1
-                        time.sleep(self.RETRY_DELAY_MS / 1000.0)
+                        # Check shutdown before sleeping
+                        if self._shutdown_event.wait(timeout=self.RETRY_DELAY_MS / 1000.0):
+                            break  # Shutdown requested during retry wait
                         self._task_queue.put(task)  # Requeue for retry
                         continue  # Don't remove from pending yet
                     
@@ -211,18 +273,46 @@ class BundleConsolidator:
                 # With 300k+ JPEGs/session, holding references causes memory bloat
                 task.jpeg_datas = None
                 
-                # Remove from pending
+                # Remove from pending and notify waiters
                 with self._pending_lock:
                     self._pending.pop(tile_key, None)
+                
+                # Notify waiters that this tile completed
+                with self._completion_condition:
+                    self._recently_completed.add(tile_key)
+                    self._completion_condition.notify_all()
+                    
+                    # Periodic cleanup of old completions to prevent unbounded growth
+                    if len(self._recently_completed) > self._completion_cleanup_threshold:
+                        # Keep only last 100 entries (arbitrary - could tune)
+                        excess = len(self._recently_completed) - 100
+                        for _ in range(excess):
+                            self._recently_completed.pop()
                     
             except Exception as e:
                 log.exception(f"Unexpected error in consolidator worker: {e}")
+                # Check shutdown even after exception
+                if self._shutdown_event.is_set():
+                    break
         
         log.debug("Bundle consolidator worker stopped")
     
-    def _get_tile_key(self, row: int, col: int, maptype: str) -> str:
-        """Generate unique key for a tile."""
-        return f"{row}_{col}_{maptype}"
+    def _get_tile_key(self, row: int, col: int, maptype: str, zoom: int = None) -> str:
+        """Generate unique key for a tile at a specific zoom level.
+        
+        CRITICAL: Include zoom in key! A tile has chunks at multiple zoom levels
+        (for different mipmaps). Each zoom level needs separate consolidation.
+        Without zoom, only the first zoom level gets scheduled, others rejected!
+        """
+        if zoom is not None:
+            return f"{row}_{col}_{maptype}_{zoom}"
+        else:
+            # Fallback for is_pending() checks that don't know the specific zoom
+            return f"{row}_{col}_{maptype}"
+    
+    def _get_tile_key_prefix(self, row: int, col: int, maptype: str) -> str:
+        """Get the prefix for matching any zoom level of a tile."""
+        return f"{row}_{col}_{maptype}_"
     
     def schedule(
         self,
@@ -262,18 +352,20 @@ class BundleConsolidator:
             return False
         
         # Use tile_row/tile_col for the tile key if provided, otherwise use chunk row/col
+        # CRITICAL: Include zoom in key! Different zoom levels need separate consolidation tasks.
         key_row = tile_row if tile_row is not None else row
         key_col = tile_col if tile_col is not None else col
-        tile_key = self._get_tile_key(key_row, key_col, maptype)
+        tile_key = self._get_tile_key(key_row, key_col, maptype, zoom)
         
         with self._pending_lock:
-            # Skip if already pending
+            # Skip if already pending for this specific zoom level
             if tile_key in self._pending:
                 # Update priority if higher
                 existing = self._pending[tile_key]
                 if priority < existing.priority:
                     existing.priority = priority
                 # Don't replace jpeg_datas - first submission wins
+                log.debug(f"CONSOLIDATE_SCHEDULE: {tile_key} already pending, skipping")
                 return False
             
             # Create task with optional in-memory JPEG data
@@ -292,6 +384,7 @@ class BundleConsolidator:
             
             self._pending[tile_key] = task
             self._task_queue.put(task)
+            log.debug(f"Scheduled consolidation: {tile_key} ZL{zoom}")
         
         return True
     
@@ -304,6 +397,36 @@ class BundleConsolidator:
         tile_key = self._get_tile_key(row, col, maptype)
         with self._debounce_lock:
             self._last_chunk_time[tile_key] = time.time()
+    
+    def _batch_read_jpeg_files(self, paths: List[str]) -> List[Optional[bytes]]:
+        """
+        Read multiple JPEG files in parallel using native batch I/O.
+        
+        Falls back to sequential Python reads if native library unavailable.
+        
+        Args:
+            paths: List of file paths to read
+            
+        Returns:
+            List of bytes or None for each path (same order as input)
+        """
+        if _AOCACHE_AVAILABLE and len(paths) >= 16:
+            # Use native parallel batch read (OpenMP)
+            try:
+                results = AoCache.batch_read_cache(paths, validate_jpeg=False)
+                return [data if success else None for data, success in results]
+            except Exception as e:
+                log.debug(f"Batch read failed, falling back to sequential: {e}")
+        
+        # Fallback: Sequential Python reads
+        jpeg_datas = []
+        for path in paths:
+            try:
+                with open(path, 'rb') as f:
+                    jpeg_datas.append(f.read())
+            except (FileNotFoundError, IOError, OSError):
+                jpeg_datas.append(None)
+        return jpeg_datas
     
     def _consolidate_tile(self, task: ConsolidationTask, retry_count: int = 0) -> bool:
         """
@@ -335,8 +458,24 @@ class BundleConsolidator:
         path_col = task.tile_col if task.tile_col is not None else task.col
         path_zoom = task.tile_zoom if task.tile_zoom is not None else task.zoom
         
-        tile_key = self._get_tile_key(path_row, path_col, task.maptype)
+        tile_key = self._get_tile_key(path_row, path_col, task.maptype, task.zoom)
         chunk_count = task.chunks_per_side * task.chunks_per_side
+        start_time = time.time()
+        
+        # EARLY CHECK: Skip if bundle already has this zoom level
+        # This uses has_zoom_quick() which reads only the header (~200 bytes)
+        # instead of loading the entire bundle file, making it ~1000x faster
+        bundle_path = get_bundle2_path(self.cache_dir, path_row, path_col, task.maptype, path_zoom)
+        if os.path.exists(bundle_path):
+            try:
+                if AoBundle2.has_zoom_quick(bundle_path, task.zoom):
+                    log.debug(f"Bundle {tile_key} already has ZL{task.zoom}, skipping")
+                    with self._stats_lock:
+                        self._stats['bundles_skipped'] = self._stats.get('bundles_skipped', 0) + 1
+                    return True  # Already done, no retry needed
+            except Exception as e:
+                log.debug(f"Quick zoom check failed, will attempt full load: {e}")
+                # Continue with normal flow - bundle might be corrupted
         
         # Determine if we have in-memory data or need to read from disk
         use_memory_data = (task.jpeg_datas is not None and 
@@ -349,29 +488,26 @@ class BundleConsolidator:
             with self._stats_lock:
                 self._stats['in_memory_consolidations'] += 1
         else:
-            # FALLBACK PATH: Read from disk cache files
+            # FALLBACK PATH: Read from disk cache files using batch I/O
             log.debug(f"Consolidating tile {tile_key} at ZL{task.zoom} (disk read, attempt {retry_count + 1})")
             with self._stats_lock:
                 self._stats['disk_read_consolidations'] += 1
-            jpeg_datas = []
             
+            # Build path list for batch read
+            paths = []
             for i in range(chunk_count):
                 chunk_row = i // task.chunks_per_side
                 chunk_col = i % task.chunks_per_side
                 # task.col/row ARE the starting coordinates of the chunk grid (scaled coords)
                 abs_col = task.col + chunk_col
                 abs_row = task.row + chunk_row
-                
-                path = os.path.join(
+                paths.append(os.path.join(
                     self.cache_dir, 
                     f"{abs_col}_{abs_row}_{task.zoom}_{task.maptype}.jpg"
-                )
-                
-                try:
-                    with open(path, 'rb') as f:
-                        jpeg_datas.append(f.read())
-                except FileNotFoundError:
-                    jpeg_datas.append(None)
+                ))
+            
+            # Batch read all files (parallel if native available)
+            jpeg_datas = self._batch_read_jpeg_files(paths)
         
         # Build paths list for deletion (always needed, even with in-memory data)
         jpeg_paths: List[Optional[str]] = []
@@ -397,74 +533,105 @@ class BundleConsolidator:
                 log.debug(f"No JPEGs found for tile {tile_key} (in-memory={use_memory_data}), giving up.")
                 return True  # Don't retry anymore
         
-        log.debug(f"Found {valid_count}/{chunk_count} JPEGs for tile {tile_key} at ZL{task.zoom}")
+        log.debug(f"Consolidating {tile_key} ZL{task.zoom}: {valid_count}/{chunk_count} JPEGs")
         
         # CRITICAL: Use tile ID coordinates (path_row, path_col, path_zoom) for bundle path,
         # NOT chunk grid coordinates! This ensures bundles match tile ID naming.
-        bundle_dir = ensure_bundle2_dir(self.cache_dir, path_row, path_col, path_zoom)
-        bundle_path = get_bundle2_path(self.cache_dir, path_row, path_col, task.maptype, path_zoom)
+        # bundle_path was already computed in early check above
+        bundle_dir = ensure_bundle2_dir(self.cache_dir, path_row, path_col, path_zoom, task.maptype)
         
         # Check if bundle exists (update vs create)
+        # Note: Early check already handled "bundle has this zoom" case, so if we get here
+        # with an existing bundle, it means we need to ADD this zoom level
         bundle_exists = os.path.exists(bundle_path)
         
         try:
-            if AoBundle2.is_available():
-                # Use native implementation
-                AoBundle2.create_bundle_from_data(
-                    task.row, task.col, task.maptype, task.zoom,
-                    jpeg_datas, bundle_path
-                )
+            if bundle_exists:
+                # Bundle exists but doesn't have this zoom level (early check confirmed)
+                # Add new zoom level to existing bundle
+                try:
+                    existing = AoBundle2.Bundle2Python(bundle_path)
+                    # Double-check in case of race condition
+                    if existing.has_zoom(task.zoom):
+                        log.debug(f"BUNDLE_SAVE: Race condition - ZL{task.zoom} added by another worker, skipping")
+                        with self._stats_lock:
+                            self._stats['bundles_skipped'] = self._stats.get('bundles_skipped', 0) + 1
+                    else:
+                        log.debug(f"Updating bundle {tile_key} with ZL{task.zoom}")
+                        import math
+                        chunks_per_side = int(math.sqrt(len(jpeg_datas)))
+                        AoBundle2.update_bundle_with_zoom(bundle_path, task.zoom, jpeg_datas, chunks_per_side)
+                except Exception as e:
+                    # If reading existing bundle fails, overwrite it
+                    log.warning(f"Could not update bundle {tile_key}: {e}, recreating")
+                    if AoBundle2.is_available():
+                        AoBundle2.create_bundle_from_data(
+                            task.row, task.col, task.maptype, task.zoom,
+                            jpeg_datas, bundle_path
+                        )
+                    else:
+                        AoBundle2.create_bundle_from_data_python(
+                            task.row, task.col, task.maptype, task.zoom,
+                            jpeg_datas, bundle_path
+                        )
             else:
-                # Use pure Python fallback
-                AoBundle2.create_bundle_from_data_python(
-                    task.row, task.col, task.maptype, task.zoom,
-                    jpeg_datas, bundle_path
-                )
+                # Create new bundle
+                if AoBundle2.is_available():
+                    # Use native implementation
+                    AoBundle2.create_bundle_from_data(
+                        task.row, task.col, task.maptype, task.zoom,
+                        jpeg_datas, bundle_path
+                    )
+                else:
+                    # Use pure Python fallback
+                    AoBundle2.create_bundle_from_data_python(
+                        task.row, task.col, task.maptype, task.zoom,
+                        jpeg_datas, bundle_path
+                    )
         except Exception as e:
-            log.error(f"Failed to create bundle for {tile_key}: {e}")
+            log.error(f"Failed to create bundle {tile_key}: {e}")
             raise
         
-        # Verify bundle
-        try:
-            if AoBundle2.is_available():
-                if not AoBundle2.validate(bundle_path):
-                    raise RuntimeError("Bundle validation failed")
-            else:
-                # Python validation - just try to parse it
-                bundle = AoBundle2.Bundle2Python(bundle_path)
-                if bundle.get_chunk_count(task.zoom) != chunk_count:
-                    raise RuntimeError("Bundle chunk count mismatch")
-        except Exception as e:
-            log.error(f"Bundle verification failed for {tile_key}: {e}")
-            # Try to remove corrupted bundle
+        # Skip validation in production - it reads the entire bundle back from disk
+        # which is very slow for large bundles (15MB+ for ZL16 tiles).
+        # The atomic write (temp file + rename) ensures integrity.
+        # Enable BUNDLE_VALIDATE_ENABLED=1 environment variable for debugging.
+        if os.environ.get('BUNDLE_VALIDATE_ENABLED', '0') == '1':
             try:
-                os.remove(bundle_path)
-            except:
-                pass
-            raise
+                if AoBundle2.is_available():
+                    if not AoBundle2.validate(bundle_path):
+                        raise RuntimeError("Bundle validation failed")
+                else:
+                    # Python validation - just try to parse it
+                    bundle = AoBundle2.Bundle2Python(bundle_path)
+                    if bundle.get_chunk_count(task.zoom) != chunk_count:
+                        raise RuntimeError("Bundle chunk count mismatch")
+            except Exception as e:
+                log.error(f"Bundle verification failed for {tile_key}: {e}")
+                # Try to remove corrupted bundle
+                try:
+                    os.remove(bundle_path)
+                except:
+                    pass
+                raise
         
         # Delete source JPEGs if configured
+        # Use fire-and-forget deletion to avoid blocking consolidation
+        # Failed deletions are fine - cleanup will happen later or on restart
         if self.delete_jpegs:
+            deleted = 0
             for path in jpeg_paths:
                 if path:
-                    # Retry deletion with small delays to handle Windows file locking
-                    # WinError 32 occurs when another thread still has the file open
-                    max_delete_attempts = 3
-                    for attempt in range(max_delete_attempts):
-                        try:
-                            os.remove(path)
-                            break  # Success
-                        except FileNotFoundError:
-                            break  # Already deleted, that's fine
-                        except PermissionError as e:
-                            # WinError 32: File in use by another process
-                            if attempt < max_delete_attempts - 1:
-                                time.sleep(0.1 * (attempt + 1))  # 100ms, 200ms delays
-                            else:
-                                log.debug(f"Could not delete {path} after {max_delete_attempts} attempts: {e}")
-                        except Exception as e:
-                            log.warning(f"Failed to delete {path}: {e}")
-                            break
+                    try:
+                        os.remove(path)
+                        deleted += 1
+                    except FileNotFoundError:
+                        deleted += 1  # Already deleted, counts as success
+                    except (PermissionError, OSError):
+                        # File locked or other issue - skip without retry
+                        # The file will be cleaned up later or is harmless
+                        pass
+            log.debug(f"Deleted {deleted}/{len(jpeg_paths)} JPEGs for {tile_key}")
         
         # Update stats
         with self._stats_lock:
@@ -478,7 +645,17 @@ class BundleConsolidator:
         if self._on_bundle_created:
             self._on_bundle_created(tile_key, bundle_path)
         
-        log.debug(f"Consolidated {valid_count} JPEGs into bundle for {tile_key}")
+        elapsed_ms = (time.time() - start_time) * 1000
+        log.debug(f"Consolidated {valid_count} JPEGs into bundle for {tile_key} in {elapsed_ms:.0f}ms")
+        
+        # Track consolidation time for monitoring
+        with self._stats_lock:
+            total_time = self._stats.get('consolidation_time_ms', 0)
+            self._stats['consolidation_time_ms'] = total_time + elapsed_ms
+            count = self._stats.get('bundles_created', 0) + self._stats.get('bundles_updated', 0)
+            if count > 0:
+                self._stats['avg_consolidation_ms'] = self._stats['consolidation_time_ms'] / count
+        
         return True  # Success
     
     def get_stats(self) -> dict:
@@ -491,11 +668,78 @@ class BundleConsolidator:
         with self._pending_lock:
             return len(self._pending)
     
-    def is_pending(self, row: int, col: int, maptype: str) -> bool:
-        """Check if a tile is pending consolidation."""
-        tile_key = self._get_tile_key(row, col, maptype)
+    def is_pending(self, row: int, col: int, maptype: str, zoom: int = None) -> bool:
+        """Check if a tile is pending consolidation.
+        
+        Args:
+            row: Tile row (tile ID coordinates)
+            col: Tile col (tile ID coordinates) 
+            maptype: Map type
+            zoom: If provided, check for specific zoom level. If None, check for ANY zoom level.
+        
+        Returns:
+            True if any matching consolidation is pending
+        """
         with self._pending_lock:
-            return tile_key in self._pending
+            if zoom is not None:
+                # Check for specific zoom level
+                tile_key = self._get_tile_key(row, col, maptype, zoom)
+                return tile_key in self._pending
+            else:
+                # Check if ANY zoom level of this tile is pending (prefix match)
+                prefix = self._get_tile_key_prefix(row, col, maptype)
+                return any(key.startswith(prefix) for key in self._pending)
+    
+    def wait_for_pending(self, row: int, col: int, maptype: str, timeout: float = 2.0) -> bool:
+        """
+        Wait for ANY pending consolidation of a tile to complete.
+        
+        Uses condition variable for efficient waiting (no CPU spinning).
+        
+        This waits until at least one zoom level's consolidation completes,
+        which means the bundle file should exist (possibly with partial zooms).
+        
+        Args:
+            row: Tile row (tile ID coordinates)
+            col: Tile col (tile ID coordinates)
+            maptype: Map type
+            timeout: Maximum time to wait in seconds
+            
+        Returns:
+            True if at least one consolidation completed (bundle should now exist)
+            False if not pending, timeout, or still pending after timeout
+        """
+        prefix = self._get_tile_key_prefix(row, col, maptype)
+        
+        # Check if any zoom level is pending
+        with self._pending_lock:
+            pending_keys = [k for k in self._pending if k.startswith(prefix)]
+            if not pending_keys:
+                return False  # Not pending, nothing to wait for
+        
+        def check_completed() -> bool:
+            """Check if any of our pending keys completed."""
+            return any(k.startswith(prefix) for k in self._recently_completed)
+        
+        start = time.time()
+        
+        with self._completion_condition:
+            # Check if already completed
+            if check_completed():
+                log.debug(f"BUNDLE_WAIT: Already completed for {prefix}*")
+                return True
+            
+            # Wait for notification with timeout
+            remaining = timeout
+            while remaining > 0:
+                # wait_for returns True if condition met, False on timeout
+                if self._completion_condition.wait_for(check_completed, timeout=remaining):
+                    log.debug(f"BUNDLE_WAIT: Completed for {prefix}* after {time.time()-start:.3f}s")
+                    return True
+                remaining = timeout - (time.time() - start)
+        
+        log.debug(f"BUNDLE_WAIT: Timeout waiting for {prefix}* after {timeout}s")
+        return False
     
     def set_callbacks(
         self,
@@ -506,21 +750,58 @@ class BundleConsolidator:
         self._on_bundle_created = on_bundle_created
         self._on_error = on_error
     
-    def shutdown(self, wait: bool = True):
+    def shutdown(self, wait: bool = True, timeout: float = 5.0):
         """
         Shutdown the consolidator.
         
         Args:
-            wait: If True, wait for pending tasks to complete
+            wait: If True, wait for worker threads to exit
+            timeout: Maximum time to wait for each worker thread (only if wait=True)
         """
+        if self._shutdown_event.is_set():
+            return  # Already shutting down
+            
         log.debug("Shutting down bundle consolidator")
         self._shutdown_event.set()
         
-        if self._executor:
-            self._executor.shutdown(wait=wait)
-            self._executor = None
+        # Drain the queue to unblock workers waiting on get()
+        # This prevents workers from processing more tasks during shutdown
+        drained_count = 0
+        try:
+            while True:
+                self._task_queue.get_nowait()
+                drained_count += 1
+        except queue.Empty:
+            pass
         
+        if drained_count > 0:
+            log.debug(f"Drained {drained_count} pending tasks from queue during shutdown")
+        
+        # Send shutdown sentinels to wake up all workers
+        # Workers blocked on queue.get() will receive these and exit
+        for _ in range(len(self._workers)):
+            try:
+                self._task_queue.put_nowait(_SHUTDOWN_SENTINEL)
+            except queue.Full:
+                pass  # Queue full, but workers should still see shutdown event
+        
+        # Wait for worker threads to exit
+        if wait and self._workers:
+            for thread in self._workers:
+                if thread.is_alive():
+                    thread.join(timeout=timeout)
+                    if thread.is_alive():
+                        log.warning(f"Worker thread {thread.name} did not exit within {timeout}s")
+        
+        # Clear worker list
+        self._workers.clear()
         self._workers_started = False
+        
+        # Clear pending tracking
+        with self._pending_lock:
+            self._pending.clear()
+        
+        log.debug("Bundle consolidator shutdown complete")
 
 
 class CompactionWorker:

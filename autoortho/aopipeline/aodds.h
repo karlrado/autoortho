@@ -297,6 +297,65 @@ AODDS_API int32_t aodds_build_from_jpegs(
 );
 
 /**
+ * Calculate compressed size for a single mipmap level.
+ * 
+ * @param width     Image width in pixels
+ * @param height    Image height in pixels
+ * @param format    Compression format
+ * 
+ * @return Compressed size in bytes (no header included)
+ */
+AODDS_API uint32_t aodds_calc_mipmap_size(
+    int32_t width,
+    int32_t height,
+    dds_format_t format
+);
+
+/**
+ * Build a single mipmap level from pre-read JPEG data.
+ * 
+ * This function builds ONLY the specified mipmap level, not the entire
+ * mipmap chain. Returns raw DXT-compressed bytes without a DDS header.
+ * 
+ * Use this for on-demand mipmap building where X-Plane requests a specific
+ * mipmap level. The output can be written directly to pydds.DDS.mipmap_list[n].databuffer.
+ * 
+ * Performance: ~3-4x faster than Python path for 64-256 chunk grids due to:
+ * - Parallel JPEG decoding (OpenMP)
+ * - ISPC SIMD compression
+ * - No Python GIL contention
+ * 
+ * @param jpeg_data         Array of JPEG data pointers (NULL = missing chunk)
+ * @param jpeg_sizes        Array of JPEG data sizes (0 = missing chunk)
+ * @param chunk_count       Number of chunks (must be perfect square: 4, 16, 64, 256)
+ * @param format            Output compression format (BC1 or BC3)
+ * @param missing_r/g/b     Fill color for missing chunks
+ * @param output            Pre-allocated output buffer for raw DXT bytes
+ * @param output_size       Output buffer size in bytes
+ * @param bytes_written     Actual bytes written (output)
+ * @param pool              Optional buffer pool for decode (may be NULL)
+ * 
+ * @return 1 on success, 0 on failure
+ * 
+ * Memory: Output buffer must be at least aodds_calc_mipmap_size() bytes.
+ * 
+ * Thread Safety: Thread-safe, can be called from multiple threads.
+ */
+AODDS_API int32_t aodds_build_single_mipmap(
+    const uint8_t** jpeg_data,
+    const uint32_t* jpeg_sizes,
+    int32_t chunk_count,
+    dds_format_t format,
+    uint8_t missing_r,
+    uint8_t missing_g,
+    uint8_t missing_b,
+    uint8_t* output,
+    uint32_t output_size,
+    uint32_t* bytes_written,
+    aodecode_pool_t* pool
+);
+
+/**
  * Build DDS from pre-read JPEG data and write directly to file.
  * 
  * PERFORMANCE OPTIMIZATION for predictive DDS:

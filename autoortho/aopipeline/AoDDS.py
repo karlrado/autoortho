@@ -41,24 +41,42 @@ FORMAT_BC3 = 1  # DXT5
 
 
 # ============================================================================
+# Buffer Pool Priority Constants
+# ============================================================================
+# Lower number = higher priority (served first)
+# Live tiles are "premium clients" and always go to the front of the queue
+# Prefetch tiles are low priority and only processed when system is idle
+
+PRIORITY_LIVE = 0       # Live tiles requested by X-Plane (premium, front of queue)
+PRIORITY_PREFETCH = 100 # Prefetch/pre-built tiles (low priority, back of queue)
+
+
+# ============================================================================
 # Buffer Pool for Zero-Copy DDS Building
 # ============================================================================
 
 class DDSBufferPool:
     """
-    Thread-safe pool of reusable numpy buffers for DDS building.
+    Thread-safe pool of reusable numpy buffers for DDS building with priority queue.
     
     Eliminates per-call allocation overhead (~15ms) and avoids copying
     data back to Python (~65ms) by reusing pre-allocated numpy arrays.
     
+    Priority Queue ("Bank Queue") System:
+    - Live tiles (PRIORITY_LIVE=0): Premium clients, served first
+    - Prefetch tiles (PRIORITY_PREFETCH=100): Low priority, served when idle
+    
+    When all buffers are in use, waiters are queued by priority. When a buffer
+    is released, the highest-priority (lowest number) waiter is served first.
+    This ensures live tiles are never blocked by prefetch work.
+    
     Usage:
         pool = DDSBufferPool(max_dds_size=11_200_000)  # ~10.7 MB for 4096x4096
         
-        # Acquire buffer, use it, release it
-        buffer, buffer_id = pool.acquire()
+        # Acquire buffer with priority
+        buffer, buffer_id = pool.acquire(priority=PRIORITY_LIVE)
         try:
             result = build_tile_to_buffer(buffer, ...)
-            # buffer now contains DDS data - use it directly or copy if needed
             dds_bytes = bytes(buffer[:result.bytes_written])
         finally:
             pool.release(buffer_id)
@@ -83,9 +101,12 @@ class DDSBufferPool:
             buffer_size: Size of each buffer in bytes (default: 4096x4096 BC1)
             pool_size: Number of buffers to pre-allocate
         """
+        import heapq
+        
         self._buffer_size = buffer_size
         self._pool_size = pool_size
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
         
         # Pre-allocate numpy arrays
         self._buffers = [
@@ -95,14 +116,28 @@ class DDSBufferPool:
         self._available = list(range(pool_size))
         self._in_use = set()
         
-        log.debug(f"DDSBufferPool: created {pool_size} buffers of {buffer_size:,} bytes each")
+        # Priority queue for waiters: (priority, sequence_number, event)
+        # sequence_number breaks ties (FIFO within same priority)
+        self._waiters = []  # heap queue
+        self._waiter_sequence = 0
+        
+        # Stats for monitoring
+        self._live_acquires = 0
+        self._prefetch_acquires = 0
+        self._live_waits = 0
+        self._prefetch_waits = 0
+        
+        log.debug(f"DDSBufferPool: created {pool_size} buffers of {buffer_size:,} bytes each (priority queue enabled)")
     
-    def acquire(self, timeout: float = 5.0) -> Tuple[np.ndarray, int]:
+    def acquire(self, timeout: float = 5.0, priority: int = PRIORITY_LIVE) -> Tuple[np.ndarray, int]:
         """
-        Acquire a buffer from the pool.
+        Acquire a buffer from the pool with priority queuing.
         
         Args:
             timeout: Maximum time to wait for a buffer (seconds)
+            priority: Queue priority (lower = higher priority)
+                      PRIORITY_LIVE (0) = front of queue
+                      PRIORITY_PREFETCH (100) = back of queue
         
         Returns:
             Tuple of (buffer, buffer_id)
@@ -111,49 +146,136 @@ class DDSBufferPool:
             TimeoutError: If no buffer available within timeout
         """
         import time
+        import heapq
+        
         start = time.monotonic()
         
-        while True:
-            with self._lock:
-                if self._available:
+        with self._condition:
+            # Fast path: buffer available and no higher-priority waiters
+            if self._available and not self._waiters:
+                buffer_id = self._available.pop()
+                self._in_use.add(buffer_id)
+                if priority == PRIORITY_LIVE:
+                    self._live_acquires += 1
+                else:
+                    self._prefetch_acquires += 1
+                return self._buffers[buffer_id], buffer_id
+            
+            # Check if there are only lower-priority waiters (we can skip ahead)
+            if self._available and self._waiters:
+                # Peek at highest-priority waiter
+                top_priority = self._waiters[0][0]
+                if priority < top_priority:
+                    # We have higher priority, take buffer immediately
                     buffer_id = self._available.pop()
                     self._in_use.add(buffer_id)
+                    if priority == PRIORITY_LIVE:
+                        self._live_acquires += 1
+                    else:
+                        self._prefetch_acquires += 1
                     return self._buffers[buffer_id], buffer_id
             
-            if time.monotonic() - start > timeout:
-                raise TimeoutError(
-                    f"DDSBufferPool: no buffer available after {timeout}s "
-                    f"({len(self._in_use)}/{self._pool_size} in use)"
-                )
+            # Slow path: need to wait in queue
+            my_event = threading.Event()
+            my_sequence = self._waiter_sequence
+            self._waiter_sequence += 1
             
-            # Brief sleep before retry
-            time.sleep(0.001)
+            # Add to priority queue: (priority, sequence, event, buffer_id_holder)
+            # buffer_id_holder is a mutable list so we can receive the assigned buffer
+            buffer_id_holder = [None]
+            waiter_entry = (priority, my_sequence, my_event, buffer_id_holder)
+            heapq.heappush(self._waiters, waiter_entry)
+            
+            if priority == PRIORITY_LIVE:
+                self._live_waits += 1
+            else:
+                self._prefetch_waits += 1
+        
+        # Wait outside lock for our turn
+        remaining = timeout - (time.monotonic() - start)
+        if remaining > 0:
+            got_buffer = my_event.wait(timeout=remaining)
+        else:
+            got_buffer = my_event.is_set()
+        
+        if got_buffer and buffer_id_holder[0] is not None:
+            return self._buffers[buffer_id_holder[0]], buffer_id_holder[0]
+        
+        # Timeout - remove ourselves from queue if still there
+        with self._condition:
+            try:
+                self._waiters = [w for w in self._waiters if w[1] != my_sequence]
+                heapq.heapify(self._waiters)
+            except Exception:
+                pass
+        
+        raise TimeoutError(
+            f"DDSBufferPool: no buffer available after {timeout}s "
+            f"({len(self._in_use)}/{self._pool_size} in use, "
+            f"priority={priority}, waiters={len(self._waiters)})"
+        )
     
     def release(self, buffer_id: int) -> None:
         """
         Release a buffer back to the pool.
         
+        If there are waiters, the highest-priority waiter gets the buffer.
+        
         Args:
             buffer_id: The buffer ID returned from acquire()
         """
-        with self._lock:
-            if buffer_id in self._in_use:
-                self._in_use.remove(buffer_id)
-                self._available.append(buffer_id)
-            else:
+        import heapq
+        
+        with self._condition:
+            if buffer_id not in self._in_use:
                 log.warning(f"DDSBufferPool: releasing buffer {buffer_id} that wasn't in use")
+                return
+            
+            self._in_use.remove(buffer_id)
+            
+            # Check for waiters - give buffer to highest priority (lowest number)
+            while self._waiters:
+                priority, sequence, event, buffer_id_holder = heapq.heappop(self._waiters)
+                
+                # Check if waiter is still waiting (not timed out)
+                if not event.is_set():
+                    # Assign buffer to this waiter
+                    buffer_id_holder[0] = buffer_id
+                    self._in_use.add(buffer_id)
+                    event.set()
+                    return
+            
+            # No waiters - return buffer to available pool
+            self._available.append(buffer_id)
     
-    def try_acquire(self) -> Optional[Tuple[np.ndarray, int]]:
+    def try_acquire(self, priority: int = PRIORITY_LIVE) -> Optional[Tuple[np.ndarray, int]]:
         """
         Try to acquire a buffer without blocking.
+        
+        Only succeeds if a buffer is immediately available AND there are no
+        higher-priority waiters ahead.
+        
+        Args:
+            priority: Queue priority (for checking against waiters)
         
         Returns:
             Tuple of (buffer, buffer_id) if available, None otherwise
         """
         with self._lock:
             if self._available:
+                # Check if there are higher-priority waiters
+                if self._waiters:
+                    top_priority = self._waiters[0][0]
+                    if priority >= top_priority:
+                        # Can't skip ahead of equal or higher priority waiters
+                        return None
+                
                 buffer_id = self._available.pop()
                 self._in_use.add(buffer_id)
+                if priority == PRIORITY_LIVE:
+                    self._live_acquires += 1
+                else:
+                    self._prefetch_acquires += 1
                 return self._buffers[buffer_id], buffer_id
             return None
     
@@ -161,6 +283,11 @@ class DDSBufferPool:
     def buffer_size(self) -> int:
         """Size of each buffer in bytes."""
         return self._buffer_size
+    
+    @property
+    def pool_size(self) -> int:
+        """Total number of buffers in pool."""
+        return self._pool_size
     
     @property
     def available_count(self) -> int:
@@ -173,6 +300,26 @@ class DDSBufferPool:
         """Number of buffers currently in use."""
         with self._lock:
             return len(self._in_use)
+    
+    @property
+    def waiter_count(self) -> int:
+        """Number of waiters in queue."""
+        with self._lock:
+            return len(self._waiters)
+    
+    def get_stats(self) -> dict:
+        """Get pool statistics for monitoring."""
+        with self._lock:
+            return {
+                'pool_size': self._pool_size,
+                'available': len(self._available),
+                'in_use': len(self._in_use),
+                'waiters': len(self._waiters),
+                'live_acquires': self._live_acquires,
+                'prefetch_acquires': self._prefetch_acquires,
+                'live_waits': self._live_waits,
+                'prefetch_waits': self._prefetch_waits,
+            }
     
     def get_ctypes_ptr(self, buffer: np.ndarray) -> POINTER(c_uint8):
         """
@@ -1651,6 +1798,186 @@ def build_from_jpegs_to_buffer(
         elapsed_ms=0.0,  # Not tracked in this API
         error="" if success else "Failed to build DDS from JPEGs"
     )
+
+
+# ============================================================================
+# Single Mipmap Build: Build one mipmap level from JPEG data
+# ============================================================================
+
+class SingleMipmapResult(NamedTuple):
+    """
+    Result from single mipmap building.
+    
+    Returns raw DXT-compressed bytes (no DDS header) that can be
+    directly written to pydds.DDS.mipmap_list[n].databuffer.
+    """
+    success: bool
+    bytes_written: int
+    data: Optional[bytes]  # Raw DXT bytes (no header)
+    elapsed_ms: float
+    error: str = ''
+
+
+def calc_mipmap_size(width: int, height: int, format: str = "BC1") -> int:
+    """
+    Calculate compressed size for a single mipmap level.
+    
+    Args:
+        width: Image width in pixels
+        height: Image height in pixels
+        format: Compression format - "BC1" (DXT1) or "BC3" (DXT5)
+    
+    Returns:
+        Compressed size in bytes (no header included)
+    """
+    block_size = 8 if format.upper() in ("BC1", "DXT1") else 16
+    blocks_x = (width + 3) // 4
+    blocks_y = (height + 3) // 4
+    return blocks_x * blocks_y * block_size
+
+
+def build_single_mipmap(
+    jpeg_datas: List[Optional[bytes]],
+    format: str = "BC1",
+    missing_color: Tuple[int, int, int] = (66, 77, 55),
+    pool: Optional[c_void_p] = None
+) -> SingleMipmapResult:
+    """
+    Build a single mipmap level from JPEG data.
+    
+    This function builds ONLY one mipmap level, not the entire mipmap chain.
+    Returns raw DXT-compressed bytes without a DDS header.
+    
+    Use this for on-demand mipmap building where X-Plane requests a specific
+    mipmap level (e.g., mipmap 2 with 64 chunks). Much faster than Python path
+    for 16+ chunks due to parallel JPEG decoding and ISPC compression.
+    
+    Performance:
+    - 16 chunks (4x4): ~3x faster than Python
+    - 64 chunks (8x8): ~3.3x faster than Python  
+    - 256 chunks (16x16): ~4x faster than Python
+    
+    Args:
+        jpeg_datas: List of JPEG bytes (None or b'' for missing chunks)
+                    Length must be a perfect square (4, 16, 64, 256)
+        format: Compression format - "BC1" (DXT1) or "BC3" (DXT5)
+        missing_color: RGB tuple for missing chunks
+        pool: Optional decode buffer pool handle from AoDecode
+    
+    Returns:
+        SingleMipmapResult with raw DXT bytes (no DDS header).
+        The data can be written directly to pydds.DDS.mipmap_list[n].databuffer.
+    
+    Example:
+        # Build mipmap 2 (64 chunks for a ZL16 tile)
+        jpeg_datas = [chunk.data for chunk in chunks]
+        result = build_single_mipmap(jpeg_datas)
+        if result.success:
+            # Write raw DXT bytes to DDS mipmap buffer
+            tile.dds.mipmap_list[2].databuffer.write(result.data)
+    """
+    import math
+    import time
+    
+    start_time = time.monotonic()
+    lib = _load_library()
+    chunk_count = len(jpeg_datas)
+    
+    if chunk_count == 0:
+        return SingleMipmapResult(
+            success=False, bytes_written=0, data=None, elapsed_ms=0.0,
+            error="No JPEG data provided"
+        )
+    
+    # Verify perfect square
+    chunks_per_side = int(math.sqrt(chunk_count))
+    if chunks_per_side * chunks_per_side != chunk_count:
+        return SingleMipmapResult(
+            success=False, bytes_written=0, data=None, elapsed_ms=0.0,
+            error=f"chunk_count must be a perfect square, got {chunk_count}"
+        )
+    
+    # Calculate required buffer size
+    tile_size = chunks_per_side * 256
+    fmt = FORMAT_BC1 if format.upper() in ("BC1", "DXT1") else FORMAT_BC3
+    output_size = calc_mipmap_size(tile_size, tile_size, format)
+    
+    # Allocate output buffer
+    output_buffer = np.zeros(output_size, dtype=np.uint8)
+    
+    # Build arrays for C
+    jpeg_ptrs = (POINTER(c_uint8) * chunk_count)()
+    jpeg_sizes = (c_uint32 * chunk_count)()
+    # Keep references to bytes objects to prevent GC during call
+    jpeg_refs = []
+    
+    for i, data in enumerate(jpeg_datas):
+        if data and len(data) > 0:
+            jpeg_refs.append(data)
+            jpeg_ptrs[i] = cast(data, POINTER(c_uint8))
+            jpeg_sizes[i] = len(data)
+        else:
+            jpeg_ptrs[i] = None
+            jpeg_sizes[i] = 0
+    
+    bytes_written = c_uint32()
+    pool_handle = pool if pool else None
+    
+    # Setup function signature if not already done
+    if not hasattr(lib, '_single_mipmap_setup_done'):
+        lib.aodds_build_single_mipmap.argtypes = [
+            POINTER(POINTER(c_uint8)),  # jpeg_data
+            POINTER(c_uint32),          # jpeg_sizes
+            c_int32,                    # chunk_count
+            c_int32,                    # format
+            c_uint8, c_uint8, c_uint8,  # missing color
+            POINTER(c_uint8),           # output
+            c_uint32,                   # output_size
+            POINTER(c_uint32),          # bytes_written
+            c_void_p                    # pool
+        ]
+        lib.aodds_build_single_mipmap.restype = c_int32
+        
+        lib.aodds_calc_mipmap_size.argtypes = [c_int32, c_int32, c_int32]
+        lib.aodds_calc_mipmap_size.restype = c_uint32
+        
+        lib._single_mipmap_setup_done = True
+    
+    # Call native function
+    success = lib.aodds_build_single_mipmap(
+        jpeg_ptrs,
+        jpeg_sizes,
+        chunk_count,
+        fmt,
+        missing_color[0],
+        missing_color[1],
+        missing_color[2],
+        output_buffer.ctypes.data_as(POINTER(c_uint8)),
+        output_size,
+        byref(bytes_written),
+        pool_handle
+    )
+    
+    elapsed_ms = (time.monotonic() - start_time) * 1000
+    
+    if success and bytes_written.value > 0:
+        # Extract bytes from numpy buffer
+        result_data = bytes(output_buffer[:bytes_written.value])
+        return SingleMipmapResult(
+            success=True,
+            bytes_written=bytes_written.value,
+            data=result_data,
+            elapsed_ms=elapsed_ms,
+            error=""
+        )
+    else:
+        return SingleMipmapResult(
+            success=False,
+            bytes_written=0,
+            data=None,
+            elapsed_ms=elapsed_ms,
+            error="Failed to build single mipmap"
+        )
 
 
 # ============================================================================

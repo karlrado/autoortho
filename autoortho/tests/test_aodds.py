@@ -323,6 +323,247 @@ class TestIntegration:
         # Note: Full test requires running the builder which needs more setup
 
 
+class TestSingleMipmapBuild:
+    """Test single mipmap building (per-mipmap native pipeline)."""
+    
+    def test_calc_mipmap_size_bc1(self):
+        """Test BC1 mipmap size calculation."""
+        try:
+            from autoortho.aopipeline import AoDDS
+            
+            # 512x512 BC1: (512/4) * (512/4) * 8 = 128 * 128 * 8 = 131072 bytes
+            size_512 = AoDDS.calc_mipmap_size(512, 512, "BC1")
+            assert size_512 == 131072
+            
+            # 1024x1024 BC1: (1024/4) * (1024/4) * 8 = 256 * 256 * 8 = 524288 bytes
+            size_1024 = AoDDS.calc_mipmap_size(1024, 1024, "BC1")
+            assert size_1024 == 524288
+            
+            # 2048x2048 BC1: (2048/4) * (2048/4) * 8 = 512 * 512 * 8 = 2097152 bytes
+            size_2048 = AoDDS.calc_mipmap_size(2048, 2048, "BC1")
+            assert size_2048 == 2097152
+            
+            # 4096x4096 BC1: (4096/4) * (4096/4) * 8 = 1024 * 1024 * 8 = 8388608 bytes
+            size_4096 = AoDDS.calc_mipmap_size(4096, 4096, "BC1")
+            assert size_4096 == 8388608
+            
+        except ImportError:
+            pytest.skip("AoDDS module not available")
+    
+    def test_calc_mipmap_size_bc3(self):
+        """Test BC3 mipmap size calculation (should be 2x BC1)."""
+        try:
+            from autoortho.aopipeline import AoDDS
+            
+            size_bc1 = AoDDS.calc_mipmap_size(1024, 1024, "BC1")
+            size_bc3 = AoDDS.calc_mipmap_size(1024, 1024, "BC3")
+            
+            # BC3 is 2x BC1
+            assert size_bc3 == size_bc1 * 2
+            
+        except ImportError:
+            pytest.skip("AoDDS module not available")
+    
+    def test_build_single_mipmap_empty_list(self):
+        """Test build_single_mipmap with empty list."""
+        try:
+            from autoortho.aopipeline import AoDDS
+            if not AoDDS.is_available():
+                pytest.skip("Native library not available")
+            
+            result = AoDDS.build_single_mipmap([])
+            assert not result.success
+            assert result.bytes_written == 0
+            assert result.data is None
+            assert "No JPEG data provided" in result.error
+            
+        except ImportError:
+            pytest.skip("AoDDS module not available")
+    
+    def test_build_single_mipmap_non_square(self):
+        """Test build_single_mipmap with non-perfect-square chunk count."""
+        try:
+            from autoortho.aopipeline import AoDDS
+            if not AoDDS.is_available():
+                pytest.skip("Native library not available")
+            
+            # 5 is not a perfect square
+            result = AoDDS.build_single_mipmap([None, None, None, None, None])
+            assert not result.success
+            assert "perfect square" in result.error
+            
+        except ImportError:
+            pytest.skip("AoDDS module not available")
+    
+    def test_build_single_mipmap_4_chunks(self, test_cache_dir, chunk_files):
+        """Test build_single_mipmap with 4 chunks (2x2 grid = mipmap 4)."""
+        try:
+            from autoortho.aopipeline import AoDDS
+            if not AoDDS.is_available():
+                pytest.skip("Native library not available")
+            
+            # Read JPEG data from chunk files
+            jpeg_datas = []
+            for i in range(4):
+                if i < len(chunk_files['paths']):
+                    with open(chunk_files['paths'][i], 'rb') as f:
+                        jpeg_datas.append(f.read())
+                else:
+                    jpeg_datas.append(None)
+            
+            try:
+                result = AoDDS.build_single_mipmap(
+                    jpeg_datas,
+                    format="BC1",
+                    missing_color=(66, 77, 55)
+                )
+                
+                # Verify result
+                assert result.success
+                assert result.bytes_written > 0
+                assert result.data is not None
+                assert len(result.data) == result.bytes_written
+                
+                # 2x2 grid of 256x256 = 512x512 tile
+                expected_size = AoDDS.calc_mipmap_size(512, 512, "BC1")
+                assert result.bytes_written == expected_size
+                
+                print(f"4 chunks: {result.elapsed_ms:.2f}ms, {result.bytes_written} bytes")
+                
+            except RuntimeError as e:
+                if "JPEG" in str(e) or "decode" in str(e).lower():
+                    pytest.skip(f"JPEG decode not available: {e}")
+                raise
+                
+        except ImportError:
+            pytest.skip("AoDDS module not available")
+    
+    def test_build_single_mipmap_16_chunks(self, test_cache_dir, chunk_files):
+        """Test build_single_mipmap with 16 chunks (4x4 grid = mipmap 3)."""
+        try:
+            from autoortho.aopipeline import AoDDS
+            if not AoDDS.is_available():
+                pytest.skip("Native library not available")
+            
+            # Read JPEG data from chunk files
+            jpeg_datas = []
+            for i in range(16):
+                if i < len(chunk_files['paths']):
+                    with open(chunk_files['paths'][i], 'rb') as f:
+                        jpeg_datas.append(f.read())
+                else:
+                    jpeg_datas.append(None)
+            
+            try:
+                result = AoDDS.build_single_mipmap(
+                    jpeg_datas,
+                    format="BC1",
+                    missing_color=(66, 77, 55)
+                )
+                
+                # Verify result
+                assert result.success
+                assert result.bytes_written > 0
+                assert result.data is not None
+                
+                # 4x4 grid of 256x256 = 1024x1024 tile
+                expected_size = AoDDS.calc_mipmap_size(1024, 1024, "BC1")
+                assert result.bytes_written == expected_size
+                
+                print(f"16 chunks: {result.elapsed_ms:.2f}ms, {result.bytes_written} bytes")
+                
+            except RuntimeError as e:
+                if "JPEG" in str(e) or "decode" in str(e).lower():
+                    pytest.skip(f"JPEG decode not available: {e}")
+                raise
+                
+        except ImportError:
+            pytest.skip("AoDDS module not available")
+    
+    def test_build_single_mipmap_with_missing_chunks(self, test_cache_dir, chunk_files):
+        """Test build_single_mipmap with some missing chunks."""
+        try:
+            from autoortho.aopipeline import AoDDS
+            if not AoDDS.is_available():
+                pytest.skip("Native library not available")
+            
+            # Read first 2 chunks, leave rest as missing
+            jpeg_datas = []
+            for i in range(16):
+                if i < 2 and i < len(chunk_files['paths']):
+                    with open(chunk_files['paths'][i], 'rb') as f:
+                        jpeg_datas.append(f.read())
+                else:
+                    jpeg_datas.append(None)  # Missing chunk
+            
+            try:
+                result = AoDDS.build_single_mipmap(
+                    jpeg_datas,
+                    format="BC1",
+                    missing_color=(255, 0, 255)  # Bright pink
+                )
+                
+                # Should still succeed with missing color fill
+                assert result.success
+                assert result.bytes_written > 0
+                
+                # 4x4 grid of 256x256 = 1024x1024 tile
+                expected_size = AoDDS.calc_mipmap_size(1024, 1024, "BC1")
+                assert result.bytes_written == expected_size
+                
+            except RuntimeError as e:
+                if "JPEG" in str(e) or "decode" in str(e).lower():
+                    pytest.skip(f"JPEG decode not available: {e}")
+                raise
+                
+        except ImportError:
+            pytest.skip("AoDDS module not available")
+    
+    def test_build_single_mipmap_bc3(self, test_cache_dir, chunk_files):
+        """Test build_single_mipmap with BC3 format."""
+        try:
+            from autoortho.aopipeline import AoDDS
+            if not AoDDS.is_available():
+                pytest.skip("Native library not available")
+            
+            # Read JPEG data from chunk files
+            jpeg_datas = []
+            for i in range(4):
+                if i < len(chunk_files['paths']):
+                    with open(chunk_files['paths'][i], 'rb') as f:
+                        jpeg_datas.append(f.read())
+                else:
+                    jpeg_datas.append(None)
+            
+            try:
+                result_bc1 = AoDDS.build_single_mipmap(
+                    jpeg_datas,
+                    format="BC1",
+                    missing_color=(66, 77, 55)
+                )
+                
+                result_bc3 = AoDDS.build_single_mipmap(
+                    jpeg_datas,
+                    format="BC3",
+                    missing_color=(66, 77, 55)
+                )
+                
+                # Both should succeed
+                assert result_bc1.success
+                assert result_bc3.success
+                
+                # BC3 should be 2x BC1
+                assert result_bc3.bytes_written == result_bc1.bytes_written * 2
+                
+            except RuntimeError as e:
+                if "JPEG" in str(e) or "decode" in str(e).lower():
+                    pytest.skip(f"JPEG decode not available: {e}")
+                raise
+                
+        except ImportError:
+            pytest.skip("AoDDS module not available")
+
+
 # ============================================================================
 # Main
 # ============================================================================

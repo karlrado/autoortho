@@ -156,6 +156,17 @@ def _setup_signatures(lib):
     # Version
     lib.aodecode_version.argtypes = []
     lib.aodecode_version.restype = c_char_p
+    
+    # Persistent decoder management
+    lib.aodecode_init_persistent_decoders.argtypes = []
+    lib.aodecode_init_persistent_decoders.restype = None
+    
+    lib.aodecode_cleanup_persistent_decoders.argtypes = []
+    lib.aodecode_cleanup_persistent_decoders.restype = None
+    
+    # Full warmup
+    lib.aodecode_warmup_full.argtypes = [c_void_p]
+    lib.aodecode_warmup_full.restype = None
 
 
 # ============================================================================
@@ -450,6 +461,71 @@ def is_available() -> bool:
         _load_library()
         return True
     except (ImportError, FileNotFoundError):
+        return False
+
+
+def init_persistent_decoders() -> bool:
+    """
+    Initialize persistent TurboJPEG decoder handles.
+    
+    Creates one decompressor per OpenMP thread for reuse across decode calls,
+    eliminating the ~0.15ms overhead of handle creation in each parallel loop.
+    
+    Returns:
+        True if initialization succeeded, False otherwise
+    """
+    try:
+        lib = _load_library()
+        lib.aodecode_init_persistent_decoders()
+        return True
+    except Exception as e:
+        log.debug(f"Failed to init persistent decoders: {e}")
+        return False
+
+
+def cleanup_persistent_decoders() -> bool:
+    """
+    Cleanup persistent TurboJPEG decoder handles.
+    
+    Call during application shutdown to release resources.
+    
+    Returns:
+        True if cleanup succeeded, False otherwise
+    """
+    try:
+        lib = _load_library()
+        lib.aodecode_cleanup_persistent_decoders()
+        return True
+    except Exception as e:
+        log.debug(f"Failed to cleanup persistent decoders: {e}")
+        return False
+
+
+def warmup_full(pool: Optional[BufferPool] = None) -> bool:
+    """
+    Pre-warm the decode pipeline for optimal first-tile performance.
+    
+    Initializes:
+    - Persistent TurboJPEG decoder handles (one per OpenMP thread)
+    - OpenMP thread pool
+    - Memory page faults for buffer pool (if provided)
+    
+    Call this once during application startup before any decode operations.
+    
+    Args:
+        pool: Optional buffer pool to pre-warm (pre-fault memory pages)
+    
+    Returns:
+        True if warmup succeeded, False otherwise
+    """
+    try:
+        lib = _load_library()
+        pool_handle = pool.handle if pool else None
+        lib.aodecode_warmup_full(pool_handle)
+        log.debug("Native decode pipeline pre-warmed")
+        return True
+    except Exception as e:
+        log.debug(f"Native decode warmup failed: {e}")
         return False
 
 

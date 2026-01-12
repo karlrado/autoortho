@@ -186,12 +186,13 @@ class TestDSFOrganization:
         # Check path structure
         assert "bundles" in output_path
         
-        # Bundle directory should contain DSF-like structure
-        bundle_dir = get_bundle2_dir(cache_dir, 26000, 10880, 16)
+        # Bundle directory should contain DSF-like structure with maptype folder
+        bundle_dir = get_bundle2_dir(cache_dir, 26000, 10880, 16, "BI")
         path_parts = bundle_dir.split(os.sep)
         
-        # Should have band and tile directories
+        # Should have band, tile, and maptype directories
         assert any('+' in p or '-' in p for p in path_parts)
+        assert "BI" in path_parts  # maptype is now a folder
     
     def test_enumerate_bundles(self, tmp_path):
         """Test bundle enumeration."""

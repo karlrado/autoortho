@@ -177,6 +177,12 @@ typedef struct {
     void* mmap_base;
     size_t mmap_size;
     
+#ifdef _WIN32
+    /* Windows memory mapping handles */
+    void* win_file;               /* HANDLE hFile (INVALID_HANDLE_VALUE if not used) */
+    void* win_mapping;            /* HANDLE hMapping (NULL if not used) */
+#endif
+    
     /* File access (for mutations) */
     int fd;                       /* File descriptor (-1 if not open for write) */
     char* path;                   /* Bundle file path (for mutations) */

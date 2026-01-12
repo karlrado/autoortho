@@ -214,6 +214,69 @@ AODECODE_API void aodecode_free_image(
  */
 AODECODE_API const char* aodecode_version(void);
 
+/* ============================================================================
+ * Persistent Decoder Pool
+ * ============================================================================
+ * Functions for managing persistent TurboJPEG decoder handles. These handles
+ * are reused across decode calls, eliminating the ~0.15ms overhead of
+ * creating/destroying handles in each parallel loop.
+ */
+
+/**
+ * Initialize persistent decoder handles.
+ * 
+ * Creates one TurboJPEG decompressor per OpenMP thread for reuse.
+ * Call this once during application startup for optimal first-tile latency.
+ * 
+ * Thread Safety: Safe to call from multiple threads (uses internal locking).
+ */
+AODECODE_API void aodecode_init_persistent_decoders(void);
+
+/**
+ * Cleanup persistent decoder handles.
+ * 
+ * Destroys all cached TurboJPEG decompressors. Call during application
+ * shutdown to release resources.
+ * 
+ * Thread Safety: Should only be called when no decode operations are active.
+ */
+AODECODE_API void aodecode_cleanup_persistent_decoders(void);
+
+/**
+ * Get a persistent decoder handle for the current thread.
+ * 
+ * Returns the cached TurboJPEG decompressor for this thread, creating it
+ * if necessary. If OpenMP is not available or thread ID is out of range,
+ * creates a new handle that must be destroyed by the caller.
+ * 
+ * Use aodecode_is_persistent_decoder() to check if destruction is needed.
+ * 
+ * @return TurboJPEG handle (never NULL unless TurboJPEG init fails)
+ */
+AODECODE_API void* aodecode_get_thread_decoder(void);
+
+/**
+ * Check if a decoder handle is from the persistent pool.
+ * 
+ * @param tjh  TurboJPEG handle to check
+ * @return 1 if persistent (don't destroy), 0 if temporary (caller must destroy)
+ */
+AODECODE_API int aodecode_is_persistent_decoder(void* tjh);
+
+/**
+ * Full warmup of the decode pipeline.
+ * 
+ * Prepares the native decode pipeline for optimal first-tile performance:
+ * - Initializes persistent TurboJPEG decoder handles
+ * - Forces OpenMP thread pool creation
+ * - Pre-faults buffer pool memory pages (if pool provided)
+ * 
+ * Call this once during application startup before any decode operations.
+ * 
+ * @param pool  Buffer pool to pre-warm (may be NULL)
+ */
+AODECODE_API void aodecode_warmup_full(aodecode_pool_t* pool);
+
 #ifdef __cplusplus
 }
 #endif

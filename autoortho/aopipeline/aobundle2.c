@@ -26,6 +26,9 @@
 
 #define AOBUNDLE2_VERSION_STR "2.0.0"
 
+/* I/O optimization: 256KB stdio buffer for efficient large writes */
+#define AOBUNDLE2_WRITE_BUFFER_SIZE (256 * 1024)
+
 /* ============================================================================
  * CRC32 Implementation (IEEE 802.3 polynomial)
  * ============================================================================ */
@@ -91,6 +94,124 @@ static uint32_t calc_header_checksum(const aobundle2_header_t* hdr) {
     return aobundle2_crc32(&temp, sizeof(temp));
 }
 
+/* Pre-size file to expected size for contiguous block allocation.
+ * This is a best-effort optimization - failure is non-fatal. */
+static int32_t preallocate_file(FILE* f, size_t size) {
+    if (!f || size == 0) return 0;
+    
+#ifdef AOPIPELINE_LINUX
+    /* Linux: posix_fallocate is most efficient - actually allocates blocks */
+    int fd = fileno(f);
+    if (fd >= 0) {
+        if (posix_fallocate(fd, 0, (off_t)size) == 0) {
+            return 1;
+        }
+        /* Fall through to ftruncate on failure */
+    }
+#endif
+    
+#ifdef AOPIPELINE_WINDOWS
+    /* Windows: SetEndOfFile after positioning */
+    int fd = _fileno(f);
+    if (fd >= 0) {
+        HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER li;
+            li.QuadPart = (LONGLONG)size;
+            if (SetFilePointerEx(hFile, li, NULL, FILE_BEGIN) &&
+                SetEndOfFile(hFile)) {
+                /* Reset position to start for subsequent writes */
+                li.QuadPart = 0;
+                SetFilePointerEx(hFile, li, NULL, FILE_BEGIN);
+                return 1;
+            }
+        }
+    }
+#else
+    /* POSIX fallback (macOS, others): ftruncate */
+    int fd = fileno(f);
+    if (fd >= 0) {
+        if (ftruncate(fd, (off_t)size) == 0) {
+            return 1;
+        }
+    }
+#endif
+    
+    return 0;  /* Non-fatal: writing will still work, just less efficiently */
+}
+
+/* ============================================================================
+ * Windows Memory-Mapped File Wrapper
+ * ============================================================================
+ * Provides mmap-like functionality on Windows using CreateFileMapping/MapViewOfFile.
+ * This enables zero-copy file access with OS-managed page caching.
+ */
+
+#ifdef AOPIPELINE_WINDOWS
+typedef struct {
+    HANDLE hFile;
+    HANDLE hMapping;
+    void* base;
+    size_t size;
+} win_mmap_t;
+
+static int win_mmap_open(const char* path, win_mmap_t* mm) {
+    memset(mm, 0, sizeof(*mm));
+    mm->hFile = INVALID_HANDLE_VALUE;
+    
+    /* Open with sequential scan hint for better prefetching */
+    mm->hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
+                            NULL, OPEN_EXISTING, 
+                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, 
+                            NULL);
+    if (mm->hFile == INVALID_HANDLE_VALUE) return 0;
+    
+    LARGE_INTEGER fsize;
+    if (!GetFileSizeEx(mm->hFile, &fsize)) {
+        CloseHandle(mm->hFile);
+        mm->hFile = INVALID_HANDLE_VALUE;
+        return 0;
+    }
+    mm->size = (size_t)fsize.QuadPart;
+    
+    /* Create file mapping - SEC_READONLY for potential sharing */
+    mm->hMapping = CreateFileMappingA(mm->hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!mm->hMapping) {
+        CloseHandle(mm->hFile);
+        mm->hFile = INVALID_HANDLE_VALUE;
+        return 0;
+    }
+    
+    /* Map view of entire file */
+    mm->base = MapViewOfFile(mm->hMapping, FILE_MAP_READ, 0, 0, 0);
+    if (!mm->base) {
+        CloseHandle(mm->hMapping);
+        CloseHandle(mm->hFile);
+        mm->hMapping = NULL;
+        mm->hFile = INVALID_HANDLE_VALUE;
+        return 0;
+    }
+    
+    return 1;
+}
+
+static void win_mmap_close(win_mmap_t* mm) {
+    if (mm->base) {
+        UnmapViewOfFile(mm->base);
+        mm->base = NULL;
+    }
+    if (mm->hMapping) {
+        CloseHandle(mm->hMapping);
+        mm->hMapping = NULL;
+    }
+    if (mm->hFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(mm->hFile);
+        mm->hFile = INVALID_HANDLE_VALUE;
+    }
+    mm->size = 0;
+}
+#endif
+
 /* Read entire file contents */
 static uint8_t* read_file_contents(const char* path, uint32_t* size) {
     *size = 0;
@@ -154,13 +275,22 @@ static uint8_t* read_file_contents(const char* path, uint32_t* size) {
 #endif
 }
 
-/* Atomic file write using temp file + rename */
+/* Atomic file write using temp file + rename.
+ * Optimized with 256KB stdio buffer and file pre-allocation. */
 static int32_t atomic_write_file(const char* path, const void* data, size_t size) {
     char temp_path[4096];
     snprintf(temp_path, sizeof(temp_path), "%s.tmp.%ld", path, (long)get_timestamp());
     
     FILE* f = fopen(temp_path, "wb");
     if (!f) return 0;
+    
+    /* Set 256KB stdio buffer for efficient large writes.
+     * Thread-local to avoid contention in parallel consolidation. */
+    static TLS_VAR char write_buffer[AOBUNDLE2_WRITE_BUFFER_SIZE];
+    setvbuf(f, write_buffer, _IOFBF, sizeof(write_buffer));
+    
+    /* Pre-allocate file size for contiguous blocks (best effort) */
+    preallocate_file(f, size);
     
     size_t written = fwrite(data, 1, size, f);
     fclose(f);
@@ -463,8 +593,82 @@ AOBUNDLE2_API int32_t aobundle2_open(
     
     memset(bundle, 0, sizeof(aobundle2_t));
     bundle->fd = -1;
+#ifdef AOPIPELINE_WINDOWS
+    bundle->win_file = INVALID_HANDLE_VALUE;
+    bundle->win_mapping = NULL;
+#endif
     
-#ifndef AOPIPELINE_WINDOWS
+#ifdef AOPIPELINE_WINDOWS
+    if (use_mmap) {
+        /* Windows memory-mapped access */
+        win_mmap_t wmm;
+        if (win_mmap_open(path, &wmm)) {
+            bundle->mmap_base = wmm.base;
+            bundle->mmap_size = wmm.size;
+            bundle->win_file = wmm.hFile;
+            bundle->win_mapping = wmm.hMapping;
+            
+            /* Parse from mmap - same as POSIX path */
+            if (wmm.size < AOBUNDLE2_HEADER_SIZE) {
+                win_mmap_close(&wmm);
+                memset(bundle, 0, sizeof(*bundle));
+                bundle->fd = -1;
+                bundle->win_file = INVALID_HANDLE_VALUE;
+                bundle->win_mapping = NULL;
+                return 0;
+            }
+            
+            aobundle2_header_t* hdr = (aobundle2_header_t*)wmm.base;
+            if (hdr->magic != AOBUNDLE2_MAGIC) {
+                win_mmap_close(&wmm);
+                memset(bundle, 0, sizeof(*bundle));
+                bundle->fd = -1;
+                bundle->win_file = INVALID_HANDLE_VALUE;
+                bundle->win_mapping = NULL;
+                return 0;
+            }
+            
+            /* Verify checksum */
+            uint32_t expected_checksum = calc_header_checksum(hdr);
+            if (hdr->checksum != expected_checksum) {
+                win_mmap_close(&wmm);
+                memset(bundle, 0, sizeof(*bundle));
+                bundle->fd = -1;
+                bundle->win_file = INVALID_HANDLE_VALUE;
+                bundle->win_mapping = NULL;
+                return 0;
+            }
+            
+            bundle->header = *hdr;
+            
+            /* Copy maptype */
+            size_t maptype_offset = AOBUNDLE2_HEADER_SIZE;
+            size_t maptype_len = hdr->maptype_len;
+            if (maptype_len > AOBUNDLE2_MAX_MAPTYPE - 1) {
+                maptype_len = AOBUNDLE2_MAX_MAPTYPE - 1;
+            }
+            memcpy(bundle->maptype, (uint8_t*)wmm.base + maptype_offset, maptype_len);
+            bundle->maptype[maptype_len] = '\0';
+            
+            /* Parse zoom table */
+            size_t maptype_padded = align_to(hdr->maptype_len, 8);
+            size_t zoom_table_offset = maptype_offset + maptype_padded;
+            aobundle2_zoom_entry_t* zt = (aobundle2_zoom_entry_t*)((uint8_t*)wmm.base + zoom_table_offset);
+            
+            for (uint16_t i = 0; i < hdr->zoom_count && i < AOBUNDLE2_MAX_ZOOM_LEVELS; i++) {
+                bundle->zoom_table[i] = zt[i];
+                bundle->chunk_indices[i] = (aobundle2_chunk_index_t*)((uint8_t*)wmm.base + zt[i].index_offset);
+            }
+            
+            /* Point to data section */
+            bundle->data = (uint8_t*)wmm.base + hdr->data_section_offset;
+            bundle->data_size = (uint32_t)(wmm.size - hdr->data_section_offset);
+            
+            return 1;
+        }
+        /* Fall through to standard I/O if mmap fails */
+    }
+#else
     if (use_mmap) {
         /* Memory-mapped access */
         int fd = open(path, O_RDONLY);
@@ -684,7 +888,36 @@ AOBUNDLE2_API void aobundle2_close(aobundle2_t* bundle) {
     /* Free path */
     free(bundle->path);
     
-#ifndef AOPIPELINE_WINDOWS
+#ifdef AOPIPELINE_WINDOWS
+    /* Windows mmap cleanup */
+    if (bundle->mmap_base) {
+        UnmapViewOfFile(bundle->mmap_base);
+        bundle->mmap_base = NULL;
+        bundle->mmap_size = 0;
+        /* Indices and data point into mmap */
+        for (int i = 0; i < AOBUNDLE2_MAX_ZOOM_LEVELS; i++) {
+            bundle->chunk_indices[i] = NULL;
+        }
+        bundle->data = NULL;
+    }
+    if (bundle->win_mapping) {
+        CloseHandle(bundle->win_mapping);
+        bundle->win_mapping = NULL;
+    }
+    if (bundle->win_file != INVALID_HANDLE_VALUE) {
+        CloseHandle(bundle->win_file);
+        bundle->win_file = INVALID_HANDLE_VALUE;
+    }
+    
+    /* If not mmap'd, free allocated memory */
+    if (!bundle->mmap_base) {
+        for (int i = 0; i < bundle->header.zoom_count && i < AOBUNDLE2_MAX_ZOOM_LEVELS; i++) {
+            free(bundle->chunk_indices[i]);
+        }
+        free(bundle->data);
+    }
+#else
+    /* POSIX mmap cleanup */
     if (bundle->mmap_base) {
         munmap(bundle->mmap_base, bundle->mmap_size);
         bundle->mmap_base = NULL;
@@ -694,18 +927,21 @@ AOBUNDLE2_API void aobundle2_close(aobundle2_t* bundle) {
             bundle->chunk_indices[i] = NULL;
         }
         bundle->data = NULL;
-    } else
-#endif
-    {
+    } else {
         /* Free allocated memory */
         for (int i = 0; i < bundle->header.zoom_count && i < AOBUNDLE2_MAX_ZOOM_LEVELS; i++) {
             free(bundle->chunk_indices[i]);
         }
         free(bundle->data);
     }
+#endif
     
     memset(bundle, 0, sizeof(aobundle2_t));
     bundle->fd = -1;
+#ifdef AOPIPELINE_WINDOWS
+    bundle->win_file = INVALID_HANDLE_VALUE;
+    bundle->win_mapping = NULL;
+#endif
 }
 
 AOBUNDLE2_API int32_t aobundle2_get_chunk(
@@ -791,13 +1027,9 @@ AOBUNDLE2_API int32_t aobundle2_build_dds(
 ) {
     if (!bundle_path || !dds_output || !bytes_written) return 0;
     
-    /* Open bundle with mmap for fastest access */
+    /* Open bundle with mmap for fastest access (all platforms now support mmap) */
     aobundle2_t bundle;
-#ifdef AOPIPELINE_WINDOWS
-    if (!aobundle2_open(bundle_path, &bundle, 0)) return 0;
-#else
     if (!aobundle2_open(bundle_path, &bundle, 1)) return 0;
-#endif
     
     /* Check if target zoom exists */
     int32_t zi = find_zoom_index(&bundle, target_zoom);
