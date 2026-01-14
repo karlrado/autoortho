@@ -15,6 +15,7 @@
 #define AODDS_H
 
 #include <stdint.h>
+#include <stddef.h>  /* For size_t */
 #include "aodecode.h"
 
 #ifdef __cplusplus
@@ -123,7 +124,7 @@ AODDS_API int32_t aodds_build_tile(
  * 
  * @return Required buffer size in bytes including DDS header
  */
-AODDS_API uint32_t aodds_calc_dds_size(
+AODDS_API size_t aodds_calc_dds_size(
     int32_t width,
     int32_t height,
     int32_t mipmap_count,
@@ -356,6 +357,99 @@ AODDS_API int32_t aodds_build_single_mipmap(
 );
 
 /**
+ * Build a rectangular partial mipmap from JPEG data.
+ * 
+ * Unlike aodds_build_single_mipmap() which requires square chunk grids,
+ * this function supports arbitrary width × height chunk layouts.
+ * Outputs ONLY the compressed DXT data (no DDS header, no mipmap chain).
+ * 
+ * Use case: Building specific rows of mipmap 0 for partial reads,
+ * providing 10-20x speedup over Python PIL + DXT compression path.
+ * 
+ * @param jpeg_data         Array of JPEG data pointers (NULL = missing chunk)
+ * @param jpeg_sizes        Array of JPEG data sizes (0 = missing chunk)
+ * @param chunks_width      Number of chunks horizontally (e.g., 8)
+ * @param chunks_height     Number of chunks vertically (e.g., 1 for single row)
+ * @param format            Output compression format (BC1 or BC3)
+ * @param missing_r/g/b     Fill color for missing chunks
+ * @param output            Pre-allocated output buffer for DXT bytes
+ * @param output_size       Output buffer size in bytes
+ * @param bytes_written     Actual bytes written (output)
+ * @param pool              Optional buffer pool for decode (may be NULL)
+ * 
+ * @return 1 on success, 0 on failure
+ * 
+ * Memory: Output buffer must be at least:
+ *         (chunks_width * 256 / 4) * (chunks_height * 256 / 4) * blocksize
+ *         where blocksize is 8 for BC1, 16 for BC3.
+ * 
+ * Thread Safety: Thread-safe, can be called from multiple threads.
+ */
+AODDS_API int32_t aodds_build_partial_mipmap(
+    const uint8_t** jpeg_data,
+    const uint32_t* jpeg_sizes,
+    int32_t chunks_width,
+    int32_t chunks_height,
+    dds_format_t format,
+    uint8_t missing_r,
+    uint8_t missing_g,
+    uint8_t missing_b,
+    uint8_t* output,
+    uint32_t output_size,
+    uint32_t* bytes_written,
+    aodecode_pool_t* pool
+);
+
+/**
+ * Build a mipmap chain from JPEG data: starting level + all smaller mipmaps.
+ * 
+ * This function builds the requested mipmap level AND all smaller mipmaps
+ * down to 4×4, matching the behavior of Python's gen_mipmaps().
+ * 
+ * Use this for on-demand mipmap building to ensure smaller mipmaps are
+ * also populated, preventing NULL buffer warnings when X-Plane reads
+ * into smaller mipmap positions.
+ * 
+ * @param jpeg_data         Array of JPEG data pointers (NULL = missing chunk)
+ * @param jpeg_sizes        Array of JPEG data sizes (0 = missing chunk)
+ * @param chunk_count       Number of chunks (must be perfect square: 4, 16, 64, 256)
+ * @param format            Output compression format (BC1 or BC3)
+ * @param missing_r/g/b     Fill color for missing chunks
+ * @param output            Pre-allocated output buffer for ALL mipmap DXT bytes
+ * @param output_size       Output buffer size in bytes
+ * @param bytes_written     Total bytes written (output)
+ * @param mipmap_count_out  Number of mipmaps generated (output)
+ * @param mipmap_offsets    Array of offsets for each mipmap in output (output)
+ * @param mipmap_sizes      Array of sizes for each mipmap (output)
+ * @param max_mipmaps       Maximum mipmaps to generate (0 = all down to 4×4)
+ * @param pool              Optional buffer pool for decode (may be NULL)
+ * 
+ * @return 1 on success, 0 on failure
+ * 
+ * Memory: Output buffer must be large enough for all mipmaps.
+ *         mipmap_offsets and mipmap_sizes must have at least max_mipmaps entries.
+ * 
+ * Thread Safety: Thread-safe, can be called from multiple threads.
+ */
+AODDS_API int32_t aodds_build_mipmap_chain(
+    const uint8_t** jpeg_data,
+    const uint32_t* jpeg_sizes,
+    int32_t chunk_count,
+    dds_format_t format,
+    uint8_t missing_r,
+    uint8_t missing_g,
+    uint8_t missing_b,
+    uint8_t* output,
+    uint32_t output_size,
+    uint32_t* bytes_written,
+    int32_t* mipmap_count_out,
+    uint32_t* mipmap_offsets,
+    uint32_t* mipmap_sizes,
+    int32_t max_mipmaps,
+    aodecode_pool_t* pool
+);
+
+/**
  * Build DDS from pre-read JPEG data and write directly to file.
  * 
  * PERFORMANCE OPTIMIZATION for predictive DDS:
@@ -455,6 +549,16 @@ AODDS_API void aodds_set_use_ispc(int32_t use_ispc);
  * @return 1 if ISPC will be used, 0 if fallback will be used
  */
 AODDS_API int32_t aodds_get_use_ispc(void);
+
+/**
+ * Check if fallback compressor is being used.
+ * 
+ * Returns 1 if ISPC is unavailable or force_fallback is set.
+ * Useful for displaying a warning to users that quality may be reduced.
+ * 
+ * @return 1 if fallback compressor will be used, 0 if ISPC is active
+ */
+AODDS_API int32_t aodds_using_fallback_compressor(void);
 
 /**
  * Get version information for the aodds module.

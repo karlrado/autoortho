@@ -81,6 +81,15 @@ static inline void safe_strcpy(char* dest, const char* src, size_t dest_size) {
 /* Thread-local error message buffer size */
 #define ERROR_MSG_SIZE 256
 
+/* Path separator for current platform */
+#ifdef AOPIPELINE_WINDOWS
+  #define PATH_SEP "\\"
+  #define PATH_SEP_CHAR '\\'
+#else
+  #define PATH_SEP "/"
+  #define PATH_SEP_CHAR '/'
+#endif
+
 /* ============================================================================
  * Thread-Local Storage (TLS) for Persistent Resources
  * ============================================================================
@@ -91,11 +100,14 @@ static inline void safe_strcpy(char* dest, const char* src, size_t dest_size) {
 #if defined(__GNUC__)
   /* GCC/Clang/MinGW - use __thread */
   #define TLS_VAR __thread
+  #define TLS_AVAILABLE 1
 #elif defined(_MSC_VER)
   /* MSVC - use __declspec(thread) */
   #define TLS_VAR __declspec(thread)
+  #define TLS_AVAILABLE 1
 #else
   #define TLS_VAR  /* Fallback: no TLS, will use array indexing */
+  #define TLS_AVAILABLE 0
 #endif
 
 /* Maximum OpenMP threads we support for persistent resource pools */

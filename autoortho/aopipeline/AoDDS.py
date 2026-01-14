@@ -22,7 +22,7 @@ Usage:
 
 from ctypes import (
     CDLL, POINTER, Structure, c_void_p,
-    c_char, c_char_p, c_int32, c_uint8, c_uint32, c_double,
+    c_char, c_char_p, c_int32, c_uint8, c_uint32, c_double, c_size_t,
     byref, cast
 )
 import logging
@@ -206,8 +206,8 @@ class DDSBufferPool:
             try:
                 self._waiters = [w for w in self._waiters if w[1] != my_sequence]
                 heapq.heapify(self._waiters)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug(f"DDSBufferPool: waiter cleanup exception (harmless): {e}")
         
         raise TimeoutError(
             f"DDSBufferPool: no buffer available after {timeout}s "
@@ -1079,9 +1079,9 @@ def _setup_signatures(lib):
     lib.aodds_build_tile.argtypes = [POINTER(DDSTileRequest), c_void_p]
     lib.aodds_build_tile.restype = c_int32
     
-    # aodds_calc_dds_size
+    # aodds_calc_dds_size - returns size_t for large buffer safety
     lib.aodds_calc_dds_size.argtypes = [c_int32, c_int32, c_int32, c_int32]
-    lib.aodds_calc_dds_size.restype = c_uint32
+    lib.aodds_calc_dds_size.restype = c_size_t
     
     # aodds_calc_mipmap_count
     lib.aodds_calc_mipmap_count.argtypes = [c_int32, c_int32]
@@ -1104,6 +1104,10 @@ def _setup_signatures(lib):
     # aodds_get_use_ispc
     lib.aodds_get_use_ispc.argtypes = []
     lib.aodds_get_use_ispc.restype = c_int32
+    
+    # aodds_using_fallback_compressor - check if using lower-quality fallback
+    lib.aodds_using_fallback_compressor.argtypes = []
+    lib.aodds_using_fallback_compressor.restype = c_int32
     
     # aodds_version
     lib.aodds_version.argtypes = []
@@ -1524,6 +1528,45 @@ def is_available() -> bool:
         return False
 
 
+# Track whether we've issued the fallback warning
+_fallback_warning_issued = False
+
+
+def using_fallback_compressor() -> bool:
+    """
+    Check if the fallback (lower-quality) compressor is being used.
+    
+    Returns True if ISPC is unavailable or force_fallback is set.
+    
+    Returns:
+        True if fallback compressor will be used, False if ISPC is active
+    """
+    lib = _load_library()
+    return bool(lib.aodds_using_fallback_compressor())
+
+
+def _check_compressor_warning():
+    """
+    Log a warning if using fallback compressor.
+    
+    Called internally on first DDS build to inform users that
+    quality may be slightly reduced without ISPC.
+    """
+    global _fallback_warning_issued
+    if _fallback_warning_issued:
+        return
+    
+    try:
+        if using_fallback_compressor():
+            log.warning(
+                "Using fallback DXT compressor (ISPC unavailable). "
+                "Quality may be slightly reduced. Install ISPC library for optimal compression."
+            )
+            _fallback_warning_issued = True
+    except Exception:
+        pass  # Don't fail builds due to warning check
+
+
 # ============================================================================
 # Hybrid Pipeline: Python reads files, Native decodes + compresses
 # ============================================================================
@@ -1573,6 +1616,9 @@ def build_from_jpegs(
         dds_bytes = build_from_jpegs(jpeg_datas)
     """
     import math
+    
+    # Check and warn about fallback compressor on first use
+    _check_compressor_warning()
     
     lib = _load_library()
     chunk_count = len(jpeg_datas)
@@ -1977,6 +2023,364 @@ def build_single_mipmap(
             data=None,
             elapsed_ms=elapsed_ms,
             error="Failed to build single mipmap"
+        )
+
+
+# ============================================================================
+# Partial Mipmap Building (Rectangular Chunk Layouts)
+# ============================================================================
+
+class PartialMipmapResult(NamedTuple):
+    """
+    Result from partial mipmap building (rectangular chunk layouts).
+    
+    Unlike SingleMipmapResult which requires square chunk grids,
+    this supports arbitrary width × height chunk layouts for building
+    specific rows of a mipmap.
+    
+    Returns raw DXT-compressed bytes that can be written directly
+    to the correct offset in pydds.DDS.mipmap_list[n].databuffer.
+    """
+    success: bool
+    bytes_written: int
+    data: Optional[bytes]       # Raw DXT bytes (no header)
+    pixel_width: int            # Width in pixels (e.g., 2048)
+    pixel_height: int           # Height in pixels (e.g., 256 for 1 row)
+    elapsed_ms: float
+    error: str = ''
+
+
+def build_partial_mipmap(
+    jpeg_datas: List[Optional[bytes]],
+    chunks_width: int,
+    chunks_height: int,
+    format: str = "BC1",
+    missing_color: Tuple[int, int, int] = (66, 77, 55),
+    pool: Optional[c_void_p] = None
+) -> PartialMipmapResult:
+    """
+    Build a rectangular partial mipmap from JPEG chunks.
+    
+    Unlike build_single_mipmap() which requires square chunk grids (e.g., 8×8),
+    this function supports arbitrary width × height layouts (e.g., 8×1 for
+    a single row of chunks).
+    
+    Use case: Building specific rows of mipmap 0 for partial reads,
+    providing 10-20x speedup over Python PIL + DXT compression path.
+    
+    Args:
+        jpeg_datas: List of JPEG bytes in row-major order (None for missing chunks)
+        chunks_width: Number of chunks horizontally (e.g., 8)
+        chunks_height: Number of chunks vertically (e.g., 1 for single row)
+        format: "BC1" (DXT1) or "BC3" (DXT5)
+        missing_color: RGB tuple for missing chunks
+        pool: Optional buffer pool (c_void_p from create_buffer_pool)
+    
+    Returns:
+        PartialMipmapResult with compressed DXT data
+    
+    Example:
+        # Build single row (8 chunks × 1 row = 2048×256 pixels)
+        result = build_partial_mipmap(
+            jpeg_datas=row_jpegs,  # 8 JPEG bytes
+            chunks_width=8,
+            chunks_height=1
+        )
+        if result.success:
+            # Write to mipmap buffer at correct offset
+            mm.data[row_offset:row_offset + result.bytes_written] = result.data
+    """
+    lib = _load_library()
+    if lib is None:
+        return PartialMipmapResult(
+            success=False, bytes_written=0, data=None,
+            pixel_width=0, pixel_height=0, elapsed_ms=0.0,
+            error="Native library not available"
+        )
+    
+    start_time = time.monotonic()
+    
+    chunk_count = chunks_width * chunks_height
+    if len(jpeg_datas) != chunk_count:
+        return PartialMipmapResult(
+            success=False, bytes_written=0, data=None,
+            pixel_width=0, pixel_height=0, elapsed_ms=0.0,
+            error=f"Expected {chunk_count} chunks ({chunks_width}×{chunks_height}), got {len(jpeg_datas)}"
+        )
+    
+    # Calculate output dimensions
+    pixel_width = chunks_width * 256
+    pixel_height = chunks_height * 256
+    
+    # Calculate output size based on format
+    fmt = DDS_FORMAT_BC1 if format == "BC1" else DDS_FORMAT_BC3
+    blocksize = 8 if format == "BC1" else 16
+    blocks_x = pixel_width // 4
+    blocks_y = pixel_height // 4
+    output_size = blocks_x * blocks_y * blocksize
+    
+    # Prepare JPEG data arrays
+    # Keep references to prevent garbage collection
+    jpeg_refs = []
+    jpeg_ptrs = (c_void_p * chunk_count)()
+    jpeg_sizes = (c_uint32 * chunk_count)()
+    
+    for i, data in enumerate(jpeg_datas):
+        if data:
+            jpeg_refs.append(data)
+            jpeg_ptrs[i] = cast(c_char_p(data), c_void_p)
+            jpeg_sizes[i] = len(data)
+        else:
+            jpeg_ptrs[i] = None
+            jpeg_sizes[i] = 0
+    
+    # Allocate output buffer using numpy for efficiency
+    output_buffer = np.zeros(output_size, dtype=np.uint8)
+    bytes_written = c_uint32(0)
+    
+    # Get pool handle if provided
+    pool_handle = pool if pool else None
+    
+    # Call native function
+    success = lib.aodds_build_partial_mipmap(
+        jpeg_ptrs,
+        jpeg_sizes,
+        c_int32(chunks_width),
+        c_int32(chunks_height),
+        c_int32(fmt),
+        c_uint8(missing_color[0]),
+        c_uint8(missing_color[1]),
+        c_uint8(missing_color[2]),
+        output_buffer.ctypes.data_as(POINTER(c_uint8)),
+        c_uint32(output_size),
+        byref(bytes_written),
+        pool_handle
+    )
+    
+    elapsed_ms = (time.monotonic() - start_time) * 1000
+    
+    if success and bytes_written.value > 0:
+        result_data = bytes(output_buffer[:bytes_written.value])
+        return PartialMipmapResult(
+            success=True,
+            bytes_written=bytes_written.value,
+            data=result_data,
+            pixel_width=pixel_width,
+            pixel_height=pixel_height,
+            elapsed_ms=elapsed_ms,
+            error=""
+        )
+    else:
+        return PartialMipmapResult(
+            success=False,
+            bytes_written=0,
+            data=None,
+            pixel_width=pixel_width,
+            pixel_height=pixel_height,
+            elapsed_ms=elapsed_ms,
+            error="Failed to build partial mipmap"
+        )
+
+
+class MipmapChainResult(NamedTuple):
+    """
+    Result from mipmap chain building.
+    
+    Contains raw DXT bytes for multiple mipmap levels, from the starting
+    level down to 4×4. Each mipmap's data can be extracted using the
+    offsets and sizes arrays.
+    """
+    success: bool
+    bytes_written: int
+    mipmap_count: int
+    data: Optional[bytes]            # All mipmaps concatenated
+    mipmap_offsets: List[int]        # Offset of each mipmap in data
+    mipmap_sizes: List[int]          # Size of each mipmap
+    elapsed_ms: float
+    error: str = ''
+    
+    def get_mipmap_data(self, mipmap_index: int) -> Optional[bytes]:
+        """Extract raw DXT bytes for a specific mipmap level."""
+        if not self.success or not self.data or mipmap_index >= self.mipmap_count:
+            return None
+        offset = self.mipmap_offsets[mipmap_index]
+        size = self.mipmap_sizes[mipmap_index]
+        return self.data[offset:offset + size]
+
+
+def build_mipmap_chain(
+    jpeg_datas: List[Optional[bytes]],
+    format: str = "BC1",
+    missing_color: Tuple[int, int, int] = (66, 77, 55),
+    max_mipmaps: int = 0,
+    pool: Optional[c_void_p] = None
+) -> MipmapChainResult:
+    """
+    Build a mipmap chain from JPEG data: starting level + all smaller mipmaps.
+    
+    This function builds the mipmap level corresponding to the chunk count
+    AND all smaller mipmaps down to 4×4, matching Python's gen_mipmaps() behavior.
+    
+    Use this for on-demand mipmap building to ensure smaller mipmaps are
+    also populated, preventing NULL buffer warnings when X-Plane reads
+    into smaller mipmap positions.
+    
+    Args:
+        jpeg_datas: List of JPEG bytes (None or b'' for missing chunks)
+                    Length must be a perfect square (4, 16, 64, 256)
+        format: Compression format - "BC1" (DXT1) or "BC3" (DXT5)
+        missing_color: RGB tuple for missing chunks
+        max_mipmaps: Maximum mipmaps to generate (0 = all down to 4×4)
+        pool: Optional decode buffer pool handle from AoDecode
+    
+    Returns:
+        MipmapChainResult with all mipmap data and offsets.
+        
+    Example:
+        # Build mipmap 2 + all smaller mipmaps (64 chunks for a ZL16 tile)
+        jpeg_datas = [chunk.data for chunk in chunks]
+        result = build_mipmap_chain(jpeg_datas)
+        if result.success:
+            # Write each mipmap to its DDS buffer
+            for i in range(result.mipmap_count):
+                mip_data = result.get_mipmap_data(i)
+                tile.dds.mipmap_list[start_mipmap + i].databuffer = BytesIO(mip_data)
+    """
+    import math
+    import time
+    
+    start_time = time.monotonic()
+    lib = _load_library()
+    chunk_count = len(jpeg_datas)
+    
+    if chunk_count == 0:
+        return MipmapChainResult(
+            success=False, bytes_written=0, mipmap_count=0, data=None,
+            mipmap_offsets=[], mipmap_sizes=[], elapsed_ms=0.0,
+            error="No JPEG data provided"
+        )
+    
+    # Verify perfect square
+    chunks_per_side = int(math.sqrt(chunk_count))
+    if chunks_per_side * chunks_per_side != chunk_count:
+        return MipmapChainResult(
+            success=False, bytes_written=0, mipmap_count=0, data=None,
+            mipmap_offsets=[], mipmap_sizes=[], elapsed_ms=0.0,
+            error=f"chunk_count must be a perfect square, got {chunk_count}"
+        )
+    
+    # Calculate required buffer size for all mipmaps
+    tile_size = chunks_per_side * 256
+    fmt = FORMAT_BC1 if format.upper() in ("BC1", "DXT1") else FORMAT_BC3
+    
+    # Calculate total size for all mipmaps down to 4×4
+    total_mipmaps = 0
+    size = tile_size
+    while size >= 4:
+        total_mipmaps += 1
+        size //= 2
+    
+    if max_mipmaps > 0:
+        total_mipmaps = min(total_mipmaps, max_mipmaps)
+    
+    # Calculate output buffer size
+    output_size = 0
+    size = tile_size
+    for _ in range(total_mipmaps):
+        output_size += calc_mipmap_size(size, size, format)
+        size //= 2
+        if size < 4:
+            size = 4
+    
+    # Allocate buffers
+    output_buffer = np.zeros(output_size, dtype=np.uint8)
+    mipmap_offsets_arr = (c_uint32 * total_mipmaps)()
+    mipmap_sizes_arr = (c_uint32 * total_mipmaps)()
+    
+    # Build arrays for C
+    jpeg_ptrs = (POINTER(c_uint8) * chunk_count)()
+    jpeg_sizes = (c_uint32 * chunk_count)()
+    jpeg_refs = []
+    
+    for i, data in enumerate(jpeg_datas):
+        if data and len(data) > 0:
+            jpeg_refs.append(data)
+            jpeg_ptrs[i] = cast(data, POINTER(c_uint8))
+            jpeg_sizes[i] = len(data)
+        else:
+            jpeg_ptrs[i] = None
+            jpeg_sizes[i] = 0
+    
+    bytes_written = c_uint32()
+    mipmap_count_out = c_int32()
+    pool_handle = pool if pool else None
+    
+    # Setup function signature if not already done
+    if not hasattr(lib, '_mipmap_chain_setup_done'):
+        lib.aodds_build_mipmap_chain.argtypes = [
+            POINTER(POINTER(c_uint8)),  # jpeg_data
+            POINTER(c_uint32),          # jpeg_sizes
+            c_int32,                    # chunk_count
+            c_int32,                    # format
+            c_uint8, c_uint8, c_uint8,  # missing color
+            POINTER(c_uint8),           # output
+            c_uint32,                   # output_size
+            POINTER(c_uint32),          # bytes_written
+            POINTER(c_int32),           # mipmap_count_out
+            POINTER(c_uint32),          # mipmap_offsets
+            POINTER(c_uint32),          # mipmap_sizes
+            c_int32,                    # max_mipmaps
+            c_void_p                    # pool
+        ]
+        lib.aodds_build_mipmap_chain.restype = c_int32
+        lib._mipmap_chain_setup_done = True
+    
+    # Call native function
+    success = lib.aodds_build_mipmap_chain(
+        jpeg_ptrs,
+        jpeg_sizes,
+        chunk_count,
+        fmt,
+        missing_color[0],
+        missing_color[1],
+        missing_color[2],
+        output_buffer.ctypes.data_as(POINTER(c_uint8)),
+        output_size,
+        byref(bytes_written),
+        byref(mipmap_count_out),
+        mipmap_offsets_arr,
+        mipmap_sizes_arr,
+        max_mipmaps if max_mipmaps > 0 else 0,
+        pool_handle
+    )
+    
+    elapsed_ms = (time.monotonic() - start_time) * 1000
+    
+    if success and bytes_written.value > 0:
+        result_data = bytes(output_buffer[:bytes_written.value])
+        offsets = [mipmap_offsets_arr[i] for i in range(mipmap_count_out.value)]
+        sizes = [mipmap_sizes_arr[i] for i in range(mipmap_count_out.value)]
+        
+        return MipmapChainResult(
+            success=True,
+            bytes_written=bytes_written.value,
+            mipmap_count=mipmap_count_out.value,
+            data=result_data,
+            mipmap_offsets=offsets,
+            mipmap_sizes=sizes,
+            elapsed_ms=elapsed_ms,
+            error=""
+        )
+    else:
+        return MipmapChainResult(
+            success=False,
+            bytes_written=0,
+            mipmap_count=0,
+            data=None,
+            mipmap_offsets=[],
+            mipmap_sizes=[],
+            elapsed_ms=elapsed_ms,
+            error="Failed to build mipmap chain"
         )
 
 

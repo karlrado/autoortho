@@ -1336,7 +1336,17 @@ def create_bundle_from_data_python(
         _preallocate_file(f, len(buffer))
         f.write(buffer)
     
-    os.rename(temp_path, output_path)
+    # Use os.replace() for atomic rename that overwrites existing files on all platforms
+    # os.rename() fails on Windows if destination exists (WinError 183)
+    try:
+        os.replace(temp_path, output_path)
+    except OSError:
+        # If replace fails (e.g., file locked), clean up temp and re-raise
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
     return output_path
 
 
@@ -1579,7 +1589,17 @@ def create_multi_zoom_bundle(
         _preallocate_file(f, len(buffer))
         f.write(buffer)
     
-    os.rename(temp_path, output_path)
+    # Use os.replace() for atomic rename that overwrites existing files on all platforms
+    # os.rename() fails on Windows if destination exists (WinError 183)
+    try:
+        os.replace(temp_path, output_path)
+    except OSError:
+        # If replace fails (e.g., file locked), clean up temp and re-raise
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
     return output_path
 
 
