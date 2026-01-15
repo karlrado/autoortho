@@ -29,6 +29,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from typing import Optional, Tuple, NamedTuple, Union, List
 
 import numpy as np
@@ -2113,7 +2114,7 @@ def build_partial_mipmap(
     pixel_height = chunks_height * 256
     
     # Calculate output size based on format
-    fmt = DDS_FORMAT_BC1 if format == "BC1" else DDS_FORMAT_BC3
+    fmt = FORMAT_BC1 if format.upper() in ("BC1", "DXT1") else FORMAT_BC3
     blocksize = 8 if format == "BC1" else 16
     blocks_x = pixel_width // 4
     blocks_y = pixel_height // 4
@@ -2140,6 +2141,23 @@ def build_partial_mipmap(
     
     # Get pool handle if provided
     pool_handle = pool if pool else None
+
+    # Setup function signature if not already done
+    if not hasattr(lib, '_partial_mipmap_setup_done'):
+        lib.aodds_build_partial_mipmap.argtypes = [
+            POINTER(c_void_p),          # jpeg_data (array of pointers)
+            POINTER(c_uint32),          # jpeg_sizes
+            c_int32,                    # chunks_width
+            c_int32,                    # chunks_height
+            c_int32,                    # format
+            c_uint8, c_uint8, c_uint8,  # missing color RGB
+            POINTER(c_uint8),           # output
+            c_uint32,                   # output_size
+            POINTER(c_uint32),          # bytes_written
+            c_void_p                    # pool
+        ]
+        lib.aodds_build_partial_mipmap.restype = c_int32
+        lib._partial_mipmap_setup_done = True
     
     # Call native function
     success = lib.aodds_build_partial_mipmap(

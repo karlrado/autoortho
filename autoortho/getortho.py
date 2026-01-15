@@ -5431,19 +5431,25 @@ class Tile(object):
             use_batch_read = native_cache is not None
             
             # Create all chunks first (skip individual cache checks if batch reading)
-            # DIAGNOSTIC: Check if any of these chunks were already downloaded before
+            # DIAGNOSTIC: Track chunks that were downloaded but cache is now missing
             recreated_count = 0
+            missing_cache_count = 0
             for r in range(row, row+height):
                 for c in range(col, col+width):
                     chunk = Chunk(c, r, self.maptype, zoom, cache_dir=self.cache_dir, 
                                   tile_id=self.id, skip_cache_check=use_batch_read)
-                    # Check if this chunk was previously downloaded
+                    # Check if this chunk was previously downloaded but cache file is missing
                     if chunk.chunk_id in ChunkGetter._downloaded_chunks:
                         recreated_count += 1
+                        if not os.path.exists(chunk.cache_path):
+                            missing_cache_count += 1
                     self.chunks[zoom].append(chunk)
             
-            if recreated_count > 0:
-                log.warning(f"CREATE_CHUNKS: Recreated {recreated_count} chunks for tile {self.id} zoom {zoom} that were ALREADY downloaded!")
+            # Only warn if previously-downloaded chunks are missing from cache (data loss/re-download needed)
+            if missing_cache_count > 0:
+                log.warning(f"CREATE_CHUNKS: {missing_cache_count}/{recreated_count} chunks for tile {self.id} zoom {zoom} "
+                           f"were downloaded but cache is MISSING - will re-download!")
+                bump('chunk_cache_data_loss', missing_cache_count)
             
             # Native batch cache read: read all cache files in parallel using C code
             if use_batch_read:

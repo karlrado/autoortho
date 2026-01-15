@@ -563,80 +563,80 @@ class BundleConsolidator:
         bundle_lock = self._get_bundle_lock(bundle_path)
         
         with bundle_lock:
-            # Check if bundle exists (update vs create)
-            # Note: Early check already handled "bundle has this zoom" case, so if we get here
-            # with an existing bundle, it means we need to ADD this zoom level
-            bundle_exists = os.path.exists(bundle_path)
-            
-            try:
-                if bundle_exists:
-                    # Bundle exists but doesn't have this zoom level (early check confirmed)
-                    # Add new zoom level to existing bundle
-                    try:
-                        existing = AoBundle2.Bundle2Python(bundle_path)
+        # Check if bundle exists (update vs create)
+        # Note: Early check already handled "bundle has this zoom" case, so if we get here
+        # with an existing bundle, it means we need to ADD this zoom level
+        bundle_exists = os.path.exists(bundle_path)
+        
+        try:
+            if bundle_exists:
+                # Bundle exists but doesn't have this zoom level (early check confirmed)
+                # Add new zoom level to existing bundle
+                try:
+                    existing = AoBundle2.Bundle2Python(bundle_path)
                         # Double-check in case of race condition (should be rare now with lock)
-                        if existing.has_zoom(task.zoom):
+                    if existing.has_zoom(task.zoom):
                             log.debug(f"BUNDLE_SAVE: ZL{task.zoom} already present, skipping")
-                            with self._stats_lock:
-                                self._stats['bundles_skipped'] = self._stats.get('bundles_skipped', 0) + 1
-                        else:
-                            log.debug(f"Updating bundle {tile_key} with ZL{task.zoom}")
-                            import math
-                            chunks_per_side = int(math.sqrt(len(jpeg_datas)))
-                            AoBundle2.update_bundle_with_zoom(bundle_path, task.zoom, jpeg_datas, chunks_per_side)
-                    except Exception as e:
-                        # If reading existing bundle fails, overwrite it
-                        log.warning(f"Could not update bundle {tile_key}: {e}, recreating")
-                        if AoBundle2.is_available():
-                            AoBundle2.create_bundle_from_data(
-                                task.row, task.col, task.maptype, task.zoom,
-                                jpeg_datas, bundle_path
-                            )
-                        else:
-                            AoBundle2.create_bundle_from_data_python(
-                                task.row, task.col, task.maptype, task.zoom,
-                                jpeg_datas, bundle_path
-                            )
-                else:
-                    # Create new bundle
+                        with self._stats_lock:
+                            self._stats['bundles_skipped'] = self._stats.get('bundles_skipped', 0) + 1
+                    else:
+                        log.debug(f"Updating bundle {tile_key} with ZL{task.zoom}")
+                        import math
+                        chunks_per_side = int(math.sqrt(len(jpeg_datas)))
+                        AoBundle2.update_bundle_with_zoom(bundle_path, task.zoom, jpeg_datas, chunks_per_side)
+                except Exception as e:
+                    # If reading existing bundle fails, overwrite it
+                    log.warning(f"Could not update bundle {tile_key}: {e}, recreating")
                     if AoBundle2.is_available():
-                        # Use native implementation
                         AoBundle2.create_bundle_from_data(
                             task.row, task.col, task.maptype, task.zoom,
                             jpeg_datas, bundle_path
                         )
                     else:
-                        # Use pure Python fallback
                         AoBundle2.create_bundle_from_data_python(
                             task.row, task.col, task.maptype, task.zoom,
                             jpeg_datas, bundle_path
                         )
+            else:
+                # Create new bundle
+                if AoBundle2.is_available():
+                    # Use native implementation
+                    AoBundle2.create_bundle_from_data(
+                        task.row, task.col, task.maptype, task.zoom,
+                        jpeg_datas, bundle_path
+                    )
+                else:
+                    # Use pure Python fallback
+                    AoBundle2.create_bundle_from_data_python(
+                        task.row, task.col, task.maptype, task.zoom,
+                        jpeg_datas, bundle_path
+                    )
+        except Exception as e:
+            log.error(f"Failed to create bundle {tile_key}: {e}")
+            raise
+        
+        # Skip validation in production - it reads the entire bundle back from disk
+        # which is very slow for large bundles (15MB+ for ZL16 tiles).
+        # The atomic write (temp file + rename) ensures integrity.
+        # Enable BUNDLE_VALIDATE_ENABLED=1 environment variable for debugging.
+        if os.environ.get('BUNDLE_VALIDATE_ENABLED', '0') == '1':
+            try:
+                if AoBundle2.is_available():
+                    if not AoBundle2.validate(bundle_path):
+                        raise RuntimeError("Bundle validation failed")
+                else:
+                    # Python validation - just try to parse it
+                    bundle = AoBundle2.Bundle2Python(bundle_path)
+                    if bundle.get_chunk_count(task.zoom) != chunk_count:
+                        raise RuntimeError("Bundle chunk count mismatch")
             except Exception as e:
-                log.error(f"Failed to create bundle {tile_key}: {e}")
-                raise
-            
-            # Skip validation in production - it reads the entire bundle back from disk
-            # which is very slow for large bundles (15MB+ for ZL16 tiles).
-            # The atomic write (temp file + rename) ensures integrity.
-            # Enable BUNDLE_VALIDATE_ENABLED=1 environment variable for debugging.
-            if os.environ.get('BUNDLE_VALIDATE_ENABLED', '0') == '1':
+                log.error(f"Bundle verification failed for {tile_key}: {e}")
+                # Try to remove corrupted bundle
                 try:
-                    if AoBundle2.is_available():
-                        if not AoBundle2.validate(bundle_path):
-                            raise RuntimeError("Bundle validation failed")
-                    else:
-                        # Python validation - just try to parse it
-                        bundle = AoBundle2.Bundle2Python(bundle_path)
-                        if bundle.get_chunk_count(task.zoom) != chunk_count:
-                            raise RuntimeError("Bundle chunk count mismatch")
-                except Exception as e:
-                    log.error(f"Bundle verification failed for {tile_key}: {e}")
-                    # Try to remove corrupted bundle
-                    try:
-                        os.remove(bundle_path)
-                    except:
-                        pass
-                    raise
+                    os.remove(bundle_path)
+                except:
+                    pass
+                raise
         
         # Delete source JPEGs if configured
         # Use fire-and-forget deletion to avoid blocking consolidation
@@ -765,16 +765,16 @@ class BundleConsolidator:
                     log.debug(f"BUNDLE_WAIT: Still waiting for {prefix}* ({time.time()-start:.1f}s elapsed)")
             else:
                 # Finite timeout
-                remaining = timeout
-                while remaining > 0:
-                    # wait_for returns True if condition met, False on timeout
-                    if self._completion_condition.wait_for(check_completed, timeout=remaining):
-                        log.debug(f"BUNDLE_WAIT: Completed for {prefix}* after {time.time()-start:.3f}s")
-                        return True
-                    remaining = timeout - (time.time() - start)
-                
-                log.debug(f"BUNDLE_WAIT: Timeout waiting for {prefix}* after {timeout}s")
-                return False
+            remaining = timeout
+            while remaining > 0:
+                # wait_for returns True if condition met, False on timeout
+                if self._completion_condition.wait_for(check_completed, timeout=remaining):
+                    log.debug(f"BUNDLE_WAIT: Completed for {prefix}* after {time.time()-start:.3f}s")
+                    return True
+                remaining = timeout - (time.time() - start)
+        
+        log.debug(f"BUNDLE_WAIT: Timeout waiting for {prefix}* after {timeout}s")
+        return False
     
     def set_callbacks(
         self,
