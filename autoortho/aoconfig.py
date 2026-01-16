@@ -159,8 +159,9 @@ use_time_budget = True
 # After this time, the tile is built with whatever has been downloaded.
 # Lower = faster loading, but may have more partial/blurry tiles
 # Higher = better quality, but longer initial load times
-# Recommended: 60.0 (fast), 120.0 (balanced), 300.0 (quality)
-tile_time_budget = 180.0
+# Recommended: 15.0 (very fast), 30.0 (balanced), 60.0 (quality)
+# Note: Higher values (120+) can cause multi-minute stalls when cache eviction occurs
+tile_time_budget = 30.0
 # Fallback level when chunks fail to download in time:
 # none = Skip all fallbacks (fastest, may have missing tiles)
 # cache = Use disk cache and already-built mipmaps, no network (balanced)
@@ -207,11 +208,18 @@ predictive_dds_enabled = True
 # Higher = slower building, lower CPU usage
 # Recommended: 250 (fast CPU), 500 (balanced), 1000 (low-end CPU)
 predictive_dds_build_interval_ms = 500
-# Number of parallel background builder workers for prefetch DDS builds (1-8)
+# Number of parallel prefetch workers for predictive DDS builds (1-8)
+# These run in the background to pre-build tiles ahead of where you're flying
 # Higher values = faster prefetch throughput, but more CPU usage during flight
 # Lower values = less CPU impact, slower prefetch
 # Recommended: 2 (balanced), 4 (fast CPU), 1 (low-end CPU or battery saving)
 background_builder_workers = 2
+# Number of concurrent tile build workers (1-32)
+# Controls how many tiles can be built simultaneously by the native pipeline
+# Higher values = faster tile processing, more CPU/RAM usage
+# Lower values = less resource usage, potential stutters
+# Recommended: 4 (low-end), 8 (mid-range, default), 16-32 (high-end CPU)
+live_builder_concurrency = 8
 # Apply fallbacks when pre-building DDS (True/False)
 # True (default): Apply same fallback logic as live requests (cache search, lower zoom, etc.)
 #   - Pro: Prebuilt tiles have best possible quality with fallbacks for failed chunks

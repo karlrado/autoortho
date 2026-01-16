@@ -866,6 +866,50 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
     uint32_t* bytes_written
 );
 
+/* ========== DECODER POOL CONFIGURATION ========== */
+
+/**
+ * Initialize the JPEG decoder pool with a specific size.
+ * 
+ * The decoder pool provides thread-safe JPEG decoding for parallel tile
+ * building. Pool size should be calculated as:
+ *   pool_size = max_builders * cpu_threads
+ * 
+ * For example: 4 background builders on 32-thread CPU = 128 decoders
+ * 
+ * Must be called before any decoding operations (typically at startup).
+ * If not called, a default pool size of 64 is used.
+ * 
+ * Memory usage: ~2KB per pooled decoder (idle), ~350KB per active decode.
+ * 
+ * @param pool_size  Number of decoders to pool (minimum 1, no upper limit)
+ * @return 1 on success, 0 if pool already in use (too late to resize)
+ * 
+ * Thread Safety: Thread-safe. Should be called once at startup.
+ */
+AODDS_API int32_t aodds_init_decoder_pool(int32_t pool_size);
+
+/**
+ * Get the current decoder pool size.
+ * @return Current pool size, or default (64) if not explicitly initialized
+ */
+AODDS_API int32_t aodds_get_decoder_pool_size(void);
+
+/**
+ * Get decoder pool statistics for monitoring.
+ * 
+ * @param out_pool_size     Output: total pool capacity
+ * @param out_in_use        Output: decoders currently in use
+ * @param out_allocated     Output: decoders actually created (lazy allocation)
+ * 
+ * Thread Safety: Thread-safe.
+ */
+AODDS_API void aodds_get_decoder_pool_stats(
+    int32_t* out_pool_size,
+    int32_t* out_in_use,
+    int32_t* out_allocated
+);
+
 #ifdef __cplusplus
 }
 #endif

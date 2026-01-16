@@ -128,22 +128,27 @@ static pthread_mutex_t g_write_buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int fallback_warning_issued = 0;
 
 /* ============================================================================
- * Thread-Safe TurboJPEG Decoder Pool
+ * Thread-Safe TurboJPEG Decoder Pool (Dynamic Size)
  * ============================================================================
  * Problem: Multiple Python threads can call build_from_jpegs simultaneously,
  * each spawning its own OpenMP parallel region. Using omp_get_thread_num()
  * for decoder selection fails because thread IDs collide across regions.
  * 
  * Solution: A global pool of decoders with mutex-protected acquisition/release.
- * - Acquisition is O(n) scan but n=64 is small and lock is brief
+ * - Acquisition is O(n) scan but n is typically small and lock is brief
  * - JPEG decoding happens OUTSIDE the lock (full parallelism)
  * - Decoders are reused across calls (no repeated init/destroy overhead)
  * - Graceful overflow: if all slots are busy, creates temporary decoder
+ * 
+ * Pool size is configurable at runtime via aodds_init_decoder_pool().
+ * Default size is 64 if not explicitly initialized.
  * ============================================================================ */
-#define DECODER_POOL_SIZE 64
+#define DECODER_POOL_DEFAULT_SIZE 64
+/* No max cap - users can request as many decoders as their config demands */
 
-static tjhandle g_decoder_pool[DECODER_POOL_SIZE];
-static volatile int g_decoder_in_use[DECODER_POOL_SIZE];
+static tjhandle* g_decoder_pool = NULL;
+static volatile int* g_decoder_in_use = NULL;
+static volatile int g_decoder_pool_size = 0;
 static volatile int g_decoder_pool_init = 0;
 
 #ifdef AOPIPELINE_WINDOWS
@@ -167,15 +172,114 @@ static void decoder_pool_lock(void) { pthread_mutex_lock(&g_decoder_mutex); }
 static void decoder_pool_unlock(void) { pthread_mutex_unlock(&g_decoder_mutex); }
 #endif
 
-/* Initialize pool (called under lock or single-threaded) */
+/* Initialize pool with default size (called under lock) */
 static void decoder_pool_init_if_needed(void) {
     if (!g_decoder_pool_init) {
-        for (int i = 0; i < DECODER_POOL_SIZE; i++) {
+        /* Allocate with default size if not already initialized */
+        if (!g_decoder_pool) {
+            g_decoder_pool_size = DECODER_POOL_DEFAULT_SIZE;
+            g_decoder_pool = (tjhandle*)calloc(g_decoder_pool_size, sizeof(tjhandle));
+            g_decoder_in_use = (volatile int*)calloc(g_decoder_pool_size, sizeof(int));
+        }
+        if (g_decoder_pool && g_decoder_in_use) {
+            for (int i = 0; i < g_decoder_pool_size; i++) {
             g_decoder_pool[i] = NULL;
             g_decoder_in_use[i] = 0;
         }
         g_decoder_pool_init = 1;
     }
+    }
+}
+
+/**
+ * Initialize the decoder pool with a specific size.
+ * Must be called before any decoding operations for the size to take effect.
+ * If called after decoding has started, returns 0 (failure).
+ * 
+ * @param pool_size  Number of decoders to pool (minimum 1, no upper limit)
+ * @return 1 on success, 0 if pool already in use
+ */
+AODDS_API int32_t aodds_init_decoder_pool(int32_t pool_size) {
+    decoder_pool_lock();
+    
+    /* Cannot resize if pool is already initialized and in use */
+    if (g_decoder_pool_init) {
+        decoder_pool_unlock();
+        return 0;
+    }
+    
+    /* Minimum pool size of 1 */
+    if (pool_size < 1) pool_size = 1;
+    
+    /* Free any existing allocations */
+    if (g_decoder_pool) {
+        free(g_decoder_pool);
+        g_decoder_pool = NULL;
+    }
+    if (g_decoder_in_use) {
+        free((void*)g_decoder_in_use);
+        g_decoder_in_use = NULL;
+    }
+    
+    /* Allocate new pool */
+    g_decoder_pool_size = pool_size;
+    g_decoder_pool = (tjhandle*)calloc(pool_size, sizeof(tjhandle));
+    g_decoder_in_use = (volatile int*)calloc(pool_size, sizeof(int));
+    
+    if (!g_decoder_pool || !g_decoder_in_use) {
+        /* Allocation failed - clean up */
+        if (g_decoder_pool) free(g_decoder_pool);
+        if (g_decoder_in_use) free((void*)g_decoder_in_use);
+        g_decoder_pool = NULL;
+        g_decoder_in_use = NULL;
+        g_decoder_pool_size = 0;
+        decoder_pool_unlock();
+        return 0;
+    }
+    
+    g_decoder_pool_init = 1;
+    decoder_pool_unlock();
+    return 1;
+}
+
+/**
+ * Get the current decoder pool size.
+ * @return Current pool size, or default if not initialized
+ */
+AODDS_API int32_t aodds_get_decoder_pool_size(void) {
+    if (g_decoder_pool_size > 0) {
+        return g_decoder_pool_size;
+    }
+    return DECODER_POOL_DEFAULT_SIZE;
+}
+
+/**
+ * Get decoder pool statistics.
+ * @param out_pool_size     Output: total pool size
+ * @param out_in_use        Output: number currently in use
+ * @param out_allocated     Output: number of decoders actually created
+ */
+AODDS_API void aodds_get_decoder_pool_stats(
+    int32_t* out_pool_size,
+    int32_t* out_in_use,
+    int32_t* out_allocated
+) {
+    decoder_pool_lock();
+    decoder_pool_init_if_needed();
+    
+    int in_use = 0;
+    int allocated = 0;
+    
+    for (int i = 0; i < g_decoder_pool_size; i++) {
+        if (g_decoder_in_use[i]) in_use++;
+        if (g_decoder_pool[i]) allocated++;
+    }
+    
+    if (out_pool_size) *out_pool_size = g_decoder_pool_size;
+    if (out_in_use) *out_in_use = in_use;
+    if (out_allocated) *out_allocated = allocated;
+    
+    decoder_pool_unlock();
 }
 
 /* Acquire a decoder from pool - creates on first use, reuses thereafter */
@@ -184,7 +288,8 @@ static tjhandle acquire_pooled_decoder(int* out_from_pool) {
     decoder_pool_init_if_needed();
     
     /* Find a free slot */
-    for (int i = 0; i < DECODER_POOL_SIZE; i++) {
+    if (g_decoder_pool && g_decoder_in_use) {
+        for (int i = 0; i < g_decoder_pool_size; i++) {
         if (!g_decoder_in_use[i]) {
             g_decoder_in_use[i] = 1;
             /* Create decoder on first use of this slot */
@@ -194,12 +299,13 @@ static tjhandle acquire_pooled_decoder(int* out_from_pool) {
             decoder_pool_unlock();
             if (out_from_pool) *out_from_pool = 1;
             return g_decoder_pool[i];
+            }
         }
     }
     
     decoder_pool_unlock();
     
-    /* All slots busy - create temporary decoder (rare overflow case) */
+    /* All slots busy - create temporary decoder (overflow case) */
     if (out_from_pool) *out_from_pool = 0;
     return tjInitDecompress();
 }
@@ -208,9 +314,9 @@ static tjhandle acquire_pooled_decoder(int* out_from_pool) {
 static void release_pooled_decoder(tjhandle tjh, int from_pool) {
     if (!tjh) return;
     
-    if (from_pool) {
+    if (from_pool && g_decoder_pool) {
         decoder_pool_lock();
-        for (int i = 0; i < DECODER_POOL_SIZE; i++) {
+        for (int i = 0; i < g_decoder_pool_size; i++) {
             if (g_decoder_pool[i] == tjh) {
                 g_decoder_in_use[i] = 0;
                 decoder_pool_unlock();

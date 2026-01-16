@@ -2377,19 +2377,21 @@ class ConfigUI(QMainWindow):
         build_interval_layout.addWidget(self.predictive_interval_value)
         autoortho_layout.addLayout(build_interval_layout)
         
-        # Background builder workers slider
-        workers_layout = QHBoxLayout()
-        self.background_workers_label = QLabel("Background workers:")
-        self.background_workers_label.setToolTip(
-            "Number of parallel background workers for prefetch DDS builds.\n\n"
-            "Higher values = faster prefetch throughput\n"
-            "Lower values = less CPU impact during flight\n\n"
+        # Prefetch workers slider (formerly "Background workers")
+        prefetch_layout = QHBoxLayout()
+        self.prefetch_workers_label = QLabel("Prefetch workers:")
+        self.prefetch_workers_label.setToolTip(
+            "Number of parallel workers for predictive/prefetch DDS builds.\n\n"
+            "These run in the background to pre-build tiles ahead of where\n"
+            "you're flying, reducing stutters when tiles are needed.\n\n"
+            "Higher values = faster prefetch, more CPU usage\n"
+            "Lower values = slower prefetch, less CPU impact\n\n"
             "Recommended:\n"
             "  • 1 - Low-end CPU or battery saving\n"
             "  • 2 - Balanced (default)\n"
-            "  • 4 - Fast CPU, maximize prefetch speed"
+            "  • 4-8 - Fast CPU, maximize prefetch speed"
         )
-        workers_layout.addWidget(self.background_workers_label)
+        prefetch_layout.addWidget(self.prefetch_workers_label)
         
         self.background_workers_slider = ModernSlider(Qt.Orientation.Horizontal)
         self.background_workers_slider.setRange(1, 8)
@@ -2400,15 +2402,15 @@ class ConfigUI(QMainWindow):
             int(getattr(self.cfg.autoortho, 'background_builder_workers', 2))
         )
         self.background_workers_slider.setObjectName('background_builder_workers')
-        self.background_workers_value = QLabel(
+        self.prefetch_workers_value = QLabel(
             f"{self.background_workers_slider.value()}"
         )
         self.background_workers_slider.valueChanged.connect(
-            lambda v: self.background_workers_value.setText(str(v))
+            lambda v: self._update_builder_concurrency_labels()
         )
-        workers_layout.addWidget(self.background_workers_slider)
-        workers_layout.addWidget(self.background_workers_value)
-        autoortho_layout.addLayout(workers_layout)
+        prefetch_layout.addWidget(self.background_workers_slider)
+        prefetch_layout.addWidget(self.prefetch_workers_value)
+        autoortho_layout.addLayout(prefetch_layout)
         
         # Use fallbacks checkbox
         fallbacks_layout = QHBoxLayout()
@@ -2490,6 +2492,47 @@ class ConfigUI(QMainWindow):
         pipeline_mode_layout.addStretch()
         autoortho_layout.addLayout(pipeline_mode_layout)
         
+        # Tile Build Workers slider (controls concurrent tile builds)
+        tile_workers_layout = QHBoxLayout()
+        self.tile_build_workers_label = QLabel("Tile build workers:")
+        self.tile_build_workers_label.setToolTip(
+            "Number of concurrent tile build workers.\n\n"
+            "Controls how many tiles can be built simultaneously by the\n"
+            "native pipeline (JPEG decode + DXT compress).\n\n"
+            "Higher values = faster tile processing, more CPU/RAM usage\n"
+            "Lower values = less resource usage, potential stutters\n\n"
+            "Recommended:\n"
+            "  • 4 - Low-end CPU (4-8 threads)\n"
+            "  • 8 - Mid-range CPU (8-16 threads, default)\n"
+            "  • 16-32 - High-end CPU (16+ threads)\n\n"
+            "Also affects JPEG decoder pool size (workers × CPU threads)."
+        )
+        tile_workers_layout.addWidget(self.tile_build_workers_label)
+        
+        self.live_concurrency_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.live_concurrency_slider.setRange(1, 32)
+        self.live_concurrency_slider.setSingleStep(1)
+        self.live_concurrency_slider.setPageStep(4)
+        self.live_concurrency_slider.setTickInterval(4)
+        self.live_concurrency_slider.setValue(
+            int(getattr(self.cfg.autoortho, 'live_builder_concurrency', 8))
+        )
+        self.live_concurrency_slider.setObjectName('live_builder_concurrency')
+        self.live_concurrency_value = QLabel()
+        self._update_builder_concurrency_labels()  # Set initial value with RAM estimate
+        self.live_concurrency_slider.valueChanged.connect(
+            lambda v: self._update_builder_concurrency_labels()
+        )
+        tile_workers_layout.addWidget(self.live_concurrency_slider)
+        tile_workers_layout.addWidget(self.live_concurrency_value)
+        autoortho_layout.addLayout(tile_workers_layout)
+        
+        # Builder RAM estimate label
+        self.builder_ram_label = QLabel()
+        self.builder_ram_label.setStyleSheet("color: #888; font-size: 11px; margin-left: 10px;")
+        self._update_builder_concurrency_labels()
+        autoortho_layout.addWidget(self.builder_ram_label)
+        
         # Buffer pool size slider
         buffer_pool_layout = QHBoxLayout()
         self.buffer_pool_label = QLabel("Buffer pool size:")
@@ -2543,39 +2586,11 @@ class ConfigUI(QMainWindow):
         )
         autoortho_layout.addWidget(self.streaming_builder_enabled_check)
         
-        # Streaming builder pool size
-        streaming_pool_layout = QHBoxLayout()
-        self.streaming_pool_label = QLabel("Builder pool size:")
-        self.streaming_pool_label.setToolTip(
-            "Number of streaming builders in the pool.\n"
-            "Each builder handles one tile at a time.\n"
-            "Higher values allow more concurrent tile builds.\n"
-            "Recommended: 4 (default), increase to 6-8 for faster CPUs"
-        )
-        streaming_pool_layout.addWidget(self.streaming_pool_label)
-        
-        self.streaming_pool_slider = ModernSlider(Qt.Orientation.Horizontal)
-        self.streaming_pool_slider.setRange(2, 64)
-        streaming_pool_value = int(getattr(self.cfg.autoortho, 'streaming_builder_pool_size', 4))
-        streaming_pool_value = max(2, min(64, streaming_pool_value))
-        self.streaming_pool_slider.setValue(streaming_pool_value)
-        self.streaming_pool_slider.setObjectName('streaming_builder_pool_size')
-        self.streaming_pool_slider.setToolTip("Number of streaming builders in pool (2-64)")
-        
-        self.streaming_pool_value_label = QLabel(f"{streaming_pool_value} builders")
-        self.streaming_pool_slider.valueChanged.connect(
-            lambda v: self.streaming_pool_value_label.setText(f"{v} builders")
-        )
-        streaming_pool_layout.addWidget(self.streaming_pool_slider)
-        streaming_pool_layout.addWidget(self.streaming_pool_value_label)
-        autoortho_layout.addLayout(streaming_pool_layout)
-        
-        # Connect streaming builder enabled to update pool control state
-        self.streaming_builder_enabled_check.stateChanged.connect(self._update_streaming_builder_controls)
+        # Note: Streaming builder pool size is now auto-calculated from
+        # prefetch_workers + live_concurrency (set earlier in this UI)
         
         # Initialize pipeline control states
         self._update_pipeline_controls()
-        self._update_streaming_builder_controls()
         
         autoortho_layout.addSpacing(10)
         
@@ -3768,6 +3783,45 @@ class ConfigUI(QMainWindow):
         
         self.buffer_pool_value_label.setText(f"{pool_count} buffers (~{pool_count * buffer_mb}MB)")
 
+    def _update_builder_concurrency_labels(self):
+        """Update tile build workers label and RAM estimate for decoder pool."""
+        # Get values from sliders (with defaults if not yet created)
+        prefetch = 2
+        tile_workers = 8
+        
+        if hasattr(self, 'background_workers_slider'):
+            prefetch = self.background_workers_slider.value()
+            if hasattr(self, 'prefetch_workers_value'):
+                self.prefetch_workers_value.setText(str(prefetch))
+        
+        if hasattr(self, 'live_concurrency_slider'):
+            tile_workers = self.live_concurrency_slider.value()
+            if hasattr(self, 'live_concurrency_value'):
+                self.live_concurrency_value.setText(str(tile_workers))
+        
+        total_builders = prefetch + tile_workers
+        
+        # Calculate decoder pool size: total_builders × CPU threads
+        import os
+        cpu_threads = os.cpu_count() or 1
+        decoder_pool_size = total_builders * cpu_threads
+        
+        # Minimum of 1 (no upper limit)
+        decoder_pool_size = max(1, decoder_pool_size)
+        
+        # Memory estimates:
+        # - Decoder pool (peak): ~350KB per decoder during active decode
+        # - Builder pool: ~10-40MB per builder (tile memory)
+        decoder_memory_mb = (decoder_pool_size * 350) / 1024  # 350KB per active decoder
+        builder_memory_mb = total_builders * 15  # ~15MB average per builder
+        total_memory_mb = decoder_memory_mb + builder_memory_mb
+        
+        if hasattr(self, 'builder_ram_label'):
+            self.builder_ram_label.setText(
+                f"Builders: {tile_workers} + {prefetch} prefetch = {total_builders} total, "
+                f"{decoder_pool_size} decoders (~{total_memory_mb:.0f}MB peak)"
+            )
+
     def _update_pipeline_controls(self):
         """Update enabled state of pipeline controls based on pipeline mode."""
         mode = self.pipeline_mode_combo.currentText().lower()
@@ -3792,21 +3846,6 @@ class ConfigUI(QMainWindow):
                 "Buffer pool is only used in Native and Hybrid modes.\n"
                 "Select a different pipeline mode to configure this setting."
             )
-
-    def _update_streaming_builder_controls(self, state=None):
-        """Update enabled state of streaming builder controls."""
-        enabled = self.streaming_builder_enabled_check.isChecked()
-        
-        self.streaming_pool_slider.setEnabled(enabled)
-        self.streaming_pool_label.setEnabled(enabled)
-        self.streaming_pool_value_label.setEnabled(enabled)
-        
-        # Update styling for disabled state
-        disabled_style = "color: #666;"
-        enabled_style = ""
-        
-        self.streaming_pool_label.setStyleSheet(enabled_style if enabled else disabled_style)
-        self.streaming_pool_value_label.setStyleSheet(enabled_style if enabled else disabled_style)
 
     def _init_dynamic_zoom_manager(self):
         """Initialize the dynamic zoom manager from config."""
@@ -4858,6 +4897,9 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.background_builder_workers = str(
                 self.background_workers_slider.value()
             )
+            self.cfg.autoortho.live_builder_concurrency = str(
+                self.live_concurrency_slider.value()
+            )
             self.cfg.autoortho.predictive_dds_use_fallbacks = self.predictive_use_fallbacks_check.isChecked()
             
             # Native pipeline settings
@@ -4866,7 +4908,8 @@ class ConfigUI(QMainWindow):
             
             # Streaming builder settings
             self.cfg.autoortho.streaming_builder_enabled = self.streaming_builder_enabled_check.isChecked()
-            self.cfg.autoortho.streaming_builder_pool_size = str(self.streaming_pool_slider.value())
+            # Note: streaming_builder_pool_size is now auto-calculated from
+            # background_builder_workers + live_builder_concurrency
             
             # Tile queue settings
             self.cfg.autoortho.tile_queue_enabled = self.tile_queue_enabled_check.isChecked()

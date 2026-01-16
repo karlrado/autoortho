@@ -988,9 +988,52 @@ _default_builder_pool: Optional[StreamingBuilderPool] = None
 _default_builder_pool_lock = threading.Lock()
 
 
+def _calculate_builder_pool_size() -> int:
+    """
+    Calculate the streaming builder pool size from config.
+    
+    Pool size = prefetch_workers + live_concurrency
+    
+    This ensures:
+    - All prefetch workers can build tiles simultaneously
+    - Live X-Plane requests have dedicated builders and won't be starved
+    
+    Returns:
+        Calculated pool size (minimum 2, maximum 64)
+    """
+    prefetch_workers = 2  # Default
+    live_concurrency = 4  # Default
+    
+    try:
+        # Try to import config - may fail during early initialization
+        try:
+            from autoortho.aoconfig import CFG
+        except ImportError:
+            from aoconfig import CFG
+        
+        prefetch_workers = int(getattr(CFG.autoortho, 'background_builder_workers', 2))
+        live_concurrency = int(getattr(CFG.autoortho, 'live_builder_concurrency', 4))
+    except Exception:
+        # Config not available yet - use defaults
+        pass
+    
+    # Calculate pool size and clamp to valid range
+    pool_size = prefetch_workers + live_concurrency
+    pool_size = max(2, min(64, pool_size))
+    
+    log.debug(f"Builder pool size: {pool_size} (prefetch={prefetch_workers} + live={live_concurrency})")
+    return pool_size
+
+
 def get_default_builder_pool() -> StreamingBuilderPool:
     """
     Get or create the default global streaming builder pool.
+    
+    Pool size is automatically calculated from config:
+        pool_size = background_builder_workers + live_builder_concurrency
+    
+    This ensures prefetch workers and live requests each have dedicated
+    builders and won't starve each other.
     
     Returns:
         The default StreamingBuilderPool instance
@@ -999,7 +1042,9 @@ def get_default_builder_pool() -> StreamingBuilderPool:
     if _default_builder_pool is None:
         with _default_builder_pool_lock:
             if _default_builder_pool is None:
-                _default_builder_pool = StreamingBuilderPool()
+                pool_size = _calculate_builder_pool_size()
+                _default_builder_pool = StreamingBuilderPool(pool_size=pool_size)
+                log.info(f"Streaming builder pool initialized: {pool_size} builders")
     return _default_builder_pool
 
 
@@ -1113,6 +1158,18 @@ def _setup_signatures(lib):
     # aodds_version
     lib.aodds_version.argtypes = []
     lib.aodds_version.restype = c_char_p
+    
+    # Decoder pool configuration
+    lib.aodds_init_decoder_pool.argtypes = [c_int32]
+    lib.aodds_init_decoder_pool.restype = c_int32
+    
+    lib.aodds_get_decoder_pool_size.argtypes = []
+    lib.aodds_get_decoder_pool_size.restype = c_int32
+    
+    lib.aodds_get_decoder_pool_stats.argtypes = [
+        POINTER(c_int32), POINTER(c_int32), POINTER(c_int32)
+    ]
+    lib.aodds_get_decoder_pool_stats.restype = None
 
 
 # ============================================================================
@@ -1544,6 +1601,110 @@ def using_fallback_compressor() -> bool:
     """
     lib = _load_library()
     return bool(lib.aodds_using_fallback_compressor())
+
+
+# ============================================================================
+# Decoder Pool Configuration
+# ============================================================================
+
+def init_decoder_pool(pool_size: int) -> bool:
+    """
+    Initialize the JPEG decoder pool with a specific size.
+    
+    The decoder pool provides thread-safe JPEG decoding for parallel tile
+    building. Pool size should be calculated as:
+        pool_size = max_builders * cpu_threads
+    
+    For example: 4 background builders on 32-thread CPU = 128 decoders
+    
+    Must be called before any decoding operations (typically at startup).
+    If not called, a default pool size of 64 is used.
+    
+    Memory usage: ~2KB per pooled decoder (idle), ~350KB per active decode.
+    
+    Args:
+        pool_size: Number of decoders to pool (minimum 1, no upper limit)
+        
+    Returns:
+        True on success, False if pool already in use (too late to resize)
+    """
+    lib = _load_library()
+    return bool(lib.aodds_init_decoder_pool(c_int32(pool_size)))
+
+
+def get_decoder_pool_size() -> int:
+    """
+    Get the current decoder pool size.
+    
+    Returns:
+        Current pool size, or default (64) if not explicitly initialized
+    """
+    lib = _load_library()
+    return lib.aodds_get_decoder_pool_size()
+
+
+class DecoderPoolStats(NamedTuple):
+    """Statistics from the decoder pool."""
+    pool_size: int      # Total pool capacity
+    in_use: int         # Decoders currently in use
+    allocated: int      # Decoders actually created (lazy allocation)
+    
+    @property
+    def available(self) -> int:
+        """Number of decoders available for use."""
+        return self.pool_size - self.in_use
+    
+    @property
+    def memory_mb_idle(self) -> float:
+        """Estimated memory usage when idle (all decoders created but not in use)."""
+        return self.allocated * 2 / 1024  # ~2KB per idle decoder
+    
+    @property
+    def memory_mb_active(self) -> float:
+        """Estimated memory usage with all in_use decoders active."""
+        return self.in_use * 0.35  # ~350KB per active decode
+
+
+def get_decoder_pool_stats() -> DecoderPoolStats:
+    """
+    Get decoder pool statistics for monitoring.
+    
+    Returns:
+        DecoderPoolStats with pool_size, in_use, and allocated counts
+    """
+    lib = _load_library()
+    pool_size = c_int32()
+    in_use = c_int32()
+    allocated = c_int32()
+    lib.aodds_get_decoder_pool_stats(byref(pool_size), byref(in_use), byref(allocated))
+    return DecoderPoolStats(
+        pool_size=pool_size.value,
+        in_use=in_use.value,
+        allocated=allocated.value
+    )
+
+
+def calculate_decoder_pool_size(max_builders: int, cpu_threads: int = 0) -> int:
+    """
+    Calculate the recommended decoder pool size based on configuration.
+    
+    Formula: max_builders * cpu_threads
+    
+    Args:
+        max_builders: Maximum number of parallel DDS builders (background_builder_workers)
+        cpu_threads: Number of CPU threads (0 = auto-detect from os.cpu_count())
+        
+    Returns:
+        Recommended pool size (minimum 1, no upper limit)
+    """
+    import os
+    if cpu_threads <= 0:
+        cpu_threads = os.cpu_count() or 1
+    
+    pool_size = max_builders * cpu_threads
+    
+    # Minimum of 1
+    return max(1, pool_size)
 
 
 def _check_compressor_warning():
