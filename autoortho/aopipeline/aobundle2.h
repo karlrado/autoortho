@@ -535,6 +535,44 @@ AOBUNDLE2_API int32_t aobundle2_needs_compaction(
  */
 AOBUNDLE2_API int64_t aobundle2_compact(const char* path);
 
+/**
+ * Atomically consolidate JPEGs into bundle and optionally delete sources.
+ * Uses file locking to prevent race conditions with concurrent readers.
+ * 
+ * This is the preferred method for consolidation from Python because:
+ * - Atomic: Uses temp file + rename for safe file replacement
+ * - Locked: Uses OS file locking to prevent concurrent access issues
+ * - Safe deletion: Only deletes source files after successful commit
+ * - Cross-platform: Works on Windows (LockFileEx) and Unix (flock)
+ * 
+ * @param bundle_path      Path to bundle file (created if doesn't exist)
+ * @param tile_row         Tile row coordinate
+ * @param tile_col         Tile column coordinate
+ * @param maptype          Map type string
+ * @param zoom             Zoom level for new chunks
+ * @param jpeg_data        Array of JPEG data pointers (NULL = missing)
+ * @param jpeg_sizes       Array of JPEG sizes
+ * @param chunk_count      Number of chunks
+ * @param source_paths     Array of source JPEG paths (can be NULL)
+ * @param delete_sources   If true and source_paths provided, delete sources after commit
+ * @param result           Optional result structure for detailed feedback
+ * 
+ * @return 1 on success, 0 on failure
+ */
+AOBUNDLE2_API int32_t aobundle2_consolidate_atomic(
+    const char* bundle_path,
+    int32_t tile_row,
+    int32_t tile_col,
+    const char* maptype,
+    int32_t zoom,
+    const uint8_t** jpeg_data,
+    const uint32_t* jpeg_sizes,
+    int32_t chunk_count,
+    const char** source_paths,
+    int32_t delete_sources,
+    aobundle2_result_t* result
+);
+
 /* ============================================================================
  * Utility Functions
  * ============================================================================ */

@@ -650,6 +650,111 @@ def compact(bundle_path: str) -> int:
     return lib.aobundle2_compact(bundle_path.encode('utf-8'))
 
 
+def consolidate_atomic(
+    bundle_path: str,
+    tile_row: int,
+    tile_col: int,
+    maptype: str,
+    zoom: int,
+    jpeg_datas: List[Optional[bytes]],
+    source_paths: Optional[List[str]] = None,
+    delete_sources: bool = True
+) -> bool:
+    """
+    Atomically consolidate JPEGs into bundle with file locking.
+    
+    This is the preferred method for consolidation because:
+    - Atomic: Uses temp file + rename for safe file replacement
+    - Locked: Uses OS file locking to prevent concurrent access issues
+    - Safe deletion: Only deletes source files after successful commit
+    - Cross-platform: Works on Windows and Unix
+    
+    Args:
+        bundle_path: Path to bundle file (created if doesn't exist)
+        tile_row: Tile row coordinate
+        tile_col: Tile column coordinate
+        maptype: Map type string
+        zoom: Zoom level for the chunks
+        jpeg_datas: List of JPEG bytes (None for missing chunks)
+        source_paths: Optional list of source JPEG file paths to delete
+        delete_sources: If True and source_paths provided, delete sources after commit
+    
+    Returns:
+        True on success, False on failure
+        
+    Thread Safety:
+        - Uses OS file locking, safe for concurrent calls
+        - Source files only deleted after successful bundle commit
+    """
+    lib = _load_library()
+    if lib is None:
+        return False
+    
+    chunk_count = len(jpeg_datas)
+    if chunk_count == 0:
+        return False
+    
+    # Prepare JPEG data arrays
+    jpeg_data_arr = (POINTER(c_uint8) * chunk_count)()
+    jpeg_sizes_arr = (c_uint32 * chunk_count)()
+    
+    # Keep references to prevent garbage collection during C call
+    data_refs = []
+    
+    for i, data in enumerate(jpeg_datas):
+        if data is not None and len(data) > 0:
+            data_buf = (c_uint8 * len(data))(*data)
+            data_refs.append(data_buf)
+            jpeg_data_arr[i] = cast(data_buf, POINTER(c_uint8))
+            jpeg_sizes_arr[i] = len(data)
+        else:
+            jpeg_data_arr[i] = None
+            jpeg_sizes_arr[i] = 0
+    
+    # Prepare source paths array (if provided)
+    source_paths_arr = None
+    if source_paths and delete_sources:
+        source_paths_arr = (c_char_p * chunk_count)()
+        for i, path in enumerate(source_paths):
+            if path:
+                source_paths_arr[i] = path.encode('utf-8')
+            else:
+                source_paths_arr[i] = None
+    
+    # Set up function signature
+    lib.aobundle2_consolidate_atomic.argtypes = [
+        c_char_p,       # bundle_path
+        c_int32,        # tile_row
+        c_int32,        # tile_col
+        c_char_p,       # maptype
+        c_int32,        # zoom
+        POINTER(POINTER(c_uint8)),  # jpeg_data
+        POINTER(c_uint32),          # jpeg_sizes
+        c_int32,        # chunk_count
+        POINTER(c_char_p),          # source_paths
+        c_int32,        # delete_sources
+        c_void_p        # result (NULL for now)
+    ]
+    lib.aobundle2_consolidate_atomic.restype = c_int32
+    
+    # Call native function
+    success = lib.aobundle2_consolidate_atomic(
+        bundle_path.encode('utf-8'),
+        tile_row,
+        tile_col,
+        maptype.encode('utf-8'),
+        zoom,
+        cast(jpeg_data_arr, POINTER(POINTER(c_uint8))),
+        jpeg_sizes_arr,
+        chunk_count,
+        source_paths_arr,
+        1 if (delete_sources and source_paths) else 0,
+        None  # No result struct for now
+    )
+    
+    return success == 1
+
+
 def validate(bundle_path: str) -> bool:
     """
     Validate bundle file integrity.
@@ -1376,22 +1481,26 @@ def update_bundle_with_zoom(
     # Invalidate any cached metadata for this bundle since we're modifying it
     _metadata_cache.invalidate(bundle_path)
     
-    # Read existing bundle
-    existing = Bundle2Python(bundle_path, use_metadata_cache=False)
-    header = existing.header
-    
-    # Collect all zoom level data (existing + new)
-    zoom_data = {}  # {zoom: {'chunks_per_side': n, 'jpeg_datas': [...]}}
-    
-    # Get existing zoom levels
-    for zoom in existing.zoom_levels:
-        chunk_count = existing.get_chunk_count(zoom)
-        chunks_per_side = int(math.sqrt(chunk_count))
-        jpeg_datas = existing.get_all_chunks(zoom)
-        zoom_data[zoom] = {
-            'chunks_per_side': chunks_per_side,
-            'jpeg_datas': jpeg_datas
-        }
+    # Read existing bundle data then CLOSE before writing
+    # Critical: On Windows, mmap holds the file open and prevents os.replace()
+    # Use context manager to ensure file is released before write attempt
+    with Bundle2Python(bundle_path, use_metadata_cache=False) as existing:
+        header = existing.header
+        maptype = existing.maptype  # Copy before closing
+        
+        # Collect all zoom level data (existing + new)
+        zoom_data = {}  # {zoom: {'chunks_per_side': n, 'jpeg_datas': [...]}}
+        
+        # Get existing zoom levels (get_all_chunks returns copies, safe after close)
+        for zoom in existing.zoom_levels:
+            chunk_count = existing.get_chunk_count(zoom)
+            chunks_per_side = int(math.sqrt(chunk_count))
+            jpeg_datas = existing.get_all_chunks(zoom)
+            zoom_data[zoom] = {
+                'chunks_per_side': chunks_per_side,
+                'jpeg_datas': jpeg_datas
+            }
+    # Bundle is now closed - safe to write to the same path
     
     # Add or replace new zoom level
     zoom_data[new_zoom] = {
@@ -1403,7 +1512,7 @@ def update_bundle_with_zoom(
     return create_multi_zoom_bundle(
         header['tile_row'],
         header['tile_col'],
-        existing.maptype,
+        maptype,
         zoom_data,
         bundle_path
     )

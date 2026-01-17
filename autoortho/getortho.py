@@ -467,9 +467,11 @@ def _build_dds_hybrid_from_bundle(
         except ImportError:
             from aopipeline import AoBundle2, AoDDS
         
-        # Python reads bundle
-        bundle = AoBundle2.Bundle2Python(bundle_path)
-        jpeg_datas = bundle.get_all_chunks(target_zoom)
+        # Python reads bundle - use context manager to release file immediately
+        # Critical: On Windows, mmap holds file open and blocks consolidation updates
+        with AoBundle2.Bundle2Python(bundle_path) as bundle:
+            jpeg_datas = bundle.get_all_chunks(target_zoom)
+        # Bundle is now closed - file handle released
         
         if not jpeg_datas:
             return None
@@ -504,9 +506,11 @@ def _build_dds_python_from_bundle(
         except ImportError:
             from aopipeline import AoBundle2
         
-        # Read bundle with Python
-        bundle = AoBundle2.Bundle2Python(bundle_path)
-        jpeg_datas = bundle.get_all_chunks(target_zoom)
+        # Read bundle with Python - use context manager to release file immediately
+        # Critical: On Windows, mmap holds file open and blocks consolidation updates
+        with AoBundle2.Bundle2Python(bundle_path) as bundle:
+            jpeg_datas = bundle.get_all_chunks(target_zoom)
+        # Bundle is now closed - file handle released
         
         if not jpeg_datas:
             return None
@@ -1506,38 +1510,52 @@ class ChunkGetter(Getter):
     _downloaded_chunks_lock = threading.Lock()
 
     def submit(self, obj, *args, **kwargs):
-        """Override submit to check chunk_id globally, not just per-object."""
+        """Override submit to check chunk_id globally, not just per-object.
+        
+        Optimized to minimize lock contention:
+        - Phase 1: Fast check under lock (no I/O)
+        - Phase 2: Slow I/O check (os.path.exists) OUTSIDE lock
+        - Phase 3: Per-object coalescing checks (no lock needed)
+        - Phase 4: Queue for download (brief lock)
+        """
         # Don't queue permanently failed chunks
         if obj.permanent_failure:
             bump('submit_skip_permanent_failure')
             return
         
         chunk_id = getattr(obj, 'chunk_id', None)
+        cache_path = getattr(obj, 'cache_path', None)
         
+        # === PHASE 1: Fast check under lock (no I/O) ===
+        needs_existence_check = False
+        is_queued = False
         with self._downloaded_chunks_lock:
-            # Check if this chunk_id was already downloaded (even by a different Chunk object)
             if chunk_id and chunk_id in self._downloaded_chunks:
-                # CRITICAL: Only skip if the cache file STILL EXISTS
-                # Cache eviction can delete the file while chunk_id remains in _downloaded_chunks
-                # If file was evicted, we MUST re-download, not mark as ready with no data!
-                cache_path = getattr(obj, 'cache_path', None)
-                if cache_path and os.path.exists(cache_path):
-                    # Cache file exists - safe to mark as ready and load from cache
-                    obj.ready.set()
-                    bump('submit_skip_already_downloaded')
-                    return
-                else:
-                    # Cache file was evicted! Remove from tracking and allow re-download
-                    self._downloaded_chunks.discard(chunk_id)
-                    bump('submit_cache_eviction_detected')
-                    # Fall through to queue for download
-            
-            # Check if this chunk_id is already queued (by a different Chunk object)
-            if chunk_id and chunk_id in self._queued_chunk_ids:
-                bump('submit_skip_id_already_queued')
-                return
+                # May need to verify file still exists (done outside lock)
+                needs_existence_check = True
+            elif chunk_id and chunk_id in self._queued_chunk_ids:
+                is_queued = True
         
-        # Per-object coalescing (for same Chunk object submitted multiple times)
+        if is_queued:
+            bump('submit_skip_id_already_queued')
+            return
+        
+        # === PHASE 2: Slow I/O check OUTSIDE lock ===
+        # os.path.exists() can take 1-50ms on Windows, don't hold lock during this
+        if needs_existence_check:
+            if cache_path and os.path.exists(cache_path):
+                # Cache file exists - safe to mark as ready and load from cache
+                obj.ready.set()
+                bump('submit_skip_already_downloaded')
+                return
+            else:
+                # Cache file was evicted! Update tracking under lock (brief)
+                with self._downloaded_chunks_lock:
+                    self._downloaded_chunks.discard(chunk_id)
+                bump('submit_cache_eviction_detected')
+                # Fall through to queue for download
+        
+        # === PHASE 3: Per-object coalescing (no lock needed) ===
         if obj.ready.is_set():
             bump('submit_skip_already_ready')
             return
@@ -1550,7 +1568,7 @@ class ChunkGetter(Getter):
         
         obj.in_queue = True
         
-        # Track this chunk_id as queued
+        # === PHASE 4: Queue for download (brief lock) ===
         if chunk_id:
             with self._downloaded_chunks_lock:
                 self._queued_chunk_ids.add(chunk_id)
@@ -2822,6 +2840,9 @@ class SpatialPrefetcher:
                 if mipmap_zoom < tile.min_zoom:
                     break
                 
+                # Wait for any pending consolidation OUTSIDE lock
+                tile._wait_for_pending_consolidation_if_needed()
+                
                 # Create chunks for this zoom level if they don't exist
                 tile._create_chunks(mipmap_zoom)
                 
@@ -3671,39 +3692,58 @@ class BackgroundDDSBuilder:
     
     def _coordinator_loop(self) -> None:
         """
-        Coordinator loop - dispatches tiles to worker pool.
+        Coordinator loop - dispatches tiles to worker pool in batches.
         
-        Runs in background thread, submits build tasks to executor.
+        Submits multiple tiles per interval to better utilize worker pool.
+        With 8 workers but only 1 submission/second, workers were underutilized.
+        Now submits up to half the workers per interval to leave capacity.
         """
         while not self._stop_event.is_set():
-            try:
-                # Non-blocking get with timeout for clean shutdown
-                item = self._queue.get(timeout=1.0)
-            except Empty:
-                continue
-            
-            # Sentinel value signals shutdown
-            if item is None:
-                continue
-            
-            priority, tile = item
-            
-            # Rate limiting: ensure minimum interval between submissions
+            # Rate limiting: wait for interval before batch submission
             elapsed = time.monotonic() - self._last_build_time
             if elapsed < self._build_interval:
                 sleep_time = self._build_interval - elapsed
-                # Use stop_event.wait() for interruptible sleep
                 if self._stop_event.wait(timeout=sleep_time):
-                    # Stop requested during sleep
-                    continue
+                    continue  # Stop requested during sleep
             
-            # Submit build task to executor
-            if self._executor is not None:
-                with self._active_lock:
-                    self._active_builds += 1
+            # Submit batch of tiles to utilize all workers
+            # Limit to half of workers to leave capacity for newly arriving tiles
+            max_batch = max(1, self._max_workers // 2)
+            batch_submitted = 0
+            
+            while batch_submitted < max_batch:
+                try:
+                    item = self._queue.get_nowait()
+                except Empty:
+                    break  # Queue exhausted
                 
-                self._executor.submit(self._build_tile_wrapper, tile)
-            self._last_build_time = time.monotonic()
+                # Sentinel value signals shutdown
+                if item is None:
+                    continue
+                
+                priority, tile = item
+                
+                if self._executor is not None:
+                    with self._active_lock:
+                        self._active_builds += 1
+                    self._executor.submit(self._build_tile_wrapper, tile)
+                    batch_submitted += 1
+            
+            if batch_submitted > 0:
+                self._last_build_time = time.monotonic()
+            else:
+                # Queue was empty - wait for new items with blocking get
+                try:
+                    item = self._queue.get(timeout=1.0)
+                    if item is not None:
+                        priority, tile = item
+                        if self._executor is not None:
+                            with self._active_lock:
+                                self._active_builds += 1
+                            self._executor.submit(self._build_tile_wrapper, tile)
+                            self._last_build_time = time.monotonic()
+                except Empty:
+                    continue
     
     def _build_tile_wrapper(self, tile) -> None:
         """Wrapper for _build_tile_dds that handles exceptions and stats."""
@@ -3966,17 +4006,26 @@ class BackgroundDDSBuilder:
             bundle_path = get_bundle2_path(tile.cache_dir, tile.row, tile.col, tile.maptype, tile.tilename_zoom)
             
             if not os.path.exists(bundle_path):
-                # Bundle doesn't exist - check if consolidation is pending
+                # Bundle doesn't exist - check if consolidation is pending or recently completed
                 global _bundle_consolidator
                 if _bundle_consolidator is not None:
+                    waited_for_consolidation = False
                     if _bundle_consolidator.is_pending(tile.row, tile.col, tile.maptype):
                         log.debug(f"Waiting for consolidation: {tile_id}")
-                        if _bundle_consolidator.wait_for_pending(tile.row, tile.col, tile.maptype, timeout=2.0):
-                            if not os.path.exists(bundle_path):
-                                return None
+                        # Use 60s timeout - consolidation will complete, waiting is better than failing
+                        wait_result = _bundle_consolidator.wait_for_pending(tile.row, tile.col, tile.maptype, timeout=60.0)
+                        waited_for_consolidation = True
+                    
+                    # ALWAYS re-check bundle - even if is_pending was False
+                    # Consolidation may have JUST completed between os.path.exists() and is_pending()
+                    if os.path.exists(bundle_path):
+                        if waited_for_consolidation:
+                            log.debug(f"Bundle appeared after consolidation wait: {tile_id}")
                         else:
-                            return None
+                            log.debug(f"Bundle appeared (consolidation completed between checks): {tile_id}")
+                            bump('jpeg_to_bundle_fallback_not_pending')
                     else:
+                        # Still no bundle after all checks
                         return None
                 else:
                     return None
@@ -4597,6 +4646,19 @@ def schedule_bundle_consolidation(tile, priority: int = 0, jpeg_datas: list = No
         bump('bundle_consolidation_scheduled')
         if jpeg_datas:
             bump('bundle_consolidation_in_memory')
+        
+        # TEMP STAT: Sync consolidator queue stats to global stats periodically
+        # (every 10 schedules to avoid overhead)
+        scheduled_count = STATS.get('bundle_consolidation_scheduled', 0)
+        if scheduled_count % 10 == 0:
+            try:
+                cstats = _bundle_consolidator.get_stats()
+                STATS['consolidator_queue_current'] = cstats.get('queue_size_current', 0)
+                STATS['consolidator_queue_max'] = cstats.get('queue_size_max', 0)
+                STATS['consolidator_time_max_ms'] = int(cstats.get('tile_consolidation_max_ms', 0))
+            except Exception:
+                pass
+        
         return True
     except Exception as e:
         log.debug(f"Failed to schedule bundle consolidation for tile {tile.row},{tile.col} at zoom {zoom}: {e}")
@@ -4768,7 +4830,7 @@ def start_predictive_dds(tile_cacher=None) -> None:
             _bundle_consolidator = BundleConsolidator(
                 cache_dir=cache_dir,
                 delete_jpegs=True,  # Remove individual JPEGs after consolidation
-                max_workers=BundleConsolidator.DEFAULT_WORKERS,
+                max_workers=4,
                 enabled=True
             )
             log.info(f"Bundle consolidation enabled (AOB2 format) - bundles saved to {cache_dir}/bundles/")
@@ -4797,6 +4859,14 @@ def stop_predictive_dds() -> None:
             _bundle_consolidator.shutdown(wait=True)
             log.info(f"Bundle consolidator: {stats['bundles_created']} bundles created, "
                     f"{stats['jpegs_consolidated']} JPEGs consolidated")
+            # TEMP STATS: Log queue and timing info for timeout tuning
+            log.info(f"Bundle consolidator timing: "
+                    f"avg={stats.get('tile_consolidation_avg_ms', 0):.1f}ms, "
+                    f"max={stats.get('tile_consolidation_max_ms', 0):.1f}ms, "
+                    f"min={stats.get('tile_consolidation_min_ms', 0):.1f}ms")
+            log.info(f"Bundle consolidator queue: "
+                    f"max_seen={stats.get('queue_size_max', 0)}, "
+                    f"avg={stats.get('queue_size_avg', 0):.1f}")
         except Exception as e:
             log.warning(f"Error shutting down bundle consolidator: {e}")
         _bundle_consolidator = None
@@ -5439,6 +5509,45 @@ class Tile(object):
     def __repr__(self):
         return f"Tile({self.col}, {self.row}, {self.maptype}, {self.tilename_zoom}, min_zoom={self.min_zoom}, max_zoom={self.max_zoom}, max_mm={self.max_mipmap})"
 
+    def _wait_for_pending_consolidation_if_needed(self, timeout: float = 30.0) -> bool:
+        """
+        Wait for pending consolidation OUTSIDE any locks.
+        
+        Must be called BEFORE _create_chunks() to avoid blocking other threads
+        while waiting for consolidation. This prevents the scenario where thread A
+        holds the tile lock for 30 seconds waiting for consolidation while thread B
+        (wanting the same tile) is blocked.
+        
+        Args:
+            timeout: Maximum time to wait in seconds (default 30s)
+            
+        Returns:
+            True if consolidation completed (or wasn't pending)
+            False if still pending after timeout
+        """
+        global _bundle_consolidator
+        if _bundle_consolidator is None:
+            return True
+        
+        if not _bundle_consolidator.is_pending(self.row, self.col, self.maptype):
+            return True
+        
+        # Determine timeout based on time budget (if live request)
+        if hasattr(self, '_tile_time_budget') and self._tile_time_budget is not None:
+            wait_timeout = max(0.5, min(self._tile_time_budget.remaining, timeout))
+        else:
+            wait_timeout = timeout
+        
+        bump('bundle_wait_started')
+        log.debug(f"Waiting for consolidation outside lock: {self.id}")
+        
+        if _bundle_consolidator.wait_for_pending(self.row, self.col, self.maptype, timeout=wait_timeout):
+            bump('bundle_wait_success')
+            return True
+        
+        bump('bundle_wait_timeout')
+        return False
+
     @locked
     def _create_chunks(self, quick_zoom=0, min_zoom=None):
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(quick_zoom, min_zoom)
@@ -5489,8 +5598,18 @@ class Tile(object):
             
             # Native batch cache read: read all cache files in parallel using C code
             if use_batch_read:
-                paths = [chunk.cache_path for chunk in self.chunks[zoom]]
-                cached_data = _batch_read_cache_files(paths)
+                # Register as reader to prevent consolidator from deleting JPEGs during read
+                reader_prefix = None
+                if _bundle_consolidator is not None:
+                    reader_prefix = _bundle_consolidator.register_reader(self.row, self.col, self.maptype)
+                
+                try:
+                    paths = [chunk.cache_path for chunk in self.chunks[zoom]]
+                    cached_data = _batch_read_cache_files(paths)
+                finally:
+                    # Unregister reader when done with disk I/O
+                    if reader_prefix is not None and _bundle_consolidator is not None:
+                        _bundle_consolidator.unregister_reader(reader_prefix)
                 
                 if cached_data:
                     hits = 0
@@ -5505,7 +5624,8 @@ class Tile(object):
                 # JPEG-TO-BUNDLE FALLBACK: Handle race condition with consolidator
                 # ═══════════════════════════════════════════════════════════════
                 # If batch read missed many files, the consolidator may have deleted
-                # them while creating a bundle. Check if bundle now exists.
+                # them while creating a bundle. Check if bundle now exists, or wait
+                # for pending consolidation to avoid re-downloading.
                 missing_count = len(paths) - len(cached_data)
                 if missing_count > 0:
                     try:
@@ -5517,21 +5637,67 @@ class Tile(object):
                             from aopipeline import AoBundle2
                         
                         bundle_path = get_bundle2_path(self.cache_dir, self.row, self.col, self.maptype, self.tilename_zoom)
+                        bundle_has_data = False
+                        
+                        # First check: bundle exists?
                         if os.path.exists(bundle_path):
-                            # Bundle exists - consolidator likely deleted JPEGs
-                            bundle = AoBundle2.Bundle2Python(bundle_path)
-                            if bundle.has_zoom(zoom):
-                                jpeg_datas = bundle.get_all_chunks(zoom)
-                                fallback_hits = 0
-                                for i, chunk in enumerate(self.chunks[zoom]):
-                                    if chunk.cache_path not in cached_data and i < len(jpeg_datas):
-                                        data = jpeg_datas[i]
-                                        if data:
-                                            chunk.set_cached_data(data)
-                                            fallback_hits += 1
-                                if fallback_hits > 0:
-                                    log.debug(f"JPEG-to-bundle fallback: recovered {fallback_hits}/{missing_count} chunks for zoom {zoom}")
-                                    bump('jpeg_to_bundle_fallback')
+                            with AoBundle2.Bundle2Python(bundle_path) as bundle:
+                                if bundle.has_zoom(zoom):
+                                    jpeg_datas = bundle.get_all_chunks(zoom)
+                                    bundle_has_data = True
+                        
+                        # Second check: consolidation pending or recently completed?
+                        # If pending, wait for it. Then ALWAYS re-check bundle regardless
+                        # of is_pending() result - consolidation may have just completed.
+                        if not bundle_has_data and _bundle_consolidator is not None:
+                            waited_for_consolidation = False
+                            if _bundle_consolidator.is_pending(self.row, self.col, self.maptype):
+                                log.debug(f"JPEG-to-bundle fallback: waiting for pending consolidation")
+                                bump('jpeg_to_bundle_wait_started')
+                                wait_start = time.monotonic()
+                                wait_result = _bundle_consolidator.wait_for_pending(self.row, self.col, self.maptype, timeout=60.0)
+                                wait_time = time.monotonic() - wait_start
+                                waited_for_consolidation = True
+                                
+                                if wait_result:
+                                    bump('jpeg_to_bundle_wait_success')
+                                    if wait_time > 5.0:
+                                        bump('jpeg_to_bundle_wait_long')
+                                        log.debug(f"JPEG-to-bundle fallback: waited {wait_time:.1f}s for consolidation")
+                                elif wait_time > 30.0:
+                                    # Only log as timeout if we actually waited a long time
+                                    bump('jpeg_to_bundle_wait_timeout')
+                                    log.warning(f"JPEG-to-bundle fallback: consolidation wait TIMEOUT after {wait_time:.1f}s - "
+                                               f"tile {self.row}_{self.col}_{self.maptype} may have stuck consolidation")
+                                else:
+                                    # Fast return (0-30s) = consolidation already completed
+                                    bump('jpeg_to_bundle_wait_already_done')
+                            
+                            # ALWAYS try bundle after wait OR if is_pending was False
+                            # Key fix: Consolidation may have JUST completed between first check
+                            # and is_pending() call - we must re-check the bundle regardless!
+                            if not bundle_has_data and os.path.exists(bundle_path):
+                                with AoBundle2.Bundle2Python(bundle_path) as bundle:
+                                    if bundle.has_zoom(zoom):
+                                        jpeg_datas = bundle.get_all_chunks(zoom)
+                                        bundle_has_data = True
+                                        if not waited_for_consolidation:
+                                            # Track cases where bundle found without waiting
+                                            # (consolidation completed between checks)
+                                            bump('jpeg_to_bundle_fallback_not_pending')
+                        
+                        # Apply recovered data to chunks
+                        if bundle_has_data and jpeg_datas:
+                            fallback_hits = 0
+                            for i, chunk in enumerate(self.chunks[zoom]):
+                                if chunk.cache_path not in cached_data and i < len(jpeg_datas):
+                                    data = jpeg_datas[i]
+                                    if data:
+                                        chunk.set_cached_data(data)
+                                        fallback_hits += 1
+                            if fallback_hits > 0:
+                                log.debug(f"JPEG-to-bundle fallback: recovered {fallback_hits}/{missing_count} chunks for zoom {zoom}")
+                                bump('jpeg_to_bundle_fallback')
                     except Exception as e:
                         log.debug(f"JPEG-to-bundle fallback failed: {e}")
                 # ═══════════════════════════════════════════════════════════════
@@ -5575,55 +5741,23 @@ class Tile(object):
             bundle_path = get_bundle2_path(self.cache_dir, self.row, self.col, self.maptype, self.tilename_zoom)
             
             if not os.path.exists(bundle_path):
-                # Bundle doesn't exist - check if consolidation is pending
-                # This prevents re-downloading chunks when the bundle is about to be created
-                if _bundle_consolidator is not None:
-                    is_pending = _bundle_consolidator.is_pending(self.row, self.col, self.maptype)
-                    
-                    if is_pending:
-                        bump('bundle_wait_started')
-                        log.debug(f"Waiting for consolidation: {self.id}")
-                        
-                        # Determine wait timeout based on tile's time budget (if live) or prefetch mode
-                        # 
-                        # For LIVE requests (X-Plane waiting): use full remaining budget
-                        # For PREFETCH/background: wait indefinitely - no deadline, let consolidation complete
-                        #   If tile becomes live during wait, the live request will use its own budget
-                        #   via the prefetch-to-live transition in get_bytes()
-                        if hasattr(self, '_tile_time_budget') and self._tile_time_budget is not None:
-                            # Live request - use full remaining budget (at least 0.5s to avoid busy-spin)
-                            wait_timeout = max(0.5, self._tile_time_budget.remaining)
-                        else:
-                            # Prefetch/background - no deadline, wait for consolidation to complete
-                            # Use None for infinite wait (consolidator.wait_for_pending handles this)
-                            wait_timeout = None
-                        
-                        if _bundle_consolidator.wait_for_pending(self.row, self.col, self.maptype, timeout=wait_timeout):
-                            # Consolidation completed - check if bundle now exists
-                            if os.path.exists(bundle_path):
-                                bump('bundle_wait_success')
-                            else:
-                                return False
-                        else:
-                            # Timeout - consolidation still pending, fall back to individual files
-                            bump('bundle_wait_timeout')
-                            return False
-                    else:
-                        # Not pending - bundle genuinely doesn't exist
-                        return False
-                else:
-                    return False
-            
-            # Open bundle and read chunks
-            bundle = AoBundle2.Bundle2Python(bundle_path)
-            
-            # Check if bundle has this zoom level
-            if not bundle.has_zoom(zoom):
-                log.debug(f"Bundle missing zoom {zoom} for {self.id}")
+                # Bundle doesn't exist - consolidation wait is now done OUTSIDE the lock
+                # via _wait_for_pending_consolidation_if_needed() called before _create_chunks()
+                # If bundle still doesn't exist here, fall back to individual files
                 return False
             
-            # Get all chunk data from bundle
-            jpeg_datas = bundle.get_all_chunks(zoom)
+            # Open bundle and read chunks - use context manager to release file immediately
+            # Critical: On Windows, mmap holds file open and blocks consolidation updates
+            with AoBundle2.Bundle2Python(bundle_path) as bundle:
+                # Check if bundle has this zoom level
+                if not bundle.has_zoom(zoom):
+                    log.debug(f"Bundle missing zoom {zoom} for {self.id}")
+                    return False
+                
+                # Get all chunk data from bundle (returns copies, safe after close)
+                jpeg_datas = bundle.get_all_chunks(zoom)
+            # Bundle is now closed - file handle released
+            
             expected_count = width * height
             
             if len(jpeg_datas) != expected_count:
@@ -5658,6 +5792,117 @@ class Tile(object):
             log.warning(f"Failed to load bundle for {self.id}: {e}")
             return False
 
+    def _try_build_dds_from_bundle(self, zoom: int, dxt_format: str = "BC1",
+                                    missing_color: Tuple[int, int, int] = (66, 77, 55)) -> Optional[bytes]:
+        """
+        Try to build complete DDS from bundle using native C code.
+        
+        This is the fastest path when a bundle exists with all required chunks.
+        Uses native aobundle2_build_dds which:
+        - Reads bundle (single file open)
+        - Decodes all JPEGs in parallel (OpenMP)
+        - Builds DDS in one pass
+        
+        Args:
+            zoom: Zoom level to build DDS for
+            dxt_format: DXT compression format ("BC1" or "BC3")
+            missing_color: RGB tuple for missing chunk fill color
+            
+        Returns:
+            Complete DDS file as bytes, or None if bundle doesn't exist/have zoom level
+            
+        Thread Safety:
+            - Uses context manager for Bundle2Python (releases mmap immediately)
+            - Native build_dds opens/closes file internally
+        """
+        try:
+            # Handle imports for both frozen (PyInstaller) and direct Python execution
+            try:
+                from autoortho.utils.bundle_paths import get_bundle2_path
+                from autoortho.aopipeline import AoBundle2
+            except ImportError:
+                from utils.bundle_paths import get_bundle2_path
+                from aopipeline import AoBundle2
+            
+            # Get bundle path for this tile
+            bundle_path = get_bundle2_path(self.cache_dir, self.row, self.col, self.maptype, self.tilename_zoom)
+            
+            if not os.path.exists(bundle_path):
+                return None
+            
+            # Check if bundle has this zoom level - use context manager to release file
+            # immediately so native build_dds can open it
+            with AoBundle2.Bundle2Python(bundle_path) as bundle:
+                has_zoom = bundle.has_zoom(zoom)
+            # Bundle is now closed - file handle released
+            
+            if not has_zoom:
+                return None
+            
+            # Native DDS build (parallel JPEG decode + DXT compress)
+            # This is ~3-4x faster than sequential Python processing
+            try:
+                dds_bytes = AoBundle2.build_dds(bundle_path, zoom, dxt_format, missing_color)
+                bump('bundle_dds_build_success')
+                return dds_bytes
+            except Exception as e:
+                log.debug(f"Native bundle DDS build failed: {e}")
+                return None
+                
+        except ImportError:
+            log.debug("Bundle modules not available for DDS build")
+            return None
+        except Exception as e:
+            log.debug(f"_try_build_dds_from_bundle failed: {e}")
+            return None
+
+    def _try_get_chunks_from_bundle(self, zoom: int) -> Optional[List[Optional[bytes]]]:
+        """
+        Try to get all chunk JPEG data from bundle for a specific zoom level.
+        
+        This provides bulk access to chunk data from a bundle, which is faster
+        than reading individual cache files when the bundle exists.
+        
+        Args:
+            zoom: Zoom level to get chunks for
+            
+        Returns:
+            List of JPEG bytes (None for missing chunks), or None if bundle unavailable
+            
+        Thread Safety:
+            - Uses context manager for Bundle2Python (releases mmap immediately)
+        """
+        try:
+            # Handle imports for both frozen (PyInstaller) and direct Python execution
+            try:
+                from autoortho.utils.bundle_paths import get_bundle2_path
+                from autoortho.aopipeline import AoBundle2
+            except ImportError:
+                from utils.bundle_paths import get_bundle2_path
+                from aopipeline import AoBundle2
+            
+            # Get bundle path for this tile
+            bundle_path = get_bundle2_path(self.cache_dir, self.row, self.col, self.maptype, self.tilename_zoom)
+            
+            if not os.path.exists(bundle_path):
+                return None
+            
+            # Read all chunks at once - use context manager to release file immediately
+            with AoBundle2.Bundle2Python(bundle_path) as bundle:
+                if not bundle.has_zoom(zoom):
+                    return None
+                jpeg_datas = bundle.get_all_chunks(zoom)
+            # Bundle is now closed - file handle released
+            
+            return jpeg_datas
+            
+        except ImportError:
+            log.debug("Bundle modules not available for chunk read")
+            return None
+        except Exception as e:
+            log.debug(f"_try_get_chunks_from_bundle failed: {e}")
+            return None
+
     def _collect_chunk_jpegs(self, zoom: int, time_budget=None,
                               min_available_ratio: float = 0.9,
                               return_partial: bool = False):
@@ -5688,6 +5933,9 @@ class Tile(object):
             - chunk_getter.submit() is thread-safe
             - No locks held during wait (allows concurrent operations)
         """
+        # Wait for any pending consolidation OUTSIDE lock to avoid blocking other threads
+        self._wait_for_pending_consolidation_if_needed()
+        
         # Ensure chunks exist for this zoom level
         self._create_chunks(zoom)
         chunks = self.chunks.get(zoom, [])
@@ -5725,8 +5973,19 @@ class Tile(object):
         # BATCH CACHE READ: Read all missing chunks in parallel using native code
         # This is ~50x faster than individual get_cache() calls (1 batch vs 256 syscalls)
         if need_cache_read_indices:
-            cache_paths = [chunks[i].cache_path for i in need_cache_read_indices]
-            cached_data = _batch_read_cache_files(cache_paths)
+            # Register as reader to prevent consolidator from deleting JPEGs during read
+            # This solves the race condition where consolidator deletes files we're about to read
+            reader_prefix = None
+            if _bundle_consolidator is not None:
+                reader_prefix = _bundle_consolidator.register_reader(self.row, self.col, self.maptype)
+            
+            try:
+                cache_paths = [chunks[i].cache_path for i in need_cache_read_indices]
+                cached_data = _batch_read_cache_files(cache_paths)
+            finally:
+                # Unregister reader when done with disk I/O
+                if reader_prefix is not None and _bundle_consolidator is not None:
+                    _bundle_consolidator.unregister_reader(reader_prefix)
             
             if cached_data:
                 # Apply batch-read data to chunks
@@ -5747,7 +6006,8 @@ class Tile(object):
                 # JPEG-TO-BUNDLE FALLBACK: Handle race condition with consolidator
                 # ═══════════════════════════════════════════════════════════
                 # If batch read missed files, consolidator may have deleted them
-                # while creating a bundle. Check if bundle now exists.
+                # while creating a bundle. Check if bundle now exists, or wait
+                # for pending consolidation to avoid re-downloading.
                 still_missing = [i for i in need_cache_read_indices 
                                 if jpeg_datas[i] is None]
                 if still_missing:
@@ -5760,22 +6020,63 @@ class Tile(object):
                             from aopipeline import AoBundle2
                         
                         bundle_path = get_bundle2_path(self.cache_dir, self.row, self.col, self.maptype, self.tilename_zoom)
+                        bundle_datas = None
+                        bundle_has_data = False
+                        
+                        # First check: bundle exists?
                         if os.path.exists(bundle_path):
-                            # Bundle exists - consolidator likely deleted JPEGs
-                            bundle = AoBundle2.Bundle2Python(bundle_path)
-                            if bundle.has_zoom(self.max_zoom):
-                                bundle_datas = bundle.get_all_chunks(self.max_zoom)
-                                fallback_hits = 0
-                                for i in still_missing:
-                                    if i < len(bundle_datas) and bundle_datas[i]:
-                                        chunks[i].set_cached_data(bundle_datas[i])
-                                        jpeg_datas[i] = bundle_datas[i]
-                                        available_count += 1
-                                        fallback_hits += 1
-                                if fallback_hits > 0:
-                                    log.debug(f"_collect_chunk_jpegs: JPEG-to-bundle fallback - "
-                                             f"recovered {fallback_hits}/{len(still_missing)} chunks")
-                                    bump('jpeg_to_bundle_fallback')
+                            with AoBundle2.Bundle2Python(bundle_path) as bundle:
+                                if bundle.has_zoom(self.max_zoom):
+                                    bundle_datas = bundle.get_all_chunks(self.max_zoom)
+                                    bundle_has_data = True
+                        
+                        # Second check: consolidation pending or recently completed?
+                        # If pending, wait. Then ALWAYS re-check bundle regardless.
+                        if not bundle_has_data and _bundle_consolidator is not None:
+                            waited_for_consolidation = False
+                            if _bundle_consolidator.is_pending(self.row, self.col, self.maptype):
+                                log.debug(f"_collect_chunk_jpegs: waiting for pending consolidation")
+                                bump('jpeg_to_bundle_wait_started')
+                                wait_start = time.monotonic()
+                                wait_result = _bundle_consolidator.wait_for_pending(self.row, self.col, self.maptype, timeout=60.0)
+                                wait_time = time.monotonic() - wait_start
+                                waited_for_consolidation = True
+                                
+                                if wait_result:
+                                    bump('jpeg_to_bundle_wait_success')
+                                    if wait_time > 5.0:
+                                        bump('jpeg_to_bundle_wait_long')
+                                        log.debug(f"_collect_chunk_jpegs: waited {wait_time:.1f}s for consolidation")
+                                elif wait_time > 30.0:
+                                    bump('jpeg_to_bundle_wait_timeout')
+                                    log.warning(f"_collect_chunk_jpegs: consolidation wait TIMEOUT after {wait_time:.1f}s - "
+                                               f"tile {self.row}_{self.col}_{self.maptype} may have stuck consolidation")
+                                else:
+                                    bump('jpeg_to_bundle_wait_already_done')
+                            
+                            # ALWAYS try bundle - even if is_pending was False
+                            # Consolidation may have completed between first check and now
+                            if not bundle_has_data and os.path.exists(bundle_path):
+                                with AoBundle2.Bundle2Python(bundle_path) as bundle:
+                                    if bundle.has_zoom(self.max_zoom):
+                                        bundle_datas = bundle.get_all_chunks(self.max_zoom)
+                                        bundle_has_data = True
+                                        if not waited_for_consolidation:
+                                            bump('jpeg_to_bundle_fallback_not_pending')
+                        
+                        # Apply recovered data
+                        if bundle_has_data and bundle_datas:
+                            fallback_hits = 0
+                            for i in still_missing:
+                                if i < len(bundle_datas) and bundle_datas[i]:
+                                    chunks[i].set_cached_data(bundle_datas[i])
+                                    jpeg_datas[i] = bundle_datas[i]
+                                    available_count += 1
+                                    fallback_hits += 1
+                            if fallback_hits > 0:
+                                log.debug(f"_collect_chunk_jpegs: JPEG-to-bundle fallback - "
+                                         f"recovered {fallback_hits}/{len(still_missing)} chunks")
+                                bump('jpeg_to_bundle_fallback')
                     except Exception as e:
                         log.debug(f"_collect_chunk_jpegs: JPEG-to-bundle fallback failed: {e}")
                 # ═══════════════════════════════════════════════════════════
@@ -6179,6 +6480,9 @@ class Tile(object):
         jpeg_refs_for_nocopy = []
         
         try:
+            # Wait for any pending consolidation OUTSIDE lock
+            self._wait_for_pending_consolidation_if_needed()
+            
             # Ensure chunks are created for target zoom
             self._create_chunks(self.max_zoom)
             chunks = self.chunks.get(self.max_zoom, [])
@@ -6513,6 +6817,9 @@ class Tile(object):
 
 
     def fetch(self, quick_zoom=0, background=False):
+        # Wait for any pending consolidation OUTSIDE lock
+        self._wait_for_pending_consolidation_if_needed()
+        
         self._create_chunks(quick_zoom)
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(quick_zoom)
 
@@ -7121,6 +7428,12 @@ class Tile(object):
             
         log.debug(f"GET_IMG: Chunk indices - start: {startchunk}, end: {endchunk}, chunks_per_row: {chunks_per_row}")
 
+        # Wait for any pending consolidation - done here INSIDE get_img but the wait
+        # itself doesn't hold any additional locks beyond the tile's RLock that get_img already holds.
+        # Note: get_img has @locked, so this wait is within the tile lock.
+        # TODO: For further optimization, this wait could be moved to callers of get_img.
+        # For now, the per-tile event-based wait is much faster than notify_all().
+        
         # Create chunks for the actual zoom level we'll download from
         self._create_chunks(zoom, min_zoom)
         chunks = self.chunks[zoom][startchunk:endchunk]
@@ -7496,11 +7809,17 @@ class Tile(object):
                 
             return (chunk, chunk_img, start_x, start_y)
         
-        # OPTIMIZATION: Submit all chunks to decode executor immediately
-        # Instead of polling for download_started, submit all chunks upfront.
-        # Each worker will wait on its chunk's ready event, sleeping efficiently.
-        # This removes polling overhead (~25ms per iteration) and lets the executor
-        # manage scheduling. The _decode_sem already limits concurrent decodes.
+        # OPTIMIZATION: Non-blocking chunk processing with bundle pre-check
+        # 
+        # Architecture:
+        # 1. EARLY BUNDLE CHECK: Try to get all chunks from bundle first (fastest path)
+        # 2. IMMEDIATE READY PROCESSING: Process ready chunks without waiting
+        # 3. EXECUTOR FOR WAITING: Use executor only for chunks that need download wait
+        # 4. ROUND-ROBIN RETRY: Poll non-ready chunks periodically instead of blocking all workers
+        #
+        # This prevents worker starvation where all 8 executor threads block on chunk.ready.wait()
+        # when downloads are slow, leaving no workers to process chunks that become ready.
+        
         max_pool_workers = min(CURRENT_CPU_COUNT, len(chunks), _MAX_DECODE)
         
         total_chunks = len(chunks)
@@ -7510,15 +7829,72 @@ class Tile(object):
         chunks_with_images = set()  # Track which chunks have images for fallback sweep
         
         try:
-            # Submit all chunks immediately (except permanently failed ones)
+            # === PHASE 0: EARLY BUNDLE CHECK ===
+            # If bundle exists with this zoom level, populate chunk data immediately
+            # This avoids submitting chunks to executor when data is already available
+            bundle_preload_count = 0
+            bundle_chunks = self._try_get_chunks_from_bundle(zoom)
+            
+            if bundle_chunks:
+                # Calculate tile origin for this zoom level
+                zoom_diff = self.max_zoom - zoom
+                tile_col_at_zoom = self.col >> zoom_diff
+                tile_row_at_zoom = self.row >> zoom_diff
+                chunks_per_side = int(round((2 ** self.max_zoom) / (2 ** zoom)))
+                
+                for chunk in chunks:
+                    if chunk.ready.is_set():
+                        continue  # Already ready
+                    
+                    # Calculate chunk's index in the bundle
+                    chunk_col_offset = chunk.col - tile_col_at_zoom
+                    chunk_row_offset = chunk.row - tile_row_at_zoom
+                    
+                    if 0 <= chunk_col_offset < chunks_per_side and 0 <= chunk_row_offset < chunks_per_side:
+                        bundle_idx = chunk_row_offset * chunks_per_side + chunk_col_offset
+                        
+                        if bundle_idx < len(bundle_chunks) and bundle_chunks[bundle_idx] is not None:
+                            # Preload chunk data from bundle
+                            chunk.set_cached_data(bundle_chunks[bundle_idx])
+                            bundle_preload_count += 1
+                
+                if bundle_preload_count > 0:
+                    log.debug(f"GET_IMG: Bundle preload populated {bundle_preload_count}/{len(chunks)} chunks")
+                    bump('bundle_preload_chunks', bundle_preload_count)
+            
+            # === PHASE 1: IMMEDIATE READY PROCESSING ===
+            # Process chunks that are already ready without submitting to executor
+            # This is faster than executor overhead for chunks that don't need waiting
+            ready_chunks = []
+            pending_chunks = []
+            
             for chunk in chunks:
                 if chunk.permanent_failure:
                     bump('chunk_missing_count')
                     continue
+                
+                if chunk.ready.is_set() and chunk.data:
+                    # Ready with data - process immediately in current thread
+                    ready_chunks.append(chunk)
+                else:
+                    # Not ready or no data - needs waiting
+                    pending_chunks.append(chunk)
+            
+            # Process ready chunks in parallel via executor (no waiting needed)
+            if ready_chunks:
+                log.debug(f"GET_IMG: Processing {len(ready_chunks)} ready chunks immediately")
+                for chunk in ready_chunks:
+                    # Use skip_download_wait=True since chunk is already ready
+                    future = executor.submit(process_chunk, chunk, skip_download_wait=False)
+                    active_futures[future] = chunk
+            
+            # === PHASE 2: SUBMIT PENDING CHUNKS ===
+            # Submit chunks that need download waiting
+            for chunk in pending_chunks:
                 future = executor.submit(process_chunk, chunk)
                 active_futures[future] = chunk
             
-            log.debug(f"GET_IMG: Submitted {len(active_futures)} chunks to decode executor")
+            log.debug(f"GET_IMG: Submitted {len(ready_chunks)} ready + {len(pending_chunks)} pending = {len(active_futures)} chunks to executor")
             
             # Collect results as they complete, respecting time budget
             while active_futures:
@@ -7600,7 +7976,64 @@ class Tile(object):
                         log.info(f"GET_IMG: Fallback sweep for {len(missing_chunks)} missing chunks "
                                 f"(remaining={fallback_budget.remaining:.2f}s)")
                     
-                    # Process missing chunks with fallback budget
+                    # === OPTIMIZATION: Try bundle-based bulk read FIRST ===
+                    # This is MUCH faster than sequential chunk processing because:
+                    # - Single file open instead of 256+ opens
+                    # - All data read in one pass
+                    # - Parallel JPEG decoding via OpenMP
+                    bundle_recovery_attempted = False
+                    bundle_jpegs = self._try_get_chunks_from_bundle(zoom)
+                    
+                    if bundle_jpegs:
+                        bundle_recovery_attempted = True
+                        bundle_recovered = 0
+                        
+                        # Build a mapping from (col, row) to bundle index
+                        # Bundle stores chunks in row-major order starting from tile origin
+                        # Calculate the tile origin for this zoom level
+                        zoom_diff = self.max_zoom - zoom
+                        tile_col_at_zoom = self.col >> zoom_diff
+                        tile_row_at_zoom = self.row >> zoom_diff
+                        chunks_per_side = int(round((2 ** self.max_zoom) / (2 ** zoom)))
+                        
+                        for chunk in missing_chunks:
+                            # Calculate chunk's index in the bundle
+                            chunk_col_offset = chunk.col - tile_col_at_zoom
+                            chunk_row_offset = chunk.row - tile_row_at_zoom
+                            
+                            # Validate offsets are within bounds
+                            if 0 <= chunk_col_offset < chunks_per_side and 0 <= chunk_row_offset < chunks_per_side:
+                                bundle_idx = chunk_row_offset * chunks_per_side + chunk_col_offset
+                                
+                                if bundle_idx < len(bundle_jpegs) and bundle_jpegs[bundle_idx] is not None:
+                                    jpeg_data = bundle_jpegs[bundle_idx]
+                                    
+                                    # Decode JPEG and paste into image
+                                    try:
+                                        with _decode_sem:
+                                            chunk_img = AoImage.load_from_memory(jpeg_data)
+                                        
+                                        if chunk_img:
+                                            start_x = int(chunk.width * (chunk.col - col))
+                                            start_y = int(chunk.height * (chunk.row - row))
+                                            _safe_paste(new_im, chunk_img, start_x, start_y)
+                                            chunks_with_images.add(id(chunk))
+                                            bundle_recovered += 1
+                                            
+                                            # Also update chunk state for future use
+                                            chunk.set_cached_data(jpeg_data)
+                                    except Exception as e:
+                                        log.debug(f"Bundle chunk decode failed: {e}")
+                        
+                        if bundle_recovered > 0:
+                            log.info(f"GET_IMG: Bundle sweep recovered {bundle_recovered}/{len(missing_chunks)} chunks")
+                            bump('fallback_bundle_sweep_recovered', bundle_recovered)
+                            
+                            # Update missing chunks list for sequential fallback
+                            missing_chunks = [c for c in missing_chunks if id(c) not in chunks_with_images]
+                    
+                    # === SEQUENTIAL FALLBACK: Process remaining missing chunks ===
+                    # Only runs if bundle didn't recover all chunks
                     sweep_recovered = 0
                     for chunk in missing_chunks:
                         if fallback_budget.exhausted:
@@ -7628,7 +8061,8 @@ class Tile(object):
                         log.info(f"GET_IMG: Fallback sweep recovered {sweep_recovered}/{len(missing_chunks)} chunks")
                     
                     # Update missing count for chunks we couldn't recover
-                    still_missing = len(missing_chunks) - sweep_recovered
+                    still_missing = len([c for c in chunks if id(c) not in chunks_with_images 
+                                        and not c.permanent_failure])
                     if still_missing > 0:
                         bump('chunk_missing_count', still_missing)
         finally:
@@ -8377,6 +8811,9 @@ class Tile(object):
         # PHASE 1: Create chunks and try bundle loading (fastest path)
         # ═══════════════════════════════════════════════════════════════════════
         
+        # Wait for any pending consolidation OUTSIDE lock
+        self._wait_for_pending_consolidation_if_needed()
+        
         # Ensure chunks exist for this zoom level
         # Note: _create_chunks already tries bundle loading internally
         self._create_chunks(zoom)
@@ -8414,8 +8851,18 @@ class Tile(object):
         # ═══════════════════════════════════════════════════════════════════════
         
         if need_cache_read and ready_count < total_chunks:
-            cache_paths = [chunks[i].cache_path for i in need_cache_read]
-            cached_data = _batch_read_cache_files(cache_paths)
+            # Register as reader to prevent consolidator from deleting JPEGs during read
+            reader_prefix = None
+            if _bundle_consolidator is not None:
+                reader_prefix = _bundle_consolidator.register_reader(self.row, self.col, self.maptype)
+            
+            try:
+                cache_paths = [chunks[i].cache_path for i in need_cache_read]
+                cached_data = _batch_read_cache_files(cache_paths)
+            finally:
+                # Unregister reader when done with disk I/O
+                if reader_prefix is not None and _bundle_consolidator is not None:
+                    _bundle_consolidator.unregister_reader(reader_prefix)
             
             if cached_data:
                 for i in need_cache_read:
@@ -8437,7 +8884,8 @@ class Tile(object):
             # JPEG-TO-BUNDLE FALLBACK: Handle race condition with consolidator
             # ═══════════════════════════════════════════════════════════════
             # If batch read missed files, consolidator may have deleted them
-            # while creating a bundle. Check if bundle now exists.
+            # while creating a bundle. Check if bundle now exists, or wait
+            # for pending consolidation to avoid re-downloading.
             if need_cache_read:
                 try:
                     try:
@@ -8448,24 +8896,65 @@ class Tile(object):
                         from aopipeline import AoBundle2
                     
                     bundle_path = get_bundle2_path(self.cache_dir, self.row, self.col, self.maptype, self.tilename_zoom)
+                    bundle_datas = None
+                    bundle_has_data = False
+                    
+                    # First check: bundle exists?
                     if os.path.exists(bundle_path):
-                        # Bundle exists - consolidator likely deleted JPEGs
-                        bundle = AoBundle2.Bundle2Python(bundle_path)
-                        if bundle.has_zoom(zoom):
-                            bundle_datas = bundle.get_all_chunks(zoom)
-                            fallback_hits = 0
-                            for i in need_cache_read:
-                                if i < len(bundle_datas) and bundle_datas[i]:
-                                    chunks[i].set_cached_data(bundle_datas[i])
-                                    jpeg_datas[i] = bundle_datas[i]
-                                    ready_count += 1
-                                    fallback_hits += 1
-                            if fallback_hits > 0:
-                                log.debug(f"_try_native_mipmap_build: JPEG-to-bundle fallback - "
-                                         f"recovered {fallback_hits}/{len(need_cache_read)} for mipmap {mipmap}")
-                                bump('jpeg_to_bundle_fallback')
-                            # Update need list
-                            need_cache_read = [i for i in need_cache_read if jpeg_datas[i] is None]
+                        with AoBundle2.Bundle2Python(bundle_path) as bundle:
+                            if bundle.has_zoom(zoom):
+                                bundle_datas = bundle.get_all_chunks(zoom)
+                                bundle_has_data = True
+                    
+                    # Second check: consolidation pending or recently completed?
+                    # If pending, wait. Then ALWAYS re-check bundle regardless.
+                    if not bundle_has_data and _bundle_consolidator is not None:
+                        waited_for_consolidation = False
+                        if _bundle_consolidator.is_pending(self.row, self.col, self.maptype):
+                            log.debug(f"_try_native_mipmap_build: waiting for pending consolidation")
+                            bump('jpeg_to_bundle_wait_started')
+                            wait_start = time.monotonic()
+                            wait_result = _bundle_consolidator.wait_for_pending(self.row, self.col, self.maptype, timeout=60.0)
+                            wait_time = time.monotonic() - wait_start
+                            waited_for_consolidation = True
+                            
+                            if wait_result:
+                                bump('jpeg_to_bundle_wait_success')
+                                if wait_time > 5.0:
+                                    bump('jpeg_to_bundle_wait_long')
+                                    log.debug(f"_try_native_mipmap_build: waited {wait_time:.1f}s for consolidation")
+                            elif wait_time > 30.0:
+                                bump('jpeg_to_bundle_wait_timeout')
+                                log.warning(f"_try_native_mipmap_build: consolidation wait TIMEOUT after {wait_time:.1f}s - "
+                                           f"tile {self.row}_{self.col}_{self.maptype} may have stuck consolidation")
+                            else:
+                                bump('jpeg_to_bundle_wait_already_done')
+                        
+                        # ALWAYS try bundle - even if is_pending was False
+                        # Consolidation may have completed between first check and now
+                        if not bundle_has_data and os.path.exists(bundle_path):
+                            with AoBundle2.Bundle2Python(bundle_path) as bundle:
+                                if bundle.has_zoom(zoom):
+                                    bundle_datas = bundle.get_all_chunks(zoom)
+                                    bundle_has_data = True
+                                    if not waited_for_consolidation:
+                                        bump('jpeg_to_bundle_fallback_not_pending')
+                    
+                    # Apply recovered data
+                    if bundle_has_data and bundle_datas:
+                        fallback_hits = 0
+                        for i in need_cache_read:
+                            if i < len(bundle_datas) and bundle_datas[i]:
+                                chunks[i].set_cached_data(bundle_datas[i])
+                                jpeg_datas[i] = bundle_datas[i]
+                                ready_count += 1
+                                fallback_hits += 1
+                        if fallback_hits > 0:
+                            log.debug(f"_try_native_mipmap_build: JPEG-to-bundle fallback - "
+                                     f"recovered {fallback_hits}/{len(need_cache_read)} for mipmap {mipmap}")
+                            bump('jpeg_to_bundle_fallback')
+                        # Update need list
+                        need_cache_read = [i for i in need_cache_read if jpeg_datas[i] is None]
                 except Exception as e:
                     log.debug(f"_try_native_mipmap_build: JPEG-to-bundle fallback failed: {e}")
             # ═══════════════════════════════════════════════════════════════
@@ -8664,6 +9153,9 @@ class Tile(object):
             - chunk.ready.wait() is thread-safe
             - chunk.data access uses GIL-protected reference copy
         """
+        # Wait for any pending consolidation OUTSIDE lock
+        self._wait_for_pending_consolidation_if_needed()
+        
         # Ensure chunks exist for this zoom level
         self._create_chunks(zoom)
         
@@ -8858,6 +9350,26 @@ class Tile(object):
                      f"{result.elapsed_ms:.1f}ms native, {build_time*1000:.1f}ms total)")
             
             bump('native_partial_mipmap_success')
+            
+            # Schedule bundle consolidation for this zoom level
+            # Track which zoom levels we've scheduled to avoid duplicate scheduling
+            # (partial builds happen row-by-row, we only need to schedule once)
+            if not hasattr(self, '_partial_build_consolidation_scheduled'):
+                self._partial_build_consolidation_scheduled = set()
+            
+            if zoom not in self._partial_build_consolidation_scheduled:
+                self._partial_build_consolidation_scheduled.add(zoom)
+                try:
+                    # Get ALL chunks for this zoom (not just partial rows) for consolidation
+                    all_chunks = self.chunks.get(zoom, [])
+                    if all_chunks:
+                        all_jpeg_datas = [chunk.data if hasattr(chunk, 'data') and chunk.data else None 
+                                          for chunk in all_chunks]
+                        schedule_bundle_consolidation(self, priority=1, jpeg_datas=all_jpeg_datas, zoom=zoom)
+                        log.debug(f"_try_native_partial_mipmap_build: Scheduled consolidation for ZL{zoom}")
+                except Exception as e:
+                    log.debug(f"_try_native_partial_mipmap_build: Consolidation scheduling failed: {e}")
+            
             return True
             
         except Exception as e:
@@ -9499,28 +10011,52 @@ class TileCacher(object):
             pass
 
     def _evict_batch(self, max_to_evict: int) -> int:
+        """
+        Evict tiles with minimal lock holding time.
+        
+        Splits eviction into two phases:
+        1. PHASE 1: Pop tiles from dict under lock (fast dict ops only)
+        2. PHASE 2: Close tiles OUTSIDE lock (slow I/O operations)
+        
+        This prevents blocking _get_tile() and _open_tile() during mass evictions.
+        """
         evicted = 0
-        # Prefer strict LRU order: left to right
-        for idx in list(self._lru_candidates()):
-            if evicted >= max_to_evict:
+        BATCH_SIZE = 20  # Balance between lock overhead and responsiveness
+        
+        while evicted < max_to_evict:
+            # PHASE 1: Collect batch to evict (under lock - fast dict ops only)
+            batch = []
+            with self.tc_lock:
+                for idx in list(self._lru_candidates()):
+                    if len(batch) >= BATCH_SIZE:
+                        break
+                    if evicted + len(batch) >= max_to_evict:
+                        break
+                    t = self.tiles.get(idx)
+                    if not t:
+                        continue
+                    if t.refs > 0:
+                        continue
+                    # Pop from dict immediately - tile is now "orphaned"
+                    try:
+                        batch.append(self.tiles.pop(idx))
+                    except KeyError:
+                        continue
+            
+            if not batch:
                 break
-            t = self.tiles.get(idx)
-            if not t:
-                continue
-            if t.refs > 0:
-                continue
-            # Evict this tile
-            try:
-                t = self.tiles.pop(idx)
-            except KeyError:
-                continue
-            try:
-                t.close()
-            except Exception:
-                pass
-            finally:
-                t = None
+            
+            # PHASE 2: Close tiles OUTSIDE lock (slow I/O operations)
+            # This is safe because tiles are already removed from self.tiles
+            for t in batch:
+                try:
+                    t.close()
+                except Exception:
+                    pass
+                finally:
+                    t = None
                 evicted += 1
+        
         return evicted
 
     def clean(self):
@@ -9579,16 +10115,16 @@ class TileCacher(object):
                 tiles_to_evict = tile_count - target_tile_count
                 if tiles_to_evict > 0:
                     log.info(f"Tile count eviction: {tile_count} tiles, evicting {tiles_to_evict} to reach {target_tile_count}")
-                    with self.tc_lock:
-                        self._evict_batch(tiles_to_evict)
+                    # _evict_batch handles its own locking internally
+                    self._evict_batch(tiles_to_evict)
 
             # Evict while above target using adaptive batch sizing
             while self.tiles and effective_mem > target_bytes:
                 over_bytes = max(0, effective_mem - target_bytes)
                 ratio = min(1.0, over_bytes / max(1, self.cache_mem_lim))
                 adaptive = max(20, int(len(self.tiles) * min(0.10, ratio)))
-                with self.tc_lock:
-                    evicted = self._evict_batch(adaptive)
+                # _evict_batch handles its own locking internally
+                evicted = self._evict_batch(adaptive)
                 if evicted == 0:
                     break
 
