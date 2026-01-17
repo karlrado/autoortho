@@ -3,6 +3,7 @@
 from ast import If
 import os
 import sys
+import shutil
 import pathlib
 import platform
 import threading
@@ -5271,59 +5272,79 @@ class ConfigUI(QMainWindow):
             sys.exit(1)
 
     def clean_cache(self, cache_dir, size_gb):
-        """Clean cache directory"""
+        """Clean cache directory
+        
+        Steps:
+        1. Delete all JPEGs from cache folder (legacy files)
+        2. Apply size-based cleanup to bundles in their new locations
+        """
         self.status_update.emit(
             f"Cleaning up cache_dir {cache_dir}. Please wait..."
         )
 
-        target_bytes = pow(2, 30) * size_gb
-
         try:
+            # Step 1: Always delete all legacy JPEGs from cache_dir root
+            jpeg_count = 0
+            for entry in os.scandir(cache_dir):
+                if entry.is_file() and entry.name.lower().endswith(('.jpg', '.jpeg')):
+                    os.remove(entry.path)
+                    jpeg_count += 1
+            if jpeg_count > 0:
+                self.status_update.emit(f"Deleted {jpeg_count} legacy JPEG files.")
+
+            # Step 2: Handle bundles
+            bundles_dir = os.path.join(cache_dir, "bundles")
+
             if size_gb == 0:
-                for entry in os.scandir(cache_dir):
-                    if entry.is_file():
-                        os.remove(entry.path)
+                # Delete all bundles
+                if os.path.isdir(bundles_dir):
+                    shutil.rmtree(bundles_dir, ignore_errors=True)
+                    self.status_update.emit("Deleted all bundle files.")
             else:
-                cfiles = sorted(
-                    pathlib.Path(cache_dir).glob('**/*'), key=os.path.getmtime
-                )
-                if not cfiles:
-                    self.status_update.emit("Cache is empty.")
+                # Size-based cleanup for bundles
+                target_bytes = pow(2, 30) * size_gb
+
+                # Find all bundle files
+                bundle_files = sorted(
+                    pathlib.Path(bundles_dir).glob('**/*.aob2'),
+                    key=os.path.getmtime
+                ) if os.path.isdir(bundles_dir) else []
+
+                if not bundle_files:
+                    self.status_update.emit("No bundles to clean.")
+                    self.status_update.emit("Cache cleanup done.")
                     return
 
-                cache_bytes = sum(
-                    file.stat().st_size for file in cfiles if file.is_file()
-                )
-                cachecount = len(cfiles)
-                avgcachesize = cache_bytes / cachecount if cachecount > 0 else 0
+                cache_bytes = sum(f.stat().st_size for f in bundle_files)
+                bundle_count = len(bundle_files)
+                avg_size = cache_bytes / bundle_count if bundle_count > 0 else 0
 
                 self.status_update.emit(
-                    f"Cache has {cachecount} files. "
-                    f"Total size approx {cache_bytes//1048576} MB."
+                    f"Cache has {bundle_count} bundles. "
+                    f"Total size approx {cache_bytes // 1048576} MB."
                 )
 
-                empty_files = [
-                    x for x in cfiles if x.is_file() and x.stat().st_size == 0
-                ]
-                self.status_update.emit(
-                    f"Found {len(empty_files)} empty files to cleanup."
-                )
-                for file in empty_files:
-                    if os.path.exists(file):
-                        os.remove(file)
+                # Remove empty bundles
+                empty_bundles = [f for f in bundle_files if f.stat().st_size == 0]
+                for f in empty_bundles:
+                    if f.exists():
+                        os.remove(f)
+                if empty_bundles:
+                    self.status_update.emit(f"Removed {len(empty_bundles)} empty bundles.")
 
-                if target_bytes > cache_bytes:
+                if target_bytes >= cache_bytes:
                     self.status_update.emit("Cache within size limits.")
+                    self.status_update.emit("Cache cleanup done.")
                     return
 
-                to_delete = int((cache_bytes - target_bytes) // avgcachesize)
-
+                to_delete = int((cache_bytes - target_bytes) // avg_size)
                 self.status_update.emit(
-                    f"Over cache size limit, will remove {to_delete} files."
+                    f"Over cache size limit, will remove {to_delete} bundles."
                 )
-                for file in cfiles[:to_delete]:
-                    if file.is_file():
-                        os.remove(file)
+
+                for f in bundle_files[:to_delete]:
+                    if f.is_file():
+                        os.remove(f)
 
             self.status_update.emit("Cache cleanup done.")
         except Exception as e:
