@@ -4007,18 +4007,25 @@ class BackgroundDDSBuilder:
             
             if not os.path.exists(bundle_path):
                 # Bundle doesn't exist - check if consolidation is pending or recently completed
+                # CRITICAL: Pass max_zoom to is_pending() - only wait for OUR zoom!
                 global _bundle_consolidator
                 if _bundle_consolidator is not None:
+                    bump('jpeg_to_bundle_fallback_entered')
                     waited_for_consolidation = False
-                    if _bundle_consolidator.is_pending(tile.row, tile.col, tile.maptype):
-                        log.debug(f"Waiting for consolidation: {tile_id}")
+                    if _bundle_consolidator.is_pending(tile.row, tile.col, tile.maptype, tile.max_zoom):
+                        log.debug(f"Waiting for consolidation (zoom {tile.max_zoom}): {tile_id}")
+                        bump('bundle_wait_started')
                         # Use 60s timeout - consolidation will complete, waiting is better than failing
-                        wait_result = _bundle_consolidator.wait_for_pending(tile.row, tile.col, tile.maptype, timeout=60.0)
+                        # Pass zoom to wait for THIS specific zoom level's consolidation
+                        wait_result = _bundle_consolidator.wait_for_pending(tile.row, tile.col, tile.maptype, timeout=60.0, zoom=tile.max_zoom)
                         waited_for_consolidation = True
+                        if wait_result:
+                            bump('bundle_wait_success')
                     
                     # ALWAYS re-check bundle - even if is_pending was False
                     # Consolidation may have JUST completed between os.path.exists() and is_pending()
                     if os.path.exists(bundle_path):
+                        bump('jpeg_to_bundle_fallback_bundle_exists')
                         if waited_for_consolidation:
                             log.debug(f"Bundle appeared after consolidation wait: {tile_id}")
                         else:
@@ -4656,6 +4663,11 @@ def schedule_bundle_consolidation(tile, priority: int = 0, jpeg_datas: list = No
                 STATS['consolidator_queue_current'] = cstats.get('queue_size_current', 0)
                 STATS['consolidator_queue_max'] = cstats.get('queue_size_max', 0)
                 STATS['consolidator_time_max_ms'] = int(cstats.get('tile_consolidation_max_ms', 0))
+                # Add detailed bundle stats for diagnostics
+                STATS['consolidator_bundles_created'] = cstats.get('bundles_created', 0)
+                STATS['consolidator_bundles_updated'] = cstats.get('bundles_updated', 0)
+                STATS['consolidator_bundles_merged'] = cstats.get('bundles_merged', 0)
+                STATS['consolidator_bundles_skipped'] = cstats.get('bundles_skipped', 0)
             except Exception:
                 pass
         
@@ -5548,6 +5560,45 @@ class Tile(object):
         bump('bundle_wait_timeout')
         return False
 
+    def _schedule_immediate_consolidation(self, jpeg_datas: list, zoom: int) -> bool:
+        """
+        Schedule consolidation immediately while JPEG data is in memory.
+        
+        This ensures that zoom levels are consolidated as soon as their data
+        is collected, before chunks can be garbage collected or evicted.
+        Critical for ensuring lower zoom levels (mipmaps) are consolidated
+        into the bundle, not just max_zoom.
+        
+        Args:
+            jpeg_datas: List of JPEG bytes (None for missing chunks)
+            zoom: Zoom level of the data
+            
+        Returns:
+            True if scheduling succeeded, False otherwise
+        """
+        try:
+            valid_count = sum(1 for d in jpeg_datas if d is not None)
+            if valid_count == 0:
+                return False
+            
+            # Use the existing schedule_bundle_consolidation function
+            result = schedule_bundle_consolidation(
+                self, 
+                priority=1,  # Normal priority (not urgent)
+                jpeg_datas=jpeg_datas, 
+                zoom=zoom
+            )
+            
+            if result:
+                bump('consolidation_scheduled_immediate')
+                log.debug(f"Scheduled immediate consolidation for {self.id} ZL{zoom} "
+                         f"({valid_count}/{len(jpeg_datas)} chunks)")
+            
+            return result
+        except Exception as e:
+            log.debug(f"_schedule_immediate_consolidation failed: {e}")
+            return False
+
     @locked
     def _create_chunks(self, quick_zoom=0, min_zoom=None):
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(quick_zoom, min_zoom)
@@ -5577,8 +5628,9 @@ class Tile(object):
             
             # Create all chunks first (skip individual cache checks if batch reading)
             # DIAGNOSTIC: Track chunks that were downloaded but cache is now missing
+            # NOTE: Warning is deferred until AFTER fallback attempt to avoid false positives
             recreated_count = 0
-            missing_cache_count = 0
+            potentially_lost_chunks = []  # Chunk indices that were downloaded but cache missing
             for r in range(row, row+height):
                 for c in range(col, col+width):
                     chunk = Chunk(c, r, self.maptype, zoom, cache_dir=self.cache_dir, 
@@ -5587,14 +5639,8 @@ class Tile(object):
                     if chunk.chunk_id in ChunkGetter._downloaded_chunks:
                         recreated_count += 1
                         if not os.path.exists(chunk.cache_path):
-                            missing_cache_count += 1
+                            potentially_lost_chunks.append(len(self.chunks[zoom]))
                     self.chunks[zoom].append(chunk)
-            
-            # Only warn if previously-downloaded chunks are missing from cache (data loss/re-download needed)
-            if missing_cache_count > 0:
-                log.warning(f"CREATE_CHUNKS: {missing_cache_count}/{recreated_count} chunks for tile {self.id} zoom {zoom} "
-                           f"were downloaded but cache is MISSING - will re-download!")
-                bump('chunk_cache_data_loss', missing_cache_count)
             
             # Native batch cache read: read all cache files in parallel using C code
             if use_batch_read:
@@ -5639,23 +5685,34 @@ class Tile(object):
                         bundle_path = get_bundle2_path(self.cache_dir, self.row, self.col, self.maptype, self.tilename_zoom)
                         bundle_has_data = False
                         
+                        # SMART FALLBACK: Only attempt recovery if zoom is likely in bundle
+                        # With immediate consolidation, all zooms should be consolidated.
+                        # Check if bundle exists to avoid wasted I/O for non-existent bundles.
+                        bundle_exists = os.path.exists(bundle_path)
+                        if not bundle_exists:
+                            # Bundle doesn't exist - no point checking further
+                            bump('jpeg_to_bundle_fallback_skipped')
+                        
                         # First check: bundle exists?
-                        if os.path.exists(bundle_path):
+                        if bundle_exists:
                             with AoBundle2.Bundle2Python(bundle_path) as bundle:
                                 if bundle.has_zoom(zoom):
                                     jpeg_datas = bundle.get_all_chunks(zoom)
                                     bundle_has_data = True
                         
                         # Second check: consolidation pending or recently completed?
-                        # If pending, wait for it. Then ALWAYS re-check bundle regardless
-                        # of is_pending() result - consolidation may have just completed.
+                        # CRITICAL: Pass zoom to is_pending() - only wait for OUR zoom!
+                        # Previously waited for ANY zoom, causing recovery failures when
+                        # a different zoom's consolidation completed first.
                         if not bundle_has_data and _bundle_consolidator is not None:
+                            bump('jpeg_to_bundle_fallback_entered')  # Track fallback entry
                             waited_for_consolidation = False
-                            if _bundle_consolidator.is_pending(self.row, self.col, self.maptype):
-                                log.debug(f"JPEG-to-bundle fallback: waiting for pending consolidation")
+                            if _bundle_consolidator.is_pending(self.row, self.col, self.maptype, zoom):
+                                log.debug(f"JPEG-to-bundle fallback: waiting for pending consolidation (zoom {zoom})")
                                 bump('jpeg_to_bundle_wait_started')
                                 wait_start = time.monotonic()
-                                wait_result = _bundle_consolidator.wait_for_pending(self.row, self.col, self.maptype, timeout=60.0)
+                                # Pass zoom to wait for THIS specific zoom level's consolidation
+                                wait_result = _bundle_consolidator.wait_for_pending(self.row, self.col, self.maptype, timeout=60.0, zoom=zoom)
                                 wait_time = time.monotonic() - wait_start
                                 waited_for_consolidation = True
                                 
@@ -5677,14 +5734,18 @@ class Tile(object):
                             # Key fix: Consolidation may have JUST completed between first check
                             # and is_pending() call - we must re-check the bundle regardless!
                             if not bundle_has_data and os.path.exists(bundle_path):
+                                bump('jpeg_to_bundle_fallback_bundle_exists')
                                 with AoBundle2.Bundle2Python(bundle_path) as bundle:
                                     if bundle.has_zoom(zoom):
+                                        bump('jpeg_to_bundle_fallback_has_zoom')
                                         jpeg_datas = bundle.get_all_chunks(zoom)
                                         bundle_has_data = True
                                         if not waited_for_consolidation:
                                             # Track cases where bundle found without waiting
                                             # (consolidation completed between checks)
                                             bump('jpeg_to_bundle_fallback_not_pending')
+                                    else:
+                                        bump('jpeg_to_bundle_fallback_no_zoom')
                         
                         # Apply recovered data to chunks
                         if bundle_has_data and jpeg_datas:
@@ -5701,6 +5762,18 @@ class Tile(object):
                     except Exception as e:
                         log.debug(f"JPEG-to-bundle fallback failed: {e}")
                 # ═══════════════════════════════════════════════════════════════
+                
+                # DEFERRED WARNING: Only now check which chunks are TRULY lost
+                # (previously downloaded, cache missing, and NOT recovered from bundle)
+                if potentially_lost_chunks:
+                    truly_lost_count = sum(
+                        1 for i in potentially_lost_chunks 
+                        if i < len(self.chunks[zoom]) and self.chunks[zoom][i].data is None
+                    )
+                    if truly_lost_count > 0:
+                        log.warning(f"CREATE_CHUNKS: {truly_lost_count}/{recreated_count} chunks for tile {self.id} zoom {zoom} "
+                                   f"were downloaded but cache is MISSING - will re-download!")
+                        bump('chunk_cache_data_loss', truly_lost_count)
         else:
             log.debug(f"Reusing existing {len(self.chunks[zoom])} chunks for zoom {zoom}")
 
@@ -6023,22 +6096,29 @@ class Tile(object):
                         bundle_datas = None
                         bundle_has_data = False
                         
+                        # SMART FALLBACK: Only attempt if bundle exists
+                        bundle_exists = os.path.exists(bundle_path)
+                        if not bundle_exists:
+                            bump('jpeg_to_bundle_fallback_skipped')
+                        
                         # First check: bundle exists?
-                        if os.path.exists(bundle_path):
+                        if bundle_exists:
                             with AoBundle2.Bundle2Python(bundle_path) as bundle:
-                                if bundle.has_zoom(self.max_zoom):
-                                    bundle_datas = bundle.get_all_chunks(self.max_zoom)
+                                if bundle.has_zoom(zoom):
+                                    bundle_datas = bundle.get_all_chunks(zoom)
                                     bundle_has_data = True
                         
                         # Second check: consolidation pending or recently completed?
-                        # If pending, wait. Then ALWAYS re-check bundle regardless.
+                        # CRITICAL: Pass zoom to is_pending() - only wait for OUR zoom!
                         if not bundle_has_data and _bundle_consolidator is not None:
+                            bump('jpeg_to_bundle_fallback_entered')
                             waited_for_consolidation = False
-                            if _bundle_consolidator.is_pending(self.row, self.col, self.maptype):
-                                log.debug(f"_collect_chunk_jpegs: waiting for pending consolidation")
+                            if _bundle_consolidator.is_pending(self.row, self.col, self.maptype, zoom):
+                                log.debug(f"_collect_chunk_jpegs: waiting for pending consolidation (zoom {zoom})")
                                 bump('jpeg_to_bundle_wait_started')
                                 wait_start = time.monotonic()
-                                wait_result = _bundle_consolidator.wait_for_pending(self.row, self.col, self.maptype, timeout=60.0)
+                                # Pass zoom to wait for THIS specific zoom level's consolidation
+                                wait_result = _bundle_consolidator.wait_for_pending(self.row, self.col, self.maptype, timeout=60.0, zoom=zoom)
                                 wait_time = time.monotonic() - wait_start
                                 waited_for_consolidation = True
                                 
@@ -6057,12 +6137,16 @@ class Tile(object):
                             # ALWAYS try bundle - even if is_pending was False
                             # Consolidation may have completed between first check and now
                             if not bundle_has_data and os.path.exists(bundle_path):
+                                bump('jpeg_to_bundle_fallback_bundle_exists')
                                 with AoBundle2.Bundle2Python(bundle_path) as bundle:
-                                    if bundle.has_zoom(self.max_zoom):
-                                        bundle_datas = bundle.get_all_chunks(self.max_zoom)
+                                    if bundle.has_zoom(zoom):
+                                        bump('jpeg_to_bundle_fallback_has_zoom')
+                                        bundle_datas = bundle.get_all_chunks(zoom)
                                         bundle_has_data = True
                                         if not waited_for_consolidation:
                                             bump('jpeg_to_bundle_fallback_not_pending')
+                                    else:
+                                        bump('jpeg_to_bundle_fallback_no_zoom')
                         
                         # Apply recovered data
                         if bundle_has_data and bundle_datas:
@@ -6095,6 +6179,9 @@ class Tile(object):
         if ratio >= min_available_ratio:
             log.debug(f"_collect_chunk_jpegs: Phase 1 sufficient - "
                       f"{available_count}/{total_chunks} chunks ({ratio*100:.0f}%)")
+            # Schedule consolidation immediately while data is in memory
+            # This ensures the zoom level gets consolidated before chunks are GC'd
+            self._schedule_immediate_consolidation(jpeg_datas, zoom)
             return jpeg_datas
         
         log.debug(f"_collect_chunk_jpegs: Phase 1 - {available_count}/{total_chunks} "
@@ -6168,6 +6255,8 @@ class Tile(object):
         if ratio >= min_available_ratio:
             log.debug(f"_collect_chunk_jpegs: Phase 2 final success - "
                       f"{available_count}/{total_chunks} ({ratio*100:.0f}%)")
+            # Schedule consolidation immediately while data is in memory
+            self._schedule_immediate_consolidation(jpeg_datas, zoom)
             return jpeg_datas
         
         log.debug(f"_collect_chunk_jpegs: Threshold not met - "
@@ -6179,6 +6268,11 @@ class Tile(object):
         self._last_collected_jpegs = jpeg_datas
         self._last_collected_ratio = ratio
         self._last_collected_missing = [i for i, d in enumerate(jpeg_datas) if d is None]
+        
+        # Schedule consolidation for partial data too - merge logic will fill in
+        # missing chunks later when they're downloaded
+        if available_count > 0:
+            self._schedule_immediate_consolidation(jpeg_datas, zoom)
         
         # If return_partial requested, return what we collected (for build-as-is mode)
         if return_partial:
@@ -8899,22 +8993,29 @@ class Tile(object):
                     bundle_datas = None
                     bundle_has_data = False
                     
+                    # SMART FALLBACK: Only attempt if bundle exists
+                    bundle_exists = os.path.exists(bundle_path)
+                    if not bundle_exists:
+                        bump('jpeg_to_bundle_fallback_skipped')
+                    
                     # First check: bundle exists?
-                    if os.path.exists(bundle_path):
+                    if bundle_exists:
                         with AoBundle2.Bundle2Python(bundle_path) as bundle:
                             if bundle.has_zoom(zoom):
                                 bundle_datas = bundle.get_all_chunks(zoom)
                                 bundle_has_data = True
                     
                     # Second check: consolidation pending or recently completed?
-                    # If pending, wait. Then ALWAYS re-check bundle regardless.
+                    # CRITICAL: Pass zoom to is_pending() - only wait for OUR zoom!
                     if not bundle_has_data and _bundle_consolidator is not None:
+                        bump('jpeg_to_bundle_fallback_entered')
                         waited_for_consolidation = False
-                        if _bundle_consolidator.is_pending(self.row, self.col, self.maptype):
-                            log.debug(f"_try_native_mipmap_build: waiting for pending consolidation")
+                        if _bundle_consolidator.is_pending(self.row, self.col, self.maptype, zoom):
+                            log.debug(f"_try_native_mipmap_build: waiting for pending consolidation (zoom {zoom})")
                             bump('jpeg_to_bundle_wait_started')
                             wait_start = time.monotonic()
-                            wait_result = _bundle_consolidator.wait_for_pending(self.row, self.col, self.maptype, timeout=60.0)
+                            # Pass zoom to wait for THIS specific zoom level's consolidation
+                            wait_result = _bundle_consolidator.wait_for_pending(self.row, self.col, self.maptype, timeout=60.0, zoom=zoom)
                             wait_time = time.monotonic() - wait_start
                             waited_for_consolidation = True
                             
@@ -8933,12 +9034,16 @@ class Tile(object):
                         # ALWAYS try bundle - even if is_pending was False
                         # Consolidation may have completed between first check and now
                         if not bundle_has_data and os.path.exists(bundle_path):
+                            bump('jpeg_to_bundle_fallback_bundle_exists')
                             with AoBundle2.Bundle2Python(bundle_path) as bundle:
                                 if bundle.has_zoom(zoom):
+                                    bump('jpeg_to_bundle_fallback_has_zoom')
                                     bundle_datas = bundle.get_all_chunks(zoom)
                                     bundle_has_data = True
                                     if not waited_for_consolidation:
                                         bump('jpeg_to_bundle_fallback_not_pending')
+                                else:
+                                    bump('jpeg_to_bundle_fallback_no_zoom')
                     
                     # Apply recovered data
                     if bundle_has_data and bundle_datas:
@@ -9013,7 +9118,18 @@ class Tile(object):
                      f"for mipmap {mipmap} ({ready_count/total_chunks*100:.0f}%), "
                      f"threshold {min_ratio*100:.0f}%, falling back to Python")
             bump('native_mipmap_threshold_miss')
+            # Still schedule consolidation for partial data - merge will fill in later
+            if ready_count > 0:
+                self._schedule_immediate_consolidation(jpeg_datas, zoom)
             return False
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # SCHEDULE CONSOLIDATION IMMEDIATELY (before build)
+        # ═══════════════════════════════════════════════════════════════════════
+        # Schedule consolidation NOW while we have the JPEG data in memory.
+        # This ensures lower zoom levels get consolidated into the bundle, not
+        # just max_zoom. The merge logic will combine with any existing data.
+        self._schedule_immediate_consolidation(jpeg_datas, zoom)
         
         # ═══════════════════════════════════════════════════════════════════════
         # BUILD MIPMAP CHAIN WITH NATIVE CODE
@@ -9108,13 +9224,8 @@ class Tile(object):
             
             bump('native_mipmap_success')
             
-            # Schedule bundle consolidation for this zoom level
-            # This was missing - native mipmap build paths weren't scheduling consolidation!
-            # Use in-memory JPEG data to avoid disk reads
-            try:
-                schedule_bundle_consolidation(self, priority=1, jpeg_datas=jpeg_datas, zoom=zoom)
-            except Exception as e:
-                log.debug(f"_try_native_mipmap_build: Consolidation scheduling failed: {e}")
+            # Consolidation was already scheduled before the build
+            # (see SCHEDULE CONSOLIDATION IMMEDIATELY section above)
             
             return True
             

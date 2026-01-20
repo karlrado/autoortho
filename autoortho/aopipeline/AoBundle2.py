@@ -122,6 +122,49 @@ def _preallocate_file(f, size: int) -> bool:
     return False  # Non-fatal
 
 
+def _atomic_replace_with_retry(temp_path: str, target_path: str, max_retries: int = 5):
+    """
+    Atomically replace target_path with temp_path, with retry on Windows file locking.
+    
+    On Windows, os.replace() fails with WinError 5 (Access Denied) if another
+    process/thread has the target file open. This function retries with exponential
+    backoff to handle transient file locks from concurrent readers.
+    
+    Args:
+        temp_path: Path to the temporary file to rename
+        target_path: Path to the destination (will be overwritten)
+        max_retries: Maximum number of retry attempts (default 5 = ~1.5s total)
+    """
+    import platform
+    
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            os.replace(temp_path, target_path)
+            return  # Success
+        except OSError as e:
+            last_error = e
+            # On Windows, WinError 5 = Access Denied (file locked)
+            # On other platforms, this shouldn't happen but handle gracefully
+            if platform.system() == 'Windows' and hasattr(e, 'winerror') and e.winerror == 5:
+                if attempt < max_retries - 1:
+                    # Exponential backoff: 50ms, 100ms, 200ms, 400ms
+                    delay = 0.05 * (2 ** attempt)
+                    time.sleep(delay)
+                    continue
+            # For other errors or final attempt, break and raise
+            break
+    
+    # Clean up temp file and raise the last error
+    try:
+        os.unlink(temp_path)
+    except OSError:
+        pass
+    
+    if last_error:
+        raise last_error
+
+
 class BundleFlags(IntFlag):
     """Bundle flags (stored in header)."""
     NONE = 0x0000
@@ -1441,17 +1484,9 @@ def create_bundle_from_data_python(
         _preallocate_file(f, len(buffer))
         f.write(buffer)
     
-    # Use os.replace() for atomic rename that overwrites existing files on all platforms
-    # os.rename() fails on Windows if destination exists (WinError 183)
-    try:
-        os.replace(temp_path, output_path)
-    except OSError:
-        # If replace fails (e.g., file locked), clean up temp and re-raise
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-        raise
+    # Use atomic replace with retry for Windows file locking
+    # os.replace() may fail on Windows if another thread has the file open
+    _atomic_replace_with_retry(temp_path, output_path)
     return output_path
 
 
@@ -1509,6 +1544,95 @@ def update_bundle_with_zoom(
     }
     
     # Write combined bundle
+    return create_multi_zoom_bundle(
+        header['tile_row'],
+        header['tile_col'],
+        maptype,
+        zoom_data,
+        bundle_path
+    )
+
+
+def merge_bundle_zoom_data(
+    bundle_path: str,
+    zoom: int,
+    new_jpeg_datas: List[Optional[bytes]],
+    chunks_per_side: int
+) -> str:
+    """
+    Merge new JPEG data into an existing bundle zoom level.
+    
+    For each chunk position:
+    - If new_data is not None: use new_data (overwrite)
+    - If new_data is None: keep existing data (preserve)
+    
+    This allows incremental filling of missing chunks without losing
+    existing data. Essential for handling partial consolidation when
+    min_chunk_ratio < 1.0, and for filling in missing chunks when
+    users increase the ratio later.
+    
+    Args:
+        bundle_path: Path to existing bundle
+        zoom: Zoom level to merge
+        new_jpeg_datas: New JPEG data (None = keep existing)
+        chunks_per_side: Chunks per side for the zoom level
+    
+    Returns:
+        Path to the updated bundle
+    
+    Thread Safety:
+        Caller must hold the per-bundle lock to prevent concurrent modifications.
+        Uses atomic write (temp file + rename) for crash safety.
+    """
+    import math
+    
+    # Invalidate any cached metadata for this bundle since we're modifying it
+    _metadata_cache.invalidate(bundle_path)
+    
+    # Read existing bundle data then CLOSE before writing
+    # Critical: On Windows, mmap holds the file open and prevents os.replace()
+    with Bundle2Python(bundle_path, use_metadata_cache=False) as existing:
+        header = existing.header
+        maptype = existing.maptype
+        
+        zoom_data = {}
+        
+        # Copy all existing zoom levels
+        for z in existing.zoom_levels:
+            chunk_count = existing.get_chunk_count(z)
+            cps = int(math.sqrt(chunk_count))
+            zoom_data[z] = {
+                'chunks_per_side': cps,
+                'jpeg_datas': existing.get_all_chunks(z)
+            }
+    # Bundle is now closed - safe to write to the same path
+    
+    # MERGE: Combine existing and new data for target zoom
+    if zoom in zoom_data:
+        existing_datas = zoom_data[zoom]['jpeg_datas']
+        merged = []
+        for i, new_data in enumerate(new_jpeg_datas):
+            if new_data is not None:
+                # Use new data (overwrite existing or fill missing)
+                merged.append(new_data)
+            elif i < len(existing_datas):
+                # Keep existing data (preserve what we have)
+                merged.append(existing_datas[i])
+            else:
+                # No data available
+                merged.append(None)
+        zoom_data[zoom] = {
+            'chunks_per_side': chunks_per_side,
+            'jpeg_datas': merged
+        }
+    else:
+        # Zoom doesn't exist in bundle yet - just add it
+        zoom_data[zoom] = {
+            'chunks_per_side': chunks_per_side,
+            'jpeg_datas': new_jpeg_datas
+        }
+    
+    # Write combined bundle with merged data
     return create_multi_zoom_bundle(
         header['tile_row'],
         header['tile_col'],
@@ -1698,17 +1822,9 @@ def create_multi_zoom_bundle(
         _preallocate_file(f, len(buffer))
         f.write(buffer)
     
-    # Use os.replace() for atomic rename that overwrites existing files on all platforms
-    # os.rename() fails on Windows if destination exists (WinError 183)
-    try:
-        os.replace(temp_path, output_path)
-    except OSError:
-        # If replace fails (e.g., file locked), clean up temp and re-raise
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-        raise
+    # Use atomic replace with retry for Windows file locking
+    # os.replace() may fail on Windows if another thread has the file open
+    _atomic_replace_with_retry(temp_path, output_path)
     return output_path
 
 

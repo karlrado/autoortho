@@ -192,6 +192,8 @@ class BundleConsolidator:
         self._stats = {
             'bundles_created': 0,
             'bundles_updated': 0,
+            'bundles_merged': 0,  # New chunks merged into existing zoom level
+            'bundles_skipped': 0,  # Skipped because zoom exists and no new data
             'jpegs_consolidated': 0,
             'bytes_saved': 0,
             'errors': 0,
@@ -388,12 +390,19 @@ class BundleConsolidator:
         Signal completion for a specific tile.
         
         Wakes only threads waiting for this tile (no thundering herd).
+        Signals BOTH the full tile_key event (for zoom-specific waits)
+        AND the prefix event (for any-zoom waits).
         """
-        # Extract prefix (row_col_maptype_) from full key (row_col_maptype_zoom)
-        parts = tile_key.split("_")
-        if len(parts) >= 3:
-            prefix = f"{parts[0]}_{parts[1]}_{parts[2]}_"
-            with self._tile_events_lock:
+        with self._tile_events_lock:
+            # Signal full tile_key event (for zoom-specific waits)
+            if tile_key in self._tile_events:
+                self._tile_events[tile_key].set()
+            
+            # Also signal prefix event (for any-zoom waits)
+            # Extract prefix (row_col_maptype_) from full key (row_col_maptype_zoom)
+            parts = tile_key.split("_")
+            if len(parts) >= 3:
+                prefix = f"{parts[0]}_{parts[1]}_{parts[2]}_"
                 if prefix in self._tile_events:
                     self._tile_events[prefix].set()
     
@@ -721,26 +730,62 @@ class BundleConsolidator:
         chunk_count = task.chunks_per_side * task.chunks_per_side
         start_time = time.time()
         
-        # EARLY CHECK: Skip if bundle already has this zoom level
+        # EARLY CHECK: Check if bundle already has this zoom level
         # This uses has_zoom_quick() which reads only the header (~200 bytes)
         # instead of loading the entire bundle file, making it ~1000x faster
         bundle_path = get_bundle2_path(self.cache_dir, path_row, path_col, task.maptype, path_zoom)
+        bundle_has_zoom = False
         if os.path.exists(bundle_path):
             try:
-                if AoBundle2.has_zoom_quick(bundle_path, task.zoom):
-                    log.debug(f"Bundle {tile_key} already has ZL{task.zoom}, skipping")
-                    with self._stats_lock:
-                        self._stats['bundles_skipped'] = self._stats.get('bundles_skipped', 0) + 1
-                    
-                    # BUG FIX: Still need to delete source JPEGs when skipping!
-                    # Otherwise JPEGs pile up in the cache folder.
-                    if self.delete_jpegs:
-                        self._delete_jpegs_for_skipped_task(task, chunk_count)
-                    
-                    return True  # Already done, no retry needed
+                bundle_has_zoom = AoBundle2.has_zoom_quick(bundle_path, task.zoom)
             except Exception as e:
                 log.debug(f"Quick zoom check failed, will attempt full load: {e}")
                 # Continue with normal flow - bundle might be corrupted
+        
+        # If bundle already has this zoom level AND we have in-memory data,
+        # we may need to MERGE new chunks into existing bundle (e.g., filling
+        # missing chunks when user increases min_chunk_ratio from 0.9 to 1.0)
+        if bundle_has_zoom and task.jpeg_datas is not None:
+            new_chunk_count = sum(1 for d in task.jpeg_datas if d is not None)
+            if new_chunk_count > 0:
+                # MERGE new data into existing bundle
+                log.debug(f"Merging {new_chunk_count} new chunks into {tile_key} ZL{task.zoom}")
+                try:
+                    import math
+                    chunks_per_side = int(math.sqrt(len(task.jpeg_datas)))
+                    
+                    # Acquire per-bundle lock for merge
+                    bundle_lock = self._get_bundle_lock(bundle_path)
+                    with bundle_lock:
+                        AoBundle2.merge_bundle_zoom_data(bundle_path, task.zoom, task.jpeg_datas, chunks_per_side)
+                    
+                    with self._stats_lock:
+                        self._stats['bundles_merged'] = self._stats.get('bundles_merged', 0) + 1
+                    
+                    # Delete source JPEGs (data is now in bundle)
+                    if self.delete_jpegs:
+                        self._delete_jpegs_for_skipped_task(task, chunk_count)
+                    
+                    return True  # Merge complete
+                except Exception as e:
+                    log.warning(f"Merge failed for {tile_key} ZL{task.zoom}: {e}, will recreate bundle")
+                    # Fall through to normal consolidation path
+            else:
+                # No new data to merge - skip
+                log.debug(f"Bundle {tile_key} already has ZL{task.zoom}, no new data to merge")
+                with self._stats_lock:
+                    self._stats['bundles_skipped'] = self._stats.get('bundles_skipped', 0) + 1
+                
+                # Still need to delete source JPEGs
+                if self.delete_jpegs:
+                    self._delete_jpegs_for_skipped_task(task, chunk_count)
+                
+                return True  # Already done
+        elif bundle_has_zoom and task.jpeg_datas is None:
+            # Bundle has zoom but no in-memory data - need to check if there are
+            # new JPEGs on disk to merge. We'll handle this in the normal flow
+            # after reading disk data.
+            pass  # Continue to disk read section
         
         # Determine if we have in-memory data or need to read from disk
         use_memory_data = (task.jpeg_datas is not None and 
@@ -828,9 +873,21 @@ class BundleConsolidator:
                         # Bundle is now closed - safe to update
                         
                         if zoom_already_exists:
-                            log.debug(f"BUNDLE_SAVE: ZL{task.zoom} already present, skipping")
-                            with self._stats_lock:
-                                self._stats['bundles_skipped'] = self._stats.get('bundles_skipped', 0) + 1
+                            # Zoom exists - MERGE new data into existing instead of skipping
+                            # This handles the case where we read data from disk and bundle
+                            # already has partial data for this zoom level
+                            new_chunk_count = sum(1 for d in jpeg_datas if d is not None)
+                            if new_chunk_count > 0:
+                                log.debug(f"BUNDLE_SAVE: Merging {new_chunk_count} chunks into existing ZL{task.zoom}")
+                                import math
+                                chunks_per_side = int(math.sqrt(len(jpeg_datas)))
+                                AoBundle2.merge_bundle_zoom_data(bundle_path, task.zoom, jpeg_datas, chunks_per_side)
+                                with self._stats_lock:
+                                    self._stats['bundles_merged'] = self._stats.get('bundles_merged', 0) + 1
+                            else:
+                                log.debug(f"BUNDLE_SAVE: ZL{task.zoom} already present, no new data")
+                                with self._stats_lock:
+                                    self._stats['bundles_skipped'] = self._stats.get('bundles_skipped', 0) + 1
                         else:
                             log.debug(f"Updating bundle {tile_key} with ZL{task.zoom}")
                             import math
@@ -996,57 +1053,85 @@ class BundleConsolidator:
                 prefix = self._get_tile_key_prefix(row, col, maptype)
                 return any(key.startswith(prefix) for key in self._pending)
     
-    def wait_for_pending(self, row: int, col: int, maptype: str, timeout: float = None) -> bool:
+    def wait_for_pending(self, row: int, col: int, maptype: str, 
+                         timeout: float = None, zoom: int = None) -> bool:
         """
-        Wait for ANY pending consolidation of a tile to complete.
+        Wait for pending consolidation of a tile to complete.
         
         Uses per-tile Events for efficient waiting (no thundering herd).
         Only the thread waiting for this specific tile is woken when it completes.
-        
-        This waits until at least one zoom level's consolidation completes,
-        which means the bundle file should exist (possibly with partial zooms).
         
         Args:
             row: Tile row (tile ID coordinates)
             col: Tile col (tile ID coordinates)
             maptype: Map type
             timeout: Maximum time to wait in seconds. None = wait up to 60s.
+            zoom: If provided, wait for this specific zoom level. If None, wait for ANY zoom.
             
         Returns:
-            True if at least one consolidation completed (bundle should now exist)
+            True if consolidation completed (bundle should now have the zoom level)
             False if not pending, timeout, or still pending after timeout
         """
-        prefix = self._get_tile_key_prefix(row, col, maptype)
-        
-        # Check if any zoom level is pending
-        with self._pending_lock:
-            pending_keys = [k for k in self._pending if k.startswith(prefix)]
-            if not pending_keys:
-                return False  # Not pending, nothing to wait for
-        
-        # Check if already completed (quick path)
-        if any(k.startswith(prefix) for k in self._recently_completed):
-            log.debug(f"BUNDLE_WAIT: Already completed for {prefix}*")
-            return True
-        
-        # Use per-tile event for efficient waiting (no thundering herd)
-        # When this tile completes, _signal_tile_completion sets our event
-        event = self._get_or_create_event(prefix)
-        
-        # Use reasonable default timeout to prevent infinite blocks
-        effective_timeout = timeout if timeout is not None else 60.0
-        
-        start = time.time()
-        try:
-            result = event.wait(timeout=effective_timeout)
-            if result:
-                log.debug(f"BUNDLE_WAIT: Completed for {prefix}* after {time.time()-start:.3f}s")
-            else:
-                log.debug(f"BUNDLE_WAIT: Timeout waiting for {prefix}* after {effective_timeout}s")
-            return result
-        finally:
-            # Cleanup event after use to prevent memory leaks
-            self._cleanup_tile_event(prefix)
+        if zoom is not None:
+            # Wait for specific zoom level
+            tile_key = self._get_tile_key(row, col, maptype, zoom)
+            
+            # Check if this specific zoom is pending
+            with self._pending_lock:
+                if tile_key not in self._pending:
+                    # Check if recently completed
+                    if tile_key in self._recently_completed:
+                        log.debug(f"BUNDLE_WAIT: ZL{zoom} already completed for tile")
+                        return True
+                    return False  # Not pending, nothing to wait for
+            
+            # Use per-tile-zoom event for efficient waiting
+            event = self._get_or_create_event(tile_key)
+            
+            effective_timeout = timeout if timeout is not None else 60.0
+            start = time.time()
+            try:
+                result = event.wait(timeout=effective_timeout)
+                if result:
+                    log.debug(f"BUNDLE_WAIT: ZL{zoom} completed after {time.time()-start:.3f}s")
+                else:
+                    log.debug(f"BUNDLE_WAIT: ZL{zoom} timeout after {effective_timeout}s")
+                return result
+            finally:
+                self._cleanup_tile_event(tile_key)
+        else:
+            # Wait for ANY zoom level (original behavior)
+            prefix = self._get_tile_key_prefix(row, col, maptype)
+            
+            # Check if any zoom level is pending
+            with self._pending_lock:
+                pending_keys = [k for k in self._pending if k.startswith(prefix)]
+                if not pending_keys:
+                    return False  # Not pending, nothing to wait for
+            
+            # Check if already completed (quick path)
+            if any(k.startswith(prefix) for k in self._recently_completed):
+                log.debug(f"BUNDLE_WAIT: Already completed for {prefix}*")
+                return True
+            
+            # Use per-tile event for efficient waiting (no thundering herd)
+            # When this tile completes, _signal_tile_completion sets our event
+            event = self._get_or_create_event(prefix)
+            
+            # Use reasonable default timeout to prevent infinite blocks
+            effective_timeout = timeout if timeout is not None else 60.0
+            
+            start = time.time()
+            try:
+                result = event.wait(timeout=effective_timeout)
+                if result:
+                    log.debug(f"BUNDLE_WAIT: Completed for {prefix}* after {time.time()-start:.3f}s")
+                else:
+                    log.debug(f"BUNDLE_WAIT: Timeout waiting for {prefix}* after {effective_timeout}s")
+                return result
+            finally:
+                # Cleanup event after use to prevent memory leaks
+                self._cleanup_tile_event(prefix)
     
     def set_callbacks(
         self,
