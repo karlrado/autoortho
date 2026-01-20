@@ -255,10 +255,14 @@ pipeline_mode = auto
 #   - ~11MB per buffer when max_zoom <= 16 and max_zoom_near_airports <= 18 (4K textures)
 #   - ~43MB per buffer when higher zoom levels are configured (8K textures)
 #   - ~43MB per buffer when using custom tiles (assumes worst case)
-# Higher = more memory usage, but less allocation overhead
-# Lower = less memory, but more allocation overhead per tile
-# Recommended: 4 (default), increase to 6-8 if you have 32GB+ RAM
-buffer_pool_size = 4
+# 
+# Default: Automatically calculated as (prefetch_workers + live_builder_concurrency)
+# This ensures optimal parallelism: each worker can have its own buffer.
+# Maximum is capped to (prefetch_workers + live_builder_concurrency) since
+# more buffers than workers would never be used simultaneously.
+# 
+# The value here (10) is a reasonable fallback = 2 prefetch + 8 live (defaults)
+buffer_pool_size = 10
 # === LIVE AOPIPELINE SETTINGS ===
 # These control the optimized pipeline for live (on-demand) DDS builds when
 # X-Plane requests tiles that aren't in the predictive cache.

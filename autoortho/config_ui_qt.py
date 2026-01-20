@@ -2542,23 +2542,26 @@ class ConfigUI(QMainWindow):
             "Buffer size is calculated dynamically based on your settings:\n"
             "• ~11MB per buffer for 4K textures (max_zoom ≤ 16)\n"
             "• ~43MB per buffer for 8K textures (max_zoom > 16 or custom tiles)\n\n"
-            "Memory usage examples (4K / 8K modes):\n"
-            "• 2 buffers: 22MB / 86MB\n"
-            "• 4 buffers: 44MB / 172MB (default)\n"
-            "• 8 buffers: 88MB / 344MB\n\n"
-            "Higher values reduce allocation overhead when building\n"
-            "multiple tiles concurrently, but use more RAM.\n\n"
+            "Default & Maximum: prefetch workers + live concurrency\n"
+            "This is optimal because each concurrent build needs exactly one buffer.\n"
+            "More buffers than workers would waste memory (never used simultaneously).\n\n"
+            "The maximum adjusts automatically when you change worker counts.\n\n"
             "Only applies to Native and Hybrid modes."
         )
         buffer_pool_layout.addWidget(self.buffer_pool_label)
         
         self.buffer_pool_slider = ModernSlider(Qt.Orientation.Horizontal)
-        self.buffer_pool_slider.setRange(2, 64)
-        buffer_pool_value = int(getattr(self.cfg.autoortho, 'buffer_pool_size', 4))
-        buffer_pool_value = max(2, min(64, buffer_pool_value))
+        # Calculate optimal pool size from worker counts (will be updated dynamically)
+        prefetch = int(getattr(self.cfg.autoortho, 'background_builder_workers', 2))
+        live = int(getattr(self.cfg.autoortho, 'live_builder_concurrency', 8))
+        optimal_pool_size = prefetch + live
+        self.buffer_pool_slider.setRange(2, optimal_pool_size)
+        # Use configured value or optimal default, clamped to valid range
+        buffer_pool_value = int(getattr(self.cfg.autoortho, 'buffer_pool_size', optimal_pool_size))
+        buffer_pool_value = max(2, min(optimal_pool_size, buffer_pool_value))
         self.buffer_pool_slider.setValue(buffer_pool_value)
         self.buffer_pool_slider.setObjectName('buffer_pool_size')
-        self.buffer_pool_slider.setToolTip("Number of pre-allocated DDS buffers (2-64)")
+        self.buffer_pool_slider.setToolTip(f"Number of pre-allocated DDS buffers (2-{optimal_pool_size})")
         
         self.buffer_pool_value_label = QLabel("")
         self._update_buffer_pool_label()
@@ -3753,6 +3756,7 @@ class ConfigUI(QMainWindow):
             return
         
         pool_count = self.buffer_pool_slider.value()
+        pool_max = self.buffer_pool_slider.maximum()
         
         # Calculate buffer size based on current UI settings
         try:
@@ -3782,10 +3786,15 @@ class ConfigUI(QMainWindow):
         except Exception:
             buffer_mb = 11  # Default to 4K estimate on error
         
-        self.buffer_pool_value_label.setText(f"{pool_count} buffers (~{pool_count * buffer_mb}MB)")
+        # Show buffer count, memory, and whether at optimal (max)
+        total_mb = pool_count * buffer_mb
+        if pool_count == pool_max:
+            self.buffer_pool_value_label.setText(f"{pool_count}/{pool_max} (~{total_mb}MB) optimal")
+        else:
+            self.buffer_pool_value_label.setText(f"{pool_count}/{pool_max} (~{total_mb}MB)")
 
     def _update_builder_concurrency_labels(self):
-        """Update tile build workers label and RAM estimate for decoder pool."""
+        """Update tile build workers label, RAM estimate, and buffer pool cap."""
         # Get values from sliders (with defaults if not yet created)
         prefetch = 2
         tile_workers = 8
@@ -3801,6 +3810,28 @@ class ConfigUI(QMainWindow):
                 self.live_concurrency_value.setText(str(tile_workers))
         
         total_builders = prefetch + tile_workers
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # DYNAMIC BUFFER POOL CAP
+        # ═══════════════════════════════════════════════════════════════════════
+        # Maximum concurrent DDS builds = prefetch + live workers.
+        # More buffers than this would never be used simultaneously (waste RAM).
+        # Update the slider's maximum and clamp current value if needed.
+        # ═══════════════════════════════════════════════════════════════════════
+        if hasattr(self, 'buffer_pool_slider'):
+            current_value = self.buffer_pool_slider.value()
+            new_max = total_builders
+            
+            # Update the slider range
+            self.buffer_pool_slider.setRange(2, new_max)
+            self.buffer_pool_slider.setToolTip(f"Number of pre-allocated DDS buffers (2-{new_max})")
+            
+            # Clamp current value if it exceeds new maximum
+            if current_value > new_max:
+                self.buffer_pool_slider.setValue(new_max)
+            
+            # Update the label to reflect any changes
+            self._update_buffer_pool_label()
         
         # Calculate decoder pool size: total_builders × CPU threads
         import os

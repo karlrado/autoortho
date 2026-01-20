@@ -721,14 +721,31 @@ def _get_dds_buffer_pool():
     try:
         native = _get_native_dds()
         if native is not None and hasattr(native, 'DDSBufferPool'):
-            # Get pool size from config with validation
+            # Calculate optimal pool size from worker counts
+            # Maximum concurrent builds = prefetch_workers + live_builder_concurrency
+            # More buffers than this would never be used simultaneously
             try:
-                pool_size = int(getattr(CFG.autoortho, 'buffer_pool_size', 4))
+                prefetch_workers = int(getattr(CFG.autoortho, 'background_builder_workers', 2))
+                live_concurrency = int(getattr(CFG.autoortho, 'live_builder_concurrency', 8))
             except (ValueError, TypeError):
-                pool_size = 4
+                prefetch_workers = 2
+                live_concurrency = 8
             
-            # Clamp to valid range (2-64)
-            pool_size = max(2, min(64, pool_size))
+            # Optimal pool size = total concurrent workers (cap)
+            optimal_pool_size = prefetch_workers + live_concurrency
+            
+            # Get user-configured pool size (defaults to optimal)
+            try:
+                pool_size = int(getattr(CFG.autoortho, 'buffer_pool_size', optimal_pool_size))
+            except (ValueError, TypeError):
+                pool_size = optimal_pool_size
+            
+            # Clamp to valid range: minimum 2, maximum is optimal (no benefit exceeding workers)
+            pool_size = max(2, min(optimal_pool_size, pool_size))
+            
+            log.debug(f"DDS buffer pool sizing: configured={getattr(CFG.autoortho, 'buffer_pool_size', 'default')}, "
+                      f"optimal={optimal_pool_size} (prefetch={prefetch_workers} + live={live_concurrency}), "
+                      f"final={pool_size}")
             
             # Calculate buffer size based on configuration
             buffer_size, size_name = _calc_required_buffer_size()
