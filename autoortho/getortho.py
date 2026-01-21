@@ -1519,60 +1519,26 @@ class Getter(object):
 
 
 class ChunkGetter(Getter):
-    # Track downloaded and in-progress chunk_ids GLOBALLY to prevent:
-    # 1. Re-downloading chunks that completed (across different Chunk objects)
-    # 2. Queueing chunks that are already in queue (across different Chunk objects)
-    _downloaded_chunks = set()
-    _queued_chunk_ids = set()  # Chunk IDs currently in queue or being downloaded
-    _downloaded_chunks_lock = threading.Lock()
+    # Track in-progress chunk_ids GLOBALLY to prevent queueing duplicates
+    _queued_chunk_ids = set()
+    _queued_lock = threading.Lock()
 
     def submit(self, obj, *args, **kwargs):
-        """Override submit to check chunk_id globally, not just per-object.
-        
-        Optimized to minimize lock contention:
-        - Phase 1: Fast check under lock (no I/O)
-        - Phase 2: Slow I/O check (os.path.exists) OUTSIDE lock
-        - Phase 3: Per-object coalescing checks (no lock needed)
-        - Phase 4: Queue for download (brief lock)
-        """
-        # Don't queue permanently failed chunks
+        """Submit chunk for download with duplicate prevention."""
         if obj.permanent_failure:
             bump('submit_skip_permanent_failure')
             return
         
         chunk_id = getattr(obj, 'chunk_id', None)
-        cache_path = getattr(obj, 'cache_path', None)
         
-        # === PHASE 1: Fast check under lock (no I/O) ===
-        needs_existence_check = False
-        is_queued = False
-        with self._downloaded_chunks_lock:
-            if chunk_id and chunk_id in self._downloaded_chunks:
-                # May need to verify file still exists (done outside lock)
-                needs_existence_check = True
-            elif chunk_id and chunk_id in self._queued_chunk_ids:
-                is_queued = True
+        # Check if already queued (fast path)
+        if chunk_id:
+            with self._queued_lock:
+                if chunk_id in self._queued_chunk_ids:
+                    bump('submit_skip_id_already_queued')
+                    return
         
-        if is_queued:
-            bump('submit_skip_id_already_queued')
-            return
-        
-        # === PHASE 2: Slow I/O check OUTSIDE lock ===
-        # os.path.exists() can take 1-50ms on Windows, don't hold lock during this
-        if needs_existence_check:
-            if cache_path and os.path.exists(cache_path):
-                # Cache file exists - safe to mark as ready and load from cache
-                obj.ready.set()
-                bump('submit_skip_already_downloaded')
-                return
-            else:
-                # Cache file was evicted! Update tracking under lock (brief)
-                with self._downloaded_chunks_lock:
-                    self._downloaded_chunks.discard(chunk_id)
-                bump('submit_cache_eviction_detected')
-                # Fall through to queue for download
-        
-        # === PHASE 3: Per-object coalescing (no lock needed) ===
+        # Per-object coalescing checks
         if obj.ready.is_set():
             bump('submit_skip_already_ready')
             return
@@ -1585,9 +1551,9 @@ class ChunkGetter(Getter):
         
         obj.in_queue = True
         
-        # === PHASE 4: Queue for download (brief lock) ===
+        # Add to queue
         if chunk_id:
-            with self._downloaded_chunks_lock:
+            with self._queued_lock:
                 self._queued_chunk_ids.add(chunk_id)
         
         bump('submit_queued')
@@ -1599,7 +1565,6 @@ class ChunkGetter(Getter):
             time.sleep(10)
         log.info(f"Exiting {self.__class__.__name__} stat thread.  Got: {self.count} total")
 
-
     def get(self, obj, *args, **kwargs):
         if obj.ready.is_set():
             log.debug(f"{obj} already retrieved.  Exit")
@@ -1607,26 +1572,15 @@ class ChunkGetter(Getter):
             return True
 
         kwargs['idx'] = self.localdata.idx
-        # Use thread-local session
         kwargs['session'] = getattr(self.localdata, 'session', None) or requests
         result = obj.get(*args, **kwargs)
         
         chunk_id = getattr(obj, 'chunk_id', None)
-        
-        # Track completion and remove from queued set
         if chunk_id:
-            with self._downloaded_chunks_lock:
-                # Remove from queued set (download complete or failed)
+            with self._queued_lock:
                 self._queued_chunk_ids.discard(chunk_id)
-                
                 if result:
-                    # Track as downloaded
-                    if chunk_id in self._downloaded_chunks:
-                        log.warning(f"DOUBLE_DOWNLOAD detected: {chunk_id}")
-                        bump('double_download_detected')
-                    else:
-                        self._downloaded_chunks.add(chunk_id)
-                        bump('chunk_download_completed')
+                    bump('chunk_download_completed')
         
         return result
 
@@ -3973,10 +3927,7 @@ class BackgroundDDSBuilder:
                     
                     # Schedule bundle consolidation for all zoom levels
                     # This ensures cached JPEGs are consolidated into bundles
-                    try:
-                        schedule_bundle_consolidation_all_zooms(tile, priority=1)
-                    except Exception as e:
-                        log.debug(f"BackgroundDDSBuilder: Consolidation scheduling failed: {e}")
+                    consolidate_tile_if_ready(tile, "background_dds")
                     
                     return True
             
@@ -4239,10 +4190,7 @@ class BackgroundDDSBuilder:
                                         bump('prebuilt_dds_builds_direct')
                                         
                                         # Schedule bundle consolidation for all zoom levels
-                                        try:
-                                            schedule_bundle_consolidation_all_zooms(tile, priority=1)
-                                        except Exception as e:
-                                            log.debug(f"BackgroundDDSBuilder: Consolidation scheduling failed: {e}")
+                                        consolidate_tile_if_ready(tile, "background_dds")
                                         
                                         return
                                     else:
@@ -4273,10 +4221,7 @@ class BackgroundDDSBuilder:
                                 bump('prebuilt_dds_builds_hybrid')
                                 
                                 # Schedule bundle consolidation for all zoom levels
-                                try:
-                                    schedule_bundle_consolidation_all_zooms(tile, priority=1)
-                                except Exception as e:
-                                    log.debug(f"BackgroundDDSBuilder: Consolidation scheduling failed: {e}")
+                                consolidate_tile_if_ready(tile, "background_dds")
                                 
                                 return
                             else:
@@ -4327,10 +4272,7 @@ class BackgroundDDSBuilder:
                             bump('prebuilt_dds_builds_native_direct')
                             
                             # Schedule bundle consolidation for all zoom levels
-                            try:
-                                schedule_bundle_consolidation_all_zooms(tile, priority=1)
-                            except Exception as e:
-                                log.debug(f"BackgroundDDSBuilder: Consolidation scheduling failed: {e}")
+                            consolidate_tile_if_ready(tile, "background_dds")
                             
                             return
                         else:
@@ -4391,10 +4333,7 @@ class BackgroundDDSBuilder:
                         bump('prebuilt_dds_builds_native_buffered')
                         
                         # Schedule bundle consolidation for all zoom levels
-                        try:
-                            schedule_bundle_consolidation_all_zooms(tile, priority=1)
-                        except Exception as e:
-                            log.debug(f"BackgroundDDSBuilder: Consolidation scheduling failed: {e}")
+                        consolidate_tile_if_ready(tile, "background_dds")
                         
                         return
                     else:
@@ -4554,10 +4493,7 @@ class BackgroundDDSBuilder:
             bump('prebuilt_dds_builds')
             
             # Schedule bundle consolidation for all zoom levels
-            try:
-                schedule_bundle_consolidation_all_zooms(tile, priority=1)
-            except Exception as e:
-                log.debug(f"BackgroundDDSBuilder: Consolidation scheduling failed: {e}")
+            consolidate_tile_if_ready(tile, "background_dds")
             
         except Exception as e:
             log.warning(f"BackgroundDDSBuilder: Failed to build {tile_id}: {e}")
@@ -4743,6 +4679,36 @@ def schedule_bundle_consolidation_all_zooms(tile, priority: int = 0) -> int:
     return scheduled
 
 
+def consolidate_tile_if_ready(tile, source: str = "unknown") -> bool:
+    """
+    Single entry point for tile consolidation.
+    
+    Call this after any successful tile build to consolidate all zoom levels.
+    The function handles deduplication internally.
+    
+    Args:
+        tile: The tile to consolidate
+        source: Debug identifier for logging (e.g., "background_dds", "aopipeline")
+    
+    Returns:
+        True if consolidation was scheduled, False otherwise
+    """
+    if tile is None or _bundle_consolidator is None:
+        return False
+    
+    # Priority: background builds use lower priority (1), live uses high (0)
+    priority = 1 if source in ("background_dds", "prefetch") else 0
+    
+    try:
+        scheduled = schedule_bundle_consolidation_all_zooms(tile, priority=priority)
+        if scheduled > 0:
+            log.debug(f"Consolidation scheduled ({source}): {scheduled} zooms for tile {tile.id}")
+        return scheduled > 0
+    except Exception as e:
+        log.debug(f"Consolidation scheduling failed ({source}): {e}")
+        return False
+
+
 def _on_tile_complete_callback(tile_id: str, tile) -> None:
     """
     Callback invoked when all chunks for a tile have been downloaded.
@@ -4752,19 +4718,7 @@ def _on_tile_complete_callback(tile_id: str, tile) -> None:
         background_dds_builder.submit(tile)
     
     # Schedule bundle consolidation for ALL zoom levels of this tile
-    # A tile has chunks at multiple zoom levels (for different mipmaps):
-    # - max_zoom: 16×16 chunks for mipmap 0
-    # - max_zoom-1: 8×8 chunks for mipmap 1
-    # - etc.
-    #
-    # Each zoom level needs to be consolidated separately with its correct
-    # coordinates and chunk count.
-    try:
-        scheduled = schedule_bundle_consolidation_all_zooms(tile, priority=1)  # Lower priority for prefetch
-        if scheduled > 0:
-            log.debug(f"Scheduled bundle consolidation for {scheduled} zoom levels of tile {tile_id}")
-    except Exception as e:
-        log.debug(f"Failed to schedule bundle consolidation for tile {tile_id}: {e}")
+    consolidate_tile_if_ready(tile, "prefetch")
 
 
 def start_predictive_dds(tile_cacher=None) -> None:
@@ -4896,6 +4850,25 @@ def stop_predictive_dds() -> None:
             log.info(f"Bundle consolidator queue: "
                     f"max_seen={stats.get('queue_size_max', 0)}, "
                     f"avg={stats.get('queue_size_avg', 0):.1f}")
+            
+            # Orphan JPEG cleanup (if enabled)
+            cleanup_orphans = getattr(CFG.autoortho, 'cleanup_orphan_jpegs_on_exit', True)
+            if isinstance(cleanup_orphans, str):
+                cleanup_orphans = cleanup_orphans.lower() in ('true', '1', 'yes', 'on')
+            
+            if cleanup_orphans:
+                try:
+                    try:
+                        from autoortho.aopipeline.bundle_consolidator import cleanup_orphan_jpegs
+                    except ImportError:
+                        from aopipeline.bundle_consolidator import cleanup_orphan_jpegs
+                    
+                    cache_dir = str(CFG.paths.cache_dir)
+                    deleted, scanned = cleanup_orphan_jpegs(cache_dir)
+                    if deleted > 0:
+                        log.info(f"Orphan cleanup: deleted {deleted}/{scanned} JPEGs (data safe in bundles)")
+                except Exception as e:
+                    log.debug(f"Orphan cleanup failed: {e}")
         except Exception as e:
             log.warning(f"Error shutting down bundle consolidator: {e}")
         _bundle_consolidator = None
@@ -5538,7 +5511,7 @@ class Tile(object):
     def __repr__(self):
         return f"Tile({self.col}, {self.row}, {self.maptype}, {self.tilename_zoom}, min_zoom={self.min_zoom}, max_zoom={self.max_zoom}, max_mm={self.max_mipmap})"
 
-    def _wait_for_pending_consolidation_if_needed(self, timeout: float = 30.0) -> bool:
+    def _wait_for_pending_consolidation_if_needed(self, timeout: float = 5.0) -> bool:
         """
         Wait for pending consolidation OUTSIDE any locks.
         
@@ -5643,36 +5616,17 @@ class Tile(object):
             native_cache = _get_native_cache()
             use_batch_read = native_cache is not None
             
-            # Create all chunks first (skip individual cache checks if batch reading)
-            # DIAGNOSTIC: Track chunks that were downloaded but cache is now missing
-            # NOTE: Warning is deferred until AFTER fallback attempt to avoid false positives
-            recreated_count = 0
-            potentially_lost_chunks = []  # Chunk indices that were downloaded but cache missing
+            # Create all chunks (skip individual cache checks if batch reading)
             for r in range(row, row+height):
                 for c in range(col, col+width):
                     chunk = Chunk(c, r, self.maptype, zoom, cache_dir=self.cache_dir, 
                                   tile_id=self.id, skip_cache_check=use_batch_read)
-                    # Check if this chunk was previously downloaded but cache file is missing
-                    if chunk.chunk_id in ChunkGetter._downloaded_chunks:
-                        recreated_count += 1
-                        if not os.path.exists(chunk.cache_path):
-                            potentially_lost_chunks.append(len(self.chunks[zoom]))
                     self.chunks[zoom].append(chunk)
             
             # Native batch cache read: read all cache files in parallel using C code
             if use_batch_read:
-                # Register as reader to prevent consolidator from deleting JPEGs during read
-                reader_prefix = None
-                if _bundle_consolidator is not None:
-                    reader_prefix = _bundle_consolidator.register_reader(self.row, self.col, self.maptype)
-                
-                try:
-                    paths = [chunk.cache_path for chunk in self.chunks[zoom]]
-                    cached_data = _batch_read_cache_files(paths)
-                finally:
-                    # Unregister reader when done with disk I/O
-                    if reader_prefix is not None and _bundle_consolidator is not None:
-                        _bundle_consolidator.unregister_reader(reader_prefix)
+                paths = [chunk.cache_path for chunk in self.chunks[zoom]]
+                cached_data = _batch_read_cache_files(paths)
                 
                 if cached_data:
                     hits = 0
@@ -5683,12 +5637,8 @@ class Tile(object):
                     if hits > 0:
                         log.debug(f"Native batch cache read: {hits}/{len(paths)} hits for zoom {zoom}")
                 
-                # ═══════════════════════════════════════════════════════════════
-                # JPEG-TO-BUNDLE FALLBACK: Handle race condition with consolidator
-                # ═══════════════════════════════════════════════════════════════
-                # If batch read missed many files, the consolidator may have deleted
-                # them while creating a bundle. Check if bundle now exists, or wait
-                # for pending consolidation to avoid re-downloading.
+                # SIMPLIFIED BUNDLE RECOVERY
+                # If batch read missed files, try bundle once (no waiting)
                 missing_count = len(paths) - len(cached_data)
                 if missing_count > 0:
                     try:
@@ -5699,98 +5649,28 @@ class Tile(object):
                             from utils.bundle_paths import get_bundle2_path
                             from aopipeline import AoBundle2
                         
-                        bundle_path = get_bundle2_path(self.cache_dir, self.row, self.col, self.maptype, self.tilename_zoom)
-                        bundle_has_data = False
+                        bundle_path = get_bundle2_path(
+                            self.cache_dir, self.row, self.col, 
+                            self.maptype, self.tilename_zoom
+                        )
                         
-                        # SMART FALLBACK: Only attempt recovery if zoom is likely in bundle
-                        # With immediate consolidation, all zooms should be consolidated.
-                        # Check if bundle exists to avoid wasted I/O for non-existent bundles.
-                        bundle_exists = os.path.exists(bundle_path)
-                        if not bundle_exists:
-                            # Bundle doesn't exist - no point checking further
-                            bump('jpeg_to_bundle_fallback_skipped')
-                        
-                        # First check: bundle exists?
-                        if bundle_exists:
+                        if os.path.exists(bundle_path):
+                            bump('bundle_fallback_attempted')
                             with AoBundle2.Bundle2Python(bundle_path) as bundle:
                                 if bundle.has_zoom(zoom):
                                     jpeg_datas = bundle.get_all_chunks(zoom)
-                                    bundle_has_data = True
-                        
-                        # Second check: consolidation pending or recently completed?
-                        # CRITICAL: Pass zoom to is_pending() - only wait for OUR zoom!
-                        # Previously waited for ANY zoom, causing recovery failures when
-                        # a different zoom's consolidation completed first.
-                        if not bundle_has_data and _bundle_consolidator is not None:
-                            bump('jpeg_to_bundle_fallback_entered')  # Track fallback entry
-                            waited_for_consolidation = False
-                            if _bundle_consolidator.is_pending(self.row, self.col, self.maptype, zoom):
-                                log.debug(f"JPEG-to-bundle fallback: waiting for pending consolidation (zoom {zoom})")
-                                bump('jpeg_to_bundle_wait_started')
-                                wait_start = time.monotonic()
-                                # Pass zoom to wait for THIS specific zoom level's consolidation
-                                wait_result = _bundle_consolidator.wait_for_pending(self.row, self.col, self.maptype, timeout=60.0, zoom=zoom)
-                                wait_time = time.monotonic() - wait_start
-                                waited_for_consolidation = True
-                                
-                                if wait_result:
-                                    bump('jpeg_to_bundle_wait_success')
-                                    if wait_time > 5.0:
-                                        bump('jpeg_to_bundle_wait_long')
-                                        log.debug(f"JPEG-to-bundle fallback: waited {wait_time:.1f}s for consolidation")
-                                elif wait_time > 30.0:
-                                    # Only log as timeout if we actually waited a long time
-                                    bump('jpeg_to_bundle_wait_timeout')
-                                    log.warning(f"JPEG-to-bundle fallback: consolidation wait TIMEOUT after {wait_time:.1f}s - "
-                                               f"tile {self.row}_{self.col}_{self.maptype} may have stuck consolidation")
-                                else:
-                                    # Fast return (0-30s) = consolidation already completed
-                                    bump('jpeg_to_bundle_wait_already_done')
-                            
-                            # ALWAYS try bundle after wait OR if is_pending was False
-                            # Key fix: Consolidation may have JUST completed between first check
-                            # and is_pending() call - we must re-check the bundle regardless!
-                            if not bundle_has_data and os.path.exists(bundle_path):
-                                bump('jpeg_to_bundle_fallback_bundle_exists')
-                                with AoBundle2.Bundle2Python(bundle_path) as bundle:
-                                    if bundle.has_zoom(zoom):
-                                        bump('jpeg_to_bundle_fallback_has_zoom')
-                                        jpeg_datas = bundle.get_all_chunks(zoom)
-                                        bundle_has_data = True
-                                        if not waited_for_consolidation:
-                                            # Track cases where bundle found without waiting
-                                            # (consolidation completed between checks)
-                                            bump('jpeg_to_bundle_fallback_not_pending')
-                                    else:
-                                        bump('jpeg_to_bundle_fallback_no_zoom')
-                        
-                        # Apply recovered data to chunks
-                        if bundle_has_data and jpeg_datas:
-                            fallback_hits = 0
-                            for i, chunk in enumerate(self.chunks[zoom]):
-                                if chunk.cache_path not in cached_data and i < len(jpeg_datas):
-                                    data = jpeg_datas[i]
-                                    if data:
-                                        chunk.set_cached_data(data)
-                                        fallback_hits += 1
-                            if fallback_hits > 0:
-                                log.debug(f"JPEG-to-bundle fallback: recovered {fallback_hits}/{missing_count} chunks for zoom {zoom}")
-                                bump('jpeg_to_bundle_fallback')
+                                    if jpeg_datas:
+                                        recovered = 0
+                                        for i, chunk in enumerate(self.chunks[zoom]):
+                                            if chunk.cache_path not in cached_data and i < len(jpeg_datas):
+                                                if jpeg_datas[i]:
+                                                    chunk.set_cached_data(jpeg_datas[i])
+                                                    recovered += 1
+                                        if recovered > 0:
+                                            bump('bundle_fallback_success')
+                                            log.debug(f"Bundle fallback: recovered {recovered}/{missing_count} chunks")
                     except Exception as e:
-                        log.debug(f"JPEG-to-bundle fallback failed: {e}")
-                # ═══════════════════════════════════════════════════════════════
-                
-                # DEFERRED WARNING: Only now check which chunks are TRULY lost
-                # (previously downloaded, cache missing, and NOT recovered from bundle)
-                if potentially_lost_chunks:
-                    truly_lost_count = sum(
-                        1 for i in potentially_lost_chunks 
-                        if i < len(self.chunks[zoom]) and self.chunks[zoom][i].data is None
-                    )
-                    if truly_lost_count > 0:
-                        log.warning(f"CREATE_CHUNKS: {truly_lost_count}/{recreated_count} chunks for tile {self.id} zoom {zoom} "
-                                   f"were downloaded but cache is MISSING - will re-download!")
-                        bump('chunk_cache_data_loss', truly_lost_count)
+                        log.debug(f"Bundle fallback failed: {e}")
         else:
             log.debug(f"Reusing existing {len(self.chunks[zoom])} chunks for zoom {zoom}")
 
@@ -6081,19 +5961,8 @@ class Tile(object):
         # BATCH CACHE READ: Read all missing chunks in parallel using native code
         # This is ~50x faster than individual get_cache() calls (1 batch vs 256 syscalls)
         if need_cache_read_indices:
-            # Register as reader to prevent consolidator from deleting JPEGs during read
-            # This solves the race condition where consolidator deletes files we're about to read
-            reader_prefix = None
-            if _bundle_consolidator is not None:
-                reader_prefix = _bundle_consolidator.register_reader(self.row, self.col, self.maptype)
-            
-            try:
-                cache_paths = [chunks[i].cache_path for i in need_cache_read_indices]
-                cached_data = _batch_read_cache_files(cache_paths)
-            finally:
-                # Unregister reader when done with disk I/O
-                if reader_prefix is not None and _bundle_consolidator is not None:
-                    _bundle_consolidator.unregister_reader(reader_prefix)
+            cache_paths = [chunks[i].cache_path for i in need_cache_read_indices]
+            cached_data = _batch_read_cache_files(cache_paths)
             
             if cached_data:
                 # Apply batch-read data to chunks
@@ -6488,8 +6357,7 @@ class Tile(object):
             bump('live_aopipeline_success')
             
             # Schedule bundle consolidation for ALL zoom levels
-            # This consolidates max_zoom with in-memory data and lower zoom levels from disk
-            schedule_bundle_consolidation_all_zooms(self, priority=0)
+            consolidate_tile_if_ready(self, "aopipeline")
             
         except Exception as e:
             log.debug(f"_try_aopipeline_build: Exception for {self.id}: {e}")
@@ -6800,8 +6668,7 @@ class Tile(object):
                         bump('streaming_builder_success')
                         
                         # Schedule bundle consolidation for ALL zoom levels
-                        # This consolidates max_zoom with in-memory data and lower zoom levels from disk
-                        schedule_bundle_consolidation_all_zooms(self, priority=0)
+                        consolidate_tile_if_ready(self, "aopipeline")
                         return True
                 
                 log.debug(f"_try_streaming_aopipeline_build: Finalize failed for {self.id}")
@@ -8980,18 +8847,8 @@ class Tile(object):
         # ═══════════════════════════════════════════════════════════════════════
         
         if need_cache_read and ready_count < total_chunks:
-            # Register as reader to prevent consolidator from deleting JPEGs during read
-            reader_prefix = None
-            if _bundle_consolidator is not None:
-                reader_prefix = _bundle_consolidator.register_reader(self.row, self.col, self.maptype)
-            
-            try:
-                cache_paths = [chunks[i].cache_path for i in need_cache_read]
-                cached_data = _batch_read_cache_files(cache_paths)
-            finally:
-                # Unregister reader when done with disk I/O
-                if reader_prefix is not None and _bundle_consolidator is not None:
-                    _bundle_consolidator.unregister_reader(reader_prefix)
+            cache_paths = [chunks[i].cache_path for i in need_cache_read]
+            cached_data = _batch_read_cache_files(cache_paths)
             
             if cached_data:
                 for i in need_cache_read:

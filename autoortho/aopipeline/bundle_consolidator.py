@@ -162,17 +162,6 @@ class BundleConsolidator:
         self._bundle_locks: Dict[str, threading.Lock] = {}
         self._bundle_locks_lock = threading.Lock()  # Protects _bundle_locks dict
         
-        # Reader tracking to prevent JPEG deletion while tiles are reading
-        # Maps tile_key_prefix -> active reader count
-        # This solves the race condition where consolidator deletes JPEGs
-        # while Tile objects are still expecting to read them
-        self._active_readers: Dict[str, int] = {}
-        self._active_readers_lock = threading.Lock()
-        
-        # Deferred JPEG deletions (paths to delete when readers finish)
-        self._deferred_deletions: Dict[str, List[str]] = {}  # tile_key_prefix -> [paths]
-        self._deferred_deletions_lock = threading.Lock()
-        
         # Per-tile completion events (replaces thundering herd notify_all)
         # Maps tile_prefix (row_col_maptype_) -> Event
         # Using per-tile events means only threads waiting for a specific tile
@@ -415,132 +404,6 @@ class BundleConsolidator:
         with self._tile_events_lock:
             self._tile_events.pop(tile_prefix, None)
     
-    def register_reader(self, row: int, col: int, maptype: str) -> str:
-        """
-        Register a tile as actively reading JPEGs.
-        
-        Call this before accessing individual JPEG cache files to prevent
-        the consolidator from deleting them while being read. This solves
-        the race condition where Tile._collect_chunk_jpegs() tries to read
-        files that consolidation has just deleted.
-        
-        Args:
-            row: Tile row coordinate
-            col: Tile column coordinate
-            maptype: Map type string
-            
-        Returns:
-            Prefix key for use with unregister_reader()
-            
-        Thread Safety:
-            - Fully thread-safe, uses internal locking
-        """
-        prefix = self._get_tile_key_prefix(row, col, maptype)
-        with self._active_readers_lock:
-            self._active_readers[prefix] = self._active_readers.get(prefix, 0) + 1
-        return prefix
-    
-    def unregister_reader(self, prefix: str):
-        """
-        Unregister when done reading JPEGs.
-        
-        Call this after finishing JPEG cache file access to allow
-        consolidation to proceed with deletion.
-        
-        Also processes any deferred deletions if this was the last reader.
-        
-        Args:
-            prefix: The prefix key returned by register_reader()
-            
-        Thread Safety:
-            - Fully thread-safe, uses internal locking
-        """
-        with self._active_readers_lock:
-            if prefix in self._active_readers:
-                self._active_readers[prefix] -= 1
-                if self._active_readers[prefix] <= 0:
-                    del self._active_readers[prefix]
-                    # This was the last reader - process deferred deletions
-                    self._process_deferred_deletions(prefix)
-    
-    def _has_active_readers(self, row: int, col: int, maptype: str) -> bool:
-        """
-        Check if any readers are active for this tile.
-        
-        Args:
-            row: Tile row coordinate
-            col: Tile column coordinate
-            maptype: Map type string
-            
-        Returns:
-            True if there are active readers, False otherwise
-            
-        Thread Safety:
-            - Fully thread-safe, uses internal locking
-        """
-        prefix = self._get_tile_key_prefix(row, col, maptype)
-        with self._active_readers_lock:
-            return self._active_readers.get(prefix, 0) > 0
-    
-    def _schedule_deferred_deletion(self, row: int, col: int, maptype: str, 
-                                     jpeg_paths: List[str]):
-        """
-        Schedule JPEG paths for deferred deletion.
-        
-        Called when readers are active - saves paths to delete later
-        when unregister_reader() is called for the last reader.
-        
-        Args:
-            row: Tile row coordinate  
-            col: Tile column coordinate
-            maptype: Map type string
-            jpeg_paths: List of JPEG file paths to delete later
-            
-        Thread Safety:
-            - Fully thread-safe, uses internal locking
-        """
-        prefix = self._get_tile_key_prefix(row, col, maptype)
-        with self._deferred_deletions_lock:
-            if prefix not in self._deferred_deletions:
-                self._deferred_deletions[prefix] = []
-            # Only add non-None paths
-            self._deferred_deletions[prefix].extend([p for p in jpeg_paths if p])
-    
-    def _process_deferred_deletions(self, prefix: str):
-        """
-        Process any deferred deletions for a tile prefix.
-        
-        Called when the last reader unregisters. Attempts to delete
-        all deferred JPEG files.
-        
-        Args:
-            prefix: The tile key prefix
-            
-        Thread Safety:
-            - Should only be called from unregister_reader with lock already held
-        """
-        # Get paths to delete (under lock)
-        with self._deferred_deletions_lock:
-            paths = self._deferred_deletions.pop(prefix, [])
-        
-        if not paths:
-            return
-        
-        # Delete files (outside lock to avoid holding lock during I/O)
-        deleted = 0
-        for path in paths:
-            try:
-                os.remove(path)
-                deleted += 1
-            except FileNotFoundError:
-                deleted += 1  # Already deleted, counts as success
-            except (PermissionError, OSError):
-                # File locked or other issue - skip
-                pass
-        
-        if deleted > 0:
-            log.debug(f"Deferred deletion: removed {deleted}/{len(paths)} JPEGs for {prefix}")
-    
     def schedule(
         self,
         row: int,
@@ -662,11 +525,8 @@ class BundleConsolidator:
         This prevents JPEGs from piling up in the cache folder when tiles are
         re-requested but the bundle already has the zoom level.
         """
-        tile_row = task.tile_row if task.tile_row is not None else task.row
-        tile_col = task.tile_col if task.tile_col is not None else task.col
-        
-        # Build JPEG paths
-        jpeg_paths = []
+        # Build JPEG paths and delete immediately
+        deleted = 0
         for i in range(chunk_count):
             chunk_row = i // task.chunks_per_side
             chunk_col = i % task.chunks_per_side
@@ -676,25 +536,15 @@ class BundleConsolidator:
                 self.cache_dir,
                 f"{abs_col}_{abs_row}_{task.zoom}_{task.maptype}.jpg"
             )
-            jpeg_paths.append(path)
-        
-        # Check for active readers before deletion
-        if self._has_active_readers(tile_row, tile_col, task.maptype):
-            log.debug(f"Deferring JPEG deletion for skipped task: active readers")
-            self._schedule_deferred_deletion(tile_row, tile_col, task.maptype, jpeg_paths)
-        else:
-            # Delete immediately
-            deleted = 0
-            for path in jpeg_paths:
-                try:
-                    os.remove(path)
-                    deleted += 1
-                except FileNotFoundError:
-                    pass  # Already deleted
-                except (PermissionError, OSError):
-                    pass  # Skip locked files
-            if deleted > 0:
-                log.debug(f"Deleted {deleted} JPEGs for skipped consolidation")
+            try:
+                os.remove(path)
+                deleted += 1
+            except FileNotFoundError:
+                pass  # Already deleted
+            except (PermissionError, OSError):
+                pass  # Locked - orphan cleanup will handle
+        if deleted > 0:
+            log.debug(f"Deleted {deleted} JPEGs for skipped consolidation")
     
     def _consolidate_tile(self, task: ConsolidationTask, retry_count: int = 0) -> bool:
         """
@@ -948,35 +798,20 @@ class BundleConsolidator:
                 raise
         
         # Delete source JPEGs if configured
-        # CRITICAL: Check for active readers before deletion to prevent race condition
-        # where Tile._collect_chunk_jpegs() tries to read files we just deleted.
-        # Failed deletions are fine - cleanup will happen later or on restart
+        # Failed deletions are fine - orphan cleanup on exit will handle them
         if self.delete_jpegs:
-            # Get tile coordinates for reader check
-            # Use task's tile coordinates (for bundle path) rather than chunk coordinates
-            tile_row = task.tile_row if task.tile_row is not None else task.row
-            tile_col = task.tile_col if task.tile_col is not None else task.col
-            
-            # Check for active readers before deletion
-            if self._has_active_readers(tile_row, tile_col, task.maptype):
-                # Readers are active - defer deletion to avoid race condition
-                log.debug(f"Deferring JPEG deletion for {tile_key}: active readers")
-                self._schedule_deferred_deletion(tile_row, tile_col, task.maptype, jpeg_paths)
-            else:
-                # No active readers - safe to delete immediately
-                deleted = 0
-                for path in jpeg_paths:
-                    if path:
-                        try:
-                            os.remove(path)
-                            deleted += 1
-                        except FileNotFoundError:
-                            deleted += 1  # Already deleted, counts as success
-                        except (PermissionError, OSError):
-                            # File locked or other issue - skip without retry
-                            # The file will be cleaned up later or is harmless
-                            pass
-                log.debug(f"Deleted {deleted}/{len(jpeg_paths)} JPEGs for {tile_key}")
+            deleted = 0
+            for path in jpeg_paths:
+                if path:
+                    try:
+                        os.remove(path)
+                        deleted += 1
+                    except FileNotFoundError:
+                        deleted += 1  # Already deleted, counts as success
+                    except (PermissionError, OSError):
+                        # Locked - orphan cleanup will handle
+                        pass
+            log.debug(f"Deleted {deleted}/{len(jpeg_paths)} JPEGs for {tile_key}")
         
         # Update stats
         with self._stats_lock:
@@ -1373,3 +1208,92 @@ def shutdown_consolidator():
         if _default_consolidator:
             _default_consolidator.shutdown()
             _default_consolidator = None
+
+
+# ============================================================================
+# Orphan JPEG Cleanup
+# ============================================================================
+
+def cleanup_orphan_jpegs(cache_dir: str) -> Tuple[int, int]:
+    """
+    Delete JPEG files whose data is already safely stored in bundles.
+    
+    Safe to call on program exit when no file locking concerns exist.
+    Scans for JPEGs matching the chunk naming pattern and checks if their
+    corresponding bundle contains the zoom level.
+    
+    Args:
+        cache_dir: Path to the cache directory to scan
+        
+    Returns:
+        Tuple of (deleted_count, scanned_count)
+    """
+    import glob
+    import re
+    
+    try:
+        from autoortho.utils.bundle_paths import get_bundle2_path
+        from autoortho.aopipeline.AoBundle2 import has_zoom_quick
+    except ImportError:
+        from utils.bundle_paths import get_bundle2_path
+        from aopipeline.AoBundle2 import has_zoom_quick
+    
+    deleted = 0
+    scanned = 0
+    
+    # Pattern: {col}_{row}_{zoom}_{maptype}.jpg
+    jpeg_pattern = os.path.join(cache_dir, "*_*_*_*.jpg")
+    jpeg_regex = re.compile(r"(\d+)_(\d+)_(\d+)_(\w+)\.jpg$")
+    
+    for jpeg_path in glob.glob(jpeg_pattern):
+        scanned += 1
+        filename = os.path.basename(jpeg_path)
+        match = jpeg_regex.match(filename)
+        if not match:
+            continue
+        
+        col, row, zoom, maptype = match.groups()
+        col, row, zoom = int(col), int(row), int(zoom)
+        
+        # Calculate tile coordinates from chunk coordinates
+        tile_row, tile_col, tilename_zoom = _chunk_to_tile_coords(row, col, zoom)
+        
+        bundle_path = get_bundle2_path(cache_dir, tile_row, tile_col, maptype, tilename_zoom)
+        
+        if os.path.exists(bundle_path):
+            # Check if bundle has this zoom level
+            if has_zoom_quick(bundle_path, zoom):
+                # Safe to delete - data is in bundle
+                try:
+                    os.remove(jpeg_path)
+                    deleted += 1
+                except (PermissionError, OSError):
+                    pass  # Still locked somehow, skip
+    
+    return deleted, scanned
+
+
+def _chunk_to_tile_coords(chunk_row: int, chunk_col: int, zoom: int) -> Tuple[int, int, int]:
+    """
+    Convert chunk coordinates back to tile coordinates.
+    
+    This is the inverse of Tile._get_quick_zoom().
+    The tilename_zoom is typically zoom - 4 (for 16x16 chunk grids).
+    
+    Args:
+        chunk_row: Chunk row coordinate
+        chunk_col: Chunk column coordinate  
+        zoom: Zoom level of the chunk
+        
+    Returns:
+        Tuple of (tile_row, tile_col, tilename_zoom)
+    """
+    # For a 16x16 chunk grid, tilename_zoom = zoom - 4
+    # tile_row = chunk_row // 16, tile_col = chunk_col // 16
+    chunks_per_side = 16
+    tilename_zoom = zoom - 4  # 16x16 grid = 4 zoom levels difference
+    
+    tile_row = chunk_row // chunks_per_side
+    tile_col = chunk_col // chunks_per_side
+    
+    return tile_row, tile_col, tilename_zoom

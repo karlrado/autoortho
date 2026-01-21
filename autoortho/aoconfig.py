@@ -312,6 +312,13 @@ simheaven_compat = False
 using_custom_tiles = False
 # Color used for missing textures. an
 missing_color = [66, 77, 55]
+# === CACHE CLEANUP SETTINGS ===
+# Clean up orphan JPEG files on program exit (True/False)
+# Deletes temporary JPEG files whose data is safely stored in bundles.
+# This recovers disk space from files that couldn't be deleted during runtime
+# due to file locking (mainly on Windows).
+# Recommended: True for disk space optimization
+cleanup_orphan_jpegs_on_exit = True
 
 [pydds]
 # ISPC or STB for dds file compression
