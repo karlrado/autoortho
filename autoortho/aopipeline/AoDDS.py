@@ -2564,6 +2564,280 @@ def build_mipmap_chain(
 
 
 # ============================================================================
+# Native Multi-Zoom Mipmap Building
+# ============================================================================
+
+class NativeMipmapResult(NamedTuple):
+    """
+    Result from building all mipmaps from native zoom level chunks.
+    
+    Each mipmap is built from its native zoom level's JPEG chunks:
+    - Mipmap 0: ZL16 chunks (best quality)
+    - Mipmap 1: ZL15 chunks
+    - Mipmap 2: ZL14 chunks
+    - etc.
+    
+    Compatible with MipmapChainResult for uniform handling in getortho.py.
+    """
+    success: bool
+    bytes_written: int
+    mipmap_count: int                    # Number of mipmaps in data
+    data: Optional[bytes]                # Complete DDS file (header + all mipmaps)
+    mipmap_offsets: List[int]            # Offset of each mipmap in data (after 128-byte header)
+    mipmap_sizes: List[int]              # Size of each mipmap
+    elapsed_ms: float
+    error: str = ''
+    
+    def get_mipmap_data(self, mipmap_index: int) -> Optional[bytes]:
+        """Extract raw DXT bytes for a specific mipmap level (excludes DDS header)."""
+        if not self.success or not self.data or mipmap_index >= self.mipmap_count:
+            return None
+        offset = self.mipmap_offsets[mipmap_index]
+        size = self.mipmap_sizes[mipmap_index]
+        return self.data[offset:offset + size]
+
+
+def build_all_mipmaps_native(
+    jpeg_datas_per_zoom: List[List[Optional[bytes]]],
+    format: str = "BC1",
+    missing_color: Tuple[int, int, int] = (66, 77, 55),
+    pool: Optional[c_void_p] = None
+) -> NativeMipmapResult:
+    """
+    Build ALL mipmaps from native zoom level chunks.
+    
+    QUALITY OPTIMIZATION:
+    Instead of building mipmap 0 and deriving smaller mipmaps via reduce_half,
+    this function builds EACH mipmap from its native zoom level's JPEG chunks:
+    - Mipmap 0: ZL16 chunks (256 chunks, 4096x4096)
+    - Mipmap 1: ZL15 chunks (64 chunks, 2048x2048)
+    - Mipmap 2: ZL14 chunks (16 chunks, 1024x1024)
+    - Mipmap 3: ZL13 chunks (4 chunks, 512x512)
+    - Mipmap 4: ZL12 chunks (1 chunk, 256x256)
+    
+    FALLBACK:
+    If a zoom level has no chunks (all None/empty), falls back to reduce_half
+    from the previous mipmap level. This maintains quality while handling
+    network failures gracefully.
+    
+    Args:
+        jpeg_datas_per_zoom: List of lists - outer list is per zoom level,
+                             inner list is JPEG bytes for that zoom.
+                             e.g., [[256 ZL16 chunks], [64 ZL15 chunks], ...]
+        format: Compression format - "BC1" (DXT1) or "BC3" (DXT5)
+        missing_color: RGB tuple for missing chunks
+        pool: Optional decode buffer pool handle from AoDecode
+    
+    Returns:
+        NativeMipmapResult with complete DDS data (including header).
+        
+    Example:
+        # Build DDS with native chunks at each zoom level
+        jpeg_datas_per_zoom = [
+            [chunk.data for chunk in tile.chunks[max_zoom]],      # ZL16
+            [chunk.data for chunk in tile.chunks[max_zoom - 1]],  # ZL15
+            [chunk.data for chunk in tile.chunks[max_zoom - 2]],  # ZL14
+            [chunk.data for chunk in tile.chunks[max_zoom - 3]],  # ZL13
+            [chunk.data for chunk in tile.chunks[max_zoom - 4]],  # ZL12
+        ]
+        result = build_all_mipmaps_native(jpeg_datas_per_zoom)
+        if result.success:
+            with open(dds_path, 'wb') as f:
+                f.write(result.data)
+    """
+    start_time = time.monotonic()
+    
+    lib = _load_library()
+    if lib is None:
+        return NativeMipmapResult(
+            success=False,
+            bytes_written=0,
+            mipmap_count=0,
+            data=None,
+            mipmap_offsets=[],
+            mipmap_sizes=[],
+            elapsed_ms=0,
+            error="Native library not available"
+        )
+    
+    if not jpeg_datas_per_zoom or len(jpeg_datas_per_zoom) == 0:
+        return NativeMipmapResult(
+            success=False,
+            bytes_written=0,
+            mipmap_count=0,
+            data=None,
+            mipmap_offsets=[],
+            mipmap_sizes=[],
+            elapsed_ms=0,
+            error="No zoom level data provided"
+        )
+    
+    # Validate first zoom level
+    first_zoom_data = jpeg_datas_per_zoom[0]
+    if not first_zoom_data or len(first_zoom_data) == 0:
+        return NativeMipmapResult(
+            success=False,
+            bytes_written=0,
+            mipmap_count=0,
+            data=None,
+            mipmap_offsets=[],
+            mipmap_sizes=[],
+            elapsed_ms=0,
+            error="First zoom level has no chunks"
+        )
+    
+    zoom_count = len(jpeg_datas_per_zoom)
+    
+    # Calculate tile size from first zoom level
+    chunk_count_0 = len(first_zoom_data)
+    chunks_per_side_0 = int(chunk_count_0 ** 0.5)
+    if chunks_per_side_0 * chunks_per_side_0 != chunk_count_0:
+        return NativeMipmapResult(
+            success=False,
+            bytes_written=0,
+            mipmap_count=0,
+            data=None,
+            mipmap_offsets=[],
+            mipmap_sizes=[],
+            elapsed_ms=0,
+            error=f"First zoom level chunk count {chunk_count_0} is not a perfect square"
+        )
+    
+    tile_size = chunks_per_side_0 * 256  # CHUNK_SIZE = 256
+    
+    # Parse format
+    fmt = 0  # BC1
+    if format.upper() in ("BC3", "DXT5"):
+        fmt = 1
+    
+    # Calculate output size and track mipmap offsets/sizes
+    block_size = 8 if fmt == 0 else 16
+    mipmap_count = 0
+    size = tile_size
+    output_size = 128  # DDS header
+    mipmap_offsets = []
+    mipmap_sizes = []
+    while size >= 4:
+        mipmap_offsets.append(output_size)  # Offset in complete DDS file (after header for first)
+        mip_size = ((size + 3) // 4) * ((size + 3) // 4) * block_size
+        mipmap_sizes.append(mip_size)
+        output_size += mip_size
+        mipmap_count += 1
+        size //= 2
+    
+    # Allocate output buffer
+    output_buffer = np.zeros(output_size, dtype=np.uint8)
+    
+    # Build chunk count array
+    chunk_counts = (c_int32 * zoom_count)()
+    for z in range(zoom_count):
+        chunk_counts[z] = len(jpeg_datas_per_zoom[z]) if jpeg_datas_per_zoom[z] else 0
+    
+    # Build JPEG data arrays (array of arrays)
+    # We need to keep references to prevent garbage collection
+    jpeg_refs = []
+    jpeg_ptr_arrays = []
+    jpeg_size_arrays = []
+    
+    for z in range(zoom_count):
+        zoom_data = jpeg_datas_per_zoom[z] if jpeg_datas_per_zoom[z] else []
+        chunk_count = len(zoom_data)
+        
+        if chunk_count > 0:
+            ptr_arr = (POINTER(c_uint8) * chunk_count)()
+            size_arr = (c_uint32 * chunk_count)()
+            
+            for i, data in enumerate(zoom_data):
+                if data and len(data) > 0:
+                    jpeg_refs.append(data)
+                    ptr_arr[i] = cast(data, POINTER(c_uint8))
+                    size_arr[i] = len(data)
+                else:
+                    ptr_arr[i] = None
+                    size_arr[i] = 0
+            
+            jpeg_ptr_arrays.append(ptr_arr)
+            jpeg_size_arrays.append(size_arr)
+        else:
+            jpeg_ptr_arrays.append(None)
+            jpeg_size_arrays.append(None)
+    
+    # Build the outer pointer arrays
+    jpeg_data_per_zoom_ptrs = (POINTER(POINTER(c_uint8)) * zoom_count)()
+    jpeg_sizes_per_zoom_ptrs = (POINTER(c_uint32) * zoom_count)()
+    
+    for z in range(zoom_count):
+        if jpeg_ptr_arrays[z] is not None:
+            jpeg_data_per_zoom_ptrs[z] = cast(jpeg_ptr_arrays[z], POINTER(POINTER(c_uint8)))
+            jpeg_sizes_per_zoom_ptrs[z] = cast(jpeg_size_arrays[z], POINTER(c_uint32))
+        else:
+            jpeg_data_per_zoom_ptrs[z] = None
+            jpeg_sizes_per_zoom_ptrs[z] = None
+    
+    bytes_written = c_uint32()
+    pool_handle = pool if pool else None
+    
+    # Setup function signature if not already done
+    if not hasattr(lib, '_all_mipmaps_native_setup_done'):
+        lib.aodds_build_all_mipmaps_native.argtypes = [
+            POINTER(POINTER(POINTER(c_uint8))),  # jpeg_data_per_zoom
+            POINTER(POINTER(c_uint32)),          # jpeg_sizes_per_zoom
+            POINTER(c_int32),                    # chunk_counts_per_zoom
+            c_int32,                             # zoom_count
+            c_int32,                             # format
+            c_uint8, c_uint8, c_uint8,           # missing color
+            POINTER(c_uint8),                    # output
+            c_uint32,                            # output_size
+            POINTER(c_uint32),                   # bytes_written
+            c_void_p                             # pool
+        ]
+        lib.aodds_build_all_mipmaps_native.restype = c_int32
+        lib._all_mipmaps_native_setup_done = True
+    
+    # Call native function
+    success = lib.aodds_build_all_mipmaps_native(
+        cast(jpeg_data_per_zoom_ptrs, POINTER(POINTER(POINTER(c_uint8)))),
+        cast(jpeg_sizes_per_zoom_ptrs, POINTER(POINTER(c_uint32))),
+        chunk_counts,
+        zoom_count,
+        fmt,
+        missing_color[0],
+        missing_color[1],
+        missing_color[2],
+        output_buffer.ctypes.data_as(POINTER(c_uint8)),
+        output_size,
+        byref(bytes_written),
+        pool_handle
+    )
+    
+    elapsed_ms = (time.monotonic() - start_time) * 1000
+    
+    if success and bytes_written.value > 0:
+        result_data = bytes(output_buffer[:bytes_written.value])
+        return NativeMipmapResult(
+            success=True,
+            bytes_written=bytes_written.value,
+            mipmap_count=mipmap_count,
+            data=result_data,
+            mipmap_offsets=mipmap_offsets,
+            mipmap_sizes=mipmap_sizes,
+            elapsed_ms=elapsed_ms,
+            error=""
+        )
+    else:
+        return NativeMipmapResult(
+            success=False,
+            bytes_written=0,
+            mipmap_count=0,
+            data=None,
+            mipmap_offsets=[],
+            mipmap_sizes=[],
+            elapsed_ms=elapsed_ms,
+            error="Failed to build mipmaps from native chunks"
+        )
+
+
+# ============================================================================
 # Direct-to-File Pipeline: Zero-copy DDS building to disk
 # ============================================================================
 

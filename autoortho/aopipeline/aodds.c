@@ -864,29 +864,38 @@ static void reduce_half_sse2(const aodecode_image_t* input, aodecode_image_t* ou
             /* sum_lo contains: [p0r, p0g, p0b, p0a, p1r, p1g, p1b, p1a] */
             /* We need: (p0 + p1) / 2, where p0 and p1 are already row0+row1 sums */
             
-            /* Extract pixel pairs and add horizontally */
-            /* Shuffle to put adjacent pixels together for horizontal add */
-            __m128i p01 = _mm_add_epi16(
-                _mm_and_si128(sum_lo, _mm_set_epi16(0, 0, 0, 0, -1, -1, -1, -1)),
-                _mm_srli_si128(sum_lo, 8)
-            );
-            __m128i p23 = _mm_add_epi16(
-                _mm_and_si128(sum_hi, _mm_set_epi16(0, 0, 0, 0, -1, -1, -1, -1)),
-                _mm_srli_si128(sum_hi, 8)
-            );
-            
-            /* Combine and divide by 4 (add 2 for rounding, then shift right 2) */
-            __m128i rounding = _mm_set1_epi16(2);
-            p01 = _mm_add_epi16(p01, rounding);
-            p23 = _mm_add_epi16(p23, rounding);
-            p01 = _mm_srli_epi16(p01, 2);
-            p23 = _mm_srli_epi16(p23, 2);
-            
-            /* Pack back to 8-bit */
-            __m128i result = _mm_packus_epi16(p01, p23);
-            
-            /* Store 2 output pixels (8 bytes) */
-            _mm_storel_epi64((__m128i*)(dst_row + x * 4), result);
+        /* Extract pixel pairs and add horizontally */
+        /* sum_lo = [P0+Q0 (4 components), P1+Q1 (4 components)] as 16-bit */
+        /* sum_hi = [P2+Q2 (4 components), P3+Q3 (4 components)] as 16-bit */
+        /* We need: out0 = (P0+Q0+P1+Q1)/4, out1 = (P2+Q2+P3+Q3)/4 */
+        
+        /* Add adjacent pixels horizontally within each sum */
+        /* p01_sum = P0+Q0+P1+Q1 for each RGBA component */
+        __m128i p01_sum = _mm_add_epi16(
+            _mm_and_si128(sum_lo, _mm_set_epi16(0, 0, 0, 0, -1, -1, -1, -1)),
+            _mm_srli_si128(sum_lo, 8)
+        );
+        /* p23_sum = P2+Q2+P3+Q3 for each RGBA component */
+        __m128i p23_sum = _mm_add_epi16(
+            _mm_and_si128(sum_hi, _mm_set_epi16(0, 0, 0, 0, -1, -1, -1, -1)),
+            _mm_srli_si128(sum_hi, 8)
+        );
+        
+        /* Combine both output pixels into one register:
+         * combined = [out0_r, out0_g, out0_b, out0_a, out1_r, out1_g, out1_b, out1_a]
+         */
+        __m128i combined = _mm_unpacklo_epi64(p01_sum, p23_sum);
+        
+        /* Divide by 4 (add 2 for rounding, then shift right 2) */
+        __m128i rounding = _mm_set1_epi16(2);
+        combined = _mm_add_epi16(combined, rounding);
+        combined = _mm_srli_epi16(combined, 2);
+        
+        /* Pack 8x 16-bit values to 8x 8-bit values in the low 64 bits */
+        __m128i result = _mm_packus_epi16(combined, combined);
+        
+        /* Store 2 output pixels (8 bytes) */
+        _mm_storel_epi64((__m128i*)(dst_row + x * 4), result);
         }
         
         /* Scalar fallback for remaining pixels */
@@ -2543,6 +2552,285 @@ AODDS_API int32_t aodds_build_mipmap_chain(
     *bytes_written = offset;
     *mipmap_count_out = mip_count;
     return (mip_count > 0) ? 1 : 0;
+}
+
+/*============================================================================
+ * Build All Mipmaps from Native Zoom Level Chunks
+ * 
+ * QUALITY OPTIMIZATION:
+ * Instead of building mipmap 0 and deriving smaller mipmaps via reduce_half,
+ * this function builds EACH mipmap from its native zoom level chunks:
+ *   - Mipmap 0: ZL16 chunks (256 chunks, 4096x4096)
+ *   - Mipmap 1: ZL15 chunks (64 chunks, 2048x2048)
+ *   - Mipmap 2: ZL14 chunks (16 chunks, 1024x1024)
+ *   - Mipmap 3: ZL13 chunks (4 chunks, 512x512)
+ *   - Mipmap 4: ZL12 chunks (1 chunk, 256x256)
+ * 
+ * FALLBACK:
+ * If a zoom level has no chunks (all NULL/empty), falls back to reduce_half
+ * from the previous mipmap level. This maintains quality while handling
+ * network failures gracefully.
+ *============================================================================*/
+
+AODDS_API int32_t aodds_build_all_mipmaps_native(
+    const uint8_t*** jpeg_data_per_zoom,
+    const uint32_t** jpeg_sizes_per_zoom,
+    const int32_t* chunk_counts_per_zoom,
+    int32_t zoom_count,
+    dds_format_t format,
+    uint8_t missing_r,
+    uint8_t missing_g,
+    uint8_t missing_b,
+    uint8_t* output,
+    uint32_t output_size,
+    uint32_t* bytes_written,
+    aodecode_pool_t* pool
+) {
+    if (!jpeg_data_per_zoom || !jpeg_sizes_per_zoom || !chunk_counts_per_zoom ||
+        !output || !bytes_written || zoom_count <= 0) {
+        return 0;
+    }
+    
+    *bytes_written = 0;
+    
+    /* Validate first zoom level has chunks (required for mipmap 0) */
+    if (chunk_counts_per_zoom[0] <= 0) {
+        return 0;
+    }
+    
+    /* Calculate base tile size from first zoom level */
+    int32_t chunks_per_side_0 = (int32_t)sqrt((double)chunk_counts_per_zoom[0]);
+    if (chunks_per_side_0 * chunks_per_side_0 != chunk_counts_per_zoom[0]) {
+        return 0;  /* First zoom must be perfect square */
+    }
+    
+    int32_t tile_size = chunks_per_side_0 * CHUNK_SIZE;
+    int32_t mipmap_count = aodds_calc_mipmap_count(tile_size, tile_size);
+    
+    /* Limit to available zoom levels (but can fill remaining with reduce_half) */
+    if (mipmap_count > zoom_count) {
+        /* We have fewer zoom levels than mipmaps - will use reduce_half for remaining */
+    }
+    
+    /* Calculate required output size */
+    uint32_t required_size = aodds_calc_dds_size(tile_size, tile_size, mipmap_count, format);
+    if (output_size < required_size) {
+        return 0;
+    }
+    
+    /* Write DDS header */
+    uint32_t offset = aodds_write_header(output, tile_size, tile_size, mipmap_count, format);
+    
+    /* Initialize ISPC */
+    aodds_init_ispc();
+    
+    /* Track the last successfully built mipmap for reduce_half fallback */
+    aodecode_image_t prev_mipmap = {0};
+    int prev_mipmap_allocated = 0;
+    
+    /* Process each mipmap level */
+    for (int32_t mip = 0; mip < mipmap_count; mip++) {
+        int32_t mip_size = tile_size >> mip;
+        if (mip_size < 4) mip_size = 4;
+        
+        aodecode_image_t mip_image = {0};
+        int mip_built_from_native = 0;
+        
+        /* Check if we have native chunks for this mipmap level */
+        if (mip < zoom_count && chunk_counts_per_zoom[mip] > 0 && 
+            jpeg_data_per_zoom[mip] != NULL) {
+            
+            int32_t chunk_count = chunk_counts_per_zoom[mip];
+            int32_t chunks_per_side = (int32_t)sqrt((double)chunk_count);
+            
+            /* Validate chunk count matches expected mipmap size */
+            if (chunks_per_side * chunks_per_side == chunk_count &&
+                chunks_per_side * CHUNK_SIZE == mip_size) {
+                
+                /* Allocate chunk image array */
+                aodecode_image_t* chunks = (aodecode_image_t*)calloc(
+                    chunk_count, sizeof(aodecode_image_t)
+                );
+                
+                if (chunks) {
+                    /* Decode all JPEGs for this zoom level */
+                    int32_t decoded = 0;
+                    
+#if AOPIPELINE_HAS_OPENMP
+                    #pragma omp parallel reduction(+:decoded)
+                    {
+                        int decoder_from_pool = 0;
+                        tjhandle tjh = acquire_pooled_decoder(&decoder_from_pool);
+                        
+                        if (tjh) {
+                            #pragma omp for schedule(static)
+                            for (int32_t i = 0; i < chunk_count; i++) {
+                                if (!jpeg_data_per_zoom[mip][i] || jpeg_sizes_per_zoom[mip][i] == 0) {
+                                    continue;
+                                }
+                                
+                                int width, height, subsamp, colorspace;
+                                if (tjDecompressHeader3(tjh, jpeg_data_per_zoom[mip][i], 
+                                                        jpeg_sizes_per_zoom[mip][i],
+                                                        &width, &height, &subsamp, &colorspace) < 0) {
+                                    continue;
+                                }
+                                
+                                if (width != CHUNK_SIZE || height != CHUNK_SIZE) {
+                                    continue;
+                                }
+                                
+                                uint8_t* buffer;
+                                int from_pool = 0;
+                                if (pool) {
+                                    buffer = aodecode_acquire_buffer(pool);
+                                    from_pool = (buffer != NULL);
+                                } else {
+                                    buffer = (uint8_t*)malloc(CHUNK_SIZE * CHUNK_SIZE * 4);
+                                }
+                                
+                                if (!buffer) continue;
+                                
+                                if (tjDecompress2(tjh, jpeg_data_per_zoom[mip][i], 
+                                                  jpeg_sizes_per_zoom[mip][i],
+                                                  buffer, width, 0, height,
+                                                  TJPF_RGBA, TJFLAG_FASTDCT) < 0) {
+                                    if (from_pool) {
+                                        aodecode_release_buffer(pool, buffer);
+                                    } else {
+                                        free(buffer);
+                                    }
+                                    continue;
+                                }
+                                
+                                chunks[i].data = buffer;
+                                chunks[i].width = width;
+                                chunks[i].height = height;
+                                chunks[i].stride = width * 4;
+                                chunks[i].channels = 4;
+                                chunks[i].from_pool = from_pool;
+                                decoded++;
+                            }
+                            release_pooled_decoder(tjh, decoder_from_pool);
+                        }
+                    }
+#else
+                    tjhandle tjh = (tjhandle)aodecode_get_thread_decoder();
+                    int is_persistent = aodecode_is_persistent_decoder(tjh);
+                    
+                    if (tjh) {
+                        for (int32_t i = 0; i < chunk_count; i++) {
+                            if (!jpeg_data_per_zoom[mip][i] || jpeg_sizes_per_zoom[mip][i] == 0) {
+                                continue;
+                            }
+                            
+                            int width, height, subsamp, colorspace;
+                            if (tjDecompressHeader3(tjh, jpeg_data_per_zoom[mip][i], 
+                                                    jpeg_sizes_per_zoom[mip][i],
+                                                    &width, &height, &subsamp, &colorspace) < 0) {
+                                continue;
+                            }
+                            
+                            if (width != CHUNK_SIZE || height != CHUNK_SIZE) {
+                                continue;
+                            }
+                            
+                            uint8_t* buffer = (uint8_t*)malloc(CHUNK_SIZE * CHUNK_SIZE * 4);
+                            if (!buffer) continue;
+                            
+                            if (tjDecompress2(tjh, jpeg_data_per_zoom[mip][i], 
+                                              jpeg_sizes_per_zoom[mip][i],
+                                              buffer, width, 0, height,
+                                              TJPF_RGBA, TJFLAG_FASTDCT) < 0) {
+                                free(buffer);
+                                continue;
+                            }
+                            
+                            chunks[i].data = buffer;
+                            chunks[i].width = width;
+                            chunks[i].height = height;
+                            chunks[i].stride = width * 4;
+                            chunks[i].channels = 4;
+                            chunks[i].from_pool = 0;
+                            decoded++;
+                        }
+                        
+                        if (!is_persistent) {
+                            tjDestroy(tjh);
+                        }
+                    }
+#endif
+                    
+                    /* If we decoded at least some chunks, compose the mipmap */
+                    if (decoded > 0) {
+                        mip_image.width = mip_size;
+                        mip_image.height = mip_size;
+                        mip_image.stride = mip_size * 4;
+                        mip_image.channels = 4;
+                        mip_image.data = (uint8_t*)malloc(mip_size * mip_size * 4);
+                        
+                        if (mip_image.data) {
+                            /* Fill and compose */
+                            aodds_fill_and_compose(chunks, chunks_per_side, &mip_image,
+                                                  missing_r, missing_g, missing_b);
+                            mip_built_from_native = 1;
+                        }
+                    }
+                    
+                    /* Free chunk images */
+                    for (int32_t i = 0; i < chunk_count; i++) {
+                        if (chunks[i].data) {
+                            if (chunks[i].from_pool && pool) {
+                                aodecode_release_buffer(pool, chunks[i].data);
+                            } else {
+                                free(chunks[i].data);
+                            }
+                        }
+                    }
+                    free(chunks);
+                }
+            }
+        }
+        
+        /* Fallback: If native build failed, use reduce_half from previous mipmap */
+        if (!mip_built_from_native && prev_mipmap.data && mip > 0) {
+            mip_image.width = mip_size;
+            mip_image.height = mip_size;
+            mip_image.stride = mip_size * 4;
+            mip_image.channels = 4;
+            mip_image.data = (uint8_t*)malloc(mip_size * mip_size * 4);
+            
+            if (mip_image.data) {
+                aodds_reduce_half(&prev_mipmap, &mip_image);
+                mip_built_from_native = 0;  /* Mark as fallback-built */
+            }
+        }
+        
+        /* If we have a mipmap image, compress it */
+        if (mip_image.data) {
+            uint32_t compressed_size = aodds_compress(&mip_image, format, output + offset);
+            offset += compressed_size;
+            
+            /* Free previous mipmap and store current for next iteration's fallback */
+            if (prev_mipmap_allocated && prev_mipmap.data) {
+                free(prev_mipmap.data);
+            }
+            prev_mipmap = mip_image;
+            prev_mipmap_allocated = 1;
+        } else if (mip == 0) {
+            /* Failed to build mipmap 0 - fatal error */
+            return 0;
+        }
+        /* If mip > 0 and no image, just continue (mipmap will be missing) */
+    }
+    
+    /* Final cleanup */
+    if (prev_mipmap_allocated && prev_mipmap.data) {
+        free(prev_mipmap.data);
+    }
+    
+    *bytes_written = offset;
+    return 1;
 }
 
 /*============================================================================

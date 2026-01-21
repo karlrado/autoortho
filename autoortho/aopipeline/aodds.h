@@ -450,6 +450,51 @@ AODDS_API int32_t aodds_build_mipmap_chain(
 );
 
 /**
+ * Build ALL mipmaps from native zoom level chunks.
+ * 
+ * QUALITY OPTIMIZATION:
+ * Builds each mipmap from its native zoom level's JPEG chunks:
+ *   - Mipmap 0: ZL16 chunks (256 chunks for 4096x4096)
+ *   - Mipmap 1: ZL15 chunks (64 chunks for 2048x2048)
+ *   - Mipmap 2: ZL14 chunks (16 chunks for 1024x1024)
+ *   - Mipmap 3: ZL13 chunks (4 chunks for 512x512)
+ *   - Mipmap 4: ZL12 chunks (1 chunk for 256x256)
+ * 
+ * FALLBACK:
+ * If a zoom level has no chunks, falls back to reduce_half from the
+ * previous mipmap level. This maintains quality while handling failures.
+ * 
+ * @param jpeg_data_per_zoom    Array of JPEG data arrays [zoom_count][chunk_count]
+ * @param jpeg_sizes_per_zoom   Array of size arrays [zoom_count][chunk_count]
+ * @param chunk_counts_per_zoom Array of chunk counts per zoom [256, 64, 16, 4, 1]
+ * @param zoom_count            Number of zoom levels provided
+ * @param format                Output compression format (BC1 or BC3)
+ * @param missing_r/g/b         Fill color for missing chunks
+ * @param output                Pre-allocated output buffer
+ * @param output_size           Output buffer size
+ * @param bytes_written         Actual bytes written (output)
+ * @param pool                  Optional buffer pool (may be NULL)
+ * 
+ * @return 1 on success, 0 on failure
+ * 
+ * Thread Safety: Thread-safe, can be called from multiple threads.
+ */
+AODDS_API int32_t aodds_build_all_mipmaps_native(
+    const uint8_t*** jpeg_data_per_zoom,
+    const uint32_t** jpeg_sizes_per_zoom,
+    const int32_t* chunk_counts_per_zoom,
+    int32_t zoom_count,
+    dds_format_t format,
+    uint8_t missing_r,
+    uint8_t missing_g,
+    uint8_t missing_b,
+    uint8_t* output,
+    uint32_t output_size,
+    uint32_t* bytes_written,
+    aodecode_pool_t* pool
+);
+
+/**
  * Build DDS from pre-read JPEG data and write directly to file.
  * 
  * PERFORMANCE OPTIMIZATION for predictive DDS:

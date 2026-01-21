@@ -5838,15 +5838,33 @@ class Tile(object):
             
             # Open bundle and read chunks - use context manager to release file immediately
             # Critical: On Windows, mmap holds file open and blocks consolidation updates
-            with AoBundle2.Bundle2Python(bundle_path) as bundle:
-                # Check if bundle has this zoom level
-                if not bundle.has_zoom(zoom):
-                    log.debug(f"Bundle missing zoom {zoom} for {self.id}")
+            max_attempts = 3
+            retry_delay = 0.2
+            jpeg_datas = None
+            last_error = None
+            for attempt in range(max_attempts):
+                try:
+                    with AoBundle2.Bundle2Python(bundle_path) as bundle:
+                        # Check if bundle has this zoom level
+                        if not bundle.has_zoom(zoom):
+                            log.debug(f"Bundle missing zoom {zoom} for {self.id}")
+                            return False
+                        
+                        # Get all chunk data from bundle (returns copies, safe after close)
+                        jpeg_datas = bundle.get_all_chunks(zoom)
+                    # Bundle is now closed - file handle released
+                    break
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_attempts - 1:
+                        time.sleep(retry_delay * (attempt + 1))
+                        continue
+                    log.warning(f"Failed to load bundle for {self.id} after {max_attempts} attempts: {e}")
                     return False
-                
-                # Get all chunk data from bundle (returns copies, safe after close)
-                jpeg_datas = bundle.get_all_chunks(zoom)
-            # Bundle is now closed - file handle released
+
+            if jpeg_datas is None:
+                log.debug(f"Bundle read returned no data for {self.id}: {last_error}")
+                return False
             
             expected_count = width * height
             
@@ -9149,11 +9167,16 @@ class Tile(object):
         self._schedule_immediate_consolidation(jpeg_datas, zoom)
         
         # ═══════════════════════════════════════════════════════════════════════
-        # BUILD MIPMAP CHAIN WITH NATIVE CODE
+        # BUILD MIPMAPS WITH NATIVE CHUNKS (QUALITY OPTIMIZED)
         # ═══════════════════════════════════════════════════════════════════════
-        # Use build_mipmap_chain to generate the requested mipmap AND all smaller
-        # mipmaps down to 4×4. This matches Python gen_mipmaps() behavior and
-        # prevents NULL buffer warnings for smaller mipmaps.
+        # QUALITY OPTIMIZATION: Build each mipmap from its native zoom level:
+        #   - Mipmap N: ZL(max_zoom - N) chunks
+        #   - Mipmap N+1: ZL(max_zoom - N - 1) chunks
+        #   - etc.
+        # This uses map provider's properly-filtered lower zoom tiles instead
+        # of deriving them via reduce_half, which produces better quality.
+        #
+        # FALLBACK: If native chunks unavailable, reduce_half is used in C code.
         
         try:
             native_build_start = time.monotonic()
@@ -9170,8 +9193,36 @@ class Tile(object):
             # smallest_mm is the 4×4 mipmap level
             max_mipmaps = self.dds.smallest_mm - mipmap + 1
             
-            # Try to use build_mipmap_chain if available
-            if hasattr(native_dds, 'build_mipmap_chain'):
+            # Try to use build_all_mipmaps_native if available (best quality)
+            # This builds each mipmap from its native zoom level chunks
+            if hasattr(native_dds, 'build_all_mipmaps_native'):
+                # Collect JPEG data for ALL mipmap levels from current to smallest
+                jpeg_datas_per_zoom = []
+                for mm in range(mipmap, self.dds.smallest_mm + 1):
+                    mm_zoom = self.max_zoom - mm
+                    if mm_zoom < self.min_zoom:
+                        # No more zoom levels available
+                        jpeg_datas_per_zoom.append([])
+                        continue
+                    
+                    if mm == mipmap:
+                        # We already collected the first mipmap's chunks above
+                        jpeg_datas_per_zoom.append(jpeg_datas)
+                    else:
+                        # Collect chunks for this zoom level
+                        mm_jpeg_datas = self._collect_chunks_for_zoom(mm_zoom)
+                        jpeg_datas_per_zoom.append(mm_jpeg_datas)
+                        # Schedule consolidation for this zoom level too
+                        if mm_jpeg_datas and any(d for d in mm_jpeg_datas):
+                            self._schedule_immediate_consolidation(mm_jpeg_datas, mm_zoom)
+                
+                result = native_dds.build_all_mipmaps_native(
+                    jpeg_datas_per_zoom,
+                    format=dxt_format,
+                    missing_color=missing_color
+                )
+            elif hasattr(native_dds, 'build_mipmap_chain'):
+                # Fallback to build_mipmap_chain (uses reduce_half for smaller mipmaps)
                 result = native_dds.build_mipmap_chain(
                     jpeg_datas,
                     format=dxt_format,
@@ -9250,6 +9301,58 @@ class Tile(object):
             log.debug(f"_try_native_mipmap_build: Exception for mipmap {mipmap}: {e}")
             bump('native_mipmap_exception')
             return False
+
+    def _collect_chunks_for_zoom(self, zoom: int) -> list:
+        """
+        Collect JPEG data for all chunks at a given zoom level.
+        
+        This is a fast collection method that:
+        1. Checks if chunks are already in memory
+        2. Falls back to disk cache for missing chunks
+        3. Does NOT trigger downloads (for speed)
+        
+        Used by build_all_mipmaps_native to collect chunks at multiple zoom levels.
+        
+        Args:
+            zoom: Zoom level to collect chunks for
+            
+        Returns:
+            List of JPEG bytes (None for missing chunks)
+        """
+        # Ensure chunks exist for this zoom level
+        self._wait_for_pending_consolidation_if_needed()
+        self._create_chunks(zoom)
+        chunks = self.chunks.get(zoom, [])
+        
+        if not chunks:
+            return []
+        
+        total_chunks = len(chunks)
+        jpeg_datas = [None] * total_chunks
+        need_cache_read = []
+        
+        # Phase 1: Collect memory-resident chunks (instant)
+        for i, chunk in enumerate(chunks):
+            chunk_data = chunk.data
+            if chunk.ready.is_set() and chunk_data:
+                jpeg_datas[i] = chunk_data
+            else:
+                need_cache_read.append(i)
+        
+        # Phase 2: Batch cache read for missing chunks
+        if need_cache_read:
+            cache_paths = [chunks[i].cache_path for i in need_cache_read]
+            cached_data = _batch_read_cache_files(cache_paths)
+            
+            if cached_data:
+                for i in need_cache_read:
+                    chunk = chunks[i]
+                    if chunk.cache_path in cached_data:
+                        data = cached_data[chunk.cache_path]
+                        chunk.set_cached_data(data)
+                        jpeg_datas[i] = data
+        
+        return jpeg_datas
 
     def _collect_row_chunk_jpegs(
         self,
