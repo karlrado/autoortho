@@ -84,12 +84,44 @@ def _load_library() -> CDLL:
             f"Please build the aopipeline library."
         )
     
-    _lib = CDLL(str(lib_path))
-    _lib_path = lib_path
-    
-    _setup_signatures(_lib)
-    
-    return _lib
+    try:
+        # Windows: Add DLL directory to search path (Python 3.8+)
+        if sys.platform == 'win32':
+            if hasattr(os, 'add_dll_directory'):
+                os.add_dll_directory(str(lib_dir))
+        
+        _lib = CDLL(str(lib_path))
+        _lib_path = lib_path
+        
+        _setup_signatures(_lib)
+        
+        return _lib
+        
+    except OSError as e:
+        error_str = str(e)
+        
+        # Provide platform-specific help
+        if sys.platform == 'linux' and 'libgomp' in error_str:
+            raise ImportError(
+                f"OpenMP runtime library not found.\n"
+                f"Install with:\n"
+                f"  Ubuntu/Debian: sudo apt install libgomp1\n"
+                f"  Fedora/RHEL:   sudo dnf install libgomp\n"
+                f"  Arch Linux:    sudo pacman -S gcc-libs\n"
+                f"Original error: {e}"
+            ) from e
+        elif sys.platform == 'win32':
+            raise ImportError(
+                f"Failed to load native library. Ensure all DLLs are present:\n"
+                f"  - aopipeline.dll\n"
+                f"  - libgomp-1.dll\n"
+                f"  - libturbojpeg.dll\n"
+                f"  - libgcc_s_seh-1.dll\n"
+                f"  - libwinpthread-1.dll\n"
+                f"Original error: {e}"
+            ) from e
+        else:
+            raise ImportError(f"Failed to load native library: {e}") from e
 
 
 def _setup_signatures(lib: CDLL):

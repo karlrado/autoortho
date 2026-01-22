@@ -1098,6 +1098,13 @@ def _load_library():
     try:
         lib_path = _get_lib_path()
         log.debug(f"Loading aodds native library from: {lib_path}")
+        
+        # Windows: Add DLL directory to search path (Python 3.8+)
+        if sys.platform == 'win32':
+            lib_dir = os.path.dirname(lib_path)
+            if hasattr(os, 'add_dll_directory'):
+                os.add_dll_directory(lib_dir)
+        
         _aodds = CDLL(lib_path)
         
         # Configure function signatures
@@ -1111,6 +1118,35 @@ def _load_library():
         log.info(f"Loaded native DDS library: {version.decode()}")
         
         return _aodds
+        
+    except OSError as e:
+        error_str = str(e)
+        
+        # Provide platform-specific help
+        if sys.platform == 'linux' and 'libgomp' in error_str:
+            _load_error = ImportError(
+                f"OpenMP runtime library not found.\n"
+                f"Install with:\n"
+                f"  Ubuntu/Debian: sudo apt install libgomp1\n"
+                f"  Fedora/RHEL:   sudo dnf install libgomp\n"
+                f"  Arch Linux:    sudo pacman -S gcc-libs\n"
+                f"Original error: {e}"
+            )
+        elif sys.platform == 'win32':
+            _load_error = ImportError(
+                f"Failed to load native library. Ensure all DLLs are present:\n"
+                f"  - aopipeline.dll\n"
+                f"  - libgomp-1.dll\n"
+                f"  - libturbojpeg.dll\n"
+                f"  - libgcc_s_seh-1.dll\n"
+                f"  - libwinpthread-1.dll\n"
+                f"Original error: {e}"
+            )
+        else:
+            _load_error = ImportError(f"Failed to load aodds native library: {e}")
+        
+        log.warning(f"Native DDS library not available: {e}")
+        raise _load_error
         
     except Exception as e:
         _load_error = ImportError(f"Failed to load aodds native library: {e}")
