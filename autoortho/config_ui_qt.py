@@ -2570,57 +2570,41 @@ class ConfigUI(QMainWindow):
         buffer_pool_layout.addWidget(self.buffer_pool_value_label)
         autoortho_layout.addLayout(buffer_pool_layout)
         
-        # --- Streaming Builder Settings ---
-        streaming_header = QLabel("Streaming Builder")
-        streaming_header.setStyleSheet("font-weight: bold; margin-top: 10px;")
-        autoortho_layout.addWidget(streaming_header)
-        
-        # Streaming builder enabled checkbox
-        self.streaming_builder_enabled_check = QCheckBox("Enable streaming builder")
-        self.streaming_builder_enabled_check.setChecked(
-            getattr(self.cfg.autoortho, 'streaming_builder_enabled', True)
+        # --- Min Chunk Ratio (quality vs speed tradeoff) ---
+        min_chunk_layout = QHBoxLayout()
+        self.min_chunk_ratio_label = QLabel("Min chunk ratio:")
+        self.min_chunk_ratio_label.setToolTip(
+            "Minimum ratio of chunks that must be available before\n"
+            "falling back to lower zoom levels or missing color.\n\n"
+            "Lower values = faster (allows more missing chunks)\n"
+            "Higher values = better quality (waits for more data)\n\n"
+            "• 80% - Fast: Allows up to 20% missing chunks\n"
+            "• 90% - Balanced (default): Up to 10% missing\n"
+            "• 95% - Quality: Only 5% missing allowed\n\n"
+            "Missing chunks are filled with fallback images\n"
+            "or the missing color if no fallback is available."
         )
-        self.streaming_builder_enabled_check.setObjectName('streaming_builder_enabled')
-        self.streaming_builder_enabled_check.setToolTip(
-            "Enable streaming builder for incremental DDS generation.\n"
-            "When enabled, chunks are processed as they arrive with\n"
-            "parallel decode at finalize for ~20% faster performance.\n"
-            "Also enables full fallback support for missing chunks.\n"
-            "Recommended: Enabled (default)"
-        )
-        autoortho_layout.addWidget(self.streaming_builder_enabled_check)
+        min_chunk_layout.addWidget(self.min_chunk_ratio_label)
         
-        # Note: Streaming builder pool size is now auto-calculated from
-        # prefetch_workers + live_concurrency (set earlier in this UI)
+        self.min_chunk_ratio_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.min_chunk_ratio_slider.setRange(50, 100)  # 50% to 100%
+        current_ratio = float(getattr(self.cfg.autoortho, 'live_aopipeline_min_chunk_ratio', 0.9))
+        current_ratio_pct = int(current_ratio * 100)
+        current_ratio_pct = max(50, min(100, current_ratio_pct))
+        self.min_chunk_ratio_slider.setValue(current_ratio_pct)
+        self.min_chunk_ratio_slider.setObjectName('live_aopipeline_min_chunk_ratio')
+        self.min_chunk_ratio_slider.setToolTip("Minimum chunk availability ratio (50-100%)")
+        
+        self.min_chunk_ratio_value_label = QLabel(f"{current_ratio_pct}%")
+        self.min_chunk_ratio_slider.valueChanged.connect(
+            lambda v: self.min_chunk_ratio_value_label.setText(f"{v}%")
+        )
+        min_chunk_layout.addWidget(self.min_chunk_ratio_slider)
+        min_chunk_layout.addWidget(self.min_chunk_ratio_value_label)
+        autoortho_layout.addLayout(min_chunk_layout)
         
         # Initialize pipeline control states
         self._update_pipeline_controls()
-        
-        autoortho_layout.addSpacing(10)
-        
-        # --- Tile Queue Settings ---
-        queue_header = QLabel("Tile Queue")
-        queue_header.setStyleSheet("font-weight: bold; margin-top: 10px;")
-        autoortho_layout.addWidget(queue_header)
-        
-        # Tile queue enabled checkbox
-        self.tile_queue_enabled_check = QCheckBox("Enable tile queue (bank-queue style)")
-        self.tile_queue_enabled_check.setChecked(
-            getattr(self.cfg.autoortho, 'tile_queue_enabled', True)
-        )
-        self.tile_queue_enabled_check.setObjectName('tile_queue_enabled')
-        self.tile_queue_enabled_check.setToolTip(
-            "When enabled, tiles wait for buffer pool slots using a\n"
-            "priority queue system.\n\n"
-            "Live tiles (X-Plane requests) are 'premium clients' and\n"
-            "are always served first, at the front of the queue.\n\n"
-            "Prefetch tiles wait in the back of the queue and only\n"
-            "get buffers when the system is idle.\n\n"
-            "This provides more consistent performance by ensuring\n"
-            "live tiles always have priority over background work.\n\n"
-            "Recommended: Enabled (default)"
-        )
-        autoortho_layout.addWidget(self.tile_queue_enabled_check)
         
         autoortho_layout.addSpacing(10)
         # ═══════════════════════════════════════════════════════════════════
@@ -3872,12 +3856,25 @@ class ConfigUI(QMainWindow):
         self.buffer_pool_label.setStyleSheet(enabled_style if buffer_pool_enabled else disabled_style)
         self.buffer_pool_value_label.setStyleSheet(enabled_style if buffer_pool_enabled else disabled_style)
         
+        # Min chunk ratio is also only relevant for native/hybrid modes
+        if hasattr(self, 'min_chunk_ratio_slider'):
+            self.min_chunk_ratio_slider.setEnabled(buffer_pool_enabled)
+            self.min_chunk_ratio_label.setEnabled(buffer_pool_enabled)
+            self.min_chunk_ratio_value_label.setEnabled(buffer_pool_enabled)
+            self.min_chunk_ratio_label.setStyleSheet(enabled_style if buffer_pool_enabled else disabled_style)
+            self.min_chunk_ratio_value_label.setStyleSheet(enabled_style if buffer_pool_enabled else disabled_style)
+        
         # Update tooltip to explain why disabled
         if not buffer_pool_enabled:
             self.buffer_pool_label.setToolTip(
                 "Buffer pool is only used in Native and Hybrid modes.\n"
                 "Select a different pipeline mode to configure this setting."
             )
+            if hasattr(self, 'min_chunk_ratio_label'):
+                self.min_chunk_ratio_label.setToolTip(
+                    "Min chunk ratio is only used in Native and Hybrid modes.\n"
+                    "Select a different pipeline mode to configure this setting."
+                )
 
     def _init_dynamic_zoom_manager(self):
         """Initialize the dynamic zoom manager from config."""
@@ -4937,14 +4934,7 @@ class ConfigUI(QMainWindow):
             # Native pipeline settings
             self.cfg.autoortho.pipeline_mode = self.pipeline_mode_combo.currentText()
             self.cfg.autoortho.buffer_pool_size = str(self.buffer_pool_slider.value())
-            
-            # Streaming builder settings
-            self.cfg.autoortho.streaming_builder_enabled = self.streaming_builder_enabled_check.isChecked()
-            # Note: streaming_builder_pool_size is now auto-calculated from
-            # background_builder_workers + live_builder_concurrency
-            
-            # Tile queue settings
-            self.cfg.autoortho.tile_queue_enabled = self.tile_queue_enabled_check.isChecked()
+            self.cfg.autoortho.live_aopipeline_min_chunk_ratio = self.min_chunk_ratio_slider.value() / 100.0
             
             self.cfg.autoortho.fetch_threads = str(
                 self.fetch_threads_spinbox.value()

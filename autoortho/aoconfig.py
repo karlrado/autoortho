@@ -142,7 +142,7 @@ dynamic_zoom_steps = []
 # A chunk download will end when EITHER limit is reached, whichever comes first.
 # This prevents a single slow chunk from consuming the entire tile budget.
 # Recommended: 2.0 (fast networks), 5.0 (normal), 10.0 (slow networks)
-maxwait = 5.0
+maxwait = 2.0
 # Temporarily increase maxwait to an effectively infinite value while X-Plane is
 # loading scenery data prior to starting the flight.  This allows more downloads to
 # succeed and reduce the use of backup chunks and missing chunks at the start of flight.
@@ -161,7 +161,7 @@ use_time_budget = True
 # Higher = better quality, but longer initial load times
 # Recommended: 15.0 (very fast), 30.0 (balanced), 60.0 (quality)
 # Note: Higher values (120+) can cause multi-minute stalls when cache eviction occurs
-tile_time_budget = 30.0
+tile_time_budget = 180.0
 # Fallback level when chunks fail to download in time:
 # none = Skip all fallbacks (fastest, may have missing tiles)
 # cache = Use disk cache and already-built mipmaps, no network (balanced)
