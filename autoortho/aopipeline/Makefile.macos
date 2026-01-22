@@ -12,23 +12,26 @@ TJ_INC      ?= /opt/homebrew/opt/jpeg-turbo/include
 TJ_LIB      := ../aoimage/lib/maclibturbojpeg.a
 ISPC_LIB    := ../lib/macos/libispc_texcomp.dylib
 
+# Static libraries for bundling (no external dependencies)
+OMP_STATIC  := lib/macos/maclibomp.a
+
 CC          := clang
 ARCH        := arm64
 MIN_MACOS   := 11.0
 
-# OpenMP support via Homebrew libomp
+# OpenMP support via Homebrew libomp (for headers only at compile time)
 OMP_INC     ?= /opt/homebrew/opt/libomp/include
-OMP_LIB     ?= /opt/homebrew/opt/libomp/lib
 
 CFLAGS      := -O3 -Wall -fPIC -fvisibility=hidden -fdiagnostics-color \
                -arch $(ARCH) -mmacosx-version-min=$(MIN_MACOS) \
                -I$(TJ_INC) -I$(OMP_INC) -I../aoimage \
                -Xpreprocessor -fopenmp -pthread
 
+# Static linking: no -L/-lomp, just include the .a files directly
 LDFLAGS     := -dynamiclib -undefined dynamic_lookup \
                -arch $(ARCH) -mmacosx-version-min=$(MIN_MACOS) \
                -Wl,-install_name,@rpath/libaopipeline.dylib \
-               -L$(OMP_LIB) -lomp
+               -Wl,-headerpad_max_install_names
 
 # Source files (no HTTP - uses Python requests instead)
 SOURCES     := aocache.c aodecode.c aodds.c aobundle.c aobundle2.c aopipeline.c
@@ -72,10 +75,11 @@ aobundle2.o: aobundle2.c aobundle2.h aodds.h internal.h
 aopipeline.o: aopipeline.c aopipeline.h aocache.h aodecode.h aodds.h aobundle.h aobundle2.h internal.h
 	$(CC) $(CFLAGS) -c aopipeline.c -o $@
 
-# Full library with static turbojpeg
-libaopipeline.dylib: $(OBJECTS) $(TJ_LIB)
+# Full library with static turbojpeg and static libomp (no external dependencies)
+libaopipeline.dylib: $(OBJECTS) $(TJ_LIB) $(OMP_STATIC)
 	@test -f "$(TJ_LIB)" || { echo "ERROR: missing $(TJ_LIB)"; exit 1; }
-	$(CC) -o $@ $(LDFLAGS) $(OBJECTS) $(TJ_LIB)
+	@test -f "$(OMP_STATIC)" || { echo "ERROR: missing $(OMP_STATIC). Copy with: cp /opt/homebrew/opt/libomp/lib/libomp.a lib/macos/maclibomp.a"; exit 1; }
+	$(CC) -o $@ $(LDFLAGS) $(OBJECTS) $(TJ_LIB) $(OMP_STATIC)
 
 clean:
 	rm -f $(OBJECTS) libaopipeline.dylib libaocache.dylib
