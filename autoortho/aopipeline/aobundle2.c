@@ -99,20 +99,24 @@ static uint32_t calc_header_checksum(const aobundle2_header_t* hdr) {
 static int32_t preallocate_file(FILE* f, size_t size) {
     if (!f || size == 0) return 0;
     
-#ifdef AOPIPELINE_LINUX
+    int fd;
+    (void)fd;  /* Suppress unused warning on some platforms */
+    
+#if defined(AOPIPELINE_LINUX)
     /* Linux: posix_fallocate is most efficient - actually allocates blocks */
-    int fd = fileno(f);
+    fd = fileno(f);
     if (fd >= 0) {
         if (posix_fallocate(fd, 0, (off_t)size) == 0) {
             return 1;
         }
         /* Fall through to ftruncate on failure */
+        if (ftruncate(fd, (off_t)size) == 0) {
+            return 1;
+        }
     }
-#endif
-    
-#ifdef AOPIPELINE_WINDOWS
+#elif defined(AOPIPELINE_WINDOWS)
     /* Windows: SetEndOfFile after positioning */
-    int fd = _fileno(f);
+    fd = _fileno(f);
     if (fd >= 0) {
         HANDLE hFile = (HANDLE)_get_osfhandle(fd);
         if (hFile != INVALID_HANDLE_VALUE) {
@@ -129,7 +133,7 @@ static int32_t preallocate_file(FILE* f, size_t size) {
     }
 #else
     /* POSIX fallback (macOS, others): ftruncate */
-    int fd = fileno(f);
+    fd = fileno(f);
     if (fd >= 0) {
         if (ftruncate(fd, (off_t)size) == 0) {
             return 1;
