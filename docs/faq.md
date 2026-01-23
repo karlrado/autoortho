@@ -162,6 +162,37 @@ For detailed explanations, see the [Performance Tuning Guide](performance.md).
 
 ---
 
+### What is the Native Pipeline and do I need it?
+
+The **native pipeline** (`aopipeline`) is an optional high-performance component that dramatically speeds up DDS texture building (10-20x faster). It's written in C and uses true multi-threading via OpenMP.
+
+**Do you need it?** 
+- If it's available for your platform (included in releases), it's used automatically
+- If not available, AutoOrtho falls back to the Python implementation
+- All features work either way; native is just faster
+
+**Benefit:** Significantly fewer stutters, especially during initial scenery load or when flying fast/low.
+
+See the [Native Pipeline Architecture](performance.md#native-pipeline-architecture) for technical details.
+
+---
+
+### Why are Apple Maps downloads slower than other sources?
+
+**Apple Maps always uses the Python HTTP client**, not the native libcurl client. This is intentional because Apple Maps requires:
+
+1. **Dynamic authentication**: Tokens must be fetched via DuckDuckGo proxy
+2. **Token rotation**: On 403/410 errors, the token must be refreshed
+3. **Special headers**: Requires `Authorization: Bearer` headers
+
+The Python path handles all this authentication flow correctly. Other imagery sources (BI, EOX, ARC, NAIP, USGS, FIREFLY, YNDX, GO2) use the faster native HTTP client.
+
+**Impact:** Apple Maps initial loading may be 2-3x slower than other sources. Once cached, performance is identical.
+
+**Workaround:** Consider using an alternative imagery source if download speed is critical.
+
+---
+
 ### I changed the settings but nothing seems different
 
 1. **Restart AutoOrtho:** Some settings require a restart to take effect

@@ -44,8 +44,13 @@ jobs:
    
     - name: Setup 
       run: |
-        sudo apt-get update && sudo apt-get install -y make ca-certificates
+        sudo apt-get update && sudo apt-get install -y make ca-certificates libomp-dev libcurl4-openssl-dev
         sudo update-ca-certificates
+    
+    - name: Build native pipeline (aopipeline)
+      run: |
+        cd autoortho/aopipeline
+        make -f Makefile.linux phase3 || echo "Native pipeline build skipped (optional)"
 
     - name: Optionally set internal version separately
       if: ${{ inputs.internalver != '' }}
@@ -89,8 +94,14 @@ jobs:
 
     - name: Setup
       run: |
+        brew install libomp jpeg-turbo curl || true
         python3 -m pip install -U -r requirements.txt
         python3 -m pip install -U -r requirements-build.txt
+
+    - name: Build native pipeline (aopipeline)
+      run: |
+        cd autoortho/aopipeline
+        make -f Makefile.macos phase3 || echo "Native pipeline build skipped (optional)"
 
     - name: Optionally set internal version separately
       if: ${{ inputs.internalver != '' }}
@@ -138,6 +149,10 @@ jobs:
           #choco --yes install winfsp
           python -m pip install -U -r requirements.txt
           python -m pip install -U -r requirements-build.txt
+
+    # Note: Native pipeline for Windows requires MinGW cross-compile or MSVC
+    # The pre-built libraries in autoortho/aopipeline/ are included if available
+    # For now, skip native build on Windows CI (can be added with proper toolchain)
 
     - name: Optionally set internal version separately
       if: ${{ inputs.internalver != '' }}

@@ -135,6 +135,34 @@ autoortho.pyz:
 %.txt: %.in
 	pip-compile $<
 
+# =============================================================================
+# Native Pipeline Build (aopipeline)
+# =============================================================================
+# These targets build the native performance library that bypasses Python's GIL.
+# The library provides parallel cache I/O, JPEG decoding, and DDS building.
+
+aopipeline_linux:
+	cd autoortho/aopipeline && $(MAKE) -f Makefile.linux
+
+aopipeline_macos:
+	cd autoortho/aopipeline && $(MAKE) -f Makefile.macos
+
+aopipeline_windows:
+	cd autoortho/aopipeline && $(MAKE) -f Makefile.mingw64
+
+aopipeline_clean:
+	cd autoortho/aopipeline && rm -f *.o *.so *.dylib *.dll 2>/dev/null || true
+
+# Convenience alias that detects platform
+aopipeline:
+ifeq ($(shell uname -s),Darwin)
+	$(MAKE) aopipeline_macos
+else ifeq ($(shell uname -s),Linux)
+	$(MAKE) aopipeline_linux
+else
+	$(MAKE) aopipeline_windows
+endif
+
 serve_docs:
 	docker run -p 8000:8000 -v `pwd`:/docs squidfunk/mkdocs-material
 
