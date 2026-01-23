@@ -223,11 +223,49 @@ def fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
             allow_other=True,
         ))
     elif system_type == 'darwin':
+        # Calculate daemon_timeout based on max possible tile_time_budget + 60s buffer.
+        # This prevents macFUSE from killing the worker when operations take longer
+        # than the default 60 second timeout.
+        #
+        # Max tile_time_budget calculation (matches _calculate_build_timeout):
+        # - Base: tile_time_budget (default 180s)
+        # - Startup multiplier: 10x during initial loading (capped at 1800s)
+        # - Fallback: + fallback_timeout if enabled (default 30s)
+        # - Buffer: + 15s for DDS operations
+        # - Safety: + 60s additional buffer for daemon_timeout
+        tile_budget = getattr(CFG.autoortho, 'tile_time_budget', 180.0)
+        if isinstance(tile_budget, str):
+            try:
+                tile_budget = float(tile_budget)
+            except ValueError:
+                tile_budget = 180.0
+        
+        # Use max startup budget (10x multiplier, capped at 1800s)
+        max_startup_budget = min(tile_budget * 10.0, 1800.0)
+        
+        # Add fallback timeout if enabled
+        fallback_extends = getattr(CFG.autoortho, 'fallback_extends_budget', False)
+        if isinstance(fallback_extends, str):
+            fallback_extends = fallback_extends.lower().strip() in ('true', '1', 'yes', 'on')
+        fallback_timeout = 0
+        if fallback_extends:
+            fallback_timeout = getattr(CFG.autoortho, 'fallback_timeout', 30)
+            if isinstance(fallback_timeout, str):
+                try:
+                    fallback_timeout = float(fallback_timeout)
+                except ValueError:
+                    fallback_timeout = 30
+        
+        # daemon_timeout = max_build_timeout + 60s safety buffer
+        # max_build_timeout = max_startup_budget + fallback_timeout + 15s buffer
+        daemon_timeout = int(max_startup_budget + fallback_timeout + 15 + 60)
+        
         options.update(dict(
             nothreads=nothreads,
             foreground=True,
             allow_other=True,
             volname=mount_name,
+            daemon_timeout=daemon_timeout,
         ))
 
     elif system_type == 'windows':
