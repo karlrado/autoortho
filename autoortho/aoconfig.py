@@ -332,7 +332,7 @@ noclean = False
 
 [fuse]
 # Enable or disable multi-threading when using FUSE
-threading = {False if system_type == "darwin" else True}
+threading = True
 # NOTE: build_timeout (FUSE lock timeout) is calculated dynamically based on
 # tile_time_budget. Formula: tile_time_budget + fallback_timeout (if enabled) + 15s.
 # This ensures the lock timeout always exceeds the maximum possible tile build time.
