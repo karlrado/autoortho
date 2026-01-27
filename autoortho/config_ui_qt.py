@@ -5430,6 +5430,51 @@ class ConfigUI(QMainWindow):
             pass
         self.uninstall_workers.clear()
 
+        # Stop update check worker if running
+        try:
+            if hasattr(self, '_update_worker') and self._update_worker:
+                self._update_worker.terminate()
+                self._update_worker.wait(2000)  # 2 second timeout
+                self._update_worker = None
+        except Exception:
+            pass
+
+        # Stop SimBrief fetch worker if running
+        try:
+            if hasattr(self, 'simbrief_fetch_worker') and self.simbrief_fetch_worker:
+                self.simbrief_fetch_worker.terminate()
+                self.simbrief_fetch_worker.wait(2000)
+                self.simbrief_fetch_worker = None
+        except Exception:
+            pass
+
+        # Stop cache thread if running
+        try:
+            if hasattr(self, 'cache_thread') and self.cache_thread:
+                self.cache_thread.quit()
+                self.cache_thread.wait(2000)
+                self.cache_thread = None
+        except Exception:
+            pass
+
+        # Stop any AddSeasons workers
+        try:
+            if hasattr(self, 'add_seasons_worker') and self.add_seasons_worker:
+                self.add_seasons_worker.terminate()
+                self.add_seasons_worker.wait(2000)
+                self.add_seasons_worker = None
+        except Exception:
+            pass
+
+        # Stop any RestoreDefaultDsfs workers
+        try:
+            if hasattr(self, 'restore_dsfs_worker') and self.restore_dsfs_worker:
+                self.restore_dsfs_worker.terminate()
+                self.restore_dsfs_worker.wait(2000)
+                self.restore_dsfs_worker = None
+        except Exception:
+            pass
+
         # Clean up background mount processes
         if hasattr(self, 'unmount_sceneries'):
             try:
