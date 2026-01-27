@@ -11,12 +11,16 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+
+    - uses: actions/setup-python@v3
+      with:
+        python-version: '3.14'
    
     - name: Setup 
       run: |
           sudo apt-get update && sudo apt-get install -y python3-tk xvfb
-          python3 -m pip install -U pytest  
-          python3 -m pip install -U -r requirements.txt
+          python -m pip install -U pytest  
+          python -m pip install -U -r requirements.txt
 
     - name: Test
       run: |
