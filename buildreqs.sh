@@ -16,7 +16,7 @@ apt-get install -y make curl patchelf python3-pip python3-venv python3-tk zlib1g
     libgl1 libegl1
 
 if python3 -c 'import sys; exit(0) if sys.version_info.minor < 12 else exit(1)'; then
-    echo "Installing Python 3.12 with pyenv..."
+    echo "Installing Python 3.14 with pyenv..."
     apt-get install -y git libssl-dev \
         libbz2-dev libreadline-dev libsqlite3-dev \
         libncursesw5-dev tk-dev libxml2-dev \
@@ -25,8 +25,8 @@ if python3 -c 'import sys; exit(0) if sys.version_info.minor < 12 else exit(1)';
     export PYENV_ROOT="$HOME/.pyenv"
     [[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
     eval "$(pyenv init - bash)"
-    pyenv install 3.12.12
-    pyenv global 3.12.12
+    pyenv install 3.14.2
+    pyenv global 3.14.2
 fi
 echo "Using Python version: "
 python3 --version

@@ -119,7 +119,9 @@ def test_get_bytes_mip_span(tmpdir):
         data1 = h.read(8)
 
     assert data0 != b'\x00'*8
-    assert data1 == b'\x00'*8
+    # With aopipeline optimization, when mipmap 0 is built, all mipmaps are
+    # populated together for performance. So mipmap 1 will also have data.
+    assert data1 != b'\x00'*8
 
 
 def test_get_bytes_row_span(tmpdir):

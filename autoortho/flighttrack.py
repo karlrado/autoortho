@@ -32,6 +32,9 @@ except ImportError:
 
 RUNNING=True
 
+# Shutdown flag for the Flask-SocketIO server
+_server_shutdown_requested = threading.Event()
+
 # Determine template folder for frozen vs dev mode
 if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
     # PyInstaller: templates are in _MEIPASS/autoortho/templates
@@ -68,7 +71,7 @@ class FlightTracker(object):
     def start(self):
         self.running = True
         self.start_time = time.time()
-        self.t = threading.Thread(target=self._udp_listen)
+        self.t = threading.Thread(target=self._udp_listen, daemon=True)
         self.t.start()
 
     def get_info(self):
@@ -159,9 +162,16 @@ class FlightTracker(object):
 
     def stop(self):
         log.info("FlightTracker shutdown requested.")
-        self.running=False
-        if self.t:
-            self.t.join()
+        self.running = False
+        # Close socket to unblock any pending recv operations
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+        if self.t and self.t.is_alive():
+            self.t.join(timeout=5.0)
+            if self.t.is_alive():
+                log.warning("FlightTracker UDP thread did not exit within timeout")
         log.info("FlightTracker exiting.")
 
 ft = FlightTracker()
@@ -225,10 +235,31 @@ def stats():
 def metrics():
     return STATS
 
+def shutdown_server():
+    """
+    Shutdown the Flask-SocketIO server gracefully.
+    
+    Call this function before ft.stop() to ensure clean exit.
+    """
+    global _server_shutdown_requested
+    log.info("FlightTracker server shutdown requested.")
+    _server_shutdown_requested.set()
+    try:
+        # socketio.stop() signals the server to stop accepting new connections
+        # and finish processing existing ones
+        socketio.stop()
+    except Exception as e:
+        log.debug(f"socketio.stop() error (may be expected): {e}")
+
+
 def run():
     #app.run(host='0.0.0.0', port=CFG.flightdata.webui_port, debug=CFG.general.debug, threaded=True, use_reloader=False)
     log.info("Start flighttracker...")
-    socketio.run(app, host='0.0.0.0', port=int(CFG.flightdata.webui_port))
+    try:
+        socketio.run(app, host='0.0.0.0', port=int(CFG.flightdata.webui_port))
+    except Exception as e:
+        if not _server_shutdown_requested.is_set():
+            log.error(f"FlightTracker server error: {e}")
     log.info("Exiting flighttracker ...") 
 
 def main():

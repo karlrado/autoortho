@@ -10341,19 +10341,58 @@ class TileCacher(object):
 
 def shutdown():
     """Free network pools, worker threads and cached tiles to minimise RSS
-    just before interpreter exit. Safe to call multiple times."""
-
+    just before interpreter exit. Safe to call multiple times.
+    
+    Shutdown order:
+    1. Spatial prefetcher (stop new prefetch requests)
+    2. Predictive DDS (bundle consolidator, DDS builder, cache)
+    3. ChunkGetter (background download threads)
+    4. Cache writer executor
+    5. Terrain indices
+    6. TileCacher instances
+    7. Stats batcher
+    8. Process memory stats
+    """
     global chunk_getter
 
-    # 1. Stop background download threads
+    # 1. Stop spatial prefetcher first (stop new prefetch requests)
+    try:
+        stop_prefetcher()
+        log.debug("Spatial prefetcher stopped")
+    except Exception as _err:
+        log.debug(f"Prefetcher stop error: {_err}")
+
+    # 2. Stop predictive DDS (includes bundle consolidator, DDS builder)
+    try:
+        stop_predictive_dds()
+        log.debug("Predictive DDS stopped")
+    except Exception as _err:
+        log.debug(f"Predictive DDS stop error: {_err}")
+
+    # 3. Stop background download threads
     try:
         if chunk_getter is not None:
             chunk_getter.stop()
             chunk_getter = None
+            log.debug("ChunkGetter stopped")
     except Exception as _err:
         log.debug(f"ChunkGetter stop error: {_err}")
 
-    # 2. Iterate over every TileCacher instance still alive and flush
+    # 4. Shutdown cache writer executor
+    try:
+        shutdown_cache_writer()
+        log.debug("Cache writer shutdown")
+    except Exception as _err:
+        log.debug(f"Cache writer shutdown error: {_err}")
+
+    # 5. Clear terrain indices
+    try:
+        clear_terrain_indices()
+        log.debug("Terrain indices cleared")
+    except Exception as _err:
+        log.debug(f"Clear terrain indices error: {_err}")
+
+    # 6. Iterate over every TileCacher instance still alive and flush
     #    its caches.  We avoid importing autoortho_fuse to prevent cycles; instead
     #    we search the GC list.
     import gc
@@ -10368,12 +10407,15 @@ def shutdown():
             # Ignore any edge-case failures during shutdown
             pass
 
+    # 7. Stop stats batcher
     try:
         if stats_batcher:
             stats_batcher.stop()
+            log.debug("Stats batcher stopped")
     except Exception:
         pass
 
+    # 8. Clear process memory stats
     try:
         clear_process_memory_stat()
     except Exception:

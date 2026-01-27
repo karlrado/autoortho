@@ -648,7 +648,9 @@ class DatarefTracker(object):
             try:
                 self.sock.sendto(message, (UDP_IP, int(udp_port)))
             except Exception as e:
-                log.warning(f"Failed to send dataref request: {e}")
+                # Don't log warnings during shutdown - socket errors are expected
+                if not self._shutdown_flag.is_set():
+                    log.warning(f"Failed to send dataref request: {e}")
                 raise
 
     def _decode_packet(self, data):
