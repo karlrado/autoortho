@@ -35,6 +35,8 @@ else:
 autoortho_path = os.path.join(os.getcwd(), 'autoortho')
 lib_path = os.path.join(autoortho_path, 'lib', platform_name)
 aoimage_path = os.path.join(autoortho_path, 'aoimage')
+aopipeline_path = os.path.join(autoortho_path, 'aopipeline')
+aopipeline_lib_path = os.path.join(aopipeline_path, 'lib', platform_name)
 
 # =============================================================================
 # Binary files (DLLs, shared libraries, executables)
@@ -48,6 +50,18 @@ elif sys.platform == 'darwin':
     binaries.append((os.path.join(aoimage_path, 'aoimage.dylib'), 'autoortho/aoimage'))
 else:
     binaries.append((os.path.join(aoimage_path, 'aoimage.so'), 'autoortho/aoimage'))
+
+# AoPipeline library and dependencies
+if sys.platform == 'win32':
+    binaries.append((os.path.join(aopipeline_lib_path, 'aopipeline.dll'), 'autoortho/aopipeline/lib/windows'))
+    binaries.append((os.path.join(aopipeline_lib_path, 'libgcc_s_seh-1.dll'), 'autoortho/aopipeline/lib/windows'))
+    binaries.append((os.path.join(aopipeline_lib_path, 'libgomp-1.dll'), 'autoortho/aopipeline/lib/windows'))
+    binaries.append((os.path.join(aopipeline_lib_path, 'libturbojpeg.dll'), 'autoortho/aopipeline/lib/windows'))
+    binaries.append((os.path.join(aopipeline_lib_path, 'libwinpthread-1.dll'), 'autoortho/aopipeline/lib/windows'))
+elif sys.platform == 'darwin':
+    binaries.append((os.path.join(aopipeline_lib_path, 'libaopipeline.dylib'), 'autoortho/aopipeline/lib/macos'))
+else:
+    binaries.append((os.path.join(aopipeline_lib_path, 'libaopipeline.so'), 'autoortho/aopipeline/lib/linux'))
 
 # Platform-specific compression libraries and tools
 if sys.platform == 'win32':
@@ -159,6 +173,15 @@ hiddenimports = [
     # Flask-SocketIO async drivers (required for frozen apps)
     'engineio.async_drivers.threading',
     'socketio.async_drivers.threading',
+    # AoPipeline modules (lazy imports - PyInstaller won't detect automatically)
+    'autoortho.aopipeline',
+    'autoortho.aopipeline.AoCache',
+    'autoortho.aopipeline.AoDecode',
+    'autoortho.aopipeline.AoDDS',
+    'autoortho.aopipeline.AoBundle',
+    'autoortho.aopipeline.AoBundle2',
+    'autoortho.aopipeline.bundle_consolidator',
+    'autoortho.aopipeline.fallback_resolver',
 ]
 
 # Platform-specific hidden imports
