@@ -47,14 +47,27 @@ _lib_path = None
 
 def _get_lib_dir() -> Path:
     """Get the directory containing the native library."""
-    this_dir = Path(__file__).parent
-    
     if sys.platform == 'win32':
-        return this_dir / 'lib' / 'windows'
+        lib_subdir = 'windows'
     elif sys.platform == 'darwin':
-        return this_dir / 'lib' / 'macos'
+        lib_subdir = 'macos'
     else:
-        return this_dir / 'lib' / 'linux'
+        lib_subdir = 'linux'
+    
+    # Check if running as PyInstaller frozen executable
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        # PyInstaller: library is in _MEIPASS/autoortho/aopipeline/lib/<platform>/
+        lib_dir = Path(sys._MEIPASS) / 'autoortho' / 'aopipeline' / 'lib' / lib_subdir
+        if lib_dir.exists():
+            return lib_dir
+        # Fallback: check without autoortho prefix
+        lib_dir = Path(sys._MEIPASS) / 'aopipeline' / 'lib' / lib_subdir
+        if lib_dir.exists():
+            return lib_dir
+    
+    # Development mode: library is relative to this file
+    this_dir = Path(__file__).parent
+    return this_dir / 'lib' / lib_subdir
 
 
 def _get_lib_name() -> str:

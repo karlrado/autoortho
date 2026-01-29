@@ -34,7 +34,20 @@ log = logging.getLogger(__name__)
 # On Windows, add the DLL directory to PATH BEFORE importing modules
 # This ensures dependencies (libturbojpeg, libgomp, etc.) can be found
 if sys.platform == 'win32':
-    _lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib', 'windows')
+    _lib_dir = None
+    
+    # Check if running as PyInstaller frozen executable
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        # PyInstaller: library is in _MEIPASS/autoortho/aopipeline/lib/windows/
+        _lib_dir = os.path.join(sys._MEIPASS, 'autoortho', 'aopipeline', 'lib', 'windows')
+        if not os.path.isdir(_lib_dir):
+            # Fallback: check without autoortho prefix
+            _lib_dir = os.path.join(sys._MEIPASS, 'aopipeline', 'lib', 'windows')
+    
+    # Development mode: library is relative to this file
+    if _lib_dir is None or not os.path.isdir(_lib_dir):
+        _lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib', 'windows')
+    
     if os.path.isdir(_lib_dir):
         # Add to PATH so Windows can find DLL dependencies
         os.environ['PATH'] = _lib_dir + os.pathsep + os.environ.get('PATH', '')

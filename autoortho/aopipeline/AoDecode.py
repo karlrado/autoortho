@@ -43,8 +43,6 @@ _load_error = None
 
 def _get_lib_path() -> str:
     """Get the path to the native library for the current platform."""
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    
     if sys.platform == 'darwin':
         lib_subdir = 'macos'
         lib_name = 'libaopipeline.dylib'
@@ -54,6 +52,20 @@ def _get_lib_path() -> str:
     else:
         lib_subdir = 'linux'
         lib_name = 'libaopipeline.so'
+    
+    # Check if running as PyInstaller frozen executable
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        # PyInstaller: library is in _MEIPASS/autoortho/aopipeline/lib/<platform>/
+        lib_path = os.path.join(sys._MEIPASS, 'autoortho', 'aopipeline', 'lib', lib_subdir, lib_name)
+        if os.path.exists(lib_path):
+            return lib_path
+        # Fallback: check without autoortho prefix
+        lib_path = os.path.join(sys._MEIPASS, 'aopipeline', 'lib', lib_subdir, lib_name)
+        if os.path.exists(lib_path):
+            return lib_path
+    
+    # Development mode: library is relative to this file
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     
     # Try platform-specific lib directory first
     lib_path = os.path.join(base_dir, 'lib', lib_subdir, lib_name)
