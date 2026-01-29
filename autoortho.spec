@@ -13,9 +13,14 @@ The resulting executable will be in dist/autoortho/
 
 import sys
 import os
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_all
 
 block_cipher = None
+
+# =============================================================================
+# Collect psutil binaries (required for Linux - has native .so extensions)
+# =============================================================================
+psutil_datas, psutil_binaries, psutil_hiddenimports = collect_all('psutil')
 
 # Determine platform
 if sys.platform == 'win32':
@@ -203,9 +208,9 @@ elif sys.platform == 'win32':
 a = Analysis(
     [os.path.join(autoortho_path, '__main__.py')],
     pathex=[autoortho_path],
-    binaries=binaries,
-    datas=datas,
-    hiddenimports=hiddenimports,
+    binaries=binaries + psutil_binaries,
+    datas=datas + psutil_datas,
+    hiddenimports=hiddenimports + psutil_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
