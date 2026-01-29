@@ -28,41 +28,12 @@ def safe_collect_all(module_name):
     except Exception:
         return [], [], []
 
-def collect_builtin_extension(module_name):
-    """
-    Collect a Python built-in C extension module (like _zstd in Python 3.14+).
-    Returns (datas, binaries, hiddenimports) tuple.
-    """
-    import importlib.util
-    datas, binaries, hiddenimports = [], [], []
-    
-    try:
-        spec = importlib.util.find_spec(module_name)
-        if spec and spec.origin and os.path.isfile(spec.origin):
-            # Add the .so/.pyd file to binaries
-            binaries.append((spec.origin, '.'))
-            hiddenimports.append(module_name)
-            print(f"Found built-in extension: {module_name} at {spec.origin}")
-    except Exception as e:
-        print(f"Could not find built-in extension {module_name}: {e}")
-    
-    return datas, binaries, hiddenimports
-
 # System monitoring
 psutil_datas, psutil_binaries, psutil_hiddenimports = safe_collect_all('psutil')
 
-# Python 3.14+ built-in compression modules (_zstd is a C extension in stdlib)
-# These need special handling because they're not pip packages
-zstd_datas, zstd_binaries, zstd_hiddenimports = collect_builtin_extension('_zstd')
-# Also collect the 'compression' package (Python 3.14+ stdlib wrapper)
-compression_datas, compression_binaries, compression_hiddenimports = [], [], []
-try:
-    compression_datas, compression_binaries, compression_hiddenimports = collect_all('compression')
-except Exception:
-    # Fallback: just add to hiddenimports
-    compression_hiddenimports = ['compression', 'compression.zstd', 'compression.zstd._zstd']
-
 # py7zr compression backends - these have native C extensions
+# _zstd is Python 3.14+ standard library zstd compression
+zstd_datas, zstd_binaries, zstd_hiddenimports = safe_collect_all('_zstd')
 pyzstd_datas, pyzstd_binaries, pyzstd_hiddenimports = safe_collect_all('pyzstd')
 pybcj_datas, pybcj_binaries, pybcj_hiddenimports = safe_collect_all('pybcj')
 pyppmd_datas, pyppmd_binaries, pyppmd_hiddenimports = safe_collect_all('pyppmd')
@@ -91,17 +62,17 @@ charset_datas, charset_binaries, charset_hiddenimports = safe_collect_all('chars
 
 # Collect all datas/binaries/hiddenimports for native modules
 native_module_datas = (
-    psutil_datas + zstd_datas + compression_datas + pyzstd_datas + pybcj_datas + pyppmd_datas + 
+    psutil_datas + zstd_datas + pyzstd_datas + pybcj_datas + pyppmd_datas + 
     inflate64_datas + brotli_datas + numpy_datas + greenlet_datas + gevent_datas + 
     zope_datas + msgpack_datas + crypto_datas + markupsafe_datas + charset_datas
 )
 native_module_binaries = (
-    psutil_binaries + zstd_binaries + compression_binaries + pyzstd_binaries + pybcj_binaries + pyppmd_binaries + 
+    psutil_binaries + zstd_binaries + pyzstd_binaries + pybcj_binaries + pyppmd_binaries + 
     inflate64_binaries + brotli_binaries + numpy_binaries + greenlet_binaries + gevent_binaries + 
     zope_binaries + msgpack_binaries + crypto_binaries + markupsafe_binaries + charset_binaries
 )
 native_module_hiddenimports = (
-    psutil_hiddenimports + zstd_hiddenimports + compression_hiddenimports + pyzstd_hiddenimports + pybcj_hiddenimports + 
+    psutil_hiddenimports + zstd_hiddenimports + pyzstd_hiddenimports + pybcj_hiddenimports + 
     pyppmd_hiddenimports + inflate64_hiddenimports + brotli_hiddenimports + numpy_hiddenimports + 
     greenlet_hiddenimports + gevent_hiddenimports + zope_hiddenimports + msgpack_hiddenimports + 
     crypto_hiddenimports + markupsafe_hiddenimports + charset_hiddenimports
@@ -276,13 +247,8 @@ hiddenimports = [
     'py7zr',
     'py7zr.compressor',
     'py7zr.archiveinfo',
-    # Python 3.14+ standard library compression module
-    '_zstd',  # Built-in C extension for zstd
-    'compression',  # Python 3.14+ compression package
+    '_zstd',  # Python 3.14+ standard library zstd
     'compression.zstd',
-    'compression.zstd._zstd',
-    'compression._zstd',
-    # Alternative zstd implementations (fallback)
     'pyzstd',
     'pybcj',
     'pyppmd',
