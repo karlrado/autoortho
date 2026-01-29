@@ -757,6 +757,16 @@ class AOMount:
         except Exception as e:
             log.debug(f"Error stopping prefetcher/predictive_dds/terrain_indices: {e}")
         
+        # Stop TimeExclusionManager
+        try:
+            try:
+                from autoortho.time_exclusion import time_exclusion_manager
+            except ImportError:
+                from time_exclusion import time_exclusion_manager
+            time_exclusion_manager.stop()
+        except Exception as e:
+            log.debug(f"Error stopping time_exclusion_manager: {e}")
+        
         for scenery in self.cfg.scenery_mounts:
             self.unmount(scenery.get('mount'), force)
 

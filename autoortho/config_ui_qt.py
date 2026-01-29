@@ -3,6 +3,7 @@
 from ast import If
 import os
 import sys
+import shutil
 import pathlib
 import platform
 import threading
@@ -963,14 +964,16 @@ class ConfigUI(QMainWindow):
         self.status_bar.showMessage("Ready")
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        # Use getattr() for all combo boxes as they may not exist during init
         if (
-            obj is self.maptype_combo
-            or obj is self.max_zoom_mode_combo
-            or obj is self.fallback_level_combo
-            or (not self.system == "darwin" and obj is self.compressor_combo)
-            or obj is self.format_combo
-            or obj is self.console_log_level_combo
-            or obj is self.file_log_level_combo
+            obj is getattr(self, 'maptype_combo', None)
+            or obj is getattr(self, 'max_zoom_mode_combo', None)
+            or obj is getattr(self, 'fallback_level_combo', None)
+            or (not self.system == "darwin" and obj is getattr(self, 'compressor_combo', None))
+            or obj is getattr(self, 'format_combo', None)
+            or obj is getattr(self, 'console_log_level_combo', None)
+            or obj is getattr(self, 'file_log_level_combo', None)
+            or obj is getattr(self, 'pipeline_mode_combo', None)
         ) and event.type() == QEvent.Type.Wheel:
             if not obj.hasFocus():
                 event.ignore()
@@ -1188,7 +1191,7 @@ class ConfigUI(QMainWindow):
         userid_layout.addWidget(userid_label)
         
         self.simbrief_userid_edit = QLineEdit(
-            getattr(self.cfg.simbrief, 'userid', '') if hasattr(self.cfg, 'simbrief') else ''
+            str(getattr(self.cfg.simbrief, 'userid', '')) if hasattr(self.cfg, 'simbrief') else ''
         )
         self.simbrief_userid_edit.setObjectName('simbrief_userid')
         self.simbrief_userid_edit.setPlaceholderText("Enter your SimBrief Pilot ID")
@@ -1747,8 +1750,22 @@ class ConfigUI(QMainWindow):
         file_cache_layout.addWidget(self.file_cache_label)
         cache_layout.addLayout(file_cache_layout)
 
-        clean_cache_controls_layout = QHBoxLayout()
-        clean_cache_controls_layout.setSpacing(10)
+        # Auto clean checkbox row
+        auto_clean_layout = QHBoxLayout()
+        self.auto_clean_cache_check = QCheckBox("Auto clean file cache on AutoOrtho exit")
+        self.auto_clean_cache_check.setChecked(self.cfg.cache.auto_clean_cache)
+        self.auto_clean_cache_check.setObjectName('auto_clean_cache')
+        self.auto_clean_cache_check.setToolTip(
+            "Automatically clean cache when AutoOrtho exits.\n"
+            "Note that this can take a long time."
+        )
+        auto_clean_layout.addWidget(self.auto_clean_cache_check)
+        auto_clean_layout.addStretch()
+        cache_layout.addLayout(auto_clean_layout)
+
+        # Cache action buttons row
+        cache_buttons_layout = QHBoxLayout()
+        cache_buttons_layout.setSpacing(10)
         self.clean_cache_btn = StyledButton("Clean Cache")
         self.clean_cache_btn.clicked.connect(self.on_clean_cache)
         self.clean_cache_btn.setToolTip(
@@ -1757,24 +1774,24 @@ class ConfigUI(QMainWindow):
             "If the cache is smaller than the clean limit, no files are deleted.\n"
             "Note that this can take a long time."
         )
-        clean_cache_controls_layout.addWidget(self.clean_cache_btn)
-        self.auto_clean_cache_check = QCheckBox("Auto clean file cache on AutoOrtho exit")
-        self.auto_clean_cache_check.setChecked(self.cfg.cache.auto_clean_cache)
-        self.auto_clean_cache_check.setObjectName('auto_clean_cache')
-        self.auto_clean_cache_check.setToolTip(
-            "Automatically clean cache when AutoOrtho exits.\n"
-            "Note that this can take a long time."
+        cache_buttons_layout.addWidget(self.clean_cache_btn)
+        self.clean_jpegs_btn = StyledButton("Clean JPEG Files")
+        self.clean_jpegs_btn.clicked.connect(self.on_clean_jpegs)
+        self.clean_jpegs_btn.setToolTip(
+            "Delete only legacy JPEG files from the cache.\n"
+            "Bundle files (.aob2) are not affected.\n"
+            "Use this to free up space from old cache format."
         )
-        clean_cache_controls_layout.addWidget(self.auto_clean_cache_check)
+        cache_buttons_layout.addWidget(self.clean_jpegs_btn)
         self.delete_cache_btn = StyledButton("Delete Cache")
         self.delete_cache_btn.clicked.connect(self.on_delete_cache)
         self.delete_cache_btn.setToolTip(
             "Delete all cache files.\n"
             "This should be faster than cleaning with a non-zero limit."
         )
-        clean_cache_controls_layout.addWidget(self.delete_cache_btn)
-        clean_cache_controls_layout.addStretch()
-        cache_layout.addLayout(clean_cache_controls_layout)
+        cache_buttons_layout.addWidget(self.delete_cache_btn)
+        cache_buttons_layout.addStretch()
+        cache_layout.addLayout(cache_buttons_layout)
 
         self.settings_layout.addWidget(cache_group)
 
@@ -1863,7 +1880,8 @@ class ConfigUI(QMainWindow):
         self.max_zoom_label = QLabel(f"{self.cfg.autoortho.max_zoom}")
         self.max_zoom_slider.valueChanged.connect(
             lambda v: (
-                self.validate_min_and_max_zoom("max")
+                self.validate_min_and_max_zoom("max"),
+                self._update_buffer_pool_label()
             )
         )
         fixed_max_zoom_row.addWidget(self.max_zoom_slider)
@@ -1921,7 +1939,8 @@ class ConfigUI(QMainWindow):
         self.max_zoom_near_airports_slider.valueChanged.connect(
             lambda v: (
                 self.max_zoom_near_airports_label.setText(f"{v}"),
-                self.validate_max_zoom_near_airports()
+                self.validate_max_zoom_near_airports(),
+                self._update_buffer_pool_label()
             )
         )
         max_zoom_near_airports_layout.addWidget(self.max_zoom_near_airports_slider)
@@ -2330,37 +2349,8 @@ class ConfigUI(QMainWindow):
         predictive_enable_layout.addStretch()
         autoortho_layout.addLayout(predictive_enable_layout)
         
-        # Cache size slider
-        cache_layout = QHBoxLayout()
-        self.predictive_cache_label = QLabel("Cache size:")
-        self.predictive_cache_label.setToolTip(
-            "Maximum memory for pre-built DDS tiles.\n"
-            "Higher = more tiles cached, fewer stutters, more RAM used\n"
-            "Lower = fewer tiles cached, more potential stutters\n\n"
-            "Recommended:\n"
-            "  • 256 MB - Low RAM systems\n"
-            "  • 512 MB - Balanced (default)\n"
-            "  • 1024 MB - High RAM, long flights\n"
-            "  • 2048 MB - Maximum caching"
-        )
-        cache_layout.addWidget(self.predictive_cache_label)
-        
-        self.predictive_cache_slider = ModernSlider(Qt.Orientation.Horizontal)
-        self.predictive_cache_slider.setRange(128, 2048)
-        self.predictive_cache_slider.setSingleStep(64)
-        self.predictive_cache_slider.setValue(
-            int(getattr(self.cfg.autoortho, 'predictive_dds_cache_mb', 512))
-        )
-        self.predictive_cache_slider.setObjectName('predictive_dds_cache_mb')
-        self.predictive_cache_value = QLabel(
-            f"{self.predictive_cache_slider.value()} MB"
-        )
-        self.predictive_cache_slider.valueChanged.connect(
-            lambda v: self.predictive_cache_value.setText(f"{v} MB")
-        )
-        cache_layout.addWidget(self.predictive_cache_slider)
-        cache_layout.addWidget(self.predictive_cache_value)
-        autoortho_layout.addLayout(cache_layout)
+        # Note: DDS cache is disk-only (ephemeral_dds_cache_mb in advanced settings)
+        # OS file cache naturally keeps hot files in RAM when memory is available
         
         # Build interval slider
         build_interval_layout = QHBoxLayout()
@@ -2402,6 +2392,41 @@ class ConfigUI(QMainWindow):
         build_interval_layout.addWidget(self.predictive_interval_value)
         autoortho_layout.addLayout(build_interval_layout)
         
+        # Prefetch workers slider (formerly "Background workers")
+        prefetch_layout = QHBoxLayout()
+        self.prefetch_workers_label = QLabel("Prefetch workers:")
+        self.prefetch_workers_label.setToolTip(
+            "Number of parallel workers for predictive/prefetch DDS builds.\n\n"
+            "These run in the background to pre-build tiles ahead of where\n"
+            "you're flying, reducing stutters when tiles are needed.\n\n"
+            "Higher values = faster prefetch, more CPU usage\n"
+            "Lower values = slower prefetch, less CPU impact\n\n"
+            "Recommended:\n"
+            "  • 1 - Low-end CPU or battery saving\n"
+            "  • 2 - Balanced (default)\n"
+            "  • 4-8 - Fast CPU, maximize prefetch speed"
+        )
+        prefetch_layout.addWidget(self.prefetch_workers_label)
+        
+        self.background_workers_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.background_workers_slider.setRange(1, 8)
+        self.background_workers_slider.setSingleStep(1)
+        self.background_workers_slider.setPageStep(1)
+        self.background_workers_slider.setTickInterval(1)
+        self.background_workers_slider.setValue(
+            int(getattr(self.cfg.autoortho, 'background_builder_workers', 2))
+        )
+        self.background_workers_slider.setObjectName('background_builder_workers')
+        self.prefetch_workers_value = QLabel(
+            f"{self.background_workers_slider.value()}"
+        )
+        self.background_workers_slider.valueChanged.connect(
+            lambda v: self._update_builder_concurrency_labels()
+        )
+        prefetch_layout.addWidget(self.background_workers_slider)
+        prefetch_layout.addWidget(self.prefetch_workers_value)
+        autoortho_layout.addLayout(prefetch_layout)
+        
         # Use fallbacks checkbox
         fallbacks_layout = QHBoxLayout()
         self.predictive_use_fallbacks_check = QCheckBox("Apply fallbacks to prebuilt DDS")
@@ -2422,6 +2447,178 @@ class ConfigUI(QMainWindow):
         fallbacks_layout.addWidget(self.predictive_use_fallbacks_check)
         fallbacks_layout.addStretch()
         autoortho_layout.addLayout(fallbacks_layout)
+        
+        autoortho_layout.addSpacing(10)
+        # ═══════════════════════════════════════════════════════════════════
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # NATIVE PIPELINE SECTION
+        # ═══════════════════════════════════════════════════════════════════
+        native_pipeline_header = QLabel("Native Pipeline")
+        native_pipeline_header.setStyleSheet("font-weight: bold; font-size: 12px; color: #8ab4f8; margin-top: 10px;")
+        autoortho_layout.addWidget(native_pipeline_header)
+        
+        native_pipeline_info = QLabel(
+            "Controls how DDS textures are built. Native code provides 3x faster compression."
+        )
+        native_pipeline_info.setStyleSheet("color: #888; font-size: 11px;")
+        native_pipeline_info.setWordWrap(True)
+        autoortho_layout.addWidget(native_pipeline_info)
+        
+        # Pipeline mode dropdown
+        pipeline_mode_layout = QHBoxLayout()
+        pipeline_mode_label = QLabel("Pipeline mode:")
+        pipeline_mode_label.setToolTip(
+            "Controls how DDS textures are built:\n\n"
+            "• Auto (Recommended): Automatically selects best mode for your platform\n"
+            "    - Windows → Native (C handles all I/O + decode + compress)\n"
+            "    - macOS/Linux → Hybrid (Python I/O + C decode/compress)\n\n"
+            "• Native: Full native pipeline - C code handles file I/O, JPEG decoding,\n"
+            "  and DXT compression. Fastest on Windows with many CPU cores.\n\n"
+            "• Hybrid: Python reads files, native code does decode + compress.\n"
+            "  Fastest on macOS/Linux due to better VFS caching.\n\n"
+            "• Python: Pure Python fallback. Slowest but most compatible.\n"
+            "  Use if native pipeline causes crashes or issues."
+        )
+        pipeline_mode_layout.addWidget(pipeline_mode_label)
+        
+        self.pipeline_mode_combo = QComboBox()
+        self.pipeline_mode_combo.installEventFilter(self)
+        self.pipeline_mode_combo.setFocusPolicy(Qt.StrongFocus)
+        self.pipeline_mode_combo.addItems(['auto', 'native', 'hybrid', 'python'])
+        current_pipeline_mode = str(getattr(self.cfg.autoortho, 'pipeline_mode', 'auto')).lower().strip()
+        if current_pipeline_mode not in ['auto', 'native', 'hybrid', 'python']:
+            current_pipeline_mode = 'auto'
+        self.pipeline_mode_combo.setCurrentText(current_pipeline_mode)
+        self.pipeline_mode_combo.setObjectName('pipeline_mode')
+        self.pipeline_mode_combo.setToolTip(
+            "Select DDS building pipeline mode:\n\n"
+            "• Auto (recommended): Uses hybrid with buffer pool optimization\n"
+            "  ~65ms per tile (Python file reads + native compression)\n\n"
+            "• Hybrid: Python reads files, native decode+compress\n"
+            "  Fastest with buffer pool, lower thread overhead\n\n"
+            "• Native: C handles all file I/O + decode + compress\n"
+            "  May be better for cold cache scenarios\n\n"
+            "• Python: Pure Python fallback (slowest)\n"
+            "  Use if native pipeline causes issues"
+        )
+        self.pipeline_mode_combo.currentTextChanged.connect(self._update_pipeline_controls)
+        pipeline_mode_layout.addWidget(self.pipeline_mode_combo)
+        pipeline_mode_layout.addStretch()
+        autoortho_layout.addLayout(pipeline_mode_layout)
+        
+        # Tile Build Workers slider (controls concurrent tile builds)
+        tile_workers_layout = QHBoxLayout()
+        self.tile_build_workers_label = QLabel("Tile build workers:")
+        self.tile_build_workers_label.setToolTip(
+            "Number of concurrent tile build workers.\n\n"
+            "Controls how many tiles can be built simultaneously by the\n"
+            "native pipeline (JPEG decode + DXT compress).\n\n"
+            "Higher values = faster tile processing, more CPU/RAM usage\n"
+            "Lower values = less resource usage, potential stutters\n\n"
+            "Recommended:\n"
+            "  • 4 - Low-end CPU (4-8 threads)\n"
+            "  • 8 - Mid-range CPU (8-16 threads, default)\n"
+            "  • 16-32 - High-end CPU (16+ threads)\n\n"
+            "Also affects JPEG decoder pool size (workers × CPU threads)."
+        )
+        tile_workers_layout.addWidget(self.tile_build_workers_label)
+        
+        self.live_concurrency_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.live_concurrency_slider.setRange(1, 32)
+        self.live_concurrency_slider.setSingleStep(1)
+        self.live_concurrency_slider.setPageStep(4)
+        self.live_concurrency_slider.setTickInterval(4)
+        self.live_concurrency_slider.setValue(
+            int(getattr(self.cfg.autoortho, 'live_builder_concurrency', 8))
+        )
+        self.live_concurrency_slider.setObjectName('live_builder_concurrency')
+        self.live_concurrency_value = QLabel()
+        self._update_builder_concurrency_labels()  # Set initial value with RAM estimate
+        self.live_concurrency_slider.valueChanged.connect(
+            lambda v: self._update_builder_concurrency_labels()
+        )
+        tile_workers_layout.addWidget(self.live_concurrency_slider)
+        tile_workers_layout.addWidget(self.live_concurrency_value)
+        autoortho_layout.addLayout(tile_workers_layout)
+        
+        # Builder RAM estimate label
+        self.builder_ram_label = QLabel()
+        self.builder_ram_label.setStyleSheet("color: #888; font-size: 11px; margin-left: 10px;")
+        self._update_builder_concurrency_labels()
+        autoortho_layout.addWidget(self.builder_ram_label)
+        
+        # Buffer pool size slider
+        buffer_pool_layout = QHBoxLayout()
+        self.buffer_pool_label = QLabel("Buffer pool size:")
+        self.buffer_pool_label.setToolTip(
+            "Number of pre-allocated buffers for zero-copy DDS building.\n\n"
+            "Buffer size is calculated dynamically based on your settings:\n"
+            "• ~11MB per buffer for 4K textures (max_zoom ≤ 16)\n"
+            "• ~43MB per buffer for 8K textures (max_zoom > 16 or custom tiles)\n\n"
+            "Default & Maximum: prefetch workers + live concurrency\n"
+            "This is optimal because each concurrent build needs exactly one buffer.\n"
+            "More buffers than workers would waste memory (never used simultaneously).\n\n"
+            "The maximum adjusts automatically when you change worker counts.\n\n"
+            "Only applies to Native and Hybrid modes."
+        )
+        buffer_pool_layout.addWidget(self.buffer_pool_label)
+        
+        self.buffer_pool_slider = ModernSlider(Qt.Orientation.Horizontal)
+        # Calculate optimal pool size from worker counts (will be updated dynamically)
+        prefetch = int(getattr(self.cfg.autoortho, 'background_builder_workers', 2))
+        live = int(getattr(self.cfg.autoortho, 'live_builder_concurrency', 8))
+        optimal_pool_size = prefetch + live
+        self.buffer_pool_slider.setRange(2, optimal_pool_size)
+        # Use configured value or optimal default, clamped to valid range
+        buffer_pool_value = int(getattr(self.cfg.autoortho, 'buffer_pool_size', optimal_pool_size))
+        buffer_pool_value = max(2, min(optimal_pool_size, buffer_pool_value))
+        self.buffer_pool_slider.setValue(buffer_pool_value)
+        self.buffer_pool_slider.setObjectName('buffer_pool_size')
+        self.buffer_pool_slider.setToolTip(f"Number of pre-allocated DDS buffers (2-{optimal_pool_size})")
+        
+        self.buffer_pool_value_label = QLabel("")
+        self._update_buffer_pool_label()
+        self.buffer_pool_slider.valueChanged.connect(lambda v: self._update_buffer_pool_label())
+        buffer_pool_layout.addWidget(self.buffer_pool_slider)
+        buffer_pool_layout.addWidget(self.buffer_pool_value_label)
+        autoortho_layout.addLayout(buffer_pool_layout)
+        
+        # --- Min Chunk Ratio (quality vs speed tradeoff) ---
+        min_chunk_layout = QHBoxLayout()
+        self.min_chunk_ratio_label = QLabel("Min chunk ratio:")
+        self.min_chunk_ratio_label.setToolTip(
+            "Minimum ratio of chunks that must be available before\n"
+            "falling back to lower zoom levels or missing color.\n\n"
+            "Lower values = faster (allows more missing chunks)\n"
+            "Higher values = better quality (waits for more data)\n\n"
+            "• 80% - Fast: Allows up to 20% missing chunks\n"
+            "• 90% - Balanced (default): Up to 10% missing\n"
+            "• 95% - Quality: Only 5% missing allowed\n\n"
+            "Missing chunks are filled with fallback images\n"
+            "or the missing color if no fallback is available."
+        )
+        min_chunk_layout.addWidget(self.min_chunk_ratio_label)
+        
+        self.min_chunk_ratio_slider = ModernSlider(Qt.Orientation.Horizontal)
+        self.min_chunk_ratio_slider.setRange(50, 100)  # 50% to 100%
+        current_ratio = float(getattr(self.cfg.autoortho, 'live_aopipeline_min_chunk_ratio', 0.9))
+        current_ratio_pct = int(current_ratio * 100)
+        current_ratio_pct = max(50, min(100, current_ratio_pct))
+        self.min_chunk_ratio_slider.setValue(current_ratio_pct)
+        self.min_chunk_ratio_slider.setObjectName('live_aopipeline_min_chunk_ratio')
+        self.min_chunk_ratio_slider.setToolTip("Minimum chunk availability ratio (50-100%)")
+        
+        self.min_chunk_ratio_value_label = QLabel(f"{current_ratio_pct}%")
+        self.min_chunk_ratio_slider.valueChanged.connect(
+            lambda v: self.min_chunk_ratio_value_label.setText(f"{v}%")
+        )
+        min_chunk_layout.addWidget(self.min_chunk_ratio_slider)
+        min_chunk_layout.addWidget(self.min_chunk_ratio_value_label)
+        autoortho_layout.addLayout(min_chunk_layout)
+        
+        # Initialize pipeline control states
+        self._update_pipeline_controls()
         
         autoortho_layout.addSpacing(10)
         # ═══════════════════════════════════════════════════════════════════
@@ -3545,15 +3742,153 @@ class ConfigUI(QMainWindow):
         
         enabled = prefetch_enabled and predictive_enabled
         
-        self.predictive_cache_slider.setEnabled(enabled)
-        self.predictive_cache_label.setEnabled(enabled)
-        self.predictive_cache_value.setEnabled(enabled)
-        
         self.predictive_interval_slider.setEnabled(enabled)
         self.predictive_interval_label.setEnabled(enabled)
         self.predictive_interval_value.setEnabled(enabled)
         
         self.predictive_use_fallbacks_check.setEnabled(enabled)
+
+    def _update_buffer_pool_label(self):
+        """Update buffer pool label with current memory estimate based on zoom settings."""
+        if not hasattr(self, 'buffer_pool_slider') or not hasattr(self, 'buffer_pool_value_label'):
+            return
+        
+        pool_count = self.buffer_pool_slider.value()
+        pool_max = self.buffer_pool_slider.maximum()
+        
+        # Calculate buffer size based on current UI settings
+        try:
+            # Check current slider/combo values (not config, since user may have changed them)
+            max_zoom = self.max_zoom_slider.value() if hasattr(self, 'max_zoom_slider') else 16
+            max_zoom_airports = self.max_zoom_near_airports_slider.value() if hasattr(self, 'max_zoom_near_airports_slider') else 18
+            using_custom = self.using_custom_tiles_check.isChecked() if hasattr(self, 'using_custom_tiles_check') else False
+            is_dynamic = hasattr(self, 'max_zoom_mode_combo') and self.max_zoom_mode_combo.currentText() == "Dynamic"
+            
+            # For dynamic mode, check the manager's steps for max zoom
+            max_step_zoom = 16
+            max_step_zoom_airports = 18
+            if is_dynamic and hasattr(self, '_dynamic_zoom_manager'):
+                for step in self._dynamic_zoom_manager.get_steps():
+                    max_step_zoom = max(max_step_zoom, step.zoom_level)
+                    max_step_zoom_airports = max(max_step_zoom_airports, step.zoom_level_airports)
+            
+            # Determine if 8K needed
+            if using_custom:
+                buffer_mb = 43
+            elif is_dynamic:
+                needs_8k = (max_step_zoom > 16) or (max_step_zoom_airports > 18)
+                buffer_mb = 43 if needs_8k else 11
+            else:
+                needs_8k = (max_zoom > 16) or (max_zoom_airports > 18)
+                buffer_mb = 43 if needs_8k else 11
+        except Exception:
+            buffer_mb = 11  # Default to 4K estimate on error
+        
+        # Show buffer count, memory, and whether at optimal (max)
+        total_mb = pool_count * buffer_mb
+        if pool_count == pool_max:
+            self.buffer_pool_value_label.setText(f"{pool_count}/{pool_max} (~{total_mb}MB) optimal")
+        else:
+            self.buffer_pool_value_label.setText(f"{pool_count}/{pool_max} (~{total_mb}MB)")
+
+    def _update_builder_concurrency_labels(self):
+        """Update tile build workers label, RAM estimate, and buffer pool cap."""
+        # Get values from sliders (with defaults if not yet created)
+        prefetch = 2
+        tile_workers = 8
+        
+        if hasattr(self, 'background_workers_slider'):
+            prefetch = self.background_workers_slider.value()
+            if hasattr(self, 'prefetch_workers_value'):
+                self.prefetch_workers_value.setText(str(prefetch))
+        
+        if hasattr(self, 'live_concurrency_slider'):
+            tile_workers = self.live_concurrency_slider.value()
+            if hasattr(self, 'live_concurrency_value'):
+                self.live_concurrency_value.setText(str(tile_workers))
+        
+        total_builders = prefetch + tile_workers
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # DYNAMIC BUFFER POOL CAP
+        # ═══════════════════════════════════════════════════════════════════════
+        # Maximum concurrent DDS builds = prefetch + live workers.
+        # More buffers than this would never be used simultaneously (waste RAM).
+        # Update the slider's maximum and clamp current value if needed.
+        # ═══════════════════════════════════════════════════════════════════════
+        if hasattr(self, 'buffer_pool_slider'):
+            current_value = self.buffer_pool_slider.value()
+            new_max = total_builders
+            
+            # Update the slider range
+            self.buffer_pool_slider.setRange(2, new_max)
+            self.buffer_pool_slider.setToolTip(f"Number of pre-allocated DDS buffers (2-{new_max})")
+            
+            # Clamp current value if it exceeds new maximum
+            if current_value > new_max:
+                self.buffer_pool_slider.setValue(new_max)
+            
+            # Update the label to reflect any changes
+            self._update_buffer_pool_label()
+        
+        # Calculate decoder pool size: total_builders × CPU threads
+        import os
+        cpu_threads = os.cpu_count() or 1
+        decoder_pool_size = total_builders * cpu_threads
+        
+        # Minimum of 1 (no upper limit)
+        decoder_pool_size = max(1, decoder_pool_size)
+        
+        # Memory estimates:
+        # - Decoder pool (peak): ~350KB per decoder during active decode
+        # - Builder pool: ~10-40MB per builder (tile memory)
+        decoder_memory_mb = (decoder_pool_size * 350) / 1024  # 350KB per active decoder
+        builder_memory_mb = total_builders * 15  # ~15MB average per builder
+        total_memory_mb = decoder_memory_mb + builder_memory_mb
+        
+        if hasattr(self, 'builder_ram_label'):
+            self.builder_ram_label.setText(
+                f"Builders: {tile_workers} + {prefetch} prefetch = {total_builders} total, "
+                f"{decoder_pool_size} decoders (~{total_memory_mb:.0f}MB peak)"
+            )
+
+    def _update_pipeline_controls(self):
+        """Update enabled state of pipeline controls based on pipeline mode."""
+        mode = self.pipeline_mode_combo.currentText().lower()
+        
+        # Buffer pool is only relevant for native/hybrid modes
+        buffer_pool_enabled = mode in ('auto', 'native', 'hybrid')
+        
+        self.buffer_pool_slider.setEnabled(buffer_pool_enabled)
+        self.buffer_pool_label.setEnabled(buffer_pool_enabled)
+        self.buffer_pool_value_label.setEnabled(buffer_pool_enabled)
+        
+        # Update styling for disabled state
+        disabled_style = "color: #666;"
+        enabled_style = ""
+        
+        self.buffer_pool_label.setStyleSheet(enabled_style if buffer_pool_enabled else disabled_style)
+        self.buffer_pool_value_label.setStyleSheet(enabled_style if buffer_pool_enabled else disabled_style)
+        
+        # Min chunk ratio is also only relevant for native/hybrid modes
+        if hasattr(self, 'min_chunk_ratio_slider'):
+            self.min_chunk_ratio_slider.setEnabled(buffer_pool_enabled)
+            self.min_chunk_ratio_label.setEnabled(buffer_pool_enabled)
+            self.min_chunk_ratio_value_label.setEnabled(buffer_pool_enabled)
+            self.min_chunk_ratio_label.setStyleSheet(enabled_style if buffer_pool_enabled else disabled_style)
+            self.min_chunk_ratio_value_label.setStyleSheet(enabled_style if buffer_pool_enabled else disabled_style)
+        
+        # Update tooltip to explain why disabled
+        if not buffer_pool_enabled:
+            self.buffer_pool_label.setToolTip(
+                "Buffer pool is only used in Native and Hybrid modes.\n"
+                "Select a different pipeline mode to configure this setting."
+            )
+            if hasattr(self, 'min_chunk_ratio_label'):
+                self.min_chunk_ratio_label.setToolTip(
+                    "Min chunk ratio is only used in Native and Hybrid modes.\n"
+                    "Select a different pipeline mode to configure this setting."
+                )
 
     def _init_dynamic_zoom_manager(self):
         """Initialize the dynamic zoom manager from config."""
@@ -3583,6 +3918,7 @@ class ConfigUI(QMainWindow):
             self._update_dynamic_summary()
         
         self._update_zoom_mode_visibility()
+        self._update_buffer_pool_label()
 
     def _update_zoom_mode_visibility(self):
         """Show/hide zoom controls based on selected mode."""
@@ -3604,6 +3940,7 @@ class ConfigUI(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._dynamic_zoom_manager = dialog.get_manager()
             self._update_dynamic_summary()
+            self._update_buffer_pool_label()
 
     def _update_dynamic_summary(self):
         """Update the summary label for dynamic zoom steps."""
@@ -4072,6 +4409,49 @@ class ConfigUI(QMainWindow):
     def on_delete_cache(self):
         self.on_clean_cache(delete_all=True)
 
+    def on_clean_jpegs(self):
+        """Handle Clean JPEG Files button click - only deletes legacy JPEG files"""
+        if self.running:
+            QMessageBox.warning(
+                self,
+                "Cannot clean cache while running",
+                "Cannot clean JPEG files while AutoOrtho injection is running. Please stop AutoOrtho and try again."
+            )
+            return
+
+        self.update_status_bar("Cleaning JPEG files...")
+        self._set_cache_buttons_enabled(False)
+
+        # Run in separate thread
+        self.cache_thread = QThread()
+        self.cache_thread.run = lambda: self.clean_jpegs_only(self.cfg.paths.cache_dir)
+        self.cache_thread.finished.connect(self.on_jpegs_cleaned)
+        self.cache_thread.start()
+
+    def on_jpegs_cleaned(self):
+        """Called when JPEG cleaning is complete"""
+        try:
+            self._set_cache_buttons_enabled(True)
+            QMessageBox.information(
+                self, "JPEG Files Cleaned", "JPEG file cleaning completed!"
+            )
+        finally:
+            # Clean up the thread reference
+            if self.cache_thread is not None:
+                try:
+                    self.cache_thread.quit()
+                except Exception:
+                    pass
+                try:
+                    self.cache_thread.wait()
+                except Exception:
+                    pass
+                try:
+                    self.cache_thread.deleteLater()
+                except Exception:
+                    pass
+                self.cache_thread = None
+
     def on_clean_cache(self, for_exit=False, delete_all=False):
         """Handle Clean Cache button click
 
@@ -4091,10 +4471,7 @@ class ConfigUI(QMainWindow):
 
         self._closing = for_exit
         self.update_status_bar("Cleaning cache...")
-        if hasattr(self, 'clean_cache_btn'):
-            self.clean_cache_btn.setEnabled(False)
-        if hasattr(self, 'run_button'):
-            self.run_button.setEnabled(False)
+        self._set_cache_buttons_enabled(False)
 
         # Run in separate thread and keep reference so we can wait on exit
         self.cache_thread = QThread()
@@ -4105,13 +4482,16 @@ class ConfigUI(QMainWindow):
         self.cache_thread.finished.connect(lambda: self.on_cache_cleaned(for_exit))
         self.cache_thread.start()
 
+    def _set_cache_buttons_enabled(self, enabled):
+        """Enable or disable all cache-related buttons"""
+        for btn_name in ('clean_cache_btn', 'clean_jpegs_btn', 'delete_cache_btn', 'run_button'):
+            if hasattr(self, btn_name):
+                getattr(self, btn_name).setEnabled(enabled)
+
     def on_cache_cleaned(self, for_exit=False):
         """Called when cache cleaning is complete"""
         try:
-            if hasattr(self, 'clean_cache_btn'):
-                self.clean_cache_btn.setEnabled(True)
-            if hasattr(self, 'run_button'):
-                self.run_button.setEnabled(True)
+            self._set_cache_buttons_enabled(True)
             if not for_exit:
                 QMessageBox.information(
                     self, "Cache Cleaned", "Cache cleaning completed!"
@@ -4555,6 +4935,13 @@ class ConfigUI(QMainWindow):
             if hasattr(self, '_dynamic_zoom_manager'):
                 self.cfg.autoortho.dynamic_zoom_steps = self._dynamic_zoom_manager.save_to_config()
             
+            # Reset buffer pool so it will be recreated with correct size for new zoom settings
+            try:
+                from getortho import reset_dds_buffer_pool
+                reset_dds_buffer_pool()
+            except ImportError:
+                pass  # Module not loaded yet, pool will be created correctly on first use
+            
             self.cfg.autoortho.maxwait = str(
                 self.maxwait_slider.value() / 10.0
             )
@@ -4590,13 +4977,21 @@ class ConfigUI(QMainWindow):
             
             # Predictive DDS settings
             self.cfg.autoortho.predictive_dds_enabled = self.predictive_dds_enabled_check.isChecked()
-            self.cfg.autoortho.predictive_dds_cache_mb = str(
-                self.predictive_cache_slider.value()
-            )
             self.cfg.autoortho.predictive_dds_build_interval_ms = str(
                 self.predictive_interval_slider.value()
             )
+            self.cfg.autoortho.background_builder_workers = str(
+                self.background_workers_slider.value()
+            )
+            self.cfg.autoortho.live_builder_concurrency = str(
+                self.live_concurrency_slider.value()
+            )
             self.cfg.autoortho.predictive_dds_use_fallbacks = self.predictive_use_fallbacks_check.isChecked()
+            
+            # Native pipeline settings
+            self.cfg.autoortho.pipeline_mode = self.pipeline_mode_combo.currentText()
+            self.cfg.autoortho.buffer_pool_size = str(self.buffer_pool_slider.value())
+            self.cfg.autoortho.live_aopipeline_min_chunk_ratio = self.min_chunk_ratio_slider.value() / 100.0
             
             self.cfg.autoortho.fetch_threads = str(
                 self.fetch_threads_spinbox.value()
@@ -4732,6 +5127,7 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.using_custom_tiles = True
 
         self.refresh_settings_tab()
+        self._update_buffer_pool_label()
 
     def apply_simheaven_compat(self, use_simheaven_overlay=False):
         """
@@ -4954,63 +5350,105 @@ class ConfigUI(QMainWindow):
             sys.exit(1)
 
     def clean_cache(self, cache_dir, size_gb):
-        """Clean cache directory"""
+        """Clean cache directory
+        
+        Steps:
+        1. Delete all JPEGs from cache folder (legacy files)
+        2. Apply size-based cleanup to bundles in their new locations
+        """
         self.status_update.emit(
             f"Cleaning up cache_dir {cache_dir}. Please wait..."
         )
 
-        target_bytes = pow(2, 30) * size_gb
-
         try:
+            # Step 1: Always delete all legacy JPEGs from cache_dir root
+            jpeg_count = 0
+            for entry in os.scandir(cache_dir):
+                if entry.is_file() and entry.name.lower().endswith(('.jpg', '.jpeg')):
+                    os.remove(entry.path)
+                    jpeg_count += 1
+            if jpeg_count > 0:
+                self.status_update.emit(f"Deleted {jpeg_count} legacy JPEG files.")
+
+            # Step 2: Handle bundles
+            bundles_dir = os.path.join(cache_dir, "bundles")
+
             if size_gb == 0:
-                for entry in os.scandir(cache_dir):
-                    if entry.is_file():
-                        os.remove(entry.path)
+                # Delete all bundles
+                if os.path.isdir(bundles_dir):
+                    shutil.rmtree(bundles_dir, ignore_errors=True)
+                    self.status_update.emit("Deleted all bundle files.")
             else:
-                cfiles = sorted(
-                    pathlib.Path(cache_dir).glob('**/*'), key=os.path.getmtime
-                )
-                if not cfiles:
-                    self.status_update.emit("Cache is empty.")
+                # Size-based cleanup for bundles
+                target_bytes = pow(2, 30) * size_gb
+
+                # Find all bundle files
+                bundle_files = sorted(
+                    pathlib.Path(bundles_dir).glob('**/*.aob2'),
+                    key=os.path.getmtime
+                ) if os.path.isdir(bundles_dir) else []
+
+                if not bundle_files:
+                    self.status_update.emit("No bundles to clean.")
+                    self.status_update.emit("Cache cleanup done.")
                     return
 
-                cache_bytes = sum(
-                    file.stat().st_size for file in cfiles if file.is_file()
-                )
-                cachecount = len(cfiles)
-                avgcachesize = cache_bytes / cachecount if cachecount > 0 else 0
+                cache_bytes = sum(f.stat().st_size for f in bundle_files)
+                bundle_count = len(bundle_files)
+                avg_size = cache_bytes / bundle_count if bundle_count > 0 else 0
 
                 self.status_update.emit(
-                    f"Cache has {cachecount} files. "
-                    f"Total size approx {cache_bytes//1048576} MB."
+                    f"Cache has {bundle_count} bundles. "
+                    f"Total size approx {cache_bytes // 1048576} MB."
                 )
 
-                empty_files = [
-                    x for x in cfiles if x.is_file() and x.stat().st_size == 0
-                ]
-                self.status_update.emit(
-                    f"Found {len(empty_files)} empty files to cleanup."
-                )
-                for file in empty_files:
-                    if os.path.exists(file):
-                        os.remove(file)
+                # Remove empty bundles
+                empty_bundles = [f for f in bundle_files if f.stat().st_size == 0]
+                for f in empty_bundles:
+                    if f.exists():
+                        os.remove(f)
+                if empty_bundles:
+                    self.status_update.emit(f"Removed {len(empty_bundles)} empty bundles.")
 
-                if target_bytes > cache_bytes:
+                if target_bytes >= cache_bytes:
                     self.status_update.emit("Cache within size limits.")
+                    self.status_update.emit("Cache cleanup done.")
                     return
 
-                to_delete = int((cache_bytes - target_bytes) // avgcachesize)
-
+                to_delete = int((cache_bytes - target_bytes) // avg_size)
                 self.status_update.emit(
-                    f"Over cache size limit, will remove {to_delete} files."
+                    f"Over cache size limit, will remove {to_delete} bundles."
                 )
-                for file in cfiles[:to_delete]:
-                    if file.is_file():
-                        os.remove(file)
+
+                for f in bundle_files[:to_delete]:
+                    if f.is_file():
+                        os.remove(f)
 
             self.status_update.emit("Cache cleanup done.")
         except Exception as e:
             self.status_update.emit(f"Cache cleanup error: {str(e)}")
+
+    def clean_jpegs_only(self, cache_dir):
+        """Clean only JPEG files from cache directory, leaving bundles untouched"""
+        self.status_update.emit(
+            f"Cleaning JPEG files from {cache_dir}. Please wait..."
+        )
+
+        try:
+            jpeg_count = 0
+            for entry in os.scandir(cache_dir):
+                if entry.is_file() and entry.name.lower().endswith(('.jpg', '.jpeg')):
+                    os.remove(entry.path)
+                    jpeg_count += 1
+            
+            if jpeg_count > 0:
+                self.status_update.emit(f"Deleted {jpeg_count} JPEG files.")
+            else:
+                self.status_update.emit("No JPEG files found to delete.")
+            
+            self.status_update.emit("JPEG cleanup done.")
+        except Exception as e:
+            self.status_update.emit(f"JPEG cleanup error: {str(e)}")
 
     def _check_ortho_dir(self, path):
         """Check if orthophoto directory is valid"""
@@ -5070,6 +5508,51 @@ class ConfigUI(QMainWindow):
         except Exception:
             pass
         self.uninstall_workers.clear()
+
+        # Stop update check worker if running
+        try:
+            if hasattr(self, '_update_worker') and self._update_worker:
+                self._update_worker.terminate()
+                self._update_worker.wait(2000)  # 2 second timeout
+                self._update_worker = None
+        except Exception:
+            pass
+
+        # Stop SimBrief fetch worker if running
+        try:
+            if hasattr(self, 'simbrief_fetch_worker') and self.simbrief_fetch_worker:
+                self.simbrief_fetch_worker.terminate()
+                self.simbrief_fetch_worker.wait(2000)
+                self.simbrief_fetch_worker = None
+        except Exception:
+            pass
+
+        # Stop cache thread if running
+        try:
+            if hasattr(self, 'cache_thread') and self.cache_thread:
+                self.cache_thread.quit()
+                self.cache_thread.wait(2000)
+                self.cache_thread = None
+        except Exception:
+            pass
+
+        # Stop any AddSeasons workers
+        try:
+            if hasattr(self, 'add_seasons_worker') and self.add_seasons_worker:
+                self.add_seasons_worker.terminate()
+                self.add_seasons_worker.wait(2000)
+                self.add_seasons_worker = None
+        except Exception:
+            pass
+
+        # Stop any RestoreDefaultDsfs workers
+        try:
+            if hasattr(self, 'restore_dsfs_worker') and self.restore_dsfs_worker:
+                self.restore_dsfs_worker.terminate()
+                self.restore_dsfs_worker.wait(2000)
+                self.restore_dsfs_worker = None
+        except Exception:
+            pass
 
         # Clean up background mount processes
         if hasattr(self, 'unmount_sceneries'):

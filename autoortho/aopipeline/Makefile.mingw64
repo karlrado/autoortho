@@ -1,0 +1,78 @@
+# Makefile.mingw64 for aopipeline - Native performance pipeline (Windows)
+# Cross-compile with MinGW-w64 to build aopipeline.dll
+#
+# Components:
+# - AoCache: Parallel batch cache file I/O
+# - AoDecode: Parallel JPEG decoding with libturbojpeg
+# - AoDDS: Native DDS texture building
+# - AoBundle: Cache bundle format for consolidated I/O
+
+PKGROOT     := ..
+JPGT        := ../aoimage/libjpeg-turbo-gcc64
+ISPC_LIB    := ../lib/windows/ispc_texcomp.dll
+
+CC          := x86_64-w64-mingw32-gcc
+LD          := x86_64-w64-mingw32-gcc
+
+CFLAGS      := -O3 -Wall -fdiagnostics-color \
+               -DWIN32 -DAOPIPELINE_EXPORTS \
+               -I$(JPGT)/include -I../aoimage \
+               -fopenmp
+
+CFLAGS_DLL  := $(CFLAGS) -mdll
+
+LDFLAGS     := -shared -static-libgcc -fopenmp
+LIBS        := -L$(JPGT)/lib -lturbojpeg
+
+# Source files (no HTTP - uses Python requests instead)
+SOURCES     := aocache.c aodecode.c aodds.c aobundle.c aobundle2.c aopipeline.c
+OBJECTS     := $(SOURCES:.c=.o)
+
+.PHONY: all clean phase1 phase2 phase3 libjpeg-turbo-gcc64
+
+# Default: build everything available
+all: aopipeline.dll
+
+# Extract libjpeg-turbo for Windows if needed
+libjpeg-turbo-gcc64:
+	@if [ ! -d "$(JPGT)" ]; then \
+		cd ../aoimage && tar -xvzf libjpeg-turbo-gcc64.tgz; \
+	fi
+
+# Phase 1: Cache I/O only
+phase1: aocache.o
+	$(LD) -o aocache.dll $(LDFLAGS) aocache.o
+
+# Phase 2: Add decoding
+phase2: aocache.o aodecode.o libjpeg-turbo-gcc64
+	$(LD) -o aopipeline.dll $(LDFLAGS) aocache.o aodecode.o $(LIBS)
+
+# Phase 3: Add DDS building (complete pipeline)
+phase3: aopipeline.dll
+
+# Pattern rules
+aocache.o: aocache.c aocache.h internal.h
+	$(CC) $(CFLAGS_DLL) -c aocache.c -o $@
+
+aodecode.o: aodecode.c aodecode.h aocache.h internal.h libjpeg-turbo-gcc64
+	$(CC) $(CFLAGS_DLL) -c aodecode.c -o $@
+
+aodds.o: aodds.c aodds.h aodecode.h internal.h
+	$(CC) $(CFLAGS_DLL) -c aodds.c -o $@
+
+aobundle.o: aobundle.c aobundle.h aodds.h internal.h
+	$(CC) $(CFLAGS_DLL) -c aobundle.c -o $@
+
+aobundle2.o: aobundle2.c aobundle2.h aodds.h internal.h
+	$(CC) $(CFLAGS_DLL) -c aobundle2.c -o $@
+
+aopipeline.o: aopipeline.c aopipeline.h aocache.h aodecode.h aodds.h aobundle.h aobundle2.h internal.h
+	$(CC) $(CFLAGS_DLL) -c aopipeline.c -o $@
+
+# Full library
+aopipeline.dll: $(OBJECTS) libjpeg-turbo-gcc64
+	$(LD) -o $@ $(LDFLAGS) $(OBJECTS) $(LIBS)
+
+clean:
+	rm -f $(OBJECTS) aopipeline.dll aocache.dll
+

@@ -114,6 +114,33 @@ I have done testing on Windows 10 with the
 [Dokan](https://github.com/dokan-dev/dokany/releases/latest) project.
 This does appear to work fine, but this is not how I use this project, so it's not my primary concern.
 
+## Performance Features
+
+AutoOrtho includes advanced performance optimizations to minimize stuttering and reduce loading times:
+
+### Native Pipeline (High Performance Mode)
+
+AutoOrtho includes a **native C pipeline** that dramatically improves DDS texture building performance by bypassing Python's Global Interpreter Lock:
+
+- **10-20x faster** DDS texture building
+- **True multi-core parallelism** via OpenMP
+- **Native HTTP client** with connection pooling for faster downloads
+
+The native pipeline is automatically used when available. See the [Performance Tuning Guide](performance.md#native-pipeline-architecture) for details.
+
+> **Note:** Apple Maps downloads always use the Python HTTP client due to its special authentication requirements. Other imagery sources use the faster native client.
+
+### Additional Features
+
+- **Spatial Prefetching**: Downloads tiles ahead of your aircraft
+- **SimBrief Integration**: Uses your flight plan for smarter prefetching
+- **Dynamic Zoom**: Automatically adjusts quality based on altitude
+- **Time Budget System**: Predictable tile loading times
+
+See the [Performance Tuning Guide](performance.md) for configuration options.
+
+---
+
 ## Known issues and limits
 * Currently I try to limit the memory usage, though it's possible it
   will exceed this in certain scenarios.
@@ -127,6 +154,7 @@ This does appear to work fine, but this is not how I use this project, so it's n
 * Windows has too many variations with how filesystems are handled, links are
   done, intrusive malware detection systems, etc and will likely always be
   slower and more difficult to use with this project.
+* **Apple Maps** always uses Python HTTP client (not native) due to special authentication requirements.
 
 ## TODOS
 

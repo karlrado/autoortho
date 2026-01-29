@@ -5,6 +5,6 @@
 #
 # Install with: pip install -r requirements-build.txt
 
-pyinstaller>=6.17.0
+pyinstaller>=6.18.0
     # Primary build tool - creates standalone executables
     # Uses real CPython interpreter for maximum compatibility

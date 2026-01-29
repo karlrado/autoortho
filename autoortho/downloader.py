@@ -557,7 +557,7 @@ class Release(object):
             self.totalsize += int(a.get('size'))
 
             m = re.match(
-                "(?P<pkgtype>[yz])_(?P<pkgname>.*)\.zip\.?(?P<pkgsub>\d*)",
+                r"(?P<pkgtype>[yz])_(?P<pkgname>.*)\.zip\.?(?P<pkgsub>\d*)",
                 asset_name
             )
             if not m:
