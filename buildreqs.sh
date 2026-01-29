@@ -15,8 +15,10 @@ apt-get install -y make curl patchelf python3-pip python3-venv python3-tk zlib1g
     libglib2.0-0 libx11-6 libxcb1 libxkbcommon0 libdbus-1-3 libfontconfig1 libfreetype6 \
     libgl1 libegl1
 
-if python3 -c 'import sys; exit(0) if sys.version_info.minor < 12 else exit(1)'; then
-    echo "Installing Python 3.14 with pyenv..."
+# Always install Python 3.14 if not already 3.14+
+# We need Python 3.14 for _zstd support and consistent builds
+if python3 -c 'import sys; exit(0) if sys.version_info < (3, 14) else exit(1)'; then
+    echo "Installing Python 3.14 with pyenv (current: $(python3 --version))..."
     apt-get install -y git libssl-dev \
         libbz2-dev libreadline-dev libsqlite3-dev \
         libncursesw5-dev tk-dev libxml2-dev \
@@ -27,9 +29,21 @@ if python3 -c 'import sys; exit(0) if sys.version_info.minor < 12 else exit(1)';
     eval "$(pyenv init - bash)"
     pyenv install 3.14.2
     pyenv global 3.14.2
+    # Rehash to ensure python3 points to pyenv version
+    pyenv rehash
+    hash -r
 fi
-echo "Using Python version: "
-python3 --version
+
+echo "Using Python version: $(python3 --version)"
+
+# Verify we have Python 3.14+
+if python3 -c 'import sys; exit(0) if sys.version_info >= (3, 14) else exit(1)'; then
+    echo "Python 3.14+ confirmed."
+else
+    echo "ERROR: Python 3.14+ is required but not available!"
+    echo "Current Python: $(python3 --version)"
+    exit 1
+fi
 
 # Create and prepare an isolated virtual environment to avoid PEP 668 restrictions
 echo "Creating virtual environment..."
