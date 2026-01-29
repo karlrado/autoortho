@@ -18,9 +18,65 @@ from PyInstaller.utils.hooks import collect_submodules, collect_data_files, coll
 block_cipher = None
 
 # =============================================================================
-# Collect psutil binaries (required for Linux - has native .so extensions)
+# Collect modules with native extensions (required for Linux - have .so files)
 # =============================================================================
-psutil_datas, psutil_binaries, psutil_hiddenimports = collect_all('psutil')
+
+def safe_collect_all(module_name):
+    """Safely collect all components of a module, returning empty lists on failure."""
+    try:
+        return collect_all(module_name)
+    except Exception:
+        return [], [], []
+
+# System monitoring
+psutil_datas, psutil_binaries, psutil_hiddenimports = safe_collect_all('psutil')
+
+# py7zr compression backends - these have native C extensions
+# _zstd is Python 3.14+ standard library zstd compression
+zstd_datas, zstd_binaries, zstd_hiddenimports = safe_collect_all('_zstd')
+pyzstd_datas, pyzstd_binaries, pyzstd_hiddenimports = safe_collect_all('pyzstd')
+pybcj_datas, pybcj_binaries, pybcj_hiddenimports = safe_collect_all('pybcj')
+pyppmd_datas, pyppmd_binaries, pyppmd_hiddenimports = safe_collect_all('pyppmd')
+inflate64_datas, inflate64_binaries, inflate64_hiddenimports = safe_collect_all('inflate64')
+brotli_datas, brotli_binaries, brotli_hiddenimports = safe_collect_all('brotli')
+
+# Numerical/scientific
+numpy_datas, numpy_binaries, numpy_hiddenimports = safe_collect_all('numpy')
+
+# Async/networking (gevent stack)
+greenlet_datas, greenlet_binaries, greenlet_hiddenimports = safe_collect_all('greenlet')
+gevent_datas, gevent_binaries, gevent_hiddenimports = safe_collect_all('gevent')
+zope_datas, zope_binaries, zope_hiddenimports = safe_collect_all('zope.interface')
+
+# Serialization
+msgpack_datas, msgpack_binaries, msgpack_hiddenimports = safe_collect_all('msgpack')
+
+# Cryptography (used by py7zr)
+crypto_datas, crypto_binaries, crypto_hiddenimports = safe_collect_all('Cryptodome')
+
+# Flask dependencies with C extensions
+markupsafe_datas, markupsafe_binaries, markupsafe_hiddenimports = safe_collect_all('markupsafe')
+
+# Character encoding
+charset_datas, charset_binaries, charset_hiddenimports = safe_collect_all('charset_normalizer')
+
+# Collect all datas/binaries/hiddenimports for native modules
+native_module_datas = (
+    psutil_datas + zstd_datas + pyzstd_datas + pybcj_datas + pyppmd_datas + 
+    inflate64_datas + brotli_datas + numpy_datas + greenlet_datas + gevent_datas + 
+    zope_datas + msgpack_datas + crypto_datas + markupsafe_datas + charset_datas
+)
+native_module_binaries = (
+    psutil_binaries + zstd_binaries + pyzstd_binaries + pybcj_binaries + pyppmd_binaries + 
+    inflate64_binaries + brotli_binaries + numpy_binaries + greenlet_binaries + gevent_binaries + 
+    zope_binaries + msgpack_binaries + crypto_binaries + markupsafe_binaries + charset_binaries
+)
+native_module_hiddenimports = (
+    psutil_hiddenimports + zstd_hiddenimports + pyzstd_hiddenimports + pybcj_hiddenimports + 
+    pyppmd_hiddenimports + inflate64_hiddenimports + brotli_hiddenimports + numpy_hiddenimports + 
+    greenlet_hiddenimports + gevent_hiddenimports + zope_hiddenimports + msgpack_hiddenimports + 
+    crypto_hiddenimports + markupsafe_hiddenimports + charset_hiddenimports
+)
 
 # Determine platform
 if sys.platform == 'win32':
@@ -187,6 +243,44 @@ hiddenimports = [
     'autoortho.aopipeline.AoBundle2',
     'autoortho.aopipeline.bundle_consolidator',
     'autoortho.aopipeline.fallback_resolver',
+    # py7zr compression backends (have native C extensions)
+    'py7zr',
+    'py7zr.compressor',
+    'py7zr.archiveinfo',
+    '_zstd',  # Python 3.14+ standard library zstd
+    'compression.zstd',
+    'pyzstd',
+    'pybcj',
+    'pyppmd',
+    'inflate64',
+    'multivolumefile',
+    'brotli',
+    # Cryptography (used by py7zr for encrypted archives)
+    'Cryptodome',
+    'Cryptodome.Cipher',
+    'Cryptodome.Cipher.AES',
+    'Cryptodome.Hash',
+    'Cryptodome.Random',
+    # Async/networking stack
+    'greenlet',
+    'gevent',
+    'gevent.resolver',
+    'gevent.ssl',
+    'zope',
+    'zope.interface',
+    'zope.event',
+    # Serialization
+    'msgpack',
+    # NumPy
+    'numpy',
+    'numpy.core',
+    'numpy.core._multiarray_umath',
+    # Flask/Jinja dependencies
+    'markupsafe',
+    'markupsafe._speedups',
+    # Character encoding
+    'charset_normalizer',
+    'charset_normalizer.md',
 ]
 
 # Platform-specific hidden imports
@@ -208,9 +302,9 @@ elif sys.platform == 'win32':
 a = Analysis(
     [os.path.join(autoortho_path, '__main__.py')],
     pathex=[autoortho_path],
-    binaries=binaries + psutil_binaries,
-    datas=datas + psutil_datas,
-    hiddenimports=hiddenimports + psutil_hiddenimports,
+    binaries=binaries + native_module_binaries,
+    datas=datas + native_module_datas,
+    hiddenimports=hiddenimports + native_module_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
