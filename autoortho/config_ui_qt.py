@@ -1750,8 +1750,22 @@ class ConfigUI(QMainWindow):
         file_cache_layout.addWidget(self.file_cache_label)
         cache_layout.addLayout(file_cache_layout)
 
-        clean_cache_controls_layout = QHBoxLayout()
-        clean_cache_controls_layout.setSpacing(10)
+        # Auto clean checkbox row
+        auto_clean_layout = QHBoxLayout()
+        self.auto_clean_cache_check = QCheckBox("Auto clean file cache on AutoOrtho exit")
+        self.auto_clean_cache_check.setChecked(self.cfg.cache.auto_clean_cache)
+        self.auto_clean_cache_check.setObjectName('auto_clean_cache')
+        self.auto_clean_cache_check.setToolTip(
+            "Automatically clean cache when AutoOrtho exits.\n"
+            "Note that this can take a long time."
+        )
+        auto_clean_layout.addWidget(self.auto_clean_cache_check)
+        auto_clean_layout.addStretch()
+        cache_layout.addLayout(auto_clean_layout)
+
+        # Cache action buttons row
+        cache_buttons_layout = QHBoxLayout()
+        cache_buttons_layout.setSpacing(10)
         self.clean_cache_btn = StyledButton("Clean Cache")
         self.clean_cache_btn.clicked.connect(self.on_clean_cache)
         self.clean_cache_btn.setToolTip(
@@ -1760,24 +1774,24 @@ class ConfigUI(QMainWindow):
             "If the cache is smaller than the clean limit, no files are deleted.\n"
             "Note that this can take a long time."
         )
-        clean_cache_controls_layout.addWidget(self.clean_cache_btn)
-        self.auto_clean_cache_check = QCheckBox("Auto clean file cache on AutoOrtho exit")
-        self.auto_clean_cache_check.setChecked(self.cfg.cache.auto_clean_cache)
-        self.auto_clean_cache_check.setObjectName('auto_clean_cache')
-        self.auto_clean_cache_check.setToolTip(
-            "Automatically clean cache when AutoOrtho exits.\n"
-            "Note that this can take a long time."
+        cache_buttons_layout.addWidget(self.clean_cache_btn)
+        self.clean_jpegs_btn = StyledButton("Clean JPEG Files")
+        self.clean_jpegs_btn.clicked.connect(self.on_clean_jpegs)
+        self.clean_jpegs_btn.setToolTip(
+            "Delete only legacy JPEG files from the cache.\n"
+            "Bundle files (.aob2) are not affected.\n"
+            "Use this to free up space from old cache format."
         )
-        clean_cache_controls_layout.addWidget(self.auto_clean_cache_check)
+        cache_buttons_layout.addWidget(self.clean_jpegs_btn)
         self.delete_cache_btn = StyledButton("Delete Cache")
         self.delete_cache_btn.clicked.connect(self.on_delete_cache)
         self.delete_cache_btn.setToolTip(
             "Delete all cache files.\n"
             "This should be faster than cleaning with a non-zero limit."
         )
-        clean_cache_controls_layout.addWidget(self.delete_cache_btn)
-        clean_cache_controls_layout.addStretch()
-        cache_layout.addLayout(clean_cache_controls_layout)
+        cache_buttons_layout.addWidget(self.delete_cache_btn)
+        cache_buttons_layout.addStretch()
+        cache_layout.addLayout(cache_buttons_layout)
 
         self.settings_layout.addWidget(cache_group)
 
@@ -4395,6 +4409,49 @@ class ConfigUI(QMainWindow):
     def on_delete_cache(self):
         self.on_clean_cache(delete_all=True)
 
+    def on_clean_jpegs(self):
+        """Handle Clean JPEG Files button click - only deletes legacy JPEG files"""
+        if self.running:
+            QMessageBox.warning(
+                self,
+                "Cannot clean cache while running",
+                "Cannot clean JPEG files while AutoOrtho injection is running. Please stop AutoOrtho and try again."
+            )
+            return
+
+        self.update_status_bar("Cleaning JPEG files...")
+        self._set_cache_buttons_enabled(False)
+
+        # Run in separate thread
+        self.cache_thread = QThread()
+        self.cache_thread.run = lambda: self.clean_jpegs_only(self.cfg.paths.cache_dir)
+        self.cache_thread.finished.connect(self.on_jpegs_cleaned)
+        self.cache_thread.start()
+
+    def on_jpegs_cleaned(self):
+        """Called when JPEG cleaning is complete"""
+        try:
+            self._set_cache_buttons_enabled(True)
+            QMessageBox.information(
+                self, "JPEG Files Cleaned", "JPEG file cleaning completed!"
+            )
+        finally:
+            # Clean up the thread reference
+            if self.cache_thread is not None:
+                try:
+                    self.cache_thread.quit()
+                except Exception:
+                    pass
+                try:
+                    self.cache_thread.wait()
+                except Exception:
+                    pass
+                try:
+                    self.cache_thread.deleteLater()
+                except Exception:
+                    pass
+                self.cache_thread = None
+
     def on_clean_cache(self, for_exit=False, delete_all=False):
         """Handle Clean Cache button click
 
@@ -4414,10 +4471,7 @@ class ConfigUI(QMainWindow):
 
         self._closing = for_exit
         self.update_status_bar("Cleaning cache...")
-        if hasattr(self, 'clean_cache_btn'):
-            self.clean_cache_btn.setEnabled(False)
-        if hasattr(self, 'run_button'):
-            self.run_button.setEnabled(False)
+        self._set_cache_buttons_enabled(False)
 
         # Run in separate thread and keep reference so we can wait on exit
         self.cache_thread = QThread()
@@ -4428,13 +4482,16 @@ class ConfigUI(QMainWindow):
         self.cache_thread.finished.connect(lambda: self.on_cache_cleaned(for_exit))
         self.cache_thread.start()
 
+    def _set_cache_buttons_enabled(self, enabled):
+        """Enable or disable all cache-related buttons"""
+        for btn_name in ('clean_cache_btn', 'clean_jpegs_btn', 'delete_cache_btn', 'run_button'):
+            if hasattr(self, btn_name):
+                getattr(self, btn_name).setEnabled(enabled)
+
     def on_cache_cleaned(self, for_exit=False):
         """Called when cache cleaning is complete"""
         try:
-            if hasattr(self, 'clean_cache_btn'):
-                self.clean_cache_btn.setEnabled(True)
-            if hasattr(self, 'run_button'):
-                self.run_button.setEnabled(True)
+            self._set_cache_buttons_enabled(True)
             if not for_exit:
                 QMessageBox.information(
                     self, "Cache Cleaned", "Cache cleaning completed!"
@@ -5370,6 +5427,28 @@ class ConfigUI(QMainWindow):
             self.status_update.emit("Cache cleanup done.")
         except Exception as e:
             self.status_update.emit(f"Cache cleanup error: {str(e)}")
+
+    def clean_jpegs_only(self, cache_dir):
+        """Clean only JPEG files from cache directory, leaving bundles untouched"""
+        self.status_update.emit(
+            f"Cleaning JPEG files from {cache_dir}. Please wait..."
+        )
+
+        try:
+            jpeg_count = 0
+            for entry in os.scandir(cache_dir):
+                if entry.is_file() and entry.name.lower().endswith(('.jpg', '.jpeg')):
+                    os.remove(entry.path)
+                    jpeg_count += 1
+            
+            if jpeg_count > 0:
+                self.status_update.emit(f"Deleted {jpeg_count} JPEG files.")
+            else:
+                self.status_update.emit("No JPEG files found to delete.")
+            
+            self.status_update.emit("JPEG cleanup done.")
+        except Exception as e:
+            self.status_update.emit(f"JPEG cleanup error: {str(e)}")
 
     def _check_ortho_dir(self, path):
         """Check if orthophoto directory is valid"""
