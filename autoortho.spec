@@ -31,15 +31,6 @@ def safe_collect_all(module_name):
 # System monitoring
 psutil_datas, psutil_binaries, psutil_hiddenimports = safe_collect_all('psutil')
 
-# py7zr compression backends - these have native C extensions
-# _zstd is Python 3.14+ standard library zstd compression
-zstd_datas, zstd_binaries, zstd_hiddenimports = safe_collect_all('_zstd')
-pyzstd_datas, pyzstd_binaries, pyzstd_hiddenimports = safe_collect_all('pyzstd')
-pybcj_datas, pybcj_binaries, pybcj_hiddenimports = safe_collect_all('pybcj')
-pyppmd_datas, pyppmd_binaries, pyppmd_hiddenimports = safe_collect_all('pyppmd')
-inflate64_datas, inflate64_binaries, inflate64_hiddenimports = safe_collect_all('inflate64')
-brotli_datas, brotli_binaries, brotli_hiddenimports = safe_collect_all('brotli')
-
 # Numerical/scientific
 numpy_datas, numpy_binaries, numpy_hiddenimports = safe_collect_all('numpy')
 
@@ -51,9 +42,6 @@ zope_datas, zope_binaries, zope_hiddenimports = safe_collect_all('zope.interface
 # Serialization
 msgpack_datas, msgpack_binaries, msgpack_hiddenimports = safe_collect_all('msgpack')
 
-# Cryptography (used by py7zr)
-crypto_datas, crypto_binaries, crypto_hiddenimports = safe_collect_all('Cryptodome')
-
 # Flask dependencies with C extensions
 markupsafe_datas, markupsafe_binaries, markupsafe_hiddenimports = safe_collect_all('markupsafe')
 
@@ -62,20 +50,17 @@ charset_datas, charset_binaries, charset_hiddenimports = safe_collect_all('chars
 
 # Collect all datas/binaries/hiddenimports for native modules
 native_module_datas = (
-    psutil_datas + zstd_datas + pyzstd_datas + pybcj_datas + pyppmd_datas + 
-    inflate64_datas + brotli_datas + numpy_datas + greenlet_datas + gevent_datas + 
-    zope_datas + msgpack_datas + crypto_datas + markupsafe_datas + charset_datas
+    psutil_datas + numpy_datas + greenlet_datas + gevent_datas + 
+    zope_datas + msgpack_datas + markupsafe_datas + charset_datas
 )
 native_module_binaries = (
-    psutil_binaries + zstd_binaries + pyzstd_binaries + pybcj_binaries + pyppmd_binaries + 
-    inflate64_binaries + brotli_binaries + numpy_binaries + greenlet_binaries + gevent_binaries + 
-    zope_binaries + msgpack_binaries + crypto_binaries + markupsafe_binaries + charset_binaries
+    psutil_binaries + numpy_binaries + greenlet_binaries + gevent_binaries + 
+    zope_binaries + msgpack_binaries + markupsafe_binaries + charset_binaries
 )
 native_module_hiddenimports = (
-    psutil_hiddenimports + zstd_hiddenimports + pyzstd_hiddenimports + pybcj_hiddenimports + 
-    pyppmd_hiddenimports + inflate64_hiddenimports + brotli_hiddenimports + numpy_hiddenimports + 
+    psutil_hiddenimports + numpy_hiddenimports + 
     greenlet_hiddenimports + gevent_hiddenimports + zope_hiddenimports + msgpack_hiddenimports + 
-    crypto_hiddenimports + markupsafe_hiddenimports + charset_hiddenimports
+    markupsafe_hiddenimports + charset_hiddenimports
 )
 
 # Determine platform
@@ -243,24 +228,8 @@ hiddenimports = [
     'autoortho.aopipeline.AoBundle2',
     'autoortho.aopipeline.bundle_consolidator',
     'autoortho.aopipeline.fallback_resolver',
-    # py7zr compression backends (have native C extensions)
-    'py7zr',
-    'py7zr.compressor',
-    'py7zr.archiveinfo',
-    '_zstd',  # Python 3.14+ standard library zstd
-    'compression.zstd',
-    'pyzstd',
-    'pybcj',
-    'pyppmd',
-    'inflate64',
-    'multivolumefile',
-    'brotli',
-    # Cryptography (used by py7zr for encrypted archives)
-    'Cryptodome',
-    'Cryptodome.Cipher',
-    'Cryptodome.Cipher.AES',
-    'Cryptodome.Hash',
-    'Cryptodome.Random',
+    # 7-Zip wrapper (replaces py7zr)
+    'autoortho.utils.sevenzip',
     # Async/networking stack
     'greenlet',
     'gevent',

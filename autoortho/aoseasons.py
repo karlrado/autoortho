@@ -1,6 +1,4 @@
 import struct, re, os, math, time, datetime, atexit
-import py7zr
-import py7zr.io
 
 # Handle imports for both frozen (PyInstaller) and direct Python execution
 try:
@@ -12,6 +10,12 @@ try:
     from autoortho.aostats import STATS, StatTracker, inc_stat
 except ImportError:
     from aostats import STATS, StatTracker, inc_stat
+
+# Use bundled 7-Zip binary instead of py7zr to avoid _zstd issues on Linux
+try:
+    from autoortho.utils.sevenzip import SevenZipFile, BytesIOFactory
+except ImportError:
+    from utils.sevenzip import SevenZipFile, BytesIOFactory
 from functools import lru_cache
 
 import logging
@@ -72,7 +76,7 @@ class AoDsfSeason():
                     if not os.path.isfile(dsf_name_full):
                         raise FileNotFoundError(f"Base DSF archive not found for {dsf_name} in {en_dir}")
 
-                    with py7zr.SevenZipFile(dsf_name_full, mode='r') as archive:
+                    with SevenZipFile(dsf_name_full, mode='r') as archive:
                         arc_names = archive.getnames()
                         target_name = None
                         for n in arc_names:
@@ -101,7 +105,7 @@ class AoDsfSeason():
 
                         limit = int(uncompressed) + (1 * 1024 * 1024)  # +1 MiB headroom
 
-                        factory = py7zr.io.BytesIOFactory(limit=limit)
+                        factory = BytesIOFactory(limit=limit)
                         archive.extract(targets=[target_name], factory=factory)
 
                         fobj = factory.products.get(target_name)
@@ -139,8 +143,8 @@ class AoDsfSeason():
             if not os.path.isfile(dsf_name_full):
                 return
 
-            # Use new py7zr factory API to extract DSF into memory (only the target file)
-            with py7zr.SevenZipFile(dsf_name_full, mode='r') as archive:
+            # Use bundled 7-Zip to extract DSF into memory (only the target file)
+            with SevenZipFile(dsf_name_full, mode='r') as archive:
                 # Find archive member that matches our DSF (exact or suffix)
                 arc_names = archive.getnames()
                 target_name = None
@@ -172,7 +176,7 @@ class AoDsfSeason():
 
                 limit = int(uncompressed) + (1 * 1024 * 1024)  # +1 MiB headroom
 
-                factory = py7zr.io.BytesIOFactory(limit=limit)
+                factory = BytesIOFactory(limit=limit)
                 archive.extract(targets=[target_name], factory=factory)
 
                 fobj = factory.products.get(target_name)
