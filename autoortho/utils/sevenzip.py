@@ -138,7 +138,11 @@ class SevenZipFile:
         self._file_info = {}
         
         # Parse technical listing format
-        # Each file block starts with "----------" and contains "Path = filename", "Size = bytes"
+        # The output has a header section (archive info) followed by file entries
+        # File entries are separated by "----------" lines
+        # We need to skip the header and only parse actual file entries
+        
+        in_file_section = False
         current_path = None
         current_size = 0
         current_compressed = 0
@@ -146,8 +150,29 @@ class SevenZipFile:
         for line in output.splitlines():
             line = line.strip()
             
+            # "----------" marks the boundary between sections
+            # First one: end of header, start of file entries
+            # Subsequent ones: between file entries
+            if line.startswith('----------'):
+                # Save previous file if we were tracking one
+                if current_path is not None:
+                    self._file_list.append(current_path)
+                    self._file_info[current_path] = SevenZipFileInfo(
+                        name=current_path,
+                        size=current_size,
+                        compressed=current_compressed
+                    )
+                    current_path = None
+                
+                in_file_section = True
+                continue
+            
+            # Only process lines after we've seen the first separator
+            if not in_file_section:
+                continue
+            
             if line.startswith('Path = '):
-                # Save previous file if any
+                # Save previous file if any (shouldn't happen with proper separator handling)
                 if current_path is not None:
                     self._file_list.append(current_path)
                     self._file_info[current_path] = SevenZipFileInfo(
