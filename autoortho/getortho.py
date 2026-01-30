@@ -1046,7 +1046,10 @@ def log_tile_creation_summary():
 seasons_enabled = CFG.seasons.enabled
 
 if seasons_enabled:
-    from aoseasons import AoSeasonCache
+    try:
+        from autoortho.aoseasons import AoSeasonCache
+    except ImportError:
+        from aoseasons import AoSeasonCache
     ao_seasons = AoSeasonCache(CFG.paths.cache_dir)
 
     # Per-DSF tile locks to serialize .si generation across threads
