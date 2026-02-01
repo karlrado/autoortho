@@ -9729,13 +9729,16 @@ class TileCacher(object):
     enable_cache = True
     cache_mem_lim = pow(2,30) * float(CFG.cache.cache_mem_limit)
     cache_tile_lim = 25
+    
+    # Maximum entries in open_count dict to prevent unbounded memory growth
+    _open_count_max = 2000
 
     def __init__(self, cache_dir='.cache'):
         if MEMTRACE:
             tracemalloc.start()
 
         self.tiles = OrderedDict()
-        self.open_count = {}
+        self.open_count = OrderedDict()  # Use OrderedDict for LRU-style eviction
 
         self.maptype_override = CFG.autoortho.maptype_override
         if self.maptype_override:
@@ -10282,6 +10285,12 @@ class TileCacher(object):
                 self.open_count[idx] = self.open_count.get(idx, 0) + 1
                 if self.open_count[idx] > 1:
                     log.debug(f"Tile: {idx} opened for the {self.open_count[idx]} time.")
+                # Limit open_count size to prevent unbounded memory growth
+                while len(self.open_count) > self._open_count_max:
+                    try:
+                        self.open_count.popitem(last=False)  # Remove oldest entry
+                    except KeyError:
+                        break
             elif tile.refs <= 0:
                 # Only in this case would this cache have made a difference
                 self.hits += 1
