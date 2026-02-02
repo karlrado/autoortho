@@ -558,6 +558,8 @@ class AOMount:
                         try:
                             # 'proc_count' is not required externally; only publish cur_mem_mb
                             self._shared_store.set('cur_mem_mb', total_rss // 1048576)
+                            # Add timestamp for staleness detection by workers
+                            self._shared_store.set('cur_mem_mb_ts', int(time.time()))
                         except Exception:
                             pass
                     except Exception:

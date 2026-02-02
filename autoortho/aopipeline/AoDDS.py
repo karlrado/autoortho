@@ -785,6 +785,16 @@ class StreamingBuilder:
         self.release()
         return False
 
+    def __del__(self):
+        """Safety net - release builder if not explicitly released."""
+        try:
+            if not self._released and self._handle is not None:
+                log.warning("StreamingBuilder.__del__: Builder was not released - "
+                           "possible resource leak. Use try/finally or context manager.")
+                self.release()
+        except Exception:
+            pass  # Don't raise in __del__
+
 
 class StreamingBuilderPool:
     """
@@ -823,6 +833,8 @@ class StreamingBuilderPool:
         self._decode_pool = decode_pool
         self._lock = threading.Lock()
         self._available: list = []
+        self._in_use: set = set()  # Track handles currently in use
+        self._total_created = 0  # Total builders ever created
         self._lib = None
         self._initialized = False
         
@@ -943,20 +955,37 @@ class StreamingBuilderPool:
             with self._lock:
                 if self._available:
                     handle = self._available.pop()
+                    self._in_use.add(id(handle))  # Track in-use handle
                     # Reset builder with new config
                     self._lib.aodds_builder_reset(handle, byref(c_config))
-                    return StreamingBuilder(handle, self, self._lib, c_config)
+                    try:
+                        return StreamingBuilder(handle, self, self._lib, c_config)
+                    except Exception:
+                        # Constructor failed - return handle to available pool
+                        self._in_use.discard(id(handle))
+                        self._available.append(handle)
+                        raise
             
             # Pool exhausted - try to create new if under limit
             with self._lock:
-                current_count = len(self._available) + self._pool_size - len(self._available)
+                # Fix: Use actual count of created builders, not buggy calculation
+                current_count = self._total_created
                 if current_count < self._pool_size * 2:
                     # Create new builder
                     handle = self._lib.aodds_builder_create(
                         byref(c_config), self._decode_pool
                     )
                     if handle:
-                        return StreamingBuilder(handle, self, self._lib, c_config)
+                        self._total_created += 1
+                        self._in_use.add(id(handle))  # Track in-use handle
+                        try:
+                            return StreamingBuilder(handle, self, self._lib, c_config)
+                        except Exception:
+                            # Constructor failed - destroy the handle
+                            self._in_use.discard(id(handle))
+                            self._total_created -= 1
+                            self._lib.aodds_builder_destroy(handle)
+                            raise
             
             if time.monotonic() - start > timeout:
                 log.warning(f"StreamingBuilderPool: timeout waiting for builder")
@@ -967,14 +996,27 @@ class StreamingBuilderPool:
     def _return_builder(self, handle: c_void_p) -> None:
         """Return a builder handle to the pool."""
         with self._lock:
+            self._in_use.discard(id(handle))
             self._available.append(handle)
     
     def close(self) -> None:
         """Destroy all builders in the pool."""
         with self._lock:
+            # Destroy available builders
             for handle in self._available:
-                self._lib.aodds_builder_destroy(handle)
+                try:
+                    self._lib.aodds_builder_destroy(handle)
+                except Exception:
+                    pass
             self._available.clear()
+            
+            # Note: in-use builders will be cleaned up when released
+            # Log warning if any builders are still in use
+            if self._in_use:
+                log.warning(f"StreamingBuilderPool.close(): {len(self._in_use)} builders "
+                           f"still in use - they will leak if not released")
+            
+            self._total_created = 0
     
     @property
     def available_count(self) -> int:
