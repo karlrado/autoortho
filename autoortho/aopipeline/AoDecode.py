@@ -23,7 +23,7 @@ Usage:
 
 from ctypes import (
     CDLL, POINTER, Structure, c_void_p,
-    c_char, c_char_p, c_int32, c_uint8, c_uint32,
+    c_char, c_char_p, c_int32, c_int64, c_uint8, c_uint32,
     byref, cast
 )
 import logging

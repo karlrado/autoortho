@@ -39,9 +39,9 @@ except ImportError:
     from aoconfig import CFG
 
 try:
-    from autoortho.aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat
+    from autoortho.aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat, update_decode_pool_stats
 except ImportError:
-    from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat
+    from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat, update_decode_pool_stats
 
 try:
     from autoortho.utils.constants import (
@@ -10181,9 +10181,17 @@ class TileCacher(object):
 
     def show_stats(self):
         process = psutil.Process(os.getpid())
-        cur_mem = process.memory_info().rss
+        mem_info = process.memory_info()
+        cur_mem = mem_info.rss
+        
+        # Log detailed memory info for debugging discrepancies with Activity Monitor
+        vms = getattr(mem_info, 'vms', 0)
+        log.debug(f"Memory detail: RSS={cur_mem//(1024**2)}MB, VMS={vms//(1024**2)}MB, PID={os.getpid()}")
+        
         # Report per-process memory to shared store; parent will aggregate
         update_process_memory_stat()
+        # Report decode pool stats for native buffer monitoring
+        update_decode_pool_stats()
         #set_stat('tile_mem_open', len(self.tiles))
         if self.enable_cache:
             #set_stat('tile_mem_miss', self.misses)
