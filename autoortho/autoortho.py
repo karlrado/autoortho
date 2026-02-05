@@ -556,8 +556,12 @@ class AOMount:
                                     total_rss += val
                                     proc_count += 1
                         try:
-                            # 'proc_count' is not required externally; only publish cur_mem_mb
+                            # Publish aggregated memory stats
                             self._shared_store.set('cur_mem_mb', total_rss // 1048576)
+                            # Add timestamp for staleness detection by workers
+                            self._shared_store.set('cur_mem_mb_ts', int(time.time()))
+                            # Publish proc_count for debugging memory discrepancies
+                            self._shared_store.set('mem_proc_count', proc_count)
                         except Exception:
                             pass
                     except Exception:
@@ -621,6 +625,7 @@ class AOMount:
 
                     snap = self._shared_store.snapshot()
                     # Hide internal per-process and batching keys from logs
+                    # But keep proc_mem_mb and proc_threads for debugging memory issues
                     try:
                         def _is_internal(k):
                             return (

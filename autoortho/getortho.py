@@ -39,9 +39,9 @@ except ImportError:
     from aoconfig import CFG
 
 try:
-    from autoortho.aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat
+    from autoortho.aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat, update_decode_pool_stats
 except ImportError:
-    from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat
+    from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat, update_decode_pool_stats
 
 try:
     from autoortho.utils.constants import (
@@ -1440,12 +1440,24 @@ class Getter(object):
 
     def stop(self):
         self.WORKING.clear()
+        
+        # Drain queue to unblock workers waiting on queue.get()
+        try:
+            while True:
+                self.queue.get_nowait()
+        except Empty:
+            pass
+        
+        # Join workers with timeout to prevent hanging on shutdown
         for t in self.workers:
-            t.join()
+            t.join(timeout=5.0)
+            if t.is_alive():
+                log.warning(f"Worker thread {t.name} did not terminate within 5s")
+        
         # If a stats thread was started, join it as well
         stat_thread = getattr(self, 'stat_t', None)
         if stat_thread is not None:
-            stat_thread.join()
+            stat_thread.join(timeout=2.0)
 
     def worker(self, idx):
         global STATS
@@ -1497,6 +1509,15 @@ class Getter(object):
                 self.submit(obj, *args, **kwargs)
             finally:
                 obj.in_flight = False
+        
+        # Worker loop ended - cleanup thread-local HTTP session
+        try:
+            session = getattr(self.localdata, 'session', None)
+            if session is not None:
+                session.close()
+                self.localdata.session = None
+        except Exception:
+            pass
 
     def get(obj, *args, **kwargs):
         raise NotImplementedError
@@ -1638,9 +1659,11 @@ def _warmup_native_pipeline():
         # Create a temporary pool for warmup (will be destroyed after warmup)
         pool = AoDecode.create_pool(64)
         if pool:
-            AoDecode.warmup_full(pool)
-            pool.destroy()
-            log.info("Native decode pipeline pre-warmed")
+            try:
+                AoDecode.warmup_full(pool)
+                log.info("Native decode pipeline pre-warmed")
+            finally:
+                pool.destroy()
     except Exception as e:
         log.debug(f"Native warmup failed: {e}")
 
@@ -1685,9 +1708,15 @@ def _async_cache_write(chunk):
 
 
 def shutdown_cache_writer():
-    """Shutdown the cache writer executor gracefully. Called during module cleanup."""
+    """Shutdown the cache writer executor gracefully. Called during module cleanup.
+    
+    Uses wait=True with a timeout to ensure pending writes complete before shutdown,
+    preventing potential file corruption or lost cache writes.
+    """
     try:
-        _cache_write_executor.shutdown(wait=False)
+        # Use wait=True to ensure pending writes complete
+        # Python 3.9+ supports cancel_futures parameter for forceful cancellation
+        _cache_write_executor.shutdown(wait=True)
     except Exception:
         pass
 
@@ -2003,6 +2032,30 @@ def get_all_tiles_for_position(lat: float, lon: float,
         for lookup in _terrain_lookups:
             results.extend(lookup.get_tiles_for_position(lat, lon, maptype_filter))
     return results
+
+
+def unregister_terrain_index(scenery_name: str) -> bool:
+    """
+    Unregister a terrain lookup for a specific scenery.
+    
+    Called when unmounting a scenery to free associated memory.
+    
+    Args:
+        scenery_name: Name of the scenery to unregister
+        
+    Returns:
+        True if the scenery was found and removed, False otherwise
+    """
+    global _terrain_lookups
+    with _terrain_lookups_lock:
+        for i, lookup in enumerate(_terrain_lookups):
+            if lookup._scenery_name == scenery_name:
+                lookup.clear_cache()
+                _terrain_lookups.pop(i)
+                log.info(f"Unregistered terrain lookup for {scenery_name}")
+                return True
+    log.debug(f"Terrain lookup for {scenery_name} not found")
+    return False
 
 
 def clear_terrain_indices() -> None:
@@ -3942,6 +3995,8 @@ class BackgroundDDSBuilder:
             return False
         
         finally:
+            # Clear JPEG refs to release memory held for zero-copy mode
+            jpeg_refs_for_nocopy.clear()
             # Clear transition tracking
             tile._active_streaming_builder = None
             tile._live_transition_event = None
@@ -5385,6 +5440,15 @@ class Tile(object):
 
     maxchunk_wait = float(CFG.autoortho.maxwait)
     imgs = None
+    
+    # Maximum cached images per tile to prevent unbounded memory growth
+    # Each AoImage holds ~64MB of RGBA data for 4096x4096 textures
+    # 4 images is sufficient for upscaling fallback logic (checks mipmap 1-4)
+    _IMGS_MAX_SIZE = 4
+    
+    # Maximum fallback chunks per tile to prevent unbounded memory growth
+    # Fallback chunks are shared parent chunks used when child chunks fail
+    _FALLBACK_POOL_MAX_SIZE = 100
 
     def __init__(self, col, row, maptype, zoom, min_zoom=0, priority=0,
             cache_dir=None, max_zoom=None):
@@ -5397,6 +5461,7 @@ class Tile(object):
         self._lock = threading.RLock()
         self.refs = 0
         self.imgs = {}
+        self._imgs_order = []  # Track insertion order for LRU eviction
 
         self.bytes_read = 0
         self.lowest_offset = 99999999
@@ -5513,6 +5578,58 @@ class Tile(object):
 
     def __repr__(self):
         return f"Tile({self.col}, {self.row}, {self.maptype}, {self.tilename_zoom}, min_zoom={self.min_zoom}, max_zoom={self.max_zoom}, max_mm={self.max_mipmap})"
+
+    def _cache_image(self, mipmap: int, img_data: tuple):
+        """Cache an image with LRU eviction when limit reached.
+        
+        This prevents unbounded memory growth from accumulating AoImage objects.
+        Each AoImage holds native RGBA pixel buffer (~64MB for 4096x4096).
+        
+        Args:
+            mipmap: Mipmap level (0 = full resolution)
+            img_data: Tuple of (image, col, row, zoom) metadata
+        """
+        # If already cached, just update (move to end for LRU)
+        if mipmap in self.imgs:
+            try:
+                self._imgs_order.remove(mipmap)
+            except ValueError:
+                pass  # Not in order list, that's fine
+            self._imgs_order.append(mipmap)
+            # Close old image before replacing
+            old_data = self.imgs.get(mipmap)
+            if old_data is not None:
+                if isinstance(old_data, tuple):
+                    im = old_data[0]
+                else:
+                    im = old_data
+                if im is not None and hasattr(im, 'close'):
+                    try:
+                        im.close()
+                    except Exception:
+                        pass
+            self.imgs[mipmap] = img_data
+            return
+        
+        # Evict oldest if at limit
+        while len(self.imgs) >= self._IMGS_MAX_SIZE and self._imgs_order:
+            oldest = self._imgs_order.pop(0)
+            old_data = self.imgs.pop(oldest, None)
+            if old_data is not None:
+                # Close the old image to free native memory immediately
+                if isinstance(old_data, tuple):
+                    im = old_data[0]
+                else:
+                    im = old_data
+                if im is not None and hasattr(im, 'close'):
+                    try:
+                        im.close()
+                    except Exception:
+                        pass
+        
+        # Insert new
+        self.imgs[mipmap] = img_data
+        self._imgs_order.append(mipmap)
 
     def _wait_for_pending_consolidation_if_needed(self, timeout: float = 5.0) -> bool:
         """
@@ -6470,6 +6587,10 @@ class Tile(object):
             wait_time_ms = (time.monotonic() - wait_start) * 1000
             log.debug(f"_try_streaming_aopipeline_build: Builder pool timeout after {wait_time_ms:.0f}ms")
             bump('streaming_builder_queue_timeout')
+            # Clear pre-collected data to free memory on early return
+            self._last_collected_jpegs = None
+            self._last_collected_missing = None
+            self._last_collected_ratio = None
             return False
         
         wait_time_ms = (time.monotonic() - wait_start) * 1000
@@ -6489,6 +6610,10 @@ class Tile(object):
             
             if not chunks:
                 log.debug(f"_try_streaming_aopipeline_build: No chunks for {self.id}")
+                # Clear pre-collected data to free memory on early return
+                self._last_collected_jpegs = None
+                self._last_collected_missing = None
+                self._last_collected_ratio = None
                 return False
             
             # Streaming builder now uses time_budget for download waits (not deprecated max_download_wait)
@@ -6687,6 +6812,8 @@ class Tile(object):
             return False
         
         finally:
+            # Clear JPEG refs to release memory held for zero-copy mode
+            jpeg_refs_for_nocopy.clear()
             builder.release()
 
     def _get_fallback_level(self) -> int:
@@ -7195,10 +7322,13 @@ class Tile(object):
         try:
             self.dds.gen_mipmaps(new_im, mipmap, mipmap, compress_len)
         finally:
-            pass
-            # We may have retrieved a full image that could be saved for later
-            # usage.  Don't close here.
-            #new_im.close()
+            # Close image if not cached in self.imgs to free native memory immediately
+            # If cached, it will be closed when evicted by _cache_image() or in close()
+            if mipmap not in self.imgs:
+                try:
+                    new_im.close()
+                except Exception:
+                    pass
 
         # We haven't fully retrieved so unset flag; guard against DDS being cleared
         log.debug(f"UNSETTING RETRIEVED! {self}")
@@ -8102,7 +8232,8 @@ class Tile(object):
         if should_cache:
             log.debug(f"GET_IMG: Save complete image for later...")
             # Store image with metadata (col, row, zoom) for coordinate mapping in upscaling
-            self.imgs[mipmap] = (new_im, col, row, zoom)
+            # Use _cache_image for LRU eviction to prevent unbounded memory growth
+            self._cache_image(mipmap, (new_im, col, row, zoom))
 
         # Log budget summary including fallback budget if used
         if fallback_budget is not None:
@@ -8232,6 +8363,16 @@ class Tile(object):
                 log.debug(f"Reusing shared fallback chunk {chunk} from pool")
                 bump('fallback_chunk_pool_hit')
                 return chunk
+            
+            # Evict oldest chunks if at limit to prevent unbounded memory growth
+            while len(self._fallback_chunk_pool) >= self._FALLBACK_POOL_MAX_SIZE:
+                oldest_key = next(iter(self._fallback_chunk_pool))
+                old_chunk = self._fallback_chunk_pool.pop(oldest_key)
+                try:
+                    old_chunk.close()
+                except Exception:
+                    pass
+                bump('fallback_chunk_pool_evict')
             
             # Create new chunk and add to pool
             # Use HIGH priority (low number) for fallback chunks since they're blocking
@@ -9546,8 +9687,13 @@ class Tile(object):
             else:
                 self.dds.gen_mipmaps(new_im, mipmap) 
         finally:
-            pass
-            #new_im.close()
+            # Close image if not cached in self.imgs to free native memory immediately
+            # If cached, it will be closed when evicted by _cache_image() or in close()
+            if mipmap not in self.imgs:
+                try:
+                    new_im.close()
+                except Exception:
+                    pass
 
         compress_end_time = time.monotonic()
         self.ready.set()
@@ -9675,13 +9821,14 @@ class Tile(object):
             pass
         finally:
             self.imgs.clear()
+            self._imgs_order = []  # Clear LRU tracking list
 
         # 2) Release DDS mip-map ByteIO buffers so the underlying bytes
         #    are no longer referenced from Python.
         if self.dds is not None:
             try:
-                for mm in getattr(self.dds, "mipmap_list", []):
-                    mm.databuffer = None
+                # Use DDS.close() method for proper cleanup
+                self.dds.close()
             except Exception:
                 pass
             # Drop the DDS object reference itself
@@ -9729,13 +9876,16 @@ class TileCacher(object):
     enable_cache = True
     cache_mem_lim = pow(2,30) * float(CFG.cache.cache_mem_limit)
     cache_tile_lim = 25
+    
+    # Maximum entries in open_count dict to prevent unbounded memory growth
+    _open_count_max = 2000
 
     def __init__(self, cache_dir='.cache'):
         if MEMTRACE:
             tracemalloc.start()
 
         self.tiles = OrderedDict()
-        self.open_count = {}
+        self.open_count = OrderedDict()  # Use OrderedDict for LRU-style eviction
 
         self.maptype_override = CFG.autoortho.maptype_override
         if self.maptype_override:
@@ -10031,15 +10181,31 @@ class TileCacher(object):
 
     def show_stats(self):
         process = psutil.Process(os.getpid())
-        cur_mem = process.memory_info().rss
+        mem_info = process.memory_info()
+        cur_mem = mem_info.rss
+        
+        # Log detailed memory info for debugging discrepancies with Activity Monitor
+        vms = getattr(mem_info, 'vms', 0)
+        log.debug(f"Memory detail: RSS={cur_mem//(1024**2)}MB, VMS={vms//(1024**2)}MB, PID={os.getpid()}")
+        
         # Report per-process memory to shared store; parent will aggregate
         update_process_memory_stat()
+        # Report decode pool stats for native buffer monitoring
+        update_decode_pool_stats()
         #set_stat('tile_mem_open', len(self.tiles))
         if self.enable_cache:
             #set_stat('tile_mem_miss', self.misses)
             #set_stat('tile_mem_hits', self.hits)
             log.debug(f"TILE CACHE:  MISS: {self.misses}  HIT: {self.hits}")
         log.debug(f"NUM OPEN TILES: {len(self.tiles)}.  TOTAL MEM: {cur_mem//1048576} MB")
+        
+        # Log warning if local RSS exceeds expected per-process share significantly
+        # This helps diagnose memory issues on MacOS with multiple worker processes
+        per_process_expected = self.cache_mem_lim // 4
+        if cur_mem > per_process_expected * 1.5:
+            log.warning(f"Memory usage ({cur_mem // (1024**2)}MB) significantly exceeds "
+                       f"expected per-process share ({per_process_expected // (1024**2)}MB). "
+                       f"Open tiles: {len(self.tiles)}")
 
     # -----------------------------
     # LRU helpers and leader logic
@@ -10159,6 +10325,15 @@ class TileCacher(object):
         # Maximum tile count before forced eviction (prevents memory bloat from tile object overhead)
         # Each tile object costs ~10-50KB in overhead even without loaded data
         max_tile_count = 5000
+        
+        # Per-process memory limit: fraction of global limit for fallback when aggregation fails
+        # MacOS runs each scenery as a separate subprocess, so each worker gets 1/4 of total limit
+        # This prevents any single worker from consuming all available memory
+        per_process_limit = self.cache_mem_lim // 4
+        
+        # Staleness threshold for global memory stats (seconds)
+        # If stats are older than this, they're considered unreliable
+        global_stat_max_age_sec = 30
 
         while True:
             process = psutil.Process(os.getpid())
@@ -10177,24 +10352,59 @@ class TileCacher(object):
                 continue
 
             # Use aggregated memory across all workers when available; otherwise local RSS
+            # Also check for staleness to avoid using outdated stats
+            global_mem_bytes = 0
+            global_stat_stale = True
+            
             try:
                 global_mem_mb = get_stat('cur_mem_mb')
-                global_mem_bytes = int(global_mem_mb) * 1048576 if isinstance(global_mem_mb, (int, float)) else 0
+                if isinstance(global_mem_mb, (int, float)) and global_mem_mb > 0:
+                    global_mem_bytes = int(global_mem_mb) * 1048576
+                    
+                    # Check staleness via last update timestamp
+                    try:
+                        last_update = get_stat('cur_mem_mb_ts')
+                        if isinstance(last_update, (int, float)):
+                            age = int(time.time()) - int(last_update)
+                            global_stat_stale = age > global_stat_max_age_sec
+                            if global_stat_stale:
+                                log.debug(f"Global memory stat is stale (age: {age}s > {global_stat_max_age_sec}s)")
+                        else:
+                            # No timestamp available - check if we're in single-process mode
+                            global_stat_stale = fast_mode  # Only stale if we expect multi-process
+                    except Exception:
+                        # No timestamp available
+                        global_stat_stale = fast_mode
             except Exception:
+                pass
+            
+            # If global stats are stale or unavailable, don't trust them
+            if global_stat_stale:
                 global_mem_bytes = 0
-
-            effective_mem = global_mem_bytes or cur_mem
+            
+            # Determine effective memory and limit based on aggregation availability
+            if global_mem_bytes > 0:
+                # Global aggregation working - use global memory vs global limit
+                effective_mem = global_mem_bytes
+                effective_limit = self.cache_mem_lim
+            else:
+                # Fallback: use local memory vs per-process limit
+                effective_mem = cur_mem
+                effective_limit = per_process_limit
+                if cur_mem > per_process_limit:
+                    log.warning(f"Global memory stats unavailable/stale, using per-process limit "
+                               f"({per_process_limit // (1024**2)}MB). Local RSS: {cur_mem // (1024**2)}MB")
 
             # Hysteresis target: evict down to limit - headroom
-            headroom = max(int(self.cache_mem_lim * self.evict_hysteresis_frac), self.evict_headroom_min_bytes)
-            target_bytes = max(0, int(self.cache_mem_lim) - headroom)
+            headroom = max(int(effective_limit * self.evict_hysteresis_frac), self.evict_headroom_min_bytes)
+            target_bytes = max(0, int(effective_limit) - headroom)
             
             # Check if we need to evict based on tile count (prevents unbounded tile accumulation)
             tile_count = len(self.tiles)
             need_tile_count_eviction = tile_count > max_tile_count
 
             # Leader election: only one worker performs eviction when shared store is present
-            need_mem_eviction = effective_mem > self.cache_mem_lim
+            need_mem_eviction = effective_mem > effective_limit
             if need_mem_eviction or need_tile_count_eviction:
                 if not self._try_acquire_evict_leader():
                     time.sleep(poll_interval)
@@ -10212,7 +10422,7 @@ class TileCacher(object):
             # Evict while above target using adaptive batch sizing
             while self.tiles and effective_mem > target_bytes:
                 over_bytes = max(0, effective_mem - target_bytes)
-                ratio = min(1.0, over_bytes / max(1, self.cache_mem_lim))
+                ratio = min(1.0, over_bytes / max(1, effective_limit))
                 adaptive = max(20, int(len(self.tiles) * min(0.10, ratio)))
                 # _evict_batch handles its own locking internally
                 evicted = self._evict_batch(adaptive)
@@ -10220,13 +10430,35 @@ class TileCacher(object):
                     break
 
                 # Recompute local RSS and, if available, the aggregated RSS
+                # Use same staleness-aware logic as main loop
                 cur_mem = process.memory_info().rss
+                global_mem_bytes = 0
                 try:
                     global_mem_mb = get_stat('cur_mem_mb')
-                    global_mem_bytes = int(global_mem_mb) * 1048576 if isinstance(global_mem_mb, (int, float)) else 0
+                    if isinstance(global_mem_mb, (int, float)) and global_mem_mb > 0:
+                        # Quick staleness check
+                        try:
+                            last_update = get_stat('cur_mem_mb_ts')
+                            if isinstance(last_update, (int, float)):
+                                age = int(time.time()) - int(last_update)
+                                if age <= global_stat_max_age_sec:
+                                    global_mem_bytes = int(global_mem_mb) * 1048576
+                        except Exception:
+                            pass
                 except Exception:
-                    global_mem_bytes = 0
-                effective_mem = global_mem_bytes or cur_mem
+                    pass
+                
+                # Update effective_mem and effective_limit consistently
+                if global_mem_bytes > 0:
+                    effective_mem = global_mem_bytes
+                    effective_limit = self.cache_mem_lim
+                else:
+                    effective_mem = cur_mem
+                    effective_limit = per_process_limit
+                
+                # Recalculate target with potentially new limit
+                headroom = max(int(effective_limit * self.evict_hysteresis_frac), self.evict_headroom_min_bytes)
+                target_bytes = max(0, int(effective_limit) - headroom)
 
                 # Renew leadership and publish heartbeat after an eviction batch
                 try:
@@ -10282,6 +10514,12 @@ class TileCacher(object):
                 self.open_count[idx] = self.open_count.get(idx, 0) + 1
                 if self.open_count[idx] > 1:
                     log.debug(f"Tile: {idx} opened for the {self.open_count[idx]} time.")
+                # Limit open_count size to prevent unbounded memory growth
+                while len(self.open_count) > self._open_count_max:
+                    try:
+                        self.open_count.popitem(last=False)  # Remove oldest entry
+                    except KeyError:
+                        break
             elif tile.refs <= 0:
                 # Only in this case would this cache have made a difference
                 self.hits += 1
