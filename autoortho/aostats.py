@@ -163,18 +163,66 @@ def delete_stat(stat: str):
 
 
 def update_process_memory_stat():
-    """Update this process's RSS and heartbeat in the shared stats store.
+    """Update this process's memory and heartbeat in the shared stats store.
 
-    Writes two keys:
-      - proc_mem_rss_bytes:<pid> = RSS in bytes
+    On macOS, Activity Monitor's "Memory" column can differ significantly from
+    psutil's RSS due to shared libraries, memory-mapped files, and native 
+    allocations. We try multiple approaches to get the most accurate value.
+    
+    Writes keys:
+      - proc_mem_rss_bytes:<pid> = memory in bytes (best available metric)
       - proc_alive_ts:<pid> = unix timestamp of last heartbeat
+      - proc_mem_mb:<pid> = human-readable MB value for debugging
     """
     try:
+        import sys
         pid = os.getpid()
-        rss = psutil.Process(pid).memory_info().rss
+        proc = psutil.Process(pid)
         now_ts = int(time.time())
-        set_stat(f"proc_mem_rss_bytes:{pid}", int(rss))
+        
+        # Get all available memory metrics
+        mem_info = proc.memory_info()
+        rss = mem_info.rss
+        vms = getattr(mem_info, 'vms', 0)
+        
+        # On macOS, try to get 'footprint' if available (matches Activity Monitor better)
+        # This requires macOS 10.9+ and psutil 5.7+
+        footprint = 0
+        if sys.platform == 'darwin':
+            try:
+                # Try to read footprint via memory_full_info if available
+                full_info = proc.memory_full_info()
+                # Some psutil versions provide 'uss' which is closer to footprint
+                if hasattr(full_info, 'uss') and full_info.uss > 0:
+                    footprint = full_info.uss
+            except (AttributeError, psutil.AccessDenied, NotImplementedError, psutil.NoSuchProcess):
+                pass
+        
+        # Use the best available metric:
+        # 1. Footprint/USS if available (most accurate on macOS)
+        # 2. Otherwise RSS
+        if footprint > 0:
+            mem_bytes = footprint
+        else:
+            mem_bytes = rss
+        
+        # Log detailed memory info periodically for debugging discrepancies
+        # This helps diagnose cases where Activity Monitor shows different values
+        if vms > rss * 3:
+            log.debug(f"Memory detail PID={pid}: RSS={rss//(1024**2)}MB, VMS={vms//(1024**2)}MB, "
+                     f"footprint={footprint//(1024**2)}MB, using={mem_bytes//(1024**2)}MB")
+        
+        set_stat(f"proc_mem_rss_bytes:{pid}", int(mem_bytes))
         set_stat(f"proc_alive_ts:{pid}", now_ts)
+        # Also publish human-readable versions for debugging
+        set_stat(f"proc_mem_mb:{pid}", int(mem_bytes // (1024 * 1024)))
+        
+        # Add thread count for debugging (high thread counts can explain memory discrepancies)
+        try:
+            thread_count = proc.num_threads()
+            set_stat(f"proc_threads:{pid}", thread_count)
+        except Exception:
+            pass
     except Exception as _err:
         # Best-effort; ignore failures
         log.debug(f"update_process_memory_stat: {_err}")
@@ -185,6 +233,49 @@ def clear_process_memory_stat():
     pid = os.getpid()
     delete_stat(f"proc_mem_rss_bytes:{pid}")
     delete_stat(f"proc_alive_ts:{pid}")
+
+
+def update_decode_pool_stats():
+    """
+    Publish decode pool statistics to the stats store.
+    
+    This is called periodically from stats loops to track native
+    JPEG decode buffer pool usage, which is critical for diagnosing
+    memory issues.
+    
+    Published stats:
+    - decode_pool_fixed: Number of fixed pool buffers
+    - decode_pool_available: Available fixed buffers
+    - decode_pool_acquired: Buffers currently in use from fixed pool
+    - decode_pool_overflow: Overflow buffers allocated via malloc
+    - decode_pool_overflow_mb: Overflow memory in MB
+    - decode_pool_limit_mb: Memory limit in MB
+    """
+    try:
+        # Import here to avoid circular imports
+        try:
+            from autoortho.aopipeline import AoDDS
+        except ImportError:
+            from aopipeline import AoDDS
+        
+        stats = AoDDS.get_decode_pool_stats()
+        if stats:
+            set_stat('decode_pool_fixed', stats['total'])
+            set_stat('decode_pool_available', stats['available'])
+            set_stat('decode_pool_acquired', stats['acquired'])
+            set_stat('decode_pool_overflow', stats['overflow_count'])
+            overflow_mb = stats['overflow_bytes'] // (1024 * 1024)
+            limit_mb = stats['memory_limit'] // (1024 * 1024)
+            set_stat('decode_pool_overflow_mb', overflow_mb)
+            set_stat('decode_pool_limit_mb', limit_mb)
+
+            # Log warning if overflow is growing
+            if stats['overflow_count'] > 0:
+                log.debug(f"Decode pool overflow: {stats['overflow_count']} "
+                          f"buffers, {overflow_mb} MB")
+    except Exception as e:
+        # Best-effort; ignore failures
+        log.debug(f"update_decode_pool_stats: {e}")
 
 
 class AOStats(object):
