@@ -10371,7 +10371,12 @@ class TileCacher(object):
         log.info(f"Started tile clean thread.  Mem limit {self.cache_mem_lim}")
         # Faster cadence when a shared stats store is present (macOS parent)
         fast_mode = self._has_shared_store()
-        poll_interval = 3 if fast_mode else 15
+        # Base poll intervals — used when memory is well below limit.
+        # When memory approaches the limit (>70%), the interval drops
+        # to poll_interval_fast to catch growth before it overshoots.
+        poll_interval_normal = 3 if fast_mode else 10
+        poll_interval_fast = 1
+        poll_interval = poll_interval_normal
         
         # Maximum tile count before forced eviction (prevents memory bloat from tile object overhead)
         # Each tile object costs ~10-50KB in overhead even without loaded data
@@ -10457,7 +10462,7 @@ class TileCacher(object):
             need_mem_eviction = effective_mem > effective_limit
             if need_mem_eviction or need_tile_count_eviction:
                 if not self._try_acquire_evict_leader():
-                    time.sleep(poll_interval)
+                    time.sleep(poll_interval_fast)
                     continue
                     
             # Evict if too many tiles (regardless of memory)
@@ -10525,6 +10530,19 @@ class TileCacher(object):
                 for stat in top_stats[:10]:
                         log.info(stat)
 
+            # Adaptive poll interval: check more frequently when
+            # memory is above 70% of the limit so eviction can
+            # react before the limit is significantly exceeded.
+            # During active tile creation, memory can grow at
+            # ~200-300 MB/s, so a 3-second sleep allows ~700 MB
+            # of overshoot.  A 1-second sleep caps it to ~250 MB.
+            mem_pressure = (
+                effective_mem / max(1, effective_limit)
+            )
+            if mem_pressure > 0.7:
+                poll_interval = poll_interval_fast
+            else:
+                poll_interval = poll_interval_normal
             time.sleep(poll_interval)
 
     def _get_tile(self, row, col, map_type, zoom):
