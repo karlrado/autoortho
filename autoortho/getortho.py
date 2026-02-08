@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import logging
 import atexit
+import ctypes
+import gc
 import os
 import re
 import sys
@@ -4823,7 +4825,12 @@ def start_predictive_dds(tile_cacher=None) -> None:
         tile_cacher: TileCacher instance (for future use)
     """
     global prebuilt_dds_cache, background_dds_builder, tile_completion_tracker, _bundle_consolidator
-    
+
+    # Prevent duplicate initialization (Windows/Linux: all mounts share one process)
+    if background_dds_builder is not None:
+        log.debug("Predictive DDS already initialized, skipping")
+        return
+
     # Check if enabled
     enabled = getattr(CFG.autoortho, 'predictive_dds_enabled', True)
     if isinstance(enabled, str):
@@ -9912,6 +9919,34 @@ class Tile(object):
         self._closed = True
 
 
+def _release_memory_to_os():
+    """
+    Force the OS to reclaim physical pages from freed Python/C allocations.
+
+    After tile eviction, Python frees objects but the C runtime heap retains
+    the pages. This causes RSS to stay high even though the memory is logically
+    free. Platform-specific calls return those pages to the OS.
+    """
+    gc.collect()
+    if sys.platform == 'linux':
+        try:
+            _libc = ctypes.CDLL("libc.so.6")
+            _libc.malloc_trim(0)
+        except Exception:
+            pass
+    elif sys.platform == 'darwin':
+        try:
+            _libc = ctypes.CDLL("libSystem.B.dylib")
+            _libc.malloc_zone_pressure_relief(None, 0)
+        except Exception:
+            pass
+    elif sys.platform == 'win32':
+        try:
+            ctypes.cdll.msvcrt._heapmin()
+        except Exception:
+            pass
+
+
 class TileCacher(object):
     hits = 0
     misses = 0
@@ -10389,6 +10424,8 @@ class TileCacher(object):
         while True:
             process = psutil.Process(os.getpid())
             cur_mem = process.memory_info().rss
+            total_evicted = 0
+            rss_before_eviction = cur_mem  # Always set so eviction-log block never sees UnboundLocalError
 
             # Publish this process heartbeat + RSS so the parent can aggregate
             try:
@@ -10464,7 +10501,8 @@ class TileCacher(object):
                 if not self._try_acquire_evict_leader():
                     time.sleep(poll_interval_fast)
                     continue
-                    
+                rss_before_eviction = process.memory_info().rss
+
             # Evict if too many tiles (regardless of memory)
             if need_tile_count_eviction:
                 target_tile_count = int(max_tile_count * 0.8)  # Evict down to 80% of max
@@ -10472,7 +10510,8 @@ class TileCacher(object):
                 if tiles_to_evict > 0:
                     log.info(f"Tile count eviction: {tile_count} tiles, evicting {tiles_to_evict} to reach {target_tile_count}")
                     # _evict_batch handles its own locking internally
-                    self._evict_batch(tiles_to_evict)
+                    evicted = self._evict_batch(tiles_to_evict)
+                    total_evicted += evicted
 
             # Evict while above target using adaptive batch sizing
             while self.tiles and effective_mem > target_bytes:
@@ -10481,6 +10520,7 @@ class TileCacher(object):
                 adaptive = max(20, int(len(self.tiles) * min(0.10, ratio)))
                 # _evict_batch handles its own locking internally
                 evicted = self._evict_batch(adaptive)
+                total_evicted += evicted
                 if evicted == 0:
                     break
 
@@ -10521,6 +10561,16 @@ class TileCacher(object):
                     update_process_memory_stat()
                 except Exception:
                     pass
+
+            if total_evicted > 0:
+                _release_memory_to_os()
+                rss_after_release = process.memory_info().rss
+                log.info(
+                    f"Eviction complete: evicted={total_evicted} tiles, "
+                    f"RSS before={rss_before_eviction // (1024**2)}MB, "
+                    f"RSS after release={rss_after_release // (1024**2)}MB, "
+                    f"freed={max(0, rss_before_eviction - rss_after_release) // (1024**2)}MB"
+                )
 
             if MEMTRACE:
                 snapshot = tracemalloc.take_snapshot()
