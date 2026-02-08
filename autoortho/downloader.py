@@ -211,19 +211,26 @@ class Package(object):
             else:
                 cur_activity['status'] = f"Downloading and/or verifying {url}"
 
-            posible_destpath = ""
+            possible_destpath = ""
             filename = os.path.basename(url)
             destpath = os.path.join(self.download_dir, filename)
-            log.info(filename)
+            log.info(f"Considering downloading {filename}")
             match = re.match(self.regex_for_assembled_files, filename)
             if (match):
-                log.info("match!")
-                posible_destpath = os.path.join(self.download_dir, match.group(1))
+                possible_destpath = os.path.join(self.download_dir, match.group(1))
+                log.info(f"{filename} is a possible part of the multi-part file {match.group(1)}")
 
             # If the file is already present, count it as done for overall progress
-            if os.path.isfile(destpath) or os.path.isfile(posible_destpath):
-                log.info(f"{destpath} already exists.  Skip.")
-                self.zf.files.append(destpath)
+            if os.path.isfile(destpath) or os.path.isfile(possible_destpath):
+                # If the assembled multipart file already exists, add it to the list only once
+                # and consider the current partial file (destpath) already downloaded.
+                if os.path.isfile(possible_destpath):
+                    log.info(f"{possible_destpath} already exists.  Skipping {destpath}.")
+                    if possible_destpath not in self.zf.files:
+                        self.zf.files.append(possible_destpath)
+                else:
+                    log.info(f"{destpath} already exists.  Skip.")
+                    self.zf.files.append(destpath)
                 #print(f"{self.zf.path} already exists.  Skip.")
                 #self.zf.assembled = True
                 #self.downloaded = True
