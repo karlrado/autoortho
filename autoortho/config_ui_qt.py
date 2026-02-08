@@ -3652,6 +3652,7 @@ class ConfigUI(QMainWindow):
         if button:
             button.setEnabled(False)
             button.setText("Uninstalling...")
+            self.update_status_bar(f"Uninstalling {region_id}...")
 
         # Create worker thread
         worker = SceneryUninstallWorker(self.dl, region_id)
@@ -4842,7 +4843,7 @@ class ConfigUI(QMainWindow):
             # Also change button text while verifying
             button = self.findChild(QPushButton, f"scenery-{region_id}")
             if button:
-                button.setText("Verifying...")
+                button.setText("Installing...")  # We're actually installing
             # Update status with verification state
             status = progress_data.get('status', 'Verifying...')
             self.update_status_bar(f"{region_id}: {status}")

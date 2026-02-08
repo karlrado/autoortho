@@ -200,7 +200,7 @@ class Package(object):
         for url in self.remote_urls:
             if progress_callback:
                 init_progress = {
-                    'status': f"Downloading {url}",
+                    'status': f"Downloading and/or verifying {url}",
                     'pcnt_done': 0,
                     'MBps': 0,
                 }
@@ -209,7 +209,7 @@ class Package(object):
                     init_progress['files_total'] = self.progress_state.get('files_total', 0)
                 progress_callback(init_progress)
             else:
-                cur_activity['status'] = f"Downloading {url}"
+                cur_activity['status'] = f"Downloading and/or verifying {url}"
 
             posible_destpath = ""
             filename = os.path.basename(url)
@@ -632,10 +632,10 @@ class Release(object):
             log.info(f"Already installed {self.name}")
             return True
         
-        print(f"Check for and cleanup existing installs..")
+        log.info("Check for and cleanup existing installs..")
         for k,v in self.packages.items():
             if v.pkgtype == "z":
-                log.debug("Must cleanup ortho type package.")
+                log.debug(f"Cleaning up ortho type package: {v.name}.")
                 v.uninstall()
 
         self.parse()
@@ -675,7 +675,7 @@ class Release(object):
                 'verify_done': done,
                 'verify_total': total,
                 'verify_pcnt': 0,
-                'status': 'Starting verification',
+                'status': 'Starting verification and installation',
             })
 
         success = True
