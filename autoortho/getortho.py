@@ -41,9 +41,9 @@ except ImportError:
     from aoconfig import CFG
 
 try:
-    from autoortho.aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat, update_decode_pool_stats
+    from autoortho.aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat, update_decode_pool_stats, _get_macos_phys_footprint
 except ImportError:
-    from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat, update_decode_pool_stats
+    from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat, update_decode_pool_stats, _get_macos_phys_footprint
 
 try:
     from autoortho.utils.constants import (
@@ -9926,6 +9926,11 @@ def _release_memory_to_os():
     After tile eviction, Python frees objects but the C runtime heap retains
     the pages. This causes RSS to stay high even though the memory is logically
     free. Platform-specific calls return those pages to the OS.
+
+    Note: on macOS we deliberately skip ``malloc_zone_pressure_relief`` because
+    the kernel's memory compressor already reclaims pages aggressively, and
+    calling it triggers page decompression/recompression churn that inflates
+    ``phys_footprint`` rather than reducing it.
     """
     gc.collect()
     if sys.platform == 'linux':
@@ -9934,17 +9939,25 @@ def _release_memory_to_os():
             _libc.malloc_trim(0)
         except Exception:
             pass
-    elif sys.platform == 'darwin':
-        try:
-            _libc = ctypes.CDLL("libSystem.B.dylib")
-            _libc.malloc_zone_pressure_relief(None, 0)
-        except Exception:
-            pass
     elif sys.platform == 'win32':
         try:
             ctypes.cdll.msvcrt._heapmin()
         except Exception:
             pass
+
+
+def _get_process_mem_bytes(process):
+    """Best available memory metric: phys_footprint on macOS, RSS elsewhere.
+
+    This is a lightweight call used inside the eviction loop to get the
+    current process's true memory pressure without going through the
+    full stats/IPC machinery.
+    """
+    if sys.platform == 'darwin':
+        fp = _get_macos_phys_footprint()
+        if fp > 0:
+            return fp
+    return process.memory_info().rss
 
 
 class TileCacher(object):
@@ -10415,7 +10428,7 @@ class TileCacher(object):
         
         # Maximum tile count before forced eviction (prevents memory bloat from tile object overhead)
         # Each tile object costs ~10-50KB in overhead even without loaded data
-        max_tile_count = 5000
+        max_tile_count = 3000
         
         # Staleness threshold for global memory stats (seconds)
         # If stats are older than this, they're considered unreliable
@@ -10423,13 +10436,15 @@ class TileCacher(object):
 
         while True:
             process = psutil.Process(os.getpid())
-            cur_mem = process.memory_info().rss
+            cur_mem = _get_process_mem_bytes(process)
             total_evicted = 0
             rss_before_eviction = cur_mem  # Always set so eviction-log block never sees UnboundLocalError
 
             # Publish this process heartbeat + RSS so the parent can aggregate
             try:
-                update_process_memory_stat()
+                stat_mem = update_process_memory_stat()
+                if stat_mem > 0:
+                    cur_mem = stat_mem  # prefer the full-featured metric
             except Exception:
                 pass
 
@@ -10473,7 +10488,9 @@ class TileCacher(object):
             # Determine effective memory and limit based on aggregation availability
             if global_mem_bytes > 0:
                 # Global aggregation working - use global memory vs global limit
-                effective_mem = global_mem_bytes
+                # Floor at local cur_mem so we never under-count if the global
+                # stat hasn't caught up with this worker's recent growth.
+                effective_mem = max(global_mem_bytes, cur_mem)
                 effective_limit = self.cache_mem_lim
             else:
                 # Fallback: use local memory vs cache limit
@@ -10501,7 +10518,7 @@ class TileCacher(object):
                 if not self._try_acquire_evict_leader():
                     time.sleep(poll_interval_fast)
                     continue
-                rss_before_eviction = process.memory_info().rss
+                rss_before_eviction = _get_process_mem_bytes(process)
 
             # Evict if too many tiles (regardless of memory)
             if need_tile_count_eviction:
@@ -10524,9 +10541,9 @@ class TileCacher(object):
                 if evicted == 0:
                     break
 
-                # Recompute local RSS and, if available, the aggregated RSS
-                # Use same staleness-aware logic as main loop
-                cur_mem = process.memory_info().rss
+                # Recompute local memory and, if available, the aggregated total.
+                # Use same staleness-aware logic as main loop.
+                cur_mem = _get_process_mem_bytes(process)
                 global_mem_bytes = 0
                 try:
                     global_mem_mb = get_stat('cur_mem_mb')
@@ -10545,7 +10562,7 @@ class TileCacher(object):
                 
                 # Update effective_mem and effective_limit consistently
                 if global_mem_bytes > 0:
-                    effective_mem = global_mem_bytes
+                    effective_mem = max(global_mem_bytes, cur_mem)
                     effective_limit = self.cache_mem_lim
                 else:
                     effective_mem = cur_mem
@@ -10564,7 +10581,7 @@ class TileCacher(object):
 
             if total_evicted > 0:
                 _release_memory_to_os()
-                rss_after_release = process.memory_info().rss
+                rss_after_release = _get_process_mem_bytes(process)
                 log.info(
                     f"Eviction complete: evicted={total_evicted} tiles, "
                     f"RSS before={rss_before_eviction // (1024**2)}MB, "

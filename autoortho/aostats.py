@@ -1,7 +1,9 @@
 import os
+import sys
 import time
 import threading
 import collections
+import ctypes
 from collections.abc import MutableMapping
 from multiprocessing.managers import BaseManager
 import psutil
@@ -162,70 +164,150 @@ def delete_stat(stat: str):
             _local_stats.pop(stat, None)
 
 
+# ---------------------------------------------------------------------------
+# macOS phys_footprint via task_info (cached lib handle, zero-cost on other OS)
+# ---------------------------------------------------------------------------
+_macos_lib = None
+_macos_phys_footprint_ok = None  # None = untested, True/False = cached result
+
+
+def _get_macos_phys_footprint():
+    """Return the current process physical footprint in bytes (macOS only).
+
+    Uses ``task_info(TASK_VM_INFO)`` to read ``phys_footprint``, which
+    includes resident + compressed + swapped pages and matches Activity
+    Monitor's "Memory" column.  Returns 0 on non-macOS or on any failure.
+    """
+    global _macos_lib, _macos_phys_footprint_ok
+
+    if sys.platform != 'darwin':
+        return 0
+    if _macos_phys_footprint_ok is False:
+        return 0
+
+    try:
+        if _macos_lib is None:
+            _macos_lib = ctypes.CDLL("libSystem.B.dylib")
+            _macos_lib.mach_task_self.restype = ctypes.c_uint32
+            _macos_lib.mach_task_self.argtypes = []
+            _macos_lib.task_info.argtypes = [
+                ctypes.c_uint32,                       # task
+                ctypes.c_int,                          # flavor
+                ctypes.c_void_p,                       # task_info_out
+                ctypes.POINTER(ctypes.c_uint32),       # count in/out
+            ]
+            _macos_lib.task_info.restype = ctypes.c_int
+
+        # task_vm_info_data_t layout through phys_footprint (XNU REV1).
+        # 20 fields, 152 bytes total.  The three purgeable_volatile fields
+        # (pmap / resident / virtual) must all be present so that
+        # phys_footprint lands at its correct offset (byte 144).
+        class _TaskVMInfo(ctypes.Structure):
+            _fields_ = [
+                ("virtual_size",                  ctypes.c_uint64),   # 0
+                ("region_count",                  ctypes.c_int32),    # 8
+                ("page_size",                     ctypes.c_int32),    # 12
+                ("resident_size",                 ctypes.c_uint64),   # 16
+                ("resident_size_peak",            ctypes.c_uint64),   # 24
+                ("device",                        ctypes.c_uint64),   # 32
+                ("device_peak",                   ctypes.c_uint64),   # 40
+                ("internal",                      ctypes.c_uint64),   # 48
+                ("internal_peak",                 ctypes.c_uint64),   # 56
+                ("external",                      ctypes.c_uint64),   # 64
+                ("external_peak",                 ctypes.c_uint64),   # 72
+                ("reusable",                      ctypes.c_uint64),   # 80
+                ("reusable_peak",                 ctypes.c_uint64),   # 88
+                ("purgeable_volatile_pmap",       ctypes.c_uint64),   # 96
+                ("purgeable_volatile_resident",   ctypes.c_uint64),   # 104
+                ("purgeable_volatile_virtual",    ctypes.c_uint64),   # 112
+                ("compressed",                    ctypes.c_uint64),   # 120
+                ("compressed_peak",               ctypes.c_uint64),   # 128
+                ("compressed_lifetime",           ctypes.c_uint64),   # 136
+                ("phys_footprint",                ctypes.c_uint64),   # 144
+            ]
+
+        TASK_VM_INFO = 22
+        buf = _TaskVMInfo()
+        # count is in units of natural_t (4 bytes on arm64/x86_64)
+        count = ctypes.c_uint32(ctypes.sizeof(_TaskVMInfo) // 4)
+        kr = _macos_lib.task_info(
+            _macos_lib.mach_task_self(),
+            TASK_VM_INFO,
+            ctypes.byref(buf),
+            ctypes.byref(count),
+        )
+        if kr != 0:
+            return 0
+
+        _macos_phys_footprint_ok = True
+        return int(buf.phys_footprint)
+
+    except Exception:
+        _macos_phys_footprint_ok = False
+        return 0
+
+
 def update_process_memory_stat():
     """Update this process's memory and heartbeat in the shared stats store.
 
-    On macOS, Activity Monitor's "Memory" column can differ significantly from
-    psutil's RSS due to shared libraries, memory-mapped files, and native 
-    allocations. We try multiple approaches to get the most accurate value.
-    
+    On macOS, Activity Monitor shows ``phys_footprint`` which includes
+    compressed and swapped pages.  ``psutil`` only exposes RSS/USS which the
+    kernel can silently compress, leading to massive under-reporting.
+
+    Priority order for the memory metric:
+      1. ``phys_footprint`` via ctypes (macOS only -- matches Activity Monitor)
+      2. ``psutil.memory_full_info().uss`` (cross-platform best-effort)
+      3. ``psutil.memory_info().rss`` (universal fallback)
+
+    Returns:
+        int: memory value in bytes that was published, or 0 on error.
+
     Writes keys:
       - proc_mem_rss_bytes:<pid> = memory in bytes (best available metric)
-      - proc_alive_ts:<pid> = unix timestamp of last heartbeat
-      - proc_mem_mb:<pid> = human-readable MB value for debugging
+      - proc_alive_ts:<pid>     = unix timestamp of last heartbeat
+      - proc_mem_mb:<pid>       = human-readable MB value for debugging
+      - proc_threads:<pid>      = thread count (diagnostic)
     """
     try:
-        import sys
         pid = os.getpid()
         proc = psutil.Process(pid)
         now_ts = int(time.time())
-        
-        # Get all available memory metrics
-        mem_info = proc.memory_info()
-        rss = mem_info.rss
-        vms = getattr(mem_info, 'vms', 0)
-        
-        # On macOS, try to get 'footprint' if available (matches Activity Monitor better)
-        # This requires macOS 10.9+ and psutil 5.7+
-        footprint = 0
+
+        # --- choose the best available memory metric ---
+        mem_bytes = 0
+
+        # 1) macOS phys_footprint (includes compressed/swapped pages)
         if sys.platform == 'darwin':
+            mem_bytes = _get_macos_phys_footprint()
+
+        # 2) USS via psutil (unique set size, excludes shared libs)
+        if mem_bytes <= 0:
             try:
-                # Try to read footprint via memory_full_info if available
                 full_info = proc.memory_full_info()
-                # Some psutil versions provide 'uss' which is closer to footprint
                 if hasattr(full_info, 'uss') and full_info.uss > 0:
-                    footprint = full_info.uss
-            except (AttributeError, psutil.AccessDenied, NotImplementedError, psutil.NoSuchProcess):
+                    mem_bytes = full_info.uss
+            except (AttributeError, psutil.AccessDenied,
+                    NotImplementedError, psutil.NoSuchProcess):
                 pass
-        
-        # Use the best available metric:
-        # 1. Footprint/USS if available (most accurate on macOS)
-        # 2. Otherwise RSS
-        if footprint > 0:
-            mem_bytes = footprint
-        else:
-            mem_bytes = rss
-        
-        # Log detailed memory info periodically for debugging discrepancies
-        # This helps diagnose cases where Activity Monitor shows different values
-        if vms > rss * 3:
-            log.debug(f"Memory detail PID={pid}: RSS={rss//(1024**2)}MB, VMS={vms//(1024**2)}MB, "
-                     f"footprint={footprint//(1024**2)}MB, using={mem_bytes//(1024**2)}MB")
-        
+
+        # 3) RSS fallback
+        if mem_bytes <= 0:
+            mem_bytes = proc.memory_info().rss
+
         set_stat(f"proc_mem_rss_bytes:{pid}", int(mem_bytes))
         set_stat(f"proc_alive_ts:{pid}", now_ts)
-        # Also publish human-readable versions for debugging
         set_stat(f"proc_mem_mb:{pid}", int(mem_bytes // (1024 * 1024)))
-        
-        # Add thread count for debugging (high thread counts can explain memory discrepancies)
+
         try:
-            thread_count = proc.num_threads()
-            set_stat(f"proc_threads:{pid}", thread_count)
+            set_stat(f"proc_threads:{pid}", proc.num_threads())
         except Exception:
             pass
+
+        return int(mem_bytes)
+
     except Exception as _err:
-        # Best-effort; ignore failures
         log.debug(f"update_process_memory_stat: {_err}")
+        return 0
 
 
 def clear_process_memory_stat():
