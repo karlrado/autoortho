@@ -125,7 +125,88 @@ class Zip(object):
     def extract(self, dest):
         with zipfile.ZipFile(self.path) as zf:
             zf.extractall(dest)
-            
+
+    # This approach is faster than extract, copytree, rmtree
+    def extractScenery_y(self, destpath):
+        with zipfile.ZipFile(self.path) as zf:
+            destpath = os.path.join(destpath, "Earth nav data")
+            os.makedirs(destpath, exist_ok=True)
+            zip_path = zipfile.Path(zf)  # This is the path to and within the zip file
+
+            children = []
+            for entry in zip_path.iterdir():
+                if (zip_path / entry.name).is_dir():
+                    children.append(entry.name)
+            if not len(children) == 1:
+                log.error(
+                    f"Unexpected directory structure in {zf}, too many top-level children."
+                )
+                return
+
+            zip_path = zip_path / children[0] / "yOrtho4XP_Overlays" / "Earth nav data"
+            if not zip_path.is_dir():
+                log.error(f"'yOrtho4XP_Overlays/Earth nav data' not found in {zf}")
+                return
+
+            for dir in zip_path.iterdir():
+                os.makedirs(os.path.join(destpath, dir.name), exist_ok=True)
+                for entry in (zip_path / dir.name).iterdir():
+                    with (
+                        entry.open(mode="rb") as source,
+                        open(
+                            os.path.join(destpath, dir.name, entry.name),
+                            "wb",
+                        ) as dest,
+                    ):
+                        shutil.copyfileobj(source, dest)
+
+    # This approach is faster than extract, copytree, rmtree
+    def extractScenery_z(self, destpath):
+        with zipfile.ZipFile(self.path) as zf:
+            os.makedirs(destpath, exist_ok=True)
+            zip_path = zipfile.Path(zf)  # This is the path to and within the zip file
+
+            children = []
+            for entry in zip_path.iterdir():
+                if (zip_path / entry.name).is_dir():
+                    children.append(entry.name)
+            if not len(children) == 1:
+                log.error(
+                    f"Unexpected directory structure in {zf}, too many top-level children."
+                )
+                return
+
+            zip_path = zip_path / children[0]
+
+            for dir in zip_path.iterdir():
+                os.makedirs(os.path.join(destpath, dir.name), exist_ok=True)
+                if dir.name == "textures" or dir.name == "terrain":
+                    for entry in (zip_path / dir.name).iterdir():
+                        with (
+                            entry.open(mode="rb") as source,
+                            open(
+                                os.path.join(destpath, dir.name, entry.name), "wb"
+                            ) as dest,
+                        ):
+                            shutil.copyfileobj(source, dest)
+                elif dir.name == "Earth nav data":
+                    earth_path = zip_path / dir.name
+                    for earth_dir in earth_path.iterdir():
+                        os.makedirs(
+                            os.path.join(destpath, dir.name, earth_dir.name),
+                            exist_ok=True,
+                        )
+                        for entry in (earth_path / earth_dir.name).iterdir():
+                            with (
+                                entry.open(mode="rb") as source,
+                                open(
+                                    os.path.join(
+                                        destpath, dir.name, earth_dir.name, entry.name
+                                    ),
+                                    "wb",
+                                ) as dest,
+                            ):
+                                shutil.copyfileobj(source, dest)
 
     def clean(self):
         if os.path.exists(self.path):
@@ -369,29 +450,10 @@ class Package(object):
         if self.installed:
             return
 
-        #self.uninstall()
-
-        self.zf.extract(self.install_dir)
-
+        if self.pkgtype == 'y':
+            self.zf.extractScenery_y(self.install_dir)
         if self.pkgtype == 'z':
-            dirs = [os.path.join(self.install_dir, self.name)]
-            #dirs = glob.glob(
-            #    os.path.join(self.install_dir, "z_*")
-            #)
-
-        elif self.pkgtype == 'y':
-            dirs = glob.glob(
-                os.path.join(self.install_dir, "y_*", "yOrtho4XP_Overlays")
-            )
-
-        for d in dirs:
-            # Setup files
-            shutil.copytree(
-                d,
-                os.path.join(self.install_dir),
-                dirs_exist_ok=True
-            )
-            shutil.rmtree(d)
+            self.zf.extractScenery_z(self.install_dir)
 
         self.installed = True
 
