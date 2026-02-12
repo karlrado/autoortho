@@ -10515,9 +10515,28 @@ class TileCacher(object):
             # Leader election: only one worker performs eviction when shared store is present
             need_mem_eviction = effective_mem > effective_limit
             if need_mem_eviction or need_tile_count_eviction:
-                if not self._try_acquire_evict_leader():
-                    time.sleep(poll_interval_fast)
+                # Workers with no tiles must NOT acquire leadership.
+                # An idle worker that holds the lock prevents the active
+                # worker (which owns all the tiles) from evicting, causing
+                # unbounded memory growth on macOS multi-process FUSE.
+                if not self.tiles:
+                    time.sleep(poll_interval_normal)
                     continue
+                if not self._try_acquire_evict_leader():
+                    # Self-preservation: if this worker's LOCAL memory
+                    # already exceeds the global limit, evict our own
+                    # tiles regardless of who holds the leader lock.
+                    # This prevents deadlock when an idle worker holds
+                    # leadership but cannot evict (it has no tiles).
+                    if cur_mem <= self.cache_mem_lim:
+                        time.sleep(poll_interval_fast)
+                        continue
+                    log.info(
+                        f"Self-preservation eviction: local mem "
+                        f"{cur_mem // (1024**2)}MB exceeds limit "
+                        f"{self.cache_mem_lim // (1024**2)}MB, "
+                        f"evicting locally (leader is another process)"
+                    )
                 rss_before_eviction = _get_process_mem_bytes(process)
 
             # Evict if too many tiles (regardless of memory)
