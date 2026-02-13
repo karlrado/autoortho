@@ -298,11 +298,6 @@ def update_process_memory_stat():
         set_stat(f"proc_alive_ts:{pid}", now_ts)
         set_stat(f"proc_mem_mb:{pid}", int(mem_bytes // (1024 * 1024)))
 
-        try:
-            set_stat(f"proc_threads:{pid}", proc.num_threads())
-        except Exception:
-            pass
-
         return int(mem_bytes)
 
     except Exception as _err:
@@ -342,17 +337,11 @@ def update_decode_pool_stats():
         
         stats = AoDDS.get_decode_pool_stats()
         if stats:
-            set_stat('decode_pool_fixed', stats['total'])
-            set_stat('decode_pool_available', stats['available'])
-            set_stat('decode_pool_acquired', stats['acquired'])
-            set_stat('decode_pool_overflow', stats['overflow_count'])
-            overflow_mb = stats['overflow_bytes'] // (1024 * 1024)
-            limit_mb = stats['memory_limit'] // (1024 * 1024)
-            set_stat('decode_pool_overflow_mb', overflow_mb)
-            set_stat('decode_pool_limit_mb', limit_mb)
-
-            # Log warning if overflow is growing
+            # Only publish overflow when it's nonzero (indicates pool exhaustion)
             if stats['overflow_count'] > 0:
+                overflow_mb = stats['overflow_bytes'] // (1024 * 1024)
+                set_stat('decode_pool_overflow', stats['overflow_count'])
+                set_stat('decode_pool_overflow_mb', overflow_mb)
                 log.debug(f"Decode pool overflow: {stats['overflow_count']} "
                           f"buffers, {overflow_mb} MB")
     except Exception as e:

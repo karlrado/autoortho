@@ -1483,7 +1483,6 @@ class Getter(object):
                 continue
 
             #STATS.setdefault('count', 0) + 1
-            bump('count', 1)
 
             try:
                 # Mark chunk as in-flight (Chunk always has these attributes)
@@ -1540,7 +1539,6 @@ class Getter(object):
             bump('submit_skip_in_flight')
             return  # Currently downloading
         obj.in_queue = True
-        bump('submit_queued')
         self.queue.put((obj, args, kwargs))
 
 
@@ -1582,7 +1580,6 @@ class ChunkGetter(Getter):
             with self._queued_lock:
                 self._queued_chunk_ids.add(chunk_id)
         
-        bump('submit_queued')
         self.queue.put((obj, args, kwargs))
 
     def show_stats(self):
@@ -4067,13 +4064,10 @@ class BackgroundDDSBuilder:
                     waited_for_consolidation = False
                     if _bundle_consolidator.is_pending(tile.row, tile.col, tile.maptype, tile.max_zoom):
                         log.debug(f"Waiting for consolidation (zoom {tile.max_zoom}): {tile_id}")
-                        bump('bundle_wait_started')
                         # Use 60s timeout - consolidation will complete, waiting is better than failing
                         # Pass zoom to wait for THIS specific zoom level's consolidation
                         wait_result = _bundle_consolidator.wait_for_pending(tile.row, tile.col, tile.maptype, timeout=60.0, zoom=tile.max_zoom)
                         waited_for_consolidation = True
-                        if wait_result:
-                            bump('bundle_wait_success')
                     
                     # ALWAYS re-check bundle - even if is_pending was False
                     # Consolidation may have JUST completed between os.path.exists() and is_pending()
@@ -4623,6 +4617,7 @@ tile_completion_tracker: Optional[TileCompletionTracker] = None
 
 # Bundle consolidator for AOB2 format (consolidates JPEGs into bundles)
 _bundle_consolidator = None
+_consolidation_schedule_count = 0
 
 
 def schedule_bundle_consolidation(tile, priority: int = 0, jpeg_datas: list = None, zoom: int = None) -> bool:
@@ -4688,24 +4683,16 @@ def schedule_bundle_consolidation(tile, priority: int = 0, jpeg_datas: list = No
             tile_col=tile.col,
             tile_zoom=tile.tilename_zoom
         )
-        bump('bundle_consolidation_scheduled')
-        if jpeg_datas:
-            bump('bundle_consolidation_in_memory')
-        
-        # TEMP STAT: Sync consolidator queue stats to global stats periodically
+        # Sync consolidator queue stats to global stats periodically
         # (every 10 schedules to avoid overhead)
-        scheduled_count = STATS.get('bundle_consolidation_scheduled', 0)
-        if scheduled_count % 10 == 0:
+        global _consolidation_schedule_count
+        _consolidation_schedule_count = _consolidation_schedule_count + 1
+        if _consolidation_schedule_count % 10 == 0:
             try:
                 cstats = _bundle_consolidator.get_stats()
                 STATS['consolidator_queue_current'] = cstats.get('queue_size_current', 0)
                 STATS['consolidator_queue_max'] = cstats.get('queue_size_max', 0)
                 STATS['consolidator_time_max_ms'] = int(cstats.get('tile_consolidation_max_ms', 0))
-                # Add detailed bundle stats for diagnostics
-                STATS['consolidator_bundles_created'] = cstats.get('bundles_created', 0)
-                STATS['consolidator_bundles_updated'] = cstats.get('bundles_updated', 0)
-                STATS['consolidator_bundles_merged'] = cstats.get('bundles_merged', 0)
-                STATS['consolidator_bundles_skipped'] = cstats.get('bundles_skipped', 0)
             except Exception:
                 pass
         
@@ -5373,8 +5360,6 @@ class Chunk(object):
                             log.warning("Severe error rate (≥25%) detected, consider checking configuration")
                 return False
 
-            bump("req_ok")
-
             data = resp.content
 
             if _is_jpeg(data[:3]):
@@ -5697,11 +5682,9 @@ class Tile(object):
         else:
             wait_timeout = timeout
         
-        bump('bundle_wait_started')
         log.debug(f"Waiting for consolidation outside lock: {self.id}")
         
         if _bundle_consolidator.wait_for_pending(self.row, self.col, self.maptype, timeout=wait_timeout):
-            bump('bundle_wait_success')
             return True
         
         bump('bundle_wait_timeout')
@@ -5737,7 +5720,6 @@ class Tile(object):
             )
             
             if result:
-                bump('consolidation_scheduled_immediate')
                 log.debug(f"Scheduled immediate consolidation for {self.id} ZL{zoom} "
                          f"({valid_count}/{len(jpeg_datas)} chunks)")
             
@@ -5762,8 +5744,6 @@ class Tile(object):
                 log.warning(f"Bundle read error for {self.id}: {e}")
             
             if bundle_loaded:
-                # Track bundle hits for monitoring cache effectiveness
-                bump('bundle_chunks_loaded', len(self.chunks[zoom]))
                 return
             else:
                 # Track bundle misses - will fall through to individual file loading
@@ -5812,7 +5792,6 @@ class Tile(object):
                         )
                         
                         if os.path.exists(bundle_path):
-                            bump('bundle_fallback_attempted')
                             with AoBundle2.Bundle2Python(bundle_path) as bundle:
                                 if bundle.has_zoom(zoom):
                                     jpeg_datas = bundle.get_all_chunks(zoom)
@@ -6511,7 +6490,6 @@ class Tile(object):
             log.debug(f"_try_aopipeline_build: SUCCESS for {self.id} - "
                       f"{result.bytes_written} bytes in {build_time:.0f}ms")
             build_success = True
-            bump('live_aopipeline_success')
             
             # Schedule bundle consolidation for ALL zoom levels
             consolidate_tile_if_ready(self, "aopipeline")
@@ -7103,8 +7081,6 @@ class Tile(object):
                     # Population failed - fall through to normal path
                     log.debug(f"GET_BYTES: Prebuilt cache hit but populate failed for {self.id}")
                     bump('prebuilt_cache_populate_fail')
-            else:
-                bump('prebuilt_cache_miss')
         # ═══════════════════════════════════════════════════════════════════
         
         # ═══════════════════════════════════════════════════════════════════
@@ -7175,9 +7151,7 @@ class Tile(object):
         # We require offset > 0 (not a header read) to trigger aopipeline.
         is_pure_mipmap_request = offset > 0
         
-        # DIAGNOSTIC: Track mipmap 0 trigger attempts
         if mipmap == 0:
-            bump('get_bytes_mipmap_0_request')
             log.debug(f"GET_BYTES_DIAG: mipmap=0 offset={offset} length={length} "
                      f"reaches_data={request_reaches_mipmap_0_data} "
                      f"is_pure_mipmap={is_pure_mipmap_request} "
@@ -9020,7 +8994,6 @@ class Tile(object):
         
         # Check if bundle loaded everything
         if ready_count == total_chunks:
-            bump('native_mipmap_bundle_hit')
             log.debug(f"_try_native_mipmap_build: All {total_chunks} chunks from bundle/memory")
         
         # ═══════════════════════════════════════════════════════════════════════
@@ -9328,8 +9301,6 @@ class Tile(object):
                      f"{len(result.data)} bytes ({mipmaps_built} mipmaps) in {total_time*1000:.0f}ms "
                      f"(native: {native_time*1000:.0f}ms, {ready_count}/{total_chunks} chunks)")
             
-            bump('native_mipmap_success')
-            
             # Consolidation was already scheduled before the build
             # (see SCHEDULE CONSOLIDATION IMMEDIATELY section above)
             
@@ -9617,8 +9588,6 @@ class Tile(object):
             log.debug(f"_try_native_partial_mipmap_build: SUCCESS rows {startrow}-{endrow} "
                      f"({result.bytes_written} bytes at offset {row_offset}, "
                      f"{result.elapsed_ms:.1f}ms native, {build_time*1000:.1f}ms total)")
-            
-            bump('native_partial_mipmap_success')
             
             # Schedule bundle consolidation for this zoom level
             # Track which zoom levels we've scheduled to avoid duplicate scheduling
@@ -9991,7 +9960,10 @@ class TileCacher(object):
         # Eviction behavior controls
         self.evict_hysteresis_frac = 0.10  # keep ~10% headroom below limit
         self.evict_headroom_min_bytes = 256 * 1048576  # at least 256MB headroom
-        self.evict_leader_ttl_sec = 5  # seconds
+        # Track last tile access time for activity-aware proportional eviction.
+        # On macOS multi-process, "cold" workers (no recent access) evict
+        # more aggressively than "hot" workers with fresh tiles.
+        self._last_access_ts = time.monotonic()
         
         self.cache_dir = CFG.paths.cache_dir
         log.info(f"Cache dir: {self.cache_dir}")
@@ -10283,6 +10255,13 @@ class TileCacher(object):
         update_process_memory_stat()
         # Report decode pool stats for native buffer monitoring
         update_decode_pool_stats()
+        # Publish activity stats for proportional eviction (macOS multi-process only)
+        if self._has_shared_store():
+            try:
+                pid = os.getpid()
+                set_stat(f"tile_count:{pid}", len(self.tiles))
+            except Exception:
+                pass
         #set_stat('tile_mem_open', len(self.tiles))
         if self.enable_cache:
             #set_stat('tile_mem_miss', self.misses)
@@ -10297,6 +10276,7 @@ class TileCacher(object):
         try:
             # Move to MRU position
             self.tiles.move_to_end(idx, last=True)
+            self._last_access_ts = time.monotonic()
         except Exception:
             pass
 
@@ -10310,45 +10290,39 @@ class TileCacher(object):
     def _has_shared_store(self) -> bool:
         return bool(getattr(STATS, "_remote", None) or os.getenv("AO_STATS_ADDR"))
 
-    def _try_acquire_evict_leader(self) -> bool:
-        if not self._has_shared_store():
-            return True
-        now = int(time.time())
+    def _compute_proportional_target(self, cur_mem, effective_mem, global_target):
+        """Compute this worker's proportional share of the global eviction target.
+
+        Workers holding more memory carry a bigger eviction burden.
+        Workers with stale tiles (no recent access) carry extra burden.
+
+        Platform behavior:
+          - Windows/Linux (single process): returns global_target unchanged.
+            No proportional logic runs. Zero overhead.
+          - macOS (multi-process): computes proportional share weighted by
+            memory and staleness.
+        """
+        if not self._has_shared_store() or effective_mem <= 0:
+            return global_target  # Single process: use global target as-is
+
+        # Base share: proportional to this worker's fraction of total memory
+        my_share = cur_mem / max(1, effective_mem)
+        my_target = int(global_target * my_share)
+
+        # Staleness penalty: cold workers get a lower target (evict more)
         try:
-            leader_until = get_stat('evict_leader_until') or 0
-            leader_pid = get_stat('evict_leader_pid') or 0
-        except Exception:
-            leader_until = 0
-            leader_pid = 0
-
-        if int(leader_until) < now:
-            # Try to become leader
-            try:
-                set_stat('evict_leader_pid', self._pid)
-                set_stat('evict_leader_until', now + self.evict_leader_ttl_sec)
-                return True
-            except Exception:
-                return False
-
-        # Renew if we are already leader
-        if int(leader_pid) == self._pid:
-            try:
-                set_stat('evict_leader_until', now + self.evict_leader_ttl_sec)
-                return True
-            except Exception:
-                return False
-
-        return False
-
-    def _renew_evict_leader(self) -> None:
-        if not self._has_shared_store():
-            return
-        try:
-            now = int(time.time())
-            if int(get_stat('evict_leader_pid') or 0) == self._pid:
-                set_stat('evict_leader_until', now + self.evict_leader_ttl_sec)
+            now = time.monotonic()
+            my_idle_sec = now - self._last_access_ts
+            # Workers idle for >30s are considered "cold"
+            if my_idle_sec > 30:
+                # Reduce target by up to 50% based on idle time (caps at 5 min)
+                penalty = min(0.5, my_idle_sec / 600)
+                my_target = int(my_target * (1.0 - penalty))
         except Exception:
             pass
+
+        # Floor: never set target below 0
+        return max(0, my_target)
 
     def _evict_batch(self, max_to_evict: int) -> int:
         """
@@ -10507,36 +10481,47 @@ class TileCacher(object):
             # Hysteresis target: evict down to limit - headroom
             headroom = max(int(effective_limit * self.evict_hysteresis_frac), self.evict_headroom_min_bytes)
             target_bytes = max(0, int(effective_limit) - headroom)
+            # Default proportional target = global target (overridden below
+            # when eviction is needed and proportional logic kicks in)
+            my_target = target_bytes
             
             # Check if we need to evict based on tile count (prevents unbounded tile accumulation)
             tile_count = len(self.tiles)
             need_tile_count_eviction = tile_count > max_tile_count
 
-            # Leader election: only one worker performs eviction when shared store is present
+            # Proportional eviction: each worker independently decides how much
+            # to evict based on its memory share and access recency.
             need_mem_eviction = effective_mem > effective_limit
             if need_mem_eviction or need_tile_count_eviction:
-                # Workers with no tiles must NOT acquire leadership.
-                # An idle worker that holds the lock prevents the active
-                # worker (which owns all the tiles) from evicting, causing
-                # unbounded memory growth on macOS multi-process FUSE.
                 if not self.tiles:
                     time.sleep(poll_interval_normal)
                     continue
-                if not self._try_acquire_evict_leader():
-                    # Self-preservation: if this worker's LOCAL memory
-                    # already exceeds the global limit, evict our own
-                    # tiles regardless of who holds the leader lock.
-                    # This prevents deadlock when an idle worker holds
-                    # leadership but cannot evict (it has no tiles).
-                    if cur_mem <= self.cache_mem_lim:
-                        time.sleep(poll_interval_fast)
-                        continue
+
+                # Compute proportional eviction target.
+                # Each worker's share of the global target is weighted by:
+                #   (a) its fraction of total memory (bigger = evict more)
+                #   (b) staleness penalty (colder = evict more)
+                my_target = self._compute_proportional_target(
+                    cur_mem, effective_mem, target_bytes
+                )
+
+                # Only evict if our LOCAL memory exceeds our proportional target
+                if cur_mem <= my_target and not need_tile_count_eviction:
+                    time.sleep(poll_interval_fast)
+                    continue
+
+                # Self-preservation safety net: if proportional target
+                # computation fails for any reason, fall back to evicting
+                # locally when cur_mem exceeds the global limit.
+                if my_target <= 0 and cur_mem > self.cache_mem_lim:
+                    my_target = int(self.cache_mem_lim * 0.9)
                     log.info(
                         f"Self-preservation eviction: local mem "
                         f"{cur_mem // (1024**2)}MB exceeds limit "
                         f"{self.cache_mem_lim // (1024**2)}MB, "
-                        f"evicting locally (leader is another process)"
+                        f"target set to {my_target // (1024**2)}MB"
                     )
+
                 rss_before_eviction = _get_process_mem_bytes(process)
 
             # Evict if too many tiles (regardless of memory)
@@ -10549,9 +10534,9 @@ class TileCacher(object):
                     evicted = self._evict_batch(tiles_to_evict)
                     total_evicted += evicted
 
-            # Evict while above target using adaptive batch sizing
-            while self.tiles and effective_mem > target_bytes:
-                over_bytes = max(0, effective_mem - target_bytes)
+            # Evict while above proportional target using adaptive batch sizing
+            while self.tiles and cur_mem > my_target:
+                over_bytes = max(0, cur_mem - my_target)
                 ratio = min(1.0, over_bytes / max(1, effective_limit))
                 adaptive = max(20, int(len(self.tiles) * min(0.10, ratio)))
                 # _evict_batch handles its own locking internally
@@ -10587,13 +10572,15 @@ class TileCacher(object):
                     effective_mem = cur_mem
                     effective_limit = self.cache_mem_lim
                 
-                # Recalculate target with potentially new limit
+                # Recalculate global target and proportional target
                 headroom = max(int(effective_limit * self.evict_hysteresis_frac), self.evict_headroom_min_bytes)
                 target_bytes = max(0, int(effective_limit) - headroom)
+                my_target = self._compute_proportional_target(
+                    cur_mem, effective_mem, target_bytes
+                )
 
-                # Renew leadership and publish heartbeat after an eviction batch
+                # Publish heartbeat after an eviction batch
                 try:
-                    self._renew_evict_leader()
                     update_process_memory_stat()
                 except Exception:
                     pass
