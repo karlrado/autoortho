@@ -1518,6 +1518,62 @@ class ConfigUI(QMainWindow):
         layout = QVBoxLayout()
         scenery_widget.setLayout(layout)
 
+        # Scenery Settings group
+        scenery_group = QGroupBox("Scenery Installation Settings")
+        scenery_layout = QVBoxLayout()
+        scenery_group.setLayout(scenery_layout)
+
+        self.noclean_check = QCheckBox("Don't cleanup downloads")
+        self.noclean_check.setChecked(self.cfg.scenery.noclean)
+        self.noclean_check.setObjectName('noclean')
+        self.noclean_check.setToolTip(
+            "Keep downloaded scenery files after installation.\n"
+            "Useful for reinstalling or sharing scenery packages.\n"
+            "Warning: Can use significant disk space over time.\n"
+            "Recommended: Disabled unless you need the original files."
+        )
+        scenery_layout.addWidget(self.noclean_check)
+
+        layout.addWidget(scenery_group)
+
+        # Scenery Tab Seasons Settings group
+        scenery_seasons_group = QGroupBox("Seasons Conversion Settings")
+        scenery_seasons_layout = QVBoxLayout()
+        scenery_seasons_group.setLayout(scenery_seasons_layout)
+
+        # Seasons convert workers
+        seasons_convert_workers_row = QHBoxLayout()
+        seasons_convert_workers_label = QLabel("DSF Seasons convert workers:")
+        self.seasons_convert_workers_slider = ModernSlider()
+        self.seasons_convert_workers_slider.setRange(1, os.cpu_count())
+        self.seasons_convert_workers_slider.setValue(int(self.cfg.seasons.seasons_convert_workers))
+        self.seasons_convert_workers_slider.setObjectName('seasons_convert_workers')
+        self.seasons_convert_workers_slider.setToolTip(
+            "Number of workers to use for converting DSF to XP12 native seasons format.\n"
+            "More workers = faster conversion but higher CPU and RAM usage.\n"
+            "Recommended: 4 and work your way up from there depending on your system."
+        )
+        self.seasons_convert_workers_value_label = QLabel(f"{self.cfg.seasons.seasons_convert_workers} workers")
+        self.seasons_convert_workers_slider.valueChanged.connect(
+            lambda v: self.seasons_convert_workers_value_label.setText(f"{v} workers")
+        )
+        seasons_convert_workers_row.addWidget(seasons_convert_workers_label)
+        seasons_convert_workers_row.addWidget(self.seasons_convert_workers_slider)
+        seasons_convert_workers_row.addWidget(self.seasons_convert_workers_value_label)
+        scenery_seasons_layout.addLayout(seasons_convert_workers_row)
+
+        # Compress DSF
+        compress_dsf_row = QHBoxLayout()
+        self.compress_dsf_check = QCheckBox("Compress DSF after conversion")
+        self.compress_dsf_check.setChecked(self.cfg.seasons.compress_dsf)
+        self.compress_dsf_check.setObjectName('compress_dsf')
+        self.compress_dsf_check.setToolTip("Compress DSF to 7z format after conversion to XP12 format")
+        compress_dsf_row.addWidget(self.compress_dsf_check)
+        scenery_seasons_layout.addLayout(compress_dsf_row)
+
+        layout.addWidget(scenery_seasons_group)
+        layout.addWidget(QLabel("Remember to Save Config after making any changes to settings."))
+
         # Create scroll area for scenery list
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
@@ -2800,37 +2856,6 @@ class ConfigUI(QMainWindow):
         win_row.addWidget(self.win_sat_value_label)
         seasons_layout.addLayout(win_row)
 
-        # Seasons convert workers
-        seasons_convert_workers_row = QHBoxLayout()
-        seasons_convert_workers_label = QLabel("DSF Seasons convert workers:")
-        self.seasons_convert_workers_slider = ModernSlider()
-        self.seasons_convert_workers_slider.setRange(1, os.cpu_count())
-        self.seasons_convert_workers_slider.setValue(int(self.cfg.seasons.seasons_convert_workers))
-        self.seasons_convert_workers_slider.setObjectName('seasons_convert_workers')
-        self.seasons_convert_workers_slider.setToolTip(
-            "Number of workers to use for converting DSF to XP12 native seasons format.\n"
-            "More workers = faster conversion but higher CPU and RAM usage.\n"
-            "Recommended: 4 and work your way up from there depending on your system."
-        )
-        self.seasons_convert_workers_value_label = QLabel(f"{self.cfg.seasons.seasons_convert_workers} workers")
-        self.seasons_convert_workers_slider.valueChanged.connect(
-            lambda v: self.seasons_convert_workers_value_label.setText(f"{v} workers")
-        )
-        seasons_convert_workers_row.addWidget(seasons_convert_workers_label)
-        seasons_convert_workers_row.addWidget(self.seasons_convert_workers_slider)
-        seasons_convert_workers_row.addWidget(self.seasons_convert_workers_value_label)
-        seasons_layout.addLayout(seasons_convert_workers_row)
-
-        # Compress DSF
-
-        compress_dsf_row = QHBoxLayout()
-        self.compress_dsf_check = QCheckBox("Compress DSF after conversion")
-        self.compress_dsf_check.setChecked(self.cfg.seasons.compress_dsf)
-        self.compress_dsf_check.setObjectName('compress_dsf')
-        self.compress_dsf_check.setToolTip("Compress DSF to 7z format after conversion to XP12 format")
-        compress_dsf_row.addWidget(self.compress_dsf_check)
-        seasons_layout.addLayout(compress_dsf_row)
-
         # Initialize enabled state of sliders
         self._set_seasons_controls_enabled(seasons_enabled)
 
@@ -2991,24 +3016,6 @@ class ConfigUI(QMainWindow):
         general_layout.addLayout(file_log_level_layout)
 
         self.settings_layout.addWidget(general_group)
-
-        # Scenery Settings group
-        scenery_group = QGroupBox("Scenery Settings")
-        scenery_layout = QVBoxLayout()
-        scenery_group.setLayout(scenery_layout)
-
-        self.noclean_check = QCheckBox("Don't cleanup downloads")
-        self.noclean_check.setChecked(self.cfg.scenery.noclean)
-        self.noclean_check.setObjectName('noclean')
-        self.noclean_check.setToolTip(
-            "Keep downloaded scenery files after installation.\n"
-            "Useful for reinstalling or sharing scenery packages.\n"
-            "Warning: Can use significant disk space over time.\n"
-            "Recommended: Disabled unless you need the original files."
-        )
-        scenery_layout.addWidget(self.noclean_check)
-
-        self.settings_layout.addWidget(scenery_group)
 
         # FUSE Settings group
         fuse_group = QGroupBox("FUSE Settings")
@@ -3652,6 +3659,7 @@ class ConfigUI(QMainWindow):
         if button:
             button.setEnabled(False)
             button.setText("Uninstalling...")
+            self.update_status_bar(f"Uninstalling {region_id}...")
 
         # Create worker thread
         worker = SceneryUninstallWorker(self.dl, region_id)
@@ -4842,7 +4850,7 @@ class ConfigUI(QMainWindow):
             # Also change button text while verifying
             button = self.findChild(QPushButton, f"scenery-{region_id}")
             if button:
-                button.setText("Verifying...")
+                button.setText("Installing...")  # We're actually installing
             # Update status with verification state
             status = progress_data.get('status', 'Verifying...')
             self.update_status_bar(f"{region_id}: {status}")

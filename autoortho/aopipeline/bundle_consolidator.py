@@ -1007,7 +1007,8 @@ class BundleConsolidator:
                     return False  # Not pending, nothing to wait for
             
             # Check if already completed (quick path)
-            if any(k.startswith(prefix) for k in self._recently_completed):
+            # Snapshot the set to avoid RuntimeError from concurrent modification
+            if any(k.startswith(prefix) for k in set(self._recently_completed)):
                 log.debug(f"BUNDLE_WAIT: Already completed for {prefix}*")
                 return True
             
