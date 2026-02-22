@@ -276,7 +276,10 @@ class AddRoughnessWorker(QThread):
     def run(self):
         """Run the worker thread"""
         try:
-            from autoortho.utils.ter_utils import ter_utils
+            try:
+                from autoortho.utils.ter_utils import ter_utils
+            except ImportError:
+                from utils.ter_utils import ter_utils
             log.info(f"Adding SUPER_ROUGHNESS {self.roughness_value} to {self.scenery_name}")
 
             def progress_callback(progress_data):
@@ -311,7 +314,10 @@ class RestoreRoughnessWorker(QThread):
     def run(self):
         """Run the worker thread"""
         try:
-            from autoortho.utils.ter_utils import ter_utils
+            try:
+                from autoortho.utils.ter_utils import ter_utils
+            except ImportError:
+                from utils.ter_utils import ter_utils
             log.info(f"Removing SUPER_ROUGHNESS from {self.scenery_name}")
 
             def progress_callback(progress_data):
@@ -990,18 +996,18 @@ class SceneryPatchesWidget(QWidget):
             color: white;
             font-size: 11px;
             font-weight: bold;
-            padding: 3px 8px;
+            padding: 3px 10px;
             border-radius: 3px;
         """)
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        badge.setFixedWidth(80)
+        badge.setMinimumWidth(85)
         return badge
     
     def _setup_ui(self):
         """Set up the widget UI."""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(0)
         
         # Container frame
         frame = QFrame()
@@ -1010,12 +1016,11 @@ class SceneryPatchesWidget(QWidget):
                 background-color: #2d2d2d;
                 border: 1px solid #444;
                 border-radius: 5px;
-                padding: 5px;
             }
         """)
         frame_layout = QVBoxLayout(frame)
-        frame_layout.setContentsMargins(8, 6, 8, 6)
-        frame_layout.setSpacing(4)
+        frame_layout.setContentsMargins(10, 8, 10, 8)
+        frame_layout.setSpacing(5)
         
         # Title
         title = QLabel("Scenery Patches")
@@ -1024,10 +1029,10 @@ class SceneryPatchesWidget(QWidget):
         
         # Seasons row
         seasons_row = QHBoxLayout()
-        seasons_row.setSpacing(10)
-        seasons_label = QLabel("Native Seasons:")
+        seasons_row.setSpacing(8)
+        seasons_label = QLabel("Seasons")
         seasons_label.setStyleSheet("color: #aaa; font-size: 11px; border: none; background: transparent;")
-        seasons_label.setFixedWidth(100)
+        seasons_label.setMinimumWidth(80)
         seasons_badge = self._create_status_badge(
             self._get_status_text(self.seasons_status),
             self._get_status_color(self.seasons_status)
@@ -1039,23 +1044,19 @@ class SceneryPatchesWidget(QWidget):
         
         # Roughness row
         roughness_row = QHBoxLayout()
-        roughness_row.setSpacing(10)
-        roughness_label = QLabel("SUPER_ROUGHNESS:")
+        roughness_row.setSpacing(8)
+        roughness_text = "Roughness"
+        if self.roughness_value is not None:
+            roughness_text += f" ({self.roughness_value:.1f})"
+        roughness_label = QLabel(roughness_text)
         roughness_label.setStyleSheet("color: #aaa; font-size: 11px; border: none; background: transparent;")
-        roughness_label.setFixedWidth(100)
+        roughness_label.setMinimumWidth(80)
         roughness_badge = self._create_status_badge(
             self._get_status_text(self.roughness_status),
             self._get_status_color(self.roughness_status)
         )
         roughness_row.addWidget(roughness_label)
         roughness_row.addWidget(roughness_badge)
-        
-        # Show roughness value if applied
-        if self.roughness_value is not None:
-            value_label = QLabel(f"({self.roughness_value:.1f})")
-            value_label.setStyleSheet("color: #888; font-size: 11px; border: none; background: transparent;")
-            roughness_row.addWidget(value_label)
-        
         roughness_row.addStretch()
         frame_layout.addLayout(roughness_row)
         
@@ -3349,6 +3350,35 @@ class ConfigUI(QMainWindow):
         )
         scenery_layout.addWidget(self.noclean_check)
 
+        # Max download workers
+        dl_workers_layout = QHBoxLayout()
+        dl_workers_label = QLabel("Parallel download workers:")
+        dl_workers_label.setToolTip(
+            "Number of files downloaded simultaneously.\n"
+            "Higher values saturate your bandwidth faster,\n"
+            "reducing total download time for multi-file packages.\n\n"
+            "Recommended: 4 (default), 2 (slow connection), 8 (fast connection)"
+        )
+        dl_workers_layout.addWidget(dl_workers_label)
+
+        self.max_download_workers_spin = ModernSpinBox()
+        self.max_download_workers_spin.setFocusPolicy(Qt.StrongFocus)
+        self.max_download_workers_spin.setRange(1, 8)
+        dl_workers_value = 4
+        try:
+            dl_workers_value = int(self.cfg.scenery.max_download_workers)
+        except (AttributeError, ValueError):
+            pass
+        self.max_download_workers_spin.setValue(dl_workers_value)
+        self.max_download_workers_spin.setObjectName('max_download_workers')
+        self.max_download_workers_spin.setToolTip(
+            "Number of files downloaded simultaneously.\n"
+            "Recommended: 4 (default), 2 (slow connection), 8 (fast connection)"
+        )
+        dl_workers_layout.addWidget(self.max_download_workers_spin)
+        dl_workers_layout.addStretch()
+        scenery_layout.addLayout(dl_workers_layout)
+
         self.settings_layout.addWidget(scenery_group)
 
         # FUSE Settings group
@@ -3873,9 +3903,17 @@ class ConfigUI(QMainWindow):
                 )
 
                 h_layout = QHBoxLayout()
-                h_layout.addWidget(patches_widget)
-                h_layout.addWidget(scenery_options_btn)
-                h_layout.addWidget(delete_btn)
+                h_layout.setSpacing(10)
+                h_layout.addWidget(patches_widget, 1)
+                buttons_col = QVBoxLayout()
+                buttons_col.addStretch()
+                buttons_row = QHBoxLayout()
+                buttons_row.setSpacing(10)
+                buttons_row.addWidget(scenery_options_btn)
+                buttons_row.addWidget(delete_btn)
+                buttons_col.addLayout(buttons_row)
+                buttons_col.addStretch()
+                h_layout.addLayout(buttons_col)
 
                 # Progress bar for patching operations (shared between seasons and roughness)
                 patch_progress_bar = QProgressBar()
@@ -5709,6 +5747,7 @@ class ConfigUI(QMainWindow):
             # Scenery settings
             self.cfg.scenery.noclean = self.noclean_check.isChecked()
             self.dl.noclean = self.cfg.scenery.noclean
+            self.cfg.scenery.max_download_workers = self.max_download_workers_spin.value()
 
             # FUSE settings
             self.cfg.fuse.threading = self.threading_check.isChecked()

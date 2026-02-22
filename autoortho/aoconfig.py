@@ -329,6 +329,10 @@ format = BC1
 [scenery]
 # Don't cleanup downloads
 noclean = False
+# Maximum parallel download workers for scenery packages (1-8)
+# Higher values download more files simultaneously, saturating bandwidth faster
+# Recommended: 4 (default), 2 (slow connection), 8 (fast connection)
+max_download_workers = 4
 
 [fuse]
 # Enable or disable multi-threading when using FUSE
