@@ -171,7 +171,88 @@ class Zip(object):
     def extract(self, dest):
         with zipfile.ZipFile(self.path) as zf:
             zf.extractall(dest)
-            
+
+    # This approach is faster than extract, copytree, rmtree
+    def extractScenery_y(self, destpath):
+        with zipfile.ZipFile(self.path) as zf:
+            destpath = os.path.join(destpath, "Earth nav data")
+            os.makedirs(destpath, exist_ok=True)
+            zip_path = zipfile.Path(zf)  # This is the path to and within the zip file
+
+            children = []
+            for entry in zip_path.iterdir():
+                if (zip_path / entry.name).is_dir():
+                    children.append(entry.name)
+            if not len(children) == 1:
+                log.error(
+                    f"Unexpected directory structure in {zf}, too many top-level children."
+                )
+                return
+
+            zip_path = zip_path / children[0] / "yOrtho4XP_Overlays" / "Earth nav data"
+            if not zip_path.is_dir():
+                log.error(f"'yOrtho4XP_Overlays/Earth nav data' not found in {zf}")
+                return
+
+            for dir in zip_path.iterdir():
+                os.makedirs(os.path.join(destpath, dir.name), exist_ok=True)
+                for entry in (zip_path / dir.name).iterdir():
+                    with (
+                        entry.open(mode="rb") as source,
+                        open(
+                            os.path.join(destpath, dir.name, entry.name),
+                            "wb",
+                        ) as dest,
+                    ):
+                        shutil.copyfileobj(source, dest)
+
+    # This approach is faster than extract, copytree, rmtree
+    def extractScenery_z(self, destpath):
+        with zipfile.ZipFile(self.path) as zf:
+            os.makedirs(destpath, exist_ok=True)
+            zip_path = zipfile.Path(zf)  # This is the path to and within the zip file
+
+            children = []
+            for entry in zip_path.iterdir():
+                if (zip_path / entry.name).is_dir():
+                    children.append(entry.name)
+            if not len(children) == 1:
+                log.error(
+                    f"Unexpected directory structure in {zf}, too many top-level children."
+                )
+                return
+
+            zip_path = zip_path / children[0]
+
+            for dir in zip_path.iterdir():
+                os.makedirs(os.path.join(destpath, dir.name), exist_ok=True)
+                if dir.name == "textures" or dir.name == "terrain":
+                    for entry in (zip_path / dir.name).iterdir():
+                        with (
+                            entry.open(mode="rb") as source,
+                            open(
+                                os.path.join(destpath, dir.name, entry.name), "wb"
+                            ) as dest,
+                        ):
+                            shutil.copyfileobj(source, dest)
+                elif dir.name == "Earth nav data":
+                    earth_path = zip_path / dir.name
+                    for earth_dir in earth_path.iterdir():
+                        os.makedirs(
+                            os.path.join(destpath, dir.name, earth_dir.name),
+                            exist_ok=True,
+                        )
+                        for entry in (earth_path / earth_dir.name).iterdir():
+                            with (
+                                entry.open(mode="rb") as source,
+                                open(
+                                    os.path.join(
+                                        destpath, dir.name, earth_dir.name, entry.name
+                                    ),
+                                    "wb",
+                                ) as dest,
+                            ):
+                                shutil.copyfileobj(source, dest)
 
     def clean(self):
         if os.path.exists(self.path):
@@ -194,31 +275,6 @@ class Zip(object):
         self.files = []
         self.assembled = False
         self.computed_hash = None
-
-
-def _move_merge(src, dst):
-    """Move files from src into dst, merging into existing directories.
-
-    Uses os.replace / shutil.move instead of copy+delete to avoid double I/O.
-    On the same filesystem os.replace is essentially instant (metadata-only).
-    """
-    os.makedirs(dst, exist_ok=True)
-    for entry in os.scandir(src):
-        dst_path = os.path.join(dst, entry.name)
-        if entry.is_dir(follow_symlinks=False):
-            if os.path.isdir(dst_path):
-                _move_merge(entry.path, dst_path)
-            else:
-                shutil.move(entry.path, dst_path)
-        else:
-            try:
-                os.replace(entry.path, dst_path)
-            except OSError:
-                shutil.move(entry.path, dst_path)
-    try:
-        os.rmdir(src)
-    except OSError:
-        shutil.rmtree(src, ignore_errors=True)
 
 
 class Package(object):
@@ -279,7 +335,7 @@ class Package(object):
         for url in self.remote_urls:
             if progress_callback:
                 init_progress = {
-                    'status': f"Downloading {url}",
+                    'status': f"Downloading and/or verifying {url}",
                     'pcnt_done': 0,
                     'MBps': 0,
                 }
@@ -288,24 +344,30 @@ class Package(object):
                     init_progress['files_total'] = self.progress_state.get('files_total', 0)
                 progress_callback(init_progress)
             else:
-                cur_activity['status'] = f"Downloading {url}"
+                cur_activity['status'] = f"Downloading and/or verifying {url}"
 
-            posible_destpath = ""
+            possible_destpath = ""
             filename = os.path.basename(url)
             destpath = os.path.join(self.download_dir, filename)
             partpath = destpath + '.part'
-            log.info(filename)
+            log.info(f"Considering downloading {filename}")
             match = re.match(self.regex_for_assembled_files, filename)
             if match:
-                log.info("match!")
-                posible_destpath = os.path.join(self.download_dir, match.group(1))
+                possible_destpath = os.path.join(self.download_dir, match.group(1))
+                log.info(f"{filename} is a possible part of the multi-part file {match.group(1)}")
 
-            if os.path.isfile(destpath) or os.path.isfile(posible_destpath):
-                log.info(f"{destpath} already exists.  Skip.")
-                if destpath.endswith('sha256'):
-                    self.zf.hashfile = destpath
+            if os.path.isfile(destpath) or os.path.isfile(possible_destpath):
+                # If the assembled multipart file already exists, add it only once
+                if os.path.isfile(possible_destpath):
+                    log.info(f"{possible_destpath} already exists.  Skipping {destpath}.")
+                    if possible_destpath not in self.zf.files:
+                        self.zf.files.append(possible_destpath)
                 else:
-                    self.zf.files.append(destpath)
+                    log.info(f"{destpath} already exists.  Skip.")
+                    if destpath.endswith('sha256'):
+                        self.zf.hashfile = destpath
+                    else:
+                        self.zf.files.append(destpath)
                 self._increment_files_done()
                 continue
 
@@ -468,25 +530,10 @@ class Package(object):
         if self.installed:
             return
 
-        self.zf.extract(self.install_dir)
-
+        if self.pkgtype == 'y':
+            self.zf.extractScenery_y(self.install_dir)
         if self.pkgtype == 'z':
-            dirs = [os.path.join(self.install_dir, self.name)]
-
-        elif self.pkgtype == 'y':
-            dirs = glob.glob(
-                os.path.join(self.install_dir, "y_*", "yOrtho4XP_Overlays")
-            )
-
-        for d in dirs:
-            _move_merge(d, self.install_dir)
-            # Clean up empty parent left by y-type extractions
-            parent = os.path.dirname(d)
-            if parent != self.install_dir:
-                try:
-                    os.rmdir(parent)
-                except OSError:
-                    pass
+            self.zf.extractScenery_z(self.install_dir)
 
         self.installed = True
 
@@ -801,10 +848,10 @@ class Release(object):
             log.info(f"Already installed {self.name}")
             return True
         
-        print(f"Check for and cleanup existing installs..")
+        log.info("Check for and cleanup existing installs..")
         for k,v in self.packages.items():
             if v.pkgtype == "z":
-                log.debug("Must cleanup ortho type package.")
+                log.debug(f"Cleaning up ortho type package: {v.name}.")
                 v.uninstall()
 
         self.parse()
@@ -844,7 +891,7 @@ class Release(object):
                 'verify_done': done,
                 'verify_total': total,
                 'verify_pcnt': 0,
-                'status': 'Starting verification',
+                'status': 'Starting verification and installation',
             })
 
         success = True
