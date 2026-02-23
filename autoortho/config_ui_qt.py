@@ -2216,9 +2216,9 @@ class ConfigUI(QMainWindow):
         self.clean_jpegs_btn = StyledButton("Clean JPEG Files")
         self.clean_jpegs_btn.clicked.connect(self.on_clean_jpegs)
         self.clean_jpegs_btn.setToolTip(
-            "Delete only legacy JPEG files from the cache.\n"
-            "Bundle files (.aob2) are not affected.\n"
-            "Use this to free up space from old cache format."
+            "Delete only JPEG files from the cache.\n"
+            "DDS cache files are not affected.\n"
+            "Use this to free up space from source images."
         )
         cache_buttons_layout.addWidget(self.clean_jpegs_btn)
         self.delete_cache_btn = StyledButton("Delete Cache")
@@ -6044,86 +6044,58 @@ class ConfigUI(QMainWindow):
             sys.exit(1)
 
     def clean_cache(self, cache_dir, size_gb):
-        """Clean cache directory
-        
-        Steps:
-        1. Delete all JPEGs from cache folder (legacy files)
-        2. Apply size-based cleanup to bundles in their new locations
+        """Clean cache with 2-phase deletion order:
+        1. JPEGs (always delete all)
+        2. Dynamic DDS (LRU eviction if still over budget)
         """
         self.status_update.emit(
             f"Cleaning up cache_dir {cache_dir}. Please wait..."
         )
 
         try:
-            # Step 1: Always delete all legacy JPEGs from cache_dir root
+            target_bytes = size_gb * (1024 ** 3)
+
+            # --- Phase 1: JPEGs ---
             jpeg_count = 0
             for entry in os.scandir(cache_dir):
                 if entry.is_file() and entry.name.lower().endswith(('.jpg', '.jpeg')):
-                    os.remove(entry.path)
-                    jpeg_count += 1
-            if jpeg_count > 0:
-                self.status_update.emit(f"Deleted {jpeg_count} legacy JPEG files.")
+                    try:
+                        os.remove(entry.path)
+                        jpeg_count += 1
+                    except OSError:
+                        pass
+            self.status_update.emit(f"Phase 1: Deleted {jpeg_count} JPEG files.")
 
-            # Step 2: Handle bundles
-            bundles_dir = os.path.join(cache_dir, "bundles")
-
+            # --- Phase 2: DDS cache (LRU, only if still over target) ---
+            dds_root = os.path.join(cache_dir, "dds_cache")
             if size_gb == 0:
-                # Delete all bundles
-                if os.path.isdir(bundles_dir):
-                    shutil.rmtree(bundles_dir, ignore_errors=True)
-                    self.status_update.emit("Deleted all bundle files.")
+                if os.path.isdir(dds_root):
+                    shutil.rmtree(dds_root, ignore_errors=True)
+                    self.status_update.emit("Phase 2: Deleted all DDS cache files.")
             else:
-                # Size-based cleanup for bundles
-                target_bytes = pow(2, 30) * size_gb
-
-                # Find all bundle files
-                bundle_files = sorted(
-                    pathlib.Path(bundles_dir).glob('**/*.aob2'),
-                    key=os.path.getmtime
-                ) if os.path.isdir(bundles_dir) else []
-
-                if not bundle_files:
-                    self.status_update.emit("No bundles to clean.")
-                    self.status_update.emit("Cache cleanup done.")
-                    return
-
-                cache_bytes = sum(f.stat().st_size for f in bundle_files)
-                bundle_count = len(bundle_files)
-                avg_size = cache_bytes / bundle_count if bundle_count > 0 else 0
-
-                self.status_update.emit(
-                    f"Cache has {bundle_count} bundles. "
-                    f"Total size approx {cache_bytes // 1048576} MB."
-                )
-
-                # Remove empty bundles
-                empty_bundles = [f for f in bundle_files if f.stat().st_size == 0]
-                for f in empty_bundles:
-                    if f.exists():
-                        os.remove(f)
-                if empty_bundles:
-                    self.status_update.emit(f"Removed {len(empty_bundles)} empty bundles.")
-
-                if target_bytes >= cache_bytes:
-                    self.status_update.emit("Cache within size limits.")
-                    self.status_update.emit("Cache cleanup done.")
-                    return
-
-                to_delete = int((cache_bytes - target_bytes) // avg_size)
-                self.status_update.emit(
-                    f"Over cache size limit, will remove {to_delete} bundles."
-                )
-
-                for f in bundle_files[:to_delete]:
-                    if f.is_file():
-                        os.remove(f)
+                try:
+                    from autoortho.getortho import dynamic_dds_cache
+                except ImportError:
+                    dynamic_dds_cache = None
+                if dynamic_dds_cache is not None:
+                    usage = dynamic_dds_cache.get_disk_usage()
+                    remaining_budget = target_bytes
+                    if usage > remaining_budget:
+                        excess = usage - int(remaining_budget * 0.9)
+                        freed = dynamic_dds_cache.evict_lru(excess)
+                        self.status_update.emit(
+                            f"Phase 2: Evicted {freed // (1024*1024)} MB from DDS cache.")
+                    else:
+                        self.status_update.emit("Phase 2: DDS cache within budget.")
+                else:
+                    self.status_update.emit("Phase 2: DDS cache not initialized, skipping.")
 
             self.status_update.emit("Cache cleanup done.")
         except Exception as e:
             self.status_update.emit(f"Cache cleanup error: {str(e)}")
 
     def clean_jpegs_only(self, cache_dir):
-        """Clean only JPEG files from cache directory, leaving bundles untouched"""
+        """Clean only JPEG files from cache directory, leaving DDS cache untouched."""
         self.status_update.emit(
             f"Cleaning JPEG files from {cache_dir}. Please wait..."
         )

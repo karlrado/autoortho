@@ -234,6 +234,17 @@ predictive_dds_use_fallbacks = True
 # Uses temp directory, auto-cleaned on session end
 # Recommended: 4096 (balanced), 8192 (large flights), 16384 (max capacity)
 ephemeral_dds_cache_mb = 4096
+# Persistent DDS cache - stores pre-built DDS textures across sessions
+# Eliminates JPEG decode + DXT compress on subsequent loads (~1-2ms read vs ~390ms rebuild)
+# Set to 0 to disable persistent DDS caching
+# Recommended: 4096 (balanced), 8192 (large regions), 0 (disk constrained)
+persistent_dds_cache_mb = 4096
+# Disk budget enforcement - automatically cleans up old cache data
+# When total cache exceeds file_cache_size, oldest data is evicted
+# Categories: DDS cache (compiled textures), JPEGs (source images)
+disk_budget_enabled = True
+# Percentage of file_cache_size allocated to persistent DDS cache (10-90)
+dds_budget_pct = 80
 # Maximum threads for native pipeline (0 = auto from CPU cores)
 # Controls parallelism for cache I/O, JPEG decoding, and DDS compression
 # Lower values reduce CPU usage but slow down DDS building
@@ -312,19 +323,21 @@ simheaven_compat = False
 using_custom_tiles = False
 # Color used for missing textures. an
 missing_color = [66, 77, 55]
-# === CACHE CLEANUP SETTINGS ===
-# Clean up orphan JPEG files on program exit (True/False)
-# Deletes temporary JPEG files whose data is safely stored in bundles.
-# This recovers disk space from files that couldn't be deleted during runtime
-# due to file locking (mainly on Windows).
-# Recommended: True for disk space optimization
-cleanup_orphan_jpegs_on_exit = True
 
 [pydds]
 # ISPC or STB for dds file compression
 compressor = ISPC
 # BC1 or BC3 for dxt1 or dxt5 respectively
 format = BC1
+# Disk compression for cached DDS files (none or zstd)
+# zstd reduces cache disk usage by 30-60% with ~2-5ms added read latency
+# none stores raw DDS data (fastest reads, largest disk usage)
+dds_compression = zstd
+# Zstd compression level (1-19, default 3)
+# Higher = smaller files, slower writes (reads are always fast)
+# Background builds can afford higher levels since writes are async
+# Recommended: 3 (balanced), 6 (smaller files), 1 (fastest writes)
+dds_compression_level = 3
 
 [scenery]
 # Don't cleanup downloads
