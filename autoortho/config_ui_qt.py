@@ -1030,12 +1030,15 @@ class SceneryPatchesWidget(QWidget):
         title.setStyleSheet("font-weight: bold; font-size: 12px; color: #ccc; border: none; background: transparent;")
         frame_layout.addWidget(title)
         
+        label_width = 125
+        label_style = "color: #aaa; font-size: 11px; border: none; background: transparent;"
+
         # Seasons row
         seasons_row = QHBoxLayout()
         seasons_row.setSpacing(8)
         seasons_label = QLabel("Seasons")
-        seasons_label.setStyleSheet("color: #aaa; font-size: 11px; border: none; background: transparent;")
-        seasons_label.setMinimumWidth(80)
+        seasons_label.setStyleSheet(label_style)
+        seasons_label.setFixedWidth(label_width)
         seasons_badge = self._create_status_badge(
             self._get_status_text(self.seasons_status),
             self._get_status_color(self.seasons_status)
@@ -1044,7 +1047,7 @@ class SceneryPatchesWidget(QWidget):
         seasons_row.addWidget(seasons_badge)
         seasons_row.addStretch()
         frame_layout.addLayout(seasons_row)
-        
+
         # Roughness row
         roughness_row = QHBoxLayout()
         roughness_row.setSpacing(8)
@@ -1052,8 +1055,8 @@ class SceneryPatchesWidget(QWidget):
         if self.roughness_value is not None:
             roughness_text += f" ({self.roughness_value:.1f})"
         roughness_label = QLabel(roughness_text)
-        roughness_label.setStyleSheet("color: #aaa; font-size: 11px; border: none; background: transparent;")
-        roughness_label.setMinimumWidth(80)
+        roughness_label.setStyleSheet(label_style)
+        roughness_label.setFixedWidth(label_width)
         roughness_badge = self._create_status_badge(
             self._get_status_text(self.roughness_status),
             self._get_status_color(self.roughness_status)
@@ -1062,7 +1065,7 @@ class SceneryPatchesWidget(QWidget):
         roughness_row.addWidget(roughness_badge)
         roughness_row.addStretch()
         frame_layout.addLayout(roughness_row)
-        
+
         layout.addWidget(frame)
 
 
