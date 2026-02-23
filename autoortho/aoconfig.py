@@ -329,6 +329,10 @@ format = BC1
 [scenery]
 # Don't cleanup downloads
 noclean = False
+# Maximum parallel download workers for scenery packages (1-8)
+# Higher values download more files simultaneously, saturating bandwidth faster
+# Recommended: 4 (default), 2 (slow connection), 8 (fast connection)
+max_download_workers = 4
 
 [fuse]
 # Enable or disable multi-threading when using FUSE
@@ -360,21 +364,33 @@ fal_saturation = 80.0
 win_saturation = 55.0
 compress_dsf = True
 
+[terrain]
+# Default SUPER_ROUGHNESS value for .ter files (0.0 to 1.0)
+# Higher values make terrain less reflective/shiny at sunset/sunrise
+default_roughness = 1.0
+# Number of workers for .ter file patching
+ter_patch_workers = 8
+
 [windows]
 prefer_winfsp = True
 
 [time_exclusion]
-# Enable time-based AutoOrtho exclusion. When active during the specified time range,
-# AutoOrtho's scenery will be hidden and X-Plane will use its default scenery instead.
+# Enable sun-position-based AutoOrtho exclusion.
+# When active, AutoOrtho scenery is disabled at night and X-Plane uses its default scenery.
+# The sun elevation angle (from sim/graphics/scenery/sun_pitch_degrees) determines day/night.
+# This is accurate across seasons, latitudes, and with time acceleration.
 enabled = False
-# Start time for exclusion in 24-hour format (HH:MM), e.g. "22:00" for 10 PM
-start_time = 23:00
-# End time for exclusion in 24-hour format (HH:MM), e.g. "06:00" for 6 AM
-end_time = 05:00
-# When enabled, assume exclusion is active until sim time is available.
+# When enabled, assume exclusion is active until sun position data is available.
 # Useful to ensure night flights start with default scenery from the beginning.
-# When disabled, AutoOrtho works normally until sim time confirms exclusion.
+# When disabled, AutoOrtho works normally until sun data confirms exclusion.
 default_to_exclusion = False
+# Sun elevation threshold to switch to night mode (degrees).
+# Nautical twilight (-12) is when artificial lights dominate the landscape.
+# Range: -18 (astronomical twilight) to 0 (horizon).
+sun_night_threshold = -12.0
+# Sun elevation threshold to switch to day mode (degrees).
+# Should be higher than night threshold to provide hysteresis and prevent rapid toggling.
+sun_day_threshold = -10.0
 
 [simbrief]
 # SimBrief user ID for flight plan integration
