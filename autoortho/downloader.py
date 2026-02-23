@@ -371,6 +371,20 @@ class Package(object):
                 self._increment_files_done()
                 continue
 
+            # file:// URLs (used in tests) bypass the requests session
+            if url.startswith('file://'):
+                from urllib.parse import urlparse
+                from urllib.request import url2pathname
+                local_path = url2pathname(urlparse(url).path)
+                shutil.copy2(local_path, destpath)
+                log.info(f"Copied local file {local_path} -> {destpath}")
+                self._increment_files_done()
+                if destpath.endswith('sha256'):
+                    self.zf.hashfile = destpath
+                else:
+                    self.zf.files.append(destpath)
+                continue
+
             retries = 0
             while retries < self.max_retries:
                 try:
@@ -518,7 +532,8 @@ class Package(object):
     def check(self):
         log.info(f"Checking {self.name}")
         precomputed = getattr(self.zf, 'computed_hash', None)
-        if not self.zf.check(precomputed_hash=precomputed):
+        check_kwargs = {'precomputed_hash': precomputed} if precomputed else {}
+        if not self.zf.check(**check_kwargs):
             log.warning(f"{self.name} is bad.  Cleaning up.")
             self.cleanup()
             self.downloaded = False
@@ -905,6 +920,7 @@ class Release(object):
                 return True
             except Exception as err:
                 log.error(f"Install error for {pkg.name}: {err}")
+                pkg.cleanup()
                 return False
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
