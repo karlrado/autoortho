@@ -76,6 +76,7 @@ class MockTile:
         self._dds_downgrade_available = None
         self._dds_needs_healing = False
         self._dds_missing_indices = []
+        self._dds_fallback_indices = []
         self.chunks_per_row = 16
         self.dds = MockDDS(dds_width, dds_height)
 
@@ -539,13 +540,12 @@ class TestDiskBudgetManager:
         mgr = DiskBudgetManager(
             cache_dir=cache_dir,
             total_budget_mb=1000,
-            dds_budget_pct=40,
-            bundle_budget_pct=55,
-            jpeg_budget_pct=5
+            dds_budget_pct=80,
+            jpeg_budget_pct=20
         )
         
         report = mgr.usage_report
-        total_budget = report['dds_budget_mb'] + report['bundle_budget_mb'] + report['jpeg_budget_mb']
+        total_budget = report['dds_budget_mb'] + report['jpeg_budget_mb']
         assert abs(total_budget - 1000) < 1  # Allow rounding
 
     def test_account_dds(self, cache_dir):
@@ -558,16 +558,6 @@ class TestDiskBudgetManager:
         report = mgr.usage_report
         assert report['dds_usage_mb'] >= 0.9
 
-    def test_account_bundle(self, cache_dir):
-        """Test bundle accounting updates usage."""
-        from autoortho.aopipeline.disk_budget_manager import DiskBudgetManager
-        
-        mgr = DiskBudgetManager(cache_dir=cache_dir, total_budget_mb=1000)
-        
-        mgr.account_bundle(5 * 1024 * 1024)  # 5MB
-        report = mgr.usage_report
-        assert report['bundle_usage_mb'] >= 4.9
-
     def test_scan_empty_dir(self, cache_dir):
         """Test scanning an empty cache directory."""
         from autoortho.aopipeline.disk_budget_manager import DiskBudgetManager
@@ -575,7 +565,6 @@ class TestDiskBudgetManager:
         mgr = DiskBudgetManager(cache_dir=cache_dir, total_budget_mb=1000)
         report = mgr.scan_disk_usage()
         
-        assert report.bundle_bytes == 0
         assert report.dds_bytes == 0
         assert report.jpeg_bytes == 0
         assert report.scan_time_ms >= 0
@@ -583,12 +572,6 @@ class TestDiskBudgetManager:
     def test_scan_with_files(self, cache_dir):
         """Test scanning a cache directory with actual files."""
         from autoortho.aopipeline.disk_budget_manager import DiskBudgetManager
-        
-        # Create some fake bundle and DDS files
-        bundles_dir = os.path.join(cache_dir, "bundles", "+50+010", "+50+010", "BI")
-        os.makedirs(bundles_dir, exist_ok=True)
-        with open(os.path.join(bundles_dir, "21728_34432.aob2"), 'wb') as f:
-            f.write(b'\x00' * 10000)
         
         dds_dir = os.path.join(cache_dir, "dds_cache", "+50+010", "+50+010", "BI")
         os.makedirs(dds_dir, exist_ok=True)
@@ -598,37 +581,7 @@ class TestDiskBudgetManager:
         mgr = DiskBudgetManager(cache_dir=cache_dir, total_budget_mb=1000)
         report = mgr.scan_disk_usage()
         
-        assert report.bundle_bytes == 10000
         assert report.dds_bytes == 20000
-
-    def test_cleanup_stale_dds_no_bundle(self, cache_dir):
-        """Test that stale DDS (no matching bundle) is cleaned up."""
-        from autoortho.aopipeline.disk_budget_manager import DiskBudgetManager
-        
-        # Create a DDS + DDM with no matching bundle
-        dds_dir = os.path.join(cache_dir, "dds_cache", "+50+010", "+50+010", "BI")
-        os.makedirs(dds_dir, exist_ok=True)
-        
-        dds_path = os.path.join(dds_dir, "21728_34432_z16.dds")
-        ddm_path = os.path.join(dds_dir, "21728_34432_z16.ddm")
-        
-        with open(dds_path, 'wb') as f:
-            f.write(b'\x00' * 1000)
-        
-        meta = {
-            "v": 1, "tile_row": 21728, "tile_col": 34432,
-            "map": "BI", "zl": 12, "max_zl": 16,
-            "fmt": "BC1", "comp": "ISPC"
-        }
-        with open(ddm_path, 'w') as f:
-            json.dump(meta, f)
-        
-        mgr = DiskBudgetManager(cache_dir=cache_dir, total_budget_mb=1000)
-        count = mgr.cleanup_stale_dds()
-        
-        assert count == 1
-        assert not os.path.exists(dds_path)
-        assert not os.path.exists(ddm_path)
 
     def test_usage_report_format(self, cache_dir):
         """Test usage_report returns expected keys."""
@@ -639,7 +592,6 @@ class TestDiskBudgetManager:
         
         expected_keys = [
             'dds_usage_mb', 'dds_budget_mb',
-            'bundle_usage_mb', 'bundle_budget_mb',
             'jpeg_usage_mb', 'jpeg_budget_mb',
             'total_usage_mb', 'total_budget_mb',
             'last_scan'
@@ -655,20 +607,18 @@ class TestDiskBudgetManager:
         mgr = DiskBudgetManager(
             cache_dir=cache_dir,
             total_budget_mb=1000,
-            dds_budget_pct=100,     # Should be clamped to 60
-            bundle_budget_pct=0,    # Should be clamped to 30
-            jpeg_budget_pct=0       # Should be clamped to 1
+            dds_budget_pct=100,     # Should be clamped to 90
+            jpeg_budget_pct=0       # Should be clamped to 5
         )
         
         report = mgr.usage_report
-        # After clamping (60 + 30 + 1 = 91) normalized to sum to 1000MB
+        # After clamping (90 + 5 = 95) normalized to sum to 1000MB
         assert report['dds_budget_mb'] > 0
-        assert report['bundle_budget_mb'] > 0
         assert report['jpeg_budget_mb'] > 0
 
 
 # ============================================================================
-# Bundle Paths Tests
+# Cache Paths Tests
 # ============================================================================
 
 class TestDDSCachePaths:
@@ -676,7 +626,7 @@ class TestDDSCachePaths:
 
     def test_get_dds_cache_path(self):
         """Test DDS cache path generation."""
-        from autoortho.utils.bundle_paths import get_dds_cache_path
+        from autoortho.utils.cache_paths import get_dds_cache_path
         
         base = get_dds_cache_path(
             cache_dir="/tmp/cache",
@@ -693,7 +643,7 @@ class TestDDSCachePaths:
 
     def test_dds_cache_path_different_zooms(self):
         """Test that different max_zoom produces different paths."""
-        from autoortho.utils.bundle_paths import get_dds_cache_path
+        from autoortho.utils.cache_paths import get_dds_cache_path
         
         path_z16 = get_dds_cache_path("/tmp/cache", 21728, 34432, "BI", 12, 16)
         path_z17 = get_dds_cache_path("/tmp/cache", 21728, 34432, "BI", 12, 17)
@@ -704,7 +654,7 @@ class TestDDSCachePaths:
 
     def test_dds_cache_dir_structure(self):
         """Test DDS cache directory structure."""
-        from autoortho.utils.bundle_paths import get_dds_cache_dir
+        from autoortho.utils.cache_paths import get_dds_cache_dir
         
         dds_dir = get_dds_cache_dir(
             cache_dir="/tmp/cache",
@@ -898,6 +848,159 @@ class TestDDMv2:
         assert dds_cache.contains(mock_tile.id, mock_tile.max_zoom, mock_tile) is False
         dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
         assert dds_cache.contains(mock_tile.id, mock_tile.max_zoom, mock_tile) is True
+
+
+# ============================================================================
+# Fallback Index Tracking Tests
+# ============================================================================
+
+class TestFallbackIndices:
+    """Tests for fallback_indices DDM metadata and healing integration."""
+
+    def test_ddm_fallback_indices_stored(self, dds_cache, mock_tile, sample_dds_bytes):
+        """Test that fallback_indices are persisted in DDM metadata."""
+        dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes,
+                        mock_tile, mm0_fallback_indices=[2, 5])
+
+        _, ddm_path = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom
+        )
+        with open(ddm_path, 'r') as f:
+            meta = json.load(f)
+
+        assert meta['fallback_indices'] == [2, 5]
+        assert meta['needs_healing'] is True
+        assert meta['healing_chunks'] == 2
+        assert meta['missing_indices'] == []
+
+        mm0 = meta['mipmaps'][0]
+        assert mm0['complete'] is False
+        assert mm0['valid'] == mm0['total']  # fallbacks count as valid
+
+    def test_ddm_fallback_only_no_missing(self, dds_cache, mock_tile, sample_dds_bytes):
+        """Test DDM when only fallbacks exist (no missing chunks)."""
+        dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes,
+                        mock_tile, mm0_fallback_indices=[1])
+
+        _, ddm_path = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom
+        )
+        with open(ddm_path, 'r') as f:
+            meta = json.load(f)
+
+        assert meta['needs_healing'] is True
+        assert meta['missing_indices'] == []
+        assert meta['fallback_indices'] == [1]
+
+    def test_ddm_both_missing_and_fallback(self, dds_cache, mock_tile, sample_dds_bytes):
+        """Test DDM with both missing and fallback indices."""
+        dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes,
+                        mock_tile, mm0_missing_indices=[0],
+                        mm0_fallback_indices=[3, 7])
+
+        _, ddm_path = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom
+        )
+        with open(ddm_path, 'r') as f:
+            meta = json.load(f)
+
+        assert meta['needs_healing'] is True
+        assert meta['healing_chunks'] == 3
+        assert meta['missing_indices'] == [0]
+        assert meta['fallback_indices'] == [3, 7]
+
+        mm0 = meta['mipmaps'][0]
+        assert mm0['complete'] is False
+        assert mm0['valid'] == mm0['total'] - 1  # only missing reduces valid
+
+    def test_load_sets_fallback_flags(self, dds_cache, mock_tile, sample_dds_bytes):
+        """Test that load() sets _dds_fallback_indices on tile."""
+        dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes,
+                        mock_tile, mm0_fallback_indices=[2, 5])
+
+        tile2 = MockTile()
+        tile2.cache_dir = mock_tile.cache_dir
+        loaded = dds_cache.load(tile2.id, tile2.max_zoom, tile2)
+
+        assert loaded is not None
+        assert tile2._dds_needs_healing is True
+        assert tile2._dds_missing_indices == []
+        assert tile2._dds_fallback_indices == [2, 5]
+
+    def test_load_sets_both_flags(self, dds_cache, mock_tile, sample_dds_bytes):
+        """Test that load() sets both missing and fallback flags."""
+        dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes,
+                        mock_tile, mm0_missing_indices=[1],
+                        mm0_fallback_indices=[4, 9])
+
+        tile2 = MockTile()
+        tile2.cache_dir = mock_tile.cache_dir
+        loaded = dds_cache.load(tile2.id, tile2.max_zoom, tile2)
+
+        assert loaded is not None
+        assert tile2._dds_needs_healing is True
+        assert tile2._dds_missing_indices == [1]
+        assert tile2._dds_fallback_indices == [4, 9]
+
+    def test_complete_tile_no_fallback_flags(self, dds_cache, mock_tile, sample_dds_bytes):
+        """Test that load() does not set fallback flags for complete tiles."""
+        dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+
+        tile2 = MockTile()
+        tile2.cache_dir = mock_tile.cache_dir
+        loaded = dds_cache.load(tile2.id, tile2.max_zoom, tile2)
+
+        assert loaded is not None
+        assert tile2._dds_needs_healing is False
+        assert tile2._dds_missing_indices == []
+        assert tile2._dds_fallback_indices == []
+
+    def test_backward_compat_old_ddm_no_fallback_field(self, dds_cache, mock_tile,
+                                                        sample_dds_bytes):
+        """Test that loading a DDM without fallback_indices defaults to []."""
+        dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes,
+                        mock_tile, mm0_missing_indices=[1])
+
+        # Manually strip fallback_indices from the DDM to simulate old format
+        _, ddm_path = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom
+        )
+        with open(ddm_path, 'r') as f:
+            meta = json.load(f)
+        del meta['fallback_indices']
+        with open(ddm_path, 'w') as f:
+            json.dump(meta, f)
+
+        tile2 = MockTile()
+        tile2.cache_dir = mock_tile.cache_dir
+        loaded = dds_cache.load(tile2.id, tile2.max_zoom, tile2)
+
+        assert loaded is not None
+        assert tile2._dds_needs_healing is True
+        assert tile2._dds_missing_indices == [1]
+        assert tile2._dds_fallback_indices == []
+
+    def test_store_from_file_with_fallback(self, dds_cache, mock_tile,
+                                            sample_dds_bytes, cache_dir):
+        """Test store_from_file preserves fallback_indices."""
+        source_path = os.path.join(cache_dir, "ephemeral_tile.dds")
+        with open(source_path, 'wb') as f:
+            f.write(sample_dds_bytes)
+
+        result = dds_cache.store_from_file(
+            mock_tile.id, mock_tile.max_zoom, source_path, mock_tile,
+            mm0_fallback_indices=[6, 8])
+        assert result is True
+
+        tile2 = MockTile()
+        tile2.cache_dir = mock_tile.cache_dir
+        loaded = dds_cache.load(tile2.id, tile2.max_zoom, tile2)
+        assert loaded is not None
+        assert tile2._dds_fallback_indices == [6, 8]
 
 
 # ============================================================================

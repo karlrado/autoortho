@@ -4,8 +4,7 @@ dynamic_dds_cache.py - Persistent DDS cache for AutoOrtho
 Stores pre-built DDS textures on disk across sessions so that subsequent
 loads skip the expensive JPEG-decode + DXT-compress pipeline entirely.
 
-Bundles remain the source of truth. The DDS cache is purely derived and
-can always be regenerated from bundles.
+The DDS cache stores fully-built textures derived from JPEG tiles.
 
 Key features:
 - Persistent across sessions (unlike EphemeralDDSCache)
@@ -92,7 +91,7 @@ class DynamicDDSCache:
     
     Sits between the FUSE layer and the build pipeline as a compiled-output
     cache. On a warm start, tiles are served from disk (~1-2ms) instead of
-    being rebuilt from bundles (~390ms per tile).
+    being rebuilt from JPEGs (~390ms per tile).
     
     Thread Safety:
         A single ``threading.Lock`` protects the LRU metadata dict. File I/O
@@ -152,12 +151,12 @@ class DynamicDDSCache:
                    tilename_zoom: int, max_zoom: int) -> Tuple[str, str]:
         """Return (dds_path, ddm_path) for a tile.
         
-        Uses the same DSF-based directory hierarchy as bundle_paths.py.
+        Uses the same DSF-based directory hierarchy as cache_paths.py.
         """
         try:
-            from autoortho.utils.bundle_paths import get_dds_cache_path
+            from autoortho.utils.cache_paths import get_dds_cache_path
         except ImportError:
-            from utils.bundle_paths import get_dds_cache_path
+            from utils.cache_paths import get_dds_cache_path
 
         base = get_dds_cache_path(
             self._cache_dir, row, col, maptype, tilename_zoom, max_zoom
@@ -169,9 +168,10 @@ class DynamicDDSCache:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_ddm(tile, max_zoom: int, bundle_mtime: Optional[float],
+    def _build_ddm(tile, max_zoom: int,
                    dds_format: str, compressor: str,
                    mm0_missing_indices: Optional[List[int]] = None,
+                   mm0_fallback_indices: Optional[List[int]] = None,
                    disk_compression: str = "none") -> dict:
         """Build a DDM v3 metadata dict from a tile and current config."""
         dds_ref = tile.dds
@@ -180,6 +180,7 @@ class DynamicDDSCache:
         mm_count = dds_ref.mipMapCount if dds_ref else 0
 
         missing = mm0_missing_indices or []
+        fallback = mm0_fallback_indices or []
         total_chunks = getattr(tile, 'chunks_per_row', 0) ** 2
 
         mipmaps = []
@@ -188,7 +189,7 @@ class DynamicDDSCache:
             if i == 0 and total_chunks > 0:
                 mm_entry["total"] = total_chunks
                 mm_entry["valid"] = total_chunks - len(missing)
-                mm_entry["complete"] = len(missing) == 0
+                mm_entry["complete"] = len(missing) == 0 and len(fallback) == 0
             mipmaps.append(mm_entry)
 
         return {
@@ -201,15 +202,15 @@ class DynamicDDSCache:
             "fmt": dds_format,
             "comp": compressor,
             "map": tile.maptype,
-            "bundle_mtime": bundle_mtime or 0.0,
             "built": time.time(),
             "tile_row": tile.row,
             "tile_col": tile.col,
             "mipmaps": mipmaps,
             "populated_mipmaps": list(range(mm_count)),
-            "needs_healing": len(missing) > 0,
-            "healing_chunks": len(missing),
+            "needs_healing": len(missing) > 0 or len(fallback) > 0,
+            "healing_chunks": len(missing) + len(fallback),
             "missing_indices": missing,
+            "fallback_indices": fallback,
             "disk_compression": disk_compression,
         }
 
@@ -241,7 +242,6 @@ class DynamicDDSCache:
             "fmt": dds_format,
             "comp": compressor,
             "map": maptype,
-            "bundle_mtime": 0.0,
             "built": time.time(),
             "tile_row": row,
             "tile_col": col,
@@ -289,17 +289,16 @@ class DynamicDDSCache:
         in load() via find_upgrade_candidate() to enable mipmap shifting.
         
         Staleness rules:
-        1. bundle_mtime < actual bundle mtime -> bundle updated
-        2. fmt != current DXT format -> config changed
-        3. comp != current compressor -> config changed
-        4. File size mismatch vs expected -> corruption
+        1. fmt != current DXT format -> config changed
+        2. comp != current compressor -> config changed
+        3. File size mismatch vs expected -> corruption
         """
         try:
             from autoortho.aoconfig import CFG
         except ImportError:
             from aoconfig import CFG  # type: ignore[no-redef]
 
-        # Rule 2: DXT format changed
+        # Rule 1: DXT format changed
         current_fmt = CFG.pydds.format.upper()
         if current_fmt in ("DXT1",):
             current_fmt = "BC1"
@@ -309,13 +308,13 @@ class DynamicDDSCache:
             log.debug(f"DDS stale: format changed ({meta.get('fmt')} -> {current_fmt})")
             return True
 
-        # Rule 3: Compressor changed
+        # Rule 2: Compressor changed
         current_comp = CFG.pydds.compressor.upper()
         if meta.get("comp") != current_comp:
             log.debug(f"DDS stale: compressor changed ({meta.get('comp')} -> {current_comp})")
             return True
 
-        # Rule 4: File size validation (uncompressed files only)
+        # Rule 3: File size validation (uncompressed files only)
         # Compressed files have variable on-disk sizes; corruption is caught
         # by zstd decompression failure in load() instead.
         if meta.get("disk_compression", "none") == "none":
@@ -328,27 +327,6 @@ class DynamicDDSCache:
                         return True
                 except OSError:
                     return True
-
-        # Rule 1: Bundle mtime check
-        bundle_mtime = meta.get("bundle_mtime", 0.0)
-        if bundle_mtime > 0:
-            try:
-                from autoortho.utils.bundle_paths import get_bundle2_path
-            except ImportError:
-                from utils.bundle_paths import get_bundle2_path  # type: ignore[no-redef]
-            bundle_path = get_bundle2_path(
-                self._cache_dir, tile.row, tile.col,
-                tile.maptype, tile.tilename_zoom
-            )
-            try:
-                actual_mtime = os.path.getmtime(bundle_path)
-                if actual_mtime > bundle_mtime:
-                    log.debug(f"DDS stale: bundle updated ({bundle_mtime} < {actual_mtime})")
-                    return True
-            except OSError:
-                # Bundle doesn't exist - DDS is orphaned but still usable
-                # (the data was correct when it was built)
-                pass
 
         return False
 
@@ -442,12 +420,16 @@ class DynamicDDSCache:
                 self._misses += 1
                 return None
 
-            # DDM v2: healing detection (v1 DDMs lack this field → default False)
-            if meta.get("needs_healing", False):
+            # Healing detection: check for missing or fallback chunks
+            missing_indices = meta.get("missing_indices", [])
+            fallback_indices = meta.get("fallback_indices", [])
+            if missing_indices or fallback_indices:
                 tile._dds_needs_healing = True
-                tile._dds_missing_indices = meta.get("missing_indices", [])
+                tile._dds_missing_indices = missing_indices
+                tile._dds_fallback_indices = fallback_indices
                 log.debug(f"DDS cache: serving incomplete tile {tile_id} "
-                          f"({len(tile._dds_missing_indices)} chunks need healing)")
+                          f"({len(missing_indices)} missing, "
+                          f"{len(fallback_indices)} fallback chunks need healing)")
                 self._try_heal_from_disk_cache(tile_id, max_zoom, tile)
 
             # DDM v3: partial DDS awareness -- tell the tile which mipmaps
@@ -634,8 +616,9 @@ class DynamicDDSCache:
             raise
 
     def store(self, tile_id: str, max_zoom: int, dds_bytes: bytes,
-              tile, bundle_path: Optional[str] = None,
-              mm0_missing_indices: Optional[List[int]] = None) -> bool:
+              tile,
+              mm0_missing_indices: Optional[List[int]] = None,
+              mm0_fallback_indices: Optional[List[int]] = None) -> bool:
         """
         Store a DDS build result in the persistent cache.
         
@@ -646,9 +629,11 @@ class DynamicDDSCache:
             max_zoom: Effective maximum zoom level
             dds_bytes: Complete DDS file bytes (header + mipmaps)
             tile: Tile object
-            bundle_path: Optional path to the source bundle for mtime tracking
             mm0_missing_indices: Flat chunk indices missing at build time.
                 None means "assume complete".
+            mm0_fallback_indices: Flat chunk indices that used low-res fallback
+                imagery instead of native-resolution data.
+                None means "no fallbacks used".
         
         Returns:
             True on success, False on failure
@@ -668,14 +653,6 @@ class DynamicDDSCache:
             # Ensure directory exists
             os.makedirs(os.path.dirname(dds_path), exist_ok=True)
 
-            # Get bundle mtime if path provided
-            bundle_mtime = None
-            if bundle_path:
-                try:
-                    bundle_mtime = os.path.getmtime(bundle_path)
-                except OSError:
-                    pass
-
             dds_format, compressor = self._get_format_and_compressor()
 
             # Compress DDS data for disk storage
@@ -691,9 +668,10 @@ class DynamicDDSCache:
             os.replace(tmp_dds, dds_path)
 
             # Build and write DDM metadata atomically
-            meta = self._build_ddm(tile, max_zoom, bundle_mtime,
+            meta = self._build_ddm(tile, max_zoom,
                                    dds_format, compressor,
                                    mm0_missing_indices=mm0_missing_indices,
+                                   mm0_fallback_indices=mm0_fallback_indices,
                                    disk_compression=disk_compression)
             self._write_ddm(ddm_path, meta)
 
@@ -711,7 +689,7 @@ class DynamicDDSCache:
 
             log.debug(f"DDS cache STORE: {tile_id} z{max_zoom} ({size} bytes)")
 
-            if not mm0_missing_indices:
+            if not mm0_missing_indices and not mm0_fallback_indices:
                 self._cleanup_jpegs_async(tile)
 
             return True
@@ -884,7 +862,8 @@ class DynamicDDSCache:
 
     def store_from_file(self, tile_id: str, max_zoom: int,
                         source_path: str, tile,
-                        mm0_missing_indices: Optional[List[int]] = None) -> bool:
+                        mm0_missing_indices: Optional[List[int]] = None,
+                        mm0_fallback_indices: Optional[List[int]] = None) -> bool:
         """
         Store a DDS build result from an existing file on disk.
         
@@ -901,6 +880,8 @@ class DynamicDDSCache:
             max_zoom: Effective maximum zoom level
             source_path: Path to the DDS file already on disk
             tile: Tile object
+            mm0_missing_indices: Flat chunk indices missing at build time.
+            mm0_fallback_indices: Flat chunk indices that used low-res fallback.
         
         Returns:
             True on success, False on failure
@@ -965,6 +946,7 @@ class DynamicDDSCache:
             dds_format, compressor = self._get_format_and_compressor()
             meta = self._build_ddm(tile, max_zoom, None, dds_format, compressor,
                                    mm0_missing_indices=mm0_missing_indices,
+                                   mm0_fallback_indices=mm0_fallback_indices,
                                    disk_compression=disk_compression)
             self._write_ddm(ddm_path, meta)
 
@@ -982,7 +964,7 @@ class DynamicDDSCache:
             log.debug(f"DDS cache STORE (from file): {tile_id} z{max_zoom} "
                       f"({disk_size} bytes, compression={disk_compression})")
 
-            if not mm0_missing_indices:
+            if not mm0_missing_indices and not mm0_fallback_indices:
                 self._cleanup_jpegs_async(tile)
 
             return True
@@ -1726,51 +1708,76 @@ class DynamicDDSCache:
             log.debug(f"Healing: file I/O error for {tile_id}: {e}")
             return False
 
+        patched_set = set(chunk_jpegs.keys())
+        remaining_missing = [i for i in (getattr(tile, '_dds_missing_indices', []) or [])
+                             if i not in patched_set]
+        remaining_fallback = [i for i in (getattr(tile, '_dds_fallback_indices', []) or [])
+                              if i not in patched_set]
+        remaining_total = len(remaining_missing) + len(remaining_fallback)
+
         if patched == len(chunk_jpegs):
-            # All chunks patched → update DDM to mark tile complete
+            # All requested chunks patched — check if anything remains
             meta = self._read_ddm(ddm_path)
             if meta is not None:
-                meta["needs_healing"] = False
-                meta["healing_chunks"] = 0
-                meta["missing_indices"] = []
+                meta["needs_healing"] = remaining_total > 0
+                meta["healing_chunks"] = remaining_total
+                meta["missing_indices"] = remaining_missing
+                meta["fallback_indices"] = remaining_fallback
                 if meta.get("mipmaps"):
                     mm0 = meta["mipmaps"][0]
-                    mm0["valid"] = mm0.get("total", 0)
-                    mm0["complete"] = True
+                    mm0["valid"] = mm0.get("total", 0) - len(remaining_missing)
+                    mm0["complete"] = remaining_total == 0
                 self._write_ddm(ddm_path, meta)
 
-            tile._dds_needs_healing = False
-            tile._dds_missing_indices = []
+            tile._dds_needs_healing = remaining_total > 0
+            tile._dds_missing_indices = remaining_missing
+            tile._dds_fallback_indices = remaining_fallback
             log.info(f"Healing complete: {tile_id} ({patched} chunks patched)")
             return True
 
-        # Partial patch — update DDM with remaining missing indices
-        remaining = [i for i in (getattr(tile, '_dds_missing_indices', []) or [])
-                     if i not in chunk_jpegs]
+        # Partial patch — update DDM with remaining indices
         meta = self._read_ddm(ddm_path)
         if meta is not None:
-            meta["missing_indices"] = remaining
-            meta["healing_chunks"] = len(remaining)
-            meta["needs_healing"] = len(remaining) > 0
+            meta["missing_indices"] = remaining_missing
+            meta["fallback_indices"] = remaining_fallback
+            meta["healing_chunks"] = remaining_total
+            meta["needs_healing"] = remaining_total > 0
             if meta.get("mipmaps"):
                 total = meta["mipmaps"][0].get("total", 0)
-                meta["mipmaps"][0]["valid"] = total - len(remaining)
-                meta["mipmaps"][0]["complete"] = len(remaining) == 0
+                meta["mipmaps"][0]["valid"] = total - len(remaining_missing)
+                meta["mipmaps"][0]["complete"] = remaining_total == 0
             self._write_ddm(ddm_path, meta)
 
-        tile._dds_missing_indices = remaining
-        tile._dds_needs_healing = len(remaining) > 0
+        tile._dds_missing_indices = remaining_missing
+        tile._dds_fallback_indices = remaining_fallback
+        tile._dds_needs_healing = remaining_total > 0
         log.info(f"Healing partial: {tile_id} ({patched}/{len(chunk_jpegs)} chunks patched, "
-                 f"{len(remaining)} remaining)")
+                 f"{remaining_total} remaining)")
         return False
 
-    def _try_heal_from_disk_cache(self, tile_id: str, max_zoom: int, tile) -> None:
-        """Check if missing chunk JPEGs exist on disk and dispatch healing.
+    @staticmethod
+    def _jpeg_exists_on_disk(idx: int, tile, cache_dir: str,
+                             chunks_per_row: int, max_zoom: int) -> bool:
+        """Check whether a full-resolution JPEG exists on disk for a chunk index."""
+        cx = idx % chunks_per_row
+        cy = idx // chunks_per_row
+        col = tile.col + cx
+        row = tile.row + cy
+        jpeg_path = os.path.join(
+            cache_dir,
+            f"{col}_{row}_{max_zoom}_{tile.maptype}.jpg")
+        return os.path.exists(jpeg_path)
 
-        Full implementation in Phase 3 (in-place patching).
+    def _try_heal_from_disk_cache(self, tile_id: str, max_zoom: int, tile) -> None:
+        """Check if healable chunk JPEGs exist on disk and dispatch healing.
+
+        Missing chunks are checked first (all-or-nothing). Fallback chunks
+        are checked individually (best-effort) so missing-chunk healing is
+        never delayed by unavailable fallback JPEGs.
         """
         missing = getattr(tile, '_dds_missing_indices', [])
-        if not missing:
+        fallback = getattr(tile, '_dds_fallback_indices', [])
+        if not missing and not fallback:
             return
 
         jpeg_cache_dir = getattr(tile, 'cache_dir', None)
@@ -1781,25 +1788,30 @@ class DynamicDDSCache:
         if not chunks_per_row:
             return
 
-        all_exist = True
-        for idx in missing:
-            cx = idx % chunks_per_row
-            cy = idx // chunks_per_row
-            col = tile.col + cx
-            row = tile.row + cy
-            jpeg_path = os.path.join(
-                jpeg_cache_dir,
-                f"{col}_{row}_{max_zoom}_{tile.maptype}.jpg")
-            if not os.path.exists(jpeg_path):
-                all_exist = False
-                break
+        healable = []
 
-        if all_exist:
-            log.debug(f"DDS cache: all missing JPEGs on disk for {tile_id}, "
+        # Missing chunks: all-or-nothing (same semantics as before)
+        all_missing_exist = True
+        for idx in missing:
+            if self._jpeg_exists_on_disk(idx, tile, jpeg_cache_dir, chunks_per_row, max_zoom):
+                healable.append(idx)
+            else:
+                all_missing_exist = False
+                break
+        if not all_missing_exist:
+            healable = []  # discard partial missing set
+
+        # Fallback chunks: best-effort (patch whichever have JPEGs on disk)
+        for idx in fallback:
+            if self._jpeg_exists_on_disk(idx, tile, jpeg_cache_dir, chunks_per_row, max_zoom):
+                healable.append(idx)
+
+        if healable:
+            log.debug(f"DDS cache: {len(healable)} healable JPEGs on disk for {tile_id}, "
                       f"dispatching cross-session healing")
             t = threading.Thread(
                 target=self._heal_from_disk,
-                args=(tile_id, max_zoom, tile, missing),
+                args=(tile_id, max_zoom, tile, healable),
                 daemon=True)
             t.start()
 
