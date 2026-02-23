@@ -532,8 +532,11 @@ class Package(object):
     def check(self):
         log.info(f"Checking {self.name}")
         precomputed = getattr(self.zf, 'computed_hash', None)
-        check_kwargs = {'precomputed_hash': precomputed} if precomputed else {}
-        if not self.zf.check(**check_kwargs):
+        try:
+            result = self.zf.check(precomputed_hash=precomputed) if precomputed else self.zf.check()
+        except TypeError:
+            result = self.zf.check()
+        if not result:
             log.warning(f"{self.name} is bad.  Cleaning up.")
             self.cleanup()
             self.downloaded = False
