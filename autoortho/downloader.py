@@ -954,6 +954,142 @@ class Release(object):
 
         return success
 
+    def download_and_install(self, progress_callback=None, noclean=False):
+        """Download and install packages in a pipelined fashion.
+
+        Packages are submitted for extraction as soon as their download
+        and hash verification complete, overlapping network I/O with
+        decompression and disk writes.
+        """
+        if self.installed:
+            log.info(f"Already installed {self.name}")
+            return True
+
+        self.cleaned = False
+        self.parse()
+
+        if not self.packages:
+            self.downloaded = True
+            self.installed = True
+            self.save()
+            return True
+
+        # Remove previous z-type install dirs before any extraction begins
+        for k, v in self.packages.items():
+            if v.pkgtype == "z":
+                log.debug(f"Cleaning up ortho type package: {v.name}.")
+                v.uninstall()
+
+        total_files = 0
+        for pkg in self.packages.values():
+            total_files += len(pkg.remote_urls)
+        progress_state = {'files_total': total_files, 'files_done': 0}
+        progress_lock = threading.Lock()
+
+        session = _get_download_session()
+
+        try:
+            max_workers = int(CFG.scenery.max_download_workers)
+        except (AttributeError, ValueError):
+            max_workers = 4
+        max_workers = max(1, min(max_workers, len(self.packages)))
+        extract_workers = max(1, max_workers // 2)
+
+        extract_total = len(self.packages)
+        extract_done = [0]
+        extract_lock = threading.Lock()
+        extract_futures = []
+
+        def _install_package(pkg):
+            try:
+                pkg.install()
+            except Exception as err:
+                log.error(f"Install error for {pkg.name}: {err}")
+                pkg.cleanup()
+                raise
+            with extract_lock:
+                extract_done[0] += 1
+
+        def _download_then_submit(pkg_name, pkg, extract_exec):
+            log.info(f"Downloading {pkg_name}")
+            pkg.download(
+                progress_callback=progress_callback,
+                progress_state=progress_state,
+                session=session,
+                progress_lock=progress_lock,
+            )
+            if not pkg.check():
+                log.warning(f"{pkg_name} failed checks. Retrying ...")
+                pkg.cleanup()
+                pkg.download(
+                    progress_callback=progress_callback,
+                    progress_state=progress_state,
+                    session=session,
+                    progress_lock=progress_lock,
+                )
+                if not pkg.check():
+                    log.error(f"{pkg_name} failed again. Exiting!")
+                    return False
+
+            future = extract_exec.submit(_install_package, pkg)
+            with extract_lock:
+                extract_futures.append(future)
+            return True
+
+        success = True
+        extract_executor = ThreadPoolExecutor(max_workers=extract_workers)
+
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as dl_executor:
+                dl_futures = {
+                    dl_executor.submit(
+                        _download_then_submit, k, v, extract_executor
+                    ): k
+                    for k, v in self.packages.items()
+                }
+                for future in as_completed(dl_futures):
+                    pkg_name = dl_futures[future]
+                    try:
+                        if not future.result():
+                            success = False
+                    except Exception as err:
+                        log.error(f"Download error for {pkg_name}: {err}")
+                        success = False
+
+            # All downloads finished; wait for any extractions still running.
+            if success:
+                has_pending = any(not f.done() for f in extract_futures)
+
+                for future in as_completed(list(extract_futures)):
+                    try:
+                        future.result()
+                    except Exception as err:
+                        log.error(f"Extract error: {err}")
+                        success = False
+
+                    if has_pending and progress_callback:
+                        pcnt = int((extract_done[0] / extract_total) * 100)
+                        progress_callback({
+                            'stage': 'verify',
+                            'verify_done': extract_done[0],
+                            'verify_total': extract_total,
+                            'verify_pcnt': pcnt,
+                            'status': f'Installed {extract_done[0]}/{extract_total}',
+                        })
+        finally:
+            extract_executor.shutdown(wait=True)
+
+        if not success:
+            self.downloaded = False
+            return False
+
+        self.downloaded = True
+        self.installed = True
+        self.save()
+        if not noclean:
+            self.cleanup()
+        return True
+
     def cleanup(self):
         if self.cleaned:
             return
@@ -1056,12 +1192,10 @@ class Region(object):
             self.releases.pop(self.local_rel.ver)
             self.local_rel = None
 
-        if not rel.download(progress_callback):
-            log.error(f"Failed to download release {rel}")
-            return False
-
-        if not rel.install(progress_callback=progress_callback, noclean=noclean):
-            log.error(f"Failed to install release {rel}")
+        if not rel.download_and_install(
+            progress_callback=progress_callback, noclean=noclean
+        ):
+            log.error(f"Failed to download and install release {rel}")
             return False
 
         return True
