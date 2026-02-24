@@ -4416,7 +4416,7 @@ class Chunk(object):
         # Hack override maptype
         #maptype = "ARC"
 
-        MAPID = "s2cloudless-2023_3857"
+        MAPID = "s2cloudless-2024_3857"
         MATRIXSET = "g"
         MAPTYPES = {
             "EOX": f"https://{server}.tiles.maps.eox.at/wmts/?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.zoom}&TileCol={self.col}&TileRow={self.row}",
