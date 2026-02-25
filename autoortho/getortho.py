@@ -4419,7 +4419,7 @@ class Chunk(object):
         MAPID = "s2cloudless-2024_3857"
         MATRIXSET = "g"
         MAPTYPES = {
-            "EOX": f"https://{server}.tiles.maps.eox.at/wmts/?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.zoom}&TileCol={self.col}&TileRow={self.row}",
+            "EOX": f"https://s2maps-tiles.eu/wmts?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.zoom}&TileCol={self.col}&TileRow={self.row}",
             "BI": f"https://t.ssl.ak.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=15312",
             "GO2": f"http://mts{server_num}.google.com/vt/lyrs=s&x={self.col}&y={self.row}&z={self.zoom}",
             "ARC": f"http://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
@@ -4521,7 +4521,7 @@ class Chunk(object):
                         log.error(f"Check your network connection, DNS, maptype choice, and firewall settings.")
                         # Enhanced circuit breaker: reduce wait times on severe error rates
                         if error_rate >= 0.25:
-                            log.warning("Severe error rate (≥25%) detected, consider checking configuration")
+                            log.warning("Severe error rate (>=25%%) detected, consider checking configuration")
                 return False
 
             data = resp.content
@@ -5452,21 +5452,37 @@ class Tile(object):
                 builder.add_chunks_batch_nocopy(newly_ready, jpeg_refs_for_nocopy)
             
             # Phase 4: Resolve fallbacks for failed chunks
-            # Use ThreadPoolExecutor for parallel disk I/O and image operations
-            if failed_indices and not (time_budget and time_budget.exhausted):
+            # Use ThreadPoolExecutor for parallel disk I/O and image operations.
+            # Always attempt fallback resolution even if the main time budget is
+            # exhausted: the resolver only does disk cache lookups and mipmap
+            # scaling (downloader=None) which are fast, sub-second operations.
+            # Skipping this phase when the budget exhausted was the root cause of
+            # permanent missing-color patches on first load, because the DDS was
+            # built with missing_color baked in and marked retrieved=True,
+            # preventing any later retry.
+            if failed_indices:
                 from concurrent.futures import ThreadPoolExecutor, as_completed
+                
+                # When main budget is exhausted, give fallback resolution a
+                # fresh budget for disk-only operations (no network), using the
+                # user-configured fallback_timeout.
+                fallback_resolve_budget = float(getattr(CFG.autoortho, 'fallback_timeout', 30.0))
                 
                 def resolve_fallback(idx):
                     """Resolve fallback for a single chunk - can run in parallel."""
                     chunk_col = self.col + (idx % self.chunks_per_row)
                     chunk_row = self.row + (idx // self.chunks_per_row)
                     
-                    # Create fallback time budget if main budget provided
+                    # Create fallback time budget:
+                    # - If main budget has time remaining, use that
+                    # - Otherwise use a fresh small budget for disk-only fallbacks
                     fb_budget = None
                     if time_budget:
                         fb_remaining = time_budget.remaining
                         if fb_remaining > 0:
                             fb_budget = FBTimeBudget(fb_remaining)
+                        else:
+                            fb_budget = FBTimeBudget(fallback_resolve_budget)
                     
                     rgba = resolver.resolve(
                         chunk_col, chunk_row, self.max_zoom,
@@ -5479,12 +5495,15 @@ class Tile(object):
                 max_workers = min(8, len(failed_indices))
                 fallback_results = []
                 
+                # Use remaining budget or a fresh small budget for collection
+                resolve_deadline_secs = max(1.0, max_wait) if not (time_budget and time_budget.exhausted) else fallback_resolve_budget
+                
                 try:
                     with ThreadPoolExecutor(max_workers=max_workers) as executor:
                         futures = {executor.submit(resolve_fallback, i): i for i in failed_indices}
                         
                         # Collect results with timeout
-                        deadline = time.monotonic() + max(1.0, max_wait)
+                        deadline = time.monotonic() + resolve_deadline_secs
                         for future in as_completed(futures, timeout=max(0.1, deadline - time.monotonic())):
                             try:
                                 idx, rgba = future.result(timeout=0.1)
@@ -5493,9 +5512,6 @@ class Tile(object):
                                 # Fallback failed, will be marked missing
                                 idx = futures[future]
                                 fallback_results.append((idx, None))
-                            
-                            if time_budget and time_budget.exhausted:
-                                break
                 except Exception:
                     # Timeout or other error - mark remaining as missing
                     pass
@@ -5516,11 +5532,6 @@ class Tile(object):
                     if i not in resolved_indices:
                         builder.mark_missing(i)
                         streaming_mm0_missing.append(i)
-            elif failed_indices:
-                # Budget exhausted - mark all failed as missing
-                for i in failed_indices:
-                    builder.mark_missing(i)
-                    streaming_mm0_missing.append(i)
             
             # Finalize: acquire DDS buffer and build
             pool = _get_dds_buffer_pool()
@@ -6512,13 +6523,18 @@ class Tile(object):
                 return (chunk, None, 0, 0)
             
             # === TIME BUDGET CHECK ===
-            # Early exit if the time budget is exhausted. This is the key improvement:
-            # instead of each chunk waiting maxwait seconds, we check the shared budget.
-            if time_budget.exhausted:
-                log.debug(f"Time budget exhausted (elapsed={time_budget.elapsed:.2f}s), skipping chunk {chunk}")
-                time_budget.record_chunk_skipped()
-                bump('chunk_budget_skipped')
-                return (chunk, None, start_x, start_y)
+            # When the budget is exhausted we no longer wait for downloads
+            # (wait_with_budget returns immediately), but we still fall through
+            # to attempt local fallbacks (Fallback 1: disk cache, Fallback 2:
+            # mipmap scaling).  These are fast, sub-millisecond operations that
+            # can eliminate missing-color patches at virtually no cost.
+            # Fallback 3 (network) has its own internal budget gates and will
+            # not fire when the budget is exhausted.
+            budget_exhausted_at_entry = time_budget.exhausted
+            if budget_exhausted_at_entry:
+                log.debug(f"Time budget exhausted (elapsed={time_budget.elapsed:.2f}s), "
+                         f"attempting local fallbacks for chunk {chunk}")
+                bump('chunk_budget_exhausted_local_fallback')
             
             # Track if this chunk permanently failed
             is_permanent_failure = chunk.permanent_failure
@@ -6902,9 +6918,8 @@ class Tile(object):
             if missing_after_lazy and len(self.imgs) > 0:
                 log.debug(f"GET_IMG: Re-processing {len(missing_after_lazy)} chunks after lazy build")
                 for chunk in missing_after_lazy:
-                    if time_budget.exhausted:
-                        break
-                    # Try Fallback 2 now that we have built lower mipmaps
+                    # get_downscaled_from_higher_mipmap is pure in-memory
+                    # scaling -- always worth attempting regardless of budget.
                     chunk_img = self.get_downscaled_from_higher_mipmap(mipmap, chunk.col, chunk.row, zoom)
                     if chunk_img:
                         start_x = int(chunk.width * (chunk.col - col))
