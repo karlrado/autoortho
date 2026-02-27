@@ -5488,7 +5488,12 @@ class ConfigUI(QMainWindow):
             del self.restore_default_dsfs_workers[region_id]
 
     def on_download_progress(self, region_id, progress_data):
-        """Update download progress"""
+        """Update download progress.
+
+        Handles both aggregated progress (from ProgressAggregator, with
+        'aggregate_MBps' / 'active_downloads' keys) and legacy per-file
+        progress (with 'pcnt_done' / 'MBps' keys).
+        """
         # Throttle UI updates to avoid freezing
         if not hasattr(self, '_last_ui_progress'):
             self._last_ui_progress = {}
@@ -5503,23 +5508,34 @@ class ConfigUI(QMainWindow):
 
         stage = progress_data.get('stage')
         if stage == 'verify':
-            # Switch to verification mode: show a single bar (overall), hide current
             if progress_current:
                 progress_current.setVisible(False)
             if progress_overall:
                 progress_overall.setVisible(True)
                 progress_overall.setValue(int(progress_data.get('verify_pcnt', 0)))
-            # Also change button text while verifying
             button = self.findChild(QPushButton, f"scenery-{region_id}")
             if button:
-                button.setText("Installing...")  # We're actually installing
-            # Update status with verification state
-            status = progress_data.get('status', 'Verifying...')
+                button.setText("Installing...")
+            status = progress_data.get('status', 'Installing...')
             self.update_status_bar(f"{region_id}: {status}")
             return
+
+        is_aggregate = 'aggregate_MBps' in progress_data
+        overall_pcnt = progress_data.get('overall_pcnt', 0) or 0
+
+        if is_aggregate:
+            # Aggregated progress: hide the per-file bar, show only overall
+            if progress_current:
+                progress_current.setVisible(False)
+            if progress_overall:
+                progress_overall.setVisible(True)
+                progress_overall.setValue(int(overall_pcnt))
+
+            status = progress_data.get('status', 'Downloading...')
+            self.update_status_bar(f"{region_id}: {status}")
         else:
+            # Legacy per-file progress (single-threaded fallback)
             pcnt_done = progress_data.get('pcnt_done', 0)
-            overall_pcnt = progress_data.get('overall_pcnt')
             files_done = progress_data.get('files_done')
             files_total = progress_data.get('files_total')
 
@@ -5528,28 +5544,22 @@ class ConfigUI(QMainWindow):
                 progress_current.setValue(int(pcnt_done))
 
             if progress_overall is not None:
-                if overall_pcnt is None and files_done is not None and files_total:
+                if overall_pcnt == 0 and files_done is not None and files_total:
                     try:
                         overall_pcnt = (float(files_done) / float(files_total)) * 100.0
                     except Exception:
                         overall_pcnt = 0
-                if overall_pcnt is None:
-                    overall_pcnt = 0
                 progress_overall.setVisible(True)
                 progress_overall.setValue(int(overall_pcnt))
 
-        status = progress_data.get('status', 'Downloading...')
-        MBps = progress_data.get('MBps', 0)
-        try:
+            MBps = progress_data.get('MBps', 0)
+            status = progress_data.get('status', 'Downloading...')
             if pcnt_done > 0:
                 self.update_status_bar(
                     f"{region_id}: {pcnt_done:.1f}% ({MBps:.1f} MB/s)"
                 )
             else:
                 self.update_status_bar(f"{region_id}: {status}")
-        except UnboundLocalError:
-            # If pcnt_done wasn't defined (e.g., stage mismatch), fall back to status
-            self.update_status_bar(f"{region_id}: {status}")
 
     def on_download_finished(self, region_id, success):
         """Handle download completion"""

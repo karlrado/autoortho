@@ -7588,6 +7588,40 @@ class Tile(object):
         else:
             return False  # Default: respect budget
 
+    def _try_incremental_dds_store(self, mipmap):
+        """Persist intermediate mipmaps (1+) incrementally to DDS cache."""
+        if mipmap == 0 or dynamic_dds_cache is None or self.dds is None:
+            return
+        _partially_cached = getattr(self, '_dds_populated_mipmaps', None) is not None
+        if self._prepopulated and not _partially_cached:
+            return
+        if self._completion_reported:
+            return
+        try:
+            mm_data = {}
+            mm_offsets = {}
+            for i in range(mipmap, len(self.dds.mipmap_list)):
+                mm = self.dds.mipmap_list[i]
+                if mm.retrieved and mm.databuffer is not None:
+                    mm.databuffer.seek(0)
+                    data = mm.databuffer.read()
+                    if data:
+                        mm_data[i] = data
+                        mm_offsets[i] = (mm.startpos, mm.length)
+            if mm_data:
+                dynamic_dds_cache.store_incremental(
+                    self.id, self.max_zoom,
+                    self.row, self.col, self.maptype,
+                    self.tilename_zoom,
+                    self.dds.header.getvalue(),
+                    self.dds.total_size,
+                    self.dds.width, self.dds.height,
+                    self.dds.mipMapCount,
+                    mm_data, mm_offsets
+                )
+        except Exception as e:
+            log.warning(f"Incremental DDS cache store failed for {self.id} mm{mipmap}: {e}")
+
     def _try_native_mipmap_build(self, mipmap: int, time_budget=None) -> bool:
         """
         Try to build a single mipmap level using native aopipeline.
@@ -8251,6 +8285,7 @@ class Tile(object):
             except Exception:
                 pass
             
+            self._try_incremental_dds_store(mipmap)
             return True
         # ═══════════════════════════════════════════════════════════════════════
 
@@ -8324,36 +8359,7 @@ class Tile(object):
         log.debug(f"GET_MIPMAP: Tile {self} mipmap {mipmap} created in {total_creation_time:.2f}s "
                  f"(download+compose: {total_creation_time - compress_time:.2f}s, compress: {compress_time:.2f}s)")
 
-        # Persist intermediate mipmaps (1+) incrementally to DDS cache
-        _partially_cached = getattr(self, '_dds_populated_mipmaps', None) is not None
-        if (mipmap > 0 and dynamic_dds_cache is not None
-                and (not self._prepopulated or _partially_cached)
-                and not self._completion_reported
-                and self.dds is not None):
-            try:
-                mm_data = {}
-                mm_offsets = {}
-                for i in range(mipmap, len(self.dds.mipmap_list)):
-                    mm = self.dds.mipmap_list[i]
-                    if mm.retrieved and mm.databuffer is not None:
-                        mm.databuffer.seek(0)
-                        data = mm.databuffer.read()
-                        if data:
-                            mm_data[i] = data
-                            mm_offsets[i] = (mm.startpos, mm.length)
-                if mm_data:
-                    dynamic_dds_cache.store_incremental(
-                        self.id, self.max_zoom,
-                        self.row, self.col, self.maptype,
-                        self.tilename_zoom,
-                        self.dds.header.getvalue(),
-                        self.dds.total_size,
-                        self.dds.width, self.dds.height,
-                        self.dds.mipMapCount,
-                        mm_data, mm_offsets
-                    )
-            except Exception:
-                pass
+        self._try_incremental_dds_store(mipmap)
 
         # Close only chunks for THIS mipmap's zoom level (not all zooms!)
         mipmap_zoom = self.max_zoom - mipmap
