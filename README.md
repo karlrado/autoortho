@@ -43,11 +43,7 @@ questions.
 Donations are not necessary. All of the work I do is me doing my contribution for the awesome X-Plane community and without an economic purpose in mind. 
 That being said if you find AutoOrtho useful and would like to support its development, you can donate via PayPal. Your support is very much appreciated and inspires me to continue improving the project.
 
-<form action="https://www.paypal.com/donate" method="post" target="_top">
-<input type="hidden" name="hosted_button_id" value="4Z8774JVYPQHG" />
-<input type="image" src="https://www.paypalobjects.com/en_US/i/btn/btn_donate_LG.gif" border="0" name="submit" title="PayPal - The safer, easier way to pay online!" alt="Donate with PayPal button" />
-<img alt="" border="0" src="https://www.paypal.com/en_MX/i/scr/pixel.gif" width="1" height="1" />
-</form>
+[![Donate with PayPal](https://www.paypalobjects.com/en_US/i/btn/btn_donate_LG.gif)](https://www.paypal.com/donate/?hosted_button_id=4Z8774JVYPQHG)
 
 ---
 Found a bug? Open an issue here and report it. I'll take a look at it.
