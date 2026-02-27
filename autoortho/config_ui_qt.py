@@ -3147,25 +3147,21 @@ class ConfigUI(QMainWindow):
         seasons_layout = QVBoxLayout()
         seasons_group.setLayout(seasons_layout)
 
-        # Enable/Disable controls
+        # Enable control
         seasons_toggle_layout = QHBoxLayout()
-        # TEMP pyside6 / Python 3.14 QRadioButton workaround
-        # self.seasons_enabled_radio = QRadioButton("Enabled")
-        # self.seasons_disabled_radio = QRadioButton("Disabled")
-        self.seasons_enabled_radio = QCheckBox("Enabled")
-        self.seasons_disabled_radio = QCheckBox("Disabled")
+        self.seasons_enabled_check = QCheckBox(
+            "Enable Seasons Saturation Adjustments"
+        )
+        self.seasons_enabled_check.setToolTip(
+            "Activates desaturation of base ortho texture to enhance the application of seasons effects.\n"
+            "NOTE: This does not turn seasons on/off.\n"
+            "Activate seasons by adding Seasons data in the Scenery tab."
+        )
 
         seasons_enabled = bool(self.cfg.seasons.enabled)
-        self.seasons_enabled_radio.setChecked(seasons_enabled)
-        self.seasons_disabled_radio.setChecked(not seasons_enabled)
-        # TEMP pyside6 / Python 3.14 QRadioButton workaround
-        # self.seasons_enabled_radio.toggled.connect(self.on_seasons_enabled_toggled)
-        # self.seasons_disabled_radio.toggled.connect(self.on_seasons_enabled_toggled)
-        self.seasons_enabled_radio.clicked.connect(self.on_seasons_enabled_checked)
-        self.seasons_disabled_radio.clicked.connect(self.on_seasons_disabled_checked)
-
-        seasons_toggle_layout.addWidget(self.seasons_enabled_radio)
-        seasons_toggle_layout.addWidget(self.seasons_disabled_radio)
+        self.seasons_enabled_check.setChecked(seasons_enabled)
+        self.seasons_enabled_check.toggled.connect(self.on_seasons_enabled_toggled)
+        seasons_toggle_layout.addWidget(self.seasons_enabled_check)
         seasons_toggle_layout.addStretch()
         seasons_layout.addLayout(seasons_toggle_layout)
 
@@ -3631,26 +3627,8 @@ class ConfigUI(QMainWindow):
 
     def on_seasons_enabled_toggled(self):
         try:
-            enabled = self.seasons_enabled_radio.isChecked()
+            enabled = self.seasons_enabled_check.isChecked()
             self._set_seasons_controls_enabled(enabled)
-        except Exception:
-            pass
-
-    # TEMP pyside6 / Python 3.14 QRadioButton workaround
-    def on_seasons_enabled_checked(self):
-        try:
-            self.seasons_enabled_radio.setChecked(True)
-            self.seasons_disabled_radio.setChecked(False)
-            self._set_seasons_controls_enabled(True)
-        except Exception:
-            pass
-
-    # TEMP pyside6 / Python 3.14 QRadioButton workaround
-    def on_seasons_disabled_checked(self):
-        try:
-            self.seasons_enabled_radio.setChecked(False)
-            self.seasons_disabled_radio.setChecked(True)
-            self._set_seasons_controls_enabled(False)
         except Exception:
             pass
 
@@ -5734,7 +5712,7 @@ class ConfigUI(QMainWindow):
             )
 
             # Seasons settings
-            self.cfg.seasons.enabled = self.seasons_enabled_radio.isChecked()
+            self.cfg.seasons.enabled = self.seasons_enabled_check.isChecked()
             self.cfg.seasons.compress_dsf = self.compress_dsf_check.isChecked()
             self.cfg.seasons.seasons_convert_workers = str(self.seasons_convert_workers_slider.value())
             self.cfg.seasons.spr_saturation = str(self.spr_sat_slider.value())
