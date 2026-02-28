@@ -2706,7 +2706,7 @@ class ConfigUI(QMainWindow):
             "Maximum number of chunks to submit per prefetch cycle.\n"
             "Higher = more aggressive prefetching, more bandwidth\n"
             "Lower = gentler prefetching, less bandwidth\n\n"
-            "Recommended: 32 (balanced), 64-128 (fast internet), 16 (slow internet)\n"
+            "Recommended: 48 (balanced), 64-128 (fast internet), 16-32 (slow internet)\n"
             "Values above 128 are for very fast connections only."
         )
         max_chunks_layout.addWidget(self.prefetch_max_chunks_label)
@@ -2714,7 +2714,7 @@ class ConfigUI(QMainWindow):
         self.prefetch_max_chunks_slider = ModernSlider(Qt.Orientation.Horizontal)
         self.prefetch_max_chunks_slider.setRange(8, 512)
         self.prefetch_max_chunks_slider.setValue(
-            int(getattr(self.cfg.autoortho, 'prefetch_max_chunks', 32))
+            int(getattr(self.cfg.autoortho, 'prefetch_max_chunks', 48))
         )
         self.prefetch_max_chunks_slider.setObjectName('prefetch_max_chunks')
         self.prefetch_max_chunks_value = QLabel(
@@ -2843,9 +2843,9 @@ class ConfigUI(QMainWindow):
             "Higher values = faster prefetch, more CPU usage\n"
             "Lower values = slower prefetch, less CPU impact\n\n"
             "Recommended:\n"
-            "  • 1 - Low-end CPU or battery saving\n"
-            "  • 2 - Balanced (default)\n"
-            "  • 4-8 - Fast CPU, maximize prefetch speed"
+            "  • 1-2 - Low-end CPU or battery saving\n"
+            "  • 4 - Balanced (default)\n"
+            "  • 6-8 - Fast CPU, maximize prefetch speed"
         )
         prefetch_layout.addWidget(self.prefetch_workers_label)
         
@@ -2855,7 +2855,7 @@ class ConfigUI(QMainWindow):
         self.background_workers_slider.setPageStep(1)
         self.background_workers_slider.setTickInterval(1)
         self.background_workers_slider.setValue(
-            int(getattr(self.cfg.autoortho, 'background_builder_workers', 2))
+            int(getattr(self.cfg.autoortho, 'background_builder_workers', 4))
         )
         self.background_workers_slider.setObjectName('background_builder_workers')
         self.prefetch_workers_value = QLabel(
@@ -3007,7 +3007,7 @@ class ConfigUI(QMainWindow):
         
         self.buffer_pool_slider = ModernSlider(Qt.Orientation.Horizontal)
         # Calculate optimal pool size from worker counts (will be updated dynamically)
-        prefetch = int(getattr(self.cfg.autoortho, 'background_builder_workers', 2))
+        prefetch = int(getattr(self.cfg.autoortho, 'background_builder_workers', 4))
         live = int(getattr(self.cfg.autoortho, 'live_builder_concurrency', 8))
         optimal_pool_size = prefetch + live
         self.buffer_pool_slider.setRange(2, optimal_pool_size)

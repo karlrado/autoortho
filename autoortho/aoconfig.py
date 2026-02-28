@@ -193,7 +193,7 @@ prefetch_lookahead = 30
 # How often to check for prefetch opportunities in seconds (1-10)
 prefetch_interval = 2.0
 # Maximum chunks to prefetch per cycle (8-512)
-prefetch_max_chunks = 32
+prefetch_max_chunks = 48
 # Prefetch radius in nautical miles (10-150)
 # Tiles within this radius of the flight path are prefetched
 # Used by both velocity-based and SimBrief prefetching
@@ -212,8 +212,8 @@ predictive_dds_build_interval_ms = 500
 # These run in the background to pre-build tiles ahead of where you're flying
 # Higher values = faster prefetch throughput, but more CPU usage during flight
 # Lower values = less CPU impact, slower prefetch
-# Recommended: 2 (balanced), 4 (fast CPU), 1 (low-end CPU or battery saving)
-background_builder_workers = 2
+# Recommended: 2 (low-end CPU or battery saving), 4 (balanced, default), 6-8 (fast CPU)
+background_builder_workers = 4
 # Number of concurrent tile build workers (1-32)
 # Controls how many tiles can be built simultaneously by the native pipeline
 # Higher values = faster tile processing, more CPU/RAM usage
@@ -245,10 +245,9 @@ persistent_dds_cache_mb = 4096
 disk_budget_enabled = True
 # Percentage of file_cache_size allocated to persistent DDS cache (10-90)
 dds_budget_pct = 80
-# Maximum threads for native pipeline (0 = auto from CPU cores)
-# Controls parallelism for cache I/O, JPEG decoding, and DDS compression
-# Lower values reduce CPU usage but slow down DDS building
-# Set to 1 for single-threaded mode (lowest CPU, slowest builds)
+# Maximum threads for native pipeline operations (per concurrent build)
+# 0 = auto (dynamically divides CPU cores across concurrent builds)
+# >0 = fixed thread count per build (e.g., 4 means each build uses 4 threads)
 native_pipeline_threads = 0
 # Pipeline mode for DDS texture building
 # auto: Automatically select best mode for your platform (recommended)
