@@ -3043,7 +3043,7 @@ class ConfigUI(QMainWindow):
         
         self.min_chunk_ratio_slider = ModernSlider(Qt.Orientation.Horizontal)
         self.min_chunk_ratio_slider.setRange(50, 100)  # 50% to 100%
-        current_ratio = float(getattr(self.cfg.autoortho, 'live_aopipeline_min_chunk_ratio', 0.9))
+        current_ratio = float(getattr(self.cfg.autoortho, 'live_aopipeline_min_chunk_ratio', 1.0))
         current_ratio_pct = int(current_ratio * 100)
         current_ratio_pct = max(50, min(100, current_ratio_pct))
         self.min_chunk_ratio_slider.setValue(current_ratio_pct)

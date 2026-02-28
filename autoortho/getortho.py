@@ -2900,7 +2900,7 @@ class TileCompletionTracker:
         # Build threshold: trigger DDS build when this fraction of chunks is ready.
         # build_from_jpegs handles None entries for missing chunks; healing fills gaps later.
         self._build_threshold = float(getattr(
-            CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 0.9
+            CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 1.0
         )) if hasattr(CFG, 'autoortho') else 0.9
     
     def start_tracking(self, tile, zoom: int) -> None:
@@ -3281,12 +3281,17 @@ class BackgroundDDSBuilder:
         Returns:
             True if build succeeded, False to fall back to other methods
         """
+        # Handle imports for both frozen (PyInstaller) and direct Python execution
         try:
             from autoortho.aopipeline.AoDDS import get_default_builder_pool
             from autoortho.aopipeline.fallback_resolver import FallbackResolver
-        except ImportError as e:
-            log.debug(f"BackgroundDDSBuilder: Streaming builder imports failed: {e}")
-            return False
+        except ImportError:
+            try:
+                from aopipeline.AoDDS import get_default_builder_pool
+                from aopipeline.fallback_resolver import FallbackResolver
+            except ImportError as e:
+                log.debug(f"BackgroundDDSBuilder: Streaming builder imports failed: {e}")
+                return False
         
         builder_pool = get_default_builder_pool()
         if builder_pool is None:
@@ -3357,7 +3362,11 @@ class BackgroundDDSBuilder:
                 return False
             
             # Import fallback TimeBudget for use during transition
-            from autoortho.aopipeline.fallback_resolver import TimeBudget as FBTimeBudget
+            # Handle imports for both frozen (PyInstaller) and direct Python execution
+            try:
+                from autoortho.aopipeline.fallback_resolver import TimeBudget as FBTimeBudget
+            except ImportError:
+                from aopipeline.fallback_resolver import TimeBudget as FBTimeBudget
             
             # Phase 1: Batch add all ready chunks at once
             ready_chunks = []
@@ -5267,8 +5276,8 @@ class Tile(object):
         # ═══════════════════════════════════════════════════════════════════════
         # Uses the entire remaining time_budget to maximize chunk collection.
         # If force_build_partial is True, we'll build with whatever we get.
-        min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 0.9))
-        
+        min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 1.0))
+
         jpeg_datas = self._collect_chunk_jpegs(
             self.max_zoom,
             time_budget=time_budget,
@@ -5415,12 +5424,17 @@ class Tile(object):
             return False
         
         # Check if native DDS module is available
+        # Handle imports for both frozen (PyInstaller) and direct Python execution
         try:
             from autoortho.aopipeline.AoDDS import get_default_builder_pool, get_default_pool
             from autoortho.aopipeline.fallback_resolver import FallbackResolver, TimeBudget as FBTimeBudget
-        except ImportError as e:
-            log.debug(f"_try_streaming_aopipeline_build: Imports not available: {e}")
-            return False
+        except ImportError:
+            try:
+                from aopipeline.AoDDS import get_default_builder_pool, get_default_pool
+                from aopipeline.fallback_resolver import FallbackResolver, TimeBudget as FBTimeBudget
+            except ImportError as e:
+                log.debug(f"_try_streaming_aopipeline_build: Imports not available: {e}")
+                return False
         
         builder_pool = get_default_builder_pool()
         if builder_pool is None:
@@ -6131,6 +6145,16 @@ class Tile(object):
                     # Both failed - continue to progressive path
                     log.debug(f"GET_BYTES: aopipeline build failed, using progressive path for {self.id}")
                     bump('live_aopipeline_fallback')
+
+                    # BUDGET PROTECTION: Give progressive path a minimum budget.
+                    # Batch collection may have consumed the entire original budget,
+                    # leaving 0 seconds for progressive. Without this, the progressive
+                    # path can't download any chunks and fills mm0 with missing_color.
+                    min_progressive_budget = float(getattr(CFG.autoortho, 'progressive_min_budget', 15.0))
+                    if time_budget is not None and time_budget.remaining < min_progressive_budget:
+                        log.debug(f"GET_BYTES: Budget exhausted ({time_budget.remaining:.1f}s remaining), "
+                                  f"granting progressive minimum budget of {min_progressive_budget}s")
+                        time_budget = TimeBudget(min_progressive_budget)
                     
                 else:
                     # FALLBACKS DISABLED: Build with whatever batch collects
@@ -6570,17 +6594,28 @@ class Tile(object):
                 if source_img is None or getattr(source_img, '_freed', False):
                     continue
                 
-                # Calculate scale factor: mipmap 1->0 = 2x, mipmap 2->0 = 4x, etc.
-                scale_factor = 1 << source_mm  # 2^source_mm
-                
-                # Verify source image dimensions match expected size
-                expected_source_width = img_width >> source_mm
-                expected_source_height = img_height >> source_mm
-                
+                # Calculate expected dimensions using _get_quick_zoom which
+                # correctly accounts for min_zoom capping. Without this, the
+                # bit-shift calculation (img_width >> source_mm) gives wrong
+                # expected sizes when min_zoom > max_zoom - source_mm.
+                source_zoom = self.max_zoom - source_mm
+                _, _, sw_chunks, sh_chunks, _, _ = self._get_quick_zoom(source_zoom, self.min_zoom)
+                expected_source_width = 256 * sw_chunks
+                expected_source_height = 256 * sh_chunks
+
                 if source_img._width != expected_source_width or source_img._height != expected_source_height:
                     log.debug(f"GET_IMG: Prefill skipping mipmap {source_mm} - size mismatch: "
                              f"got {source_img._width}x{source_img._height}, expected {expected_source_width}x{expected_source_height}")
                     continue
+
+                # Calculate scale factor from actual dimensions
+                scale_factor_w = img_width // expected_source_width
+                scale_factor_h = img_height // expected_source_height
+                if scale_factor_w != scale_factor_h or scale_factor_w < 1:
+                    log.debug(f"GET_IMG: Prefill skipping mipmap {source_mm} - non-uniform scale: "
+                              f"{scale_factor_w}x{scale_factor_h}")
+                    continue
+                scale_factor = scale_factor_w
                 
                 # Upscale to mipmap 0 size
                 log.debug(f"GET_IMG: Pre-initializing mipmap 0 base from mipmap {source_mm} "
@@ -7813,7 +7848,7 @@ class Tile(object):
         # Get threshold config with validation
         # UNIFIED: Use the same threshold as live_aopipeline for consistency
         # This removes the separate native_mipmap_min_ratio config
-        min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 0.9))
+        min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 1.0))
         min_ratio = max(0.0, min(1.0, min_ratio))  # Clamp to valid range
         
         # ═══════════════════════════════════════════════════════════════════════
@@ -8282,8 +8317,8 @@ class Tile(object):
             log.debug(f"_try_native_partial_mipmap_build: No chunks for rows {startrow}-{endrow}")
             return False
         
-        # Check threshold - need 90% of chunks
-        min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 0.9))
+        # Check threshold - need configured % of chunks
+        min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 1.0))
         valid_count = sum(1 for d in jpeg_datas if d is not None)
         
         if valid_count < chunk_count * min_ratio:

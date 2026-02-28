@@ -283,11 +283,10 @@ buffer_pool_size = 10
 # Recommended: True (enables fast path when chunks are cached/prefetched)
 live_aopipeline_enabled = True
 # Minimum ratio of chunks that must be available for aopipeline build (0.0-1.0)
-# 0.9 = 90%%, allows up to 10%% missing (filled with missing_color)
-# Lower values may show more missing chunks but reduce latency
-# Higher values ensure quality but may fall back more often
-# Recommended: 0.9 (balanced), 0.8 (faster), 0.95 (quality)
-live_aopipeline_min_chunk_ratio = 0.9
+# 1.0 = 100%%, waits for all chunks then builds (best quality, fallbacks resolve missing)
+# Lower values build earlier with missing chunks filled by missing_color (faster but visual artifacts)
+# Recommended: 1.0 (quality, uses fallbacks), 0.9 (balanced), 0.8 (faster)
+live_aopipeline_min_chunk_ratio = 1.0
 # === STREAMING BUILDER SETTINGS ===
 # Enable streaming builder for incremental DDS generation (True/False)
 # When enabled, chunks are processed as they arrive rather than in batch.
