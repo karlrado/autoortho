@@ -6002,9 +6002,21 @@ class Tile(object):
             cached_bytes = dynamic_dds_cache.load(self.id, self.max_zoom, self)
             if cached_bytes is not None:
                 if self._populate_dds_from_prebuilt(cached_bytes):
-                    log.debug(f"GET_BYTES: Dynamic DDS cache HIT for {self.id}")
-                    bump('dynamic_dds_cache_hit')
-                    return True
+                    # FIX: Only return early if mm0 was actually populated.
+                    # Partial DDS entries (from store_incremental) contain mm4-12 but
+                    # NOT mm0. Returning True here would serve empty mm0 data to X-Plane
+                    # and set _prepopulated=True, permanently blocking the complete DDS
+                    # from being loaded later. This is the root cause of the 2.1.0
+                    # pixelation regression: partial cache hit → empty mm0 served →
+                    # complete DDS from BackgroundDDSBuilder never loaded.
+                    if self.dds and self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
+                        log.debug(f"GET_BYTES: Dynamic DDS cache HIT (complete) for {self.id}")
+                        bump('dynamic_dds_cache_hit')
+                        return True
+                    else:
+                        log.debug(f"GET_BYTES: Dynamic DDS cache HIT (partial, mm0 missing) for {self.id} "
+                                  f"— falling through to build paths")
+                        bump('dynamic_dds_cache_hit_partial')
                 else:
                     log.debug(f"GET_BYTES: Dynamic DDS cache hit but populate failed for {self.id}")
                     bump('dynamic_dds_cache_populate_fail')
@@ -6035,9 +6047,11 @@ class Tile(object):
                         cached_bytes = dynamic_dds_cache.load(self.id, self.max_zoom, self)
                         if cached_bytes is not None:
                             if self._populate_dds_from_prebuilt(cached_bytes):
-                                log.debug(f"GET_BYTES: DDS cache HIT after transition for {self.id}")
-                                bump('dds_cache_hit_after_transition')
-                                return True
+                                # Only return if mm0 was populated (same guard as primary cache path)
+                                if self.dds and self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
+                                    log.debug(f"GET_BYTES: DDS cache HIT after transition for {self.id}")
+                                    bump('dds_cache_hit_after_transition')
+                                    return True
         # ═══════════════════════════════════════════════════════════════════
 
         mipmap = self.find_mipmap_pos(offset)
