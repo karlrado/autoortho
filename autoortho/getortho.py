@@ -800,6 +800,32 @@ _progressive_executor_lock = threading.Lock()
 _active_native_builds = 0
 _active_native_builds_lock = threading.Lock()
 
+# Track live (FUSE-requested) tile reads in progress.
+# When > 0, prefetching and background DDS building pause to give
+# all chunk download and tile building resources to live requests.
+_live_reads_in_progress = 0
+_live_reads_lock = threading.Lock()
+
+
+def _live_read_start():
+    """Signal that a live tile read has started."""
+    global _live_reads_in_progress
+    with _live_reads_lock:
+        _live_reads_in_progress += 1
+
+
+def _live_read_end():
+    """Signal that a live tile read has finished."""
+    global _live_reads_in_progress
+    with _live_reads_lock:
+        _live_reads_in_progress -= 1
+
+
+def is_live_building() -> bool:
+    """Return True if any live tile reads are in progress."""
+    with _live_reads_lock:
+        return _live_reads_in_progress > 0
+
 
 def _compute_thread_budget() -> int:
     """Compute per-build OpenMP thread count to avoid oversubscription.
@@ -2059,16 +2085,16 @@ class SpatialPrefetcher:
             # Clamp to reasonable range (1-60 minutes = 60-3600 seconds)
             self.lookahead_sec = max(60, min(3600, self.lookahead_sec))
         
-        self.interval_sec = float(getattr(CFG.autoortho, 'prefetch_interval', 2.0))
-        self.max_chunks = int(getattr(CFG.autoortho, 'prefetch_max_chunks', 48))
-        
+        self.interval_sec = float(getattr(CFG.autoortho, 'prefetch_interval', 1.0))
+        self.max_chunks = int(getattr(CFG.autoortho, 'prefetch_max_chunks', 512))
+
         # Unified prefetch radius (used by both velocity and SimBrief methods)
         # This replaces the old simbrief-specific route_prefetch_radius_nm
         self.prefetch_radius_nm = float(getattr(CFG.autoortho, 'prefetch_radius_nm', 40))
         self.prefetch_radius_nm = max(10, min(150, self.prefetch_radius_nm))
-        
-        self.interval_sec = max(1.0, min(10.0, self.interval_sec))
-        self.max_chunks = max(8, min(512, self.max_chunks))
+
+        self.interval_sec = max(0.5, min(10.0, self.interval_sec))
+        self.max_chunks = max(32, min(4096, self.max_chunks))
         
     def set_tile_cacher(self, tile_cacher):
         """Set the tile cacher reference for accessing tiles."""
@@ -2125,9 +2151,13 @@ class SpatialPrefetcher:
 
         If SimBrief flight data is loaded and enabled, prefetches along the
         flight plan waypoints. Otherwise, uses velocity-based prediction.
-        
+
         Falls back to velocity-based prefetching if aircraft deviates from route.
         """
+        # Yield all resources to live tile reads when X-Plane is active
+        if is_live_building():
+            return
+
         # Check if tile_cacher is available
         if self._tile_cacher is None:
             return
@@ -2293,22 +2323,23 @@ class SpatialPrefetcher:
                 log.debug(f"Skipping prefetch for {row},{col}@ZL{zoom} - already opened by X-Plane")
                 continue
             
-            # Add to recently prefetched
-            self._recently_prefetched.add(tile_key)
-            if len(self._recently_prefetched) > self._max_recent:
-                try:
-                    self._recently_prefetched.pop()
-                except KeyError:
-                    pass
-            
             # Prefetch this tile
-            submitted = self._prefetch_tile(row, col, zoom)
+            submitted, complete = self._prefetch_tile(row, col, zoom)
             chunks_submitted += submitted
-            
+
             if submitted > 0:
                 tiles_prefetched += 1
                 log.debug(f"Prefetch tile ({row},{col}) ZL{zoom}: ETA={time_sec/60:.1f}min, alt={alt_agl}ft AGL")
-        
+
+            # Only mark as recently prefetched if ALL chunks were submitted
+            if complete:
+                self._recently_prefetched.add(tile_key)
+                if len(self._recently_prefetched) > self._max_recent:
+                    try:
+                        self._recently_prefetched.pop()
+                    except KeyError:
+                        pass
+
         return chunks_submitted
     
     def _prefetch_along_flight_plan_waypoints(self, lat: float, lon: float) -> int:
@@ -2490,18 +2521,19 @@ class SpatialPrefetcher:
                     log.debug(f"Skipping prefetch for {row},{col}@ZL{zoom} - already opened by X-Plane")
                     continue
                 
-                # Add to recently prefetched
-                self._recently_prefetched.add(tile_key)
-                if len(self._recently_prefetched) > self._max_recent:
-                    try:
-                        self._recently_prefetched.pop()
-                    except KeyError:
-                        pass
-                
                 # Prefetch this tile
-                submitted = self._prefetch_tile(row, col, zoom)
+                submitted, complete = self._prefetch_tile(row, col, zoom)
                 chunks_submitted += submitted
-        
+
+                # Only mark as recently prefetched if ALL chunks were submitted
+                if complete:
+                    self._recently_prefetched.add(tile_key)
+                    if len(self._recently_prefetched) > self._max_recent:
+                        try:
+                            self._recently_prefetched.pop()
+                        except KeyError:
+                            pass
+
         return chunks_submitted
     
     def _get_zoom_for_altitude(self, altitude_ft: int) -> int:
@@ -2688,18 +2720,19 @@ class SpatialPrefetcher:
                 log.debug(f"Skipping prefetch for {row},{col}@ZL{zoom} - already opened by X-Plane")
                 continue
             
-            # Add to recently prefetched
-            self._recently_prefetched.add(tile_key)
-            if len(self._recently_prefetched) > self._max_recent:
-                try:
-                    self._recently_prefetched.pop()
-                except KeyError:
-                    pass
-            
-            submitted = self._prefetch_tile(row, col, zoom, maptype)
+            submitted, complete = self._prefetch_tile(row, col, zoom, maptype)
             chunks_submitted += submitted
             if submitted > 0:
                 tiles_prefetched += 1
+
+            # Only mark as recently prefetched if ALL chunks were submitted
+            if complete:
+                self._recently_prefetched.add(tile_key)
+                if len(self._recently_prefetched) > self._max_recent:
+                    try:
+                        self._recently_prefetched.pop()
+                    except KeyError:
+                        pass
         
         if chunks_submitted > 0:
             self._prefetch_count += chunks_submitted
@@ -2721,30 +2754,27 @@ class SpatialPrefetcher:
                 return override
         return None  # Accept any maptype from terrain index
     
-    # Maximum chunks to submit per tile per prefetch cycle
-    # With 5 mipmaps (0-4), a ZL16 tile has 256+64+16+4+1 = 341 chunks total
-    # We limit per-tile to avoid one tile dominating the queue
-    MAX_CHUNKS_PER_TILE = 32
-    
     def _prefetch_tile(self, row, col, zoom, maptype: Optional[str] = None):
         """
         Submit prefetch requests for a tile's chunks at ALL mipmap levels.
-        
+
         Args:
             row: Tile row coordinate
-            col: Tile column coordinate  
+            col: Tile column coordinate
             zoom: Zoom level (max zoom for this tile)
             maptype: Optional maptype (e.g., "BI", "EOX"). If None, uses config.
-        
-        Returns number of chunks submitted.
-        
+
+        Returns (submitted, complete) tuple:
+            submitted: Number of chunks submitted to the queue
+            complete: True if all submittable chunks were submitted (or none needed)
+
         Downloads chunks for all mipmap levels (ZL16, ZL15, ZL14, etc.) to ensure
         the prebuilt DDS matches on-demand behavior where X-Plane may request
         any mipmap level first and get native-resolution chunks.
-        
+
         IMPORTANT: Uses _open_tile()/_close_tile() pair to properly manage refs.
         This ensures prefetched tiles can be evicted when no longer needed.
-        
+
         If X-Plane has also opened this tile (refs > 1 after our open), we drop
         it and let the on-demand tile build logic handle it instead.
         """
@@ -2760,17 +2790,18 @@ class SpatialPrefetcher:
             # This ensures prefetched tiles don't accumulate refs and block eviction.
             tile = self._tile_cacher._open_tile(row, col, maptype, zoom)
             if not tile:
-                return 0
+                return 0, True
             
             # If tile has refs > 1, X-Plane has also opened it - drop and let on-demand handle
             # Our _open_tile incremented refs to 1 (new) or +1 (existing). If refs > 1 now,
             # it means X-Plane is actively using this tile.
             if tile.refs > 1:
                 log.debug(f"Tile {row},{col}@ZL{zoom} has refs={tile.refs}, X-Plane is using it - dropping prefetch")
-                return 0
+                return 0, True
             
             submitted = 0
-            
+            total_submittable = 0
+
             # =========================================================================
             # Download chunks for ALL mipmap levels (not just mipmap 0)
             # This ensures prebuilt DDS matches on-demand behavior where X-Plane
@@ -2783,22 +2814,21 @@ class SpatialPrefetcher:
             #   mipmap 3 → max_zoom-3 (ZL13) → 4 chunks
             #   mipmap 4 → max_zoom-4 (ZL12) → 1 chunk (lowest detail)
             # =========================================================================
-            
+
             for mipmap in range(tile.max_mipmap + 1):
                 mipmap_zoom = tile.max_zoom - mipmap
-                
+
                 # Don't go below minimum zoom
                 if mipmap_zoom < tile.min_zoom:
                     break
-                
-                
+
                 # Create chunks for this zoom level if they don't exist
                 tile._create_chunks(mipmap_zoom)
-                
+
                 mipmap_chunks = tile.chunks.get(mipmap_zoom, [])
                 if not mipmap_chunks:
                     continue
-                
+
                 for chunk in mipmap_chunks:
                     # Skip if already ready, in flight, or failed
                     if chunk.ready.is_set():
@@ -2807,34 +2837,30 @@ class SpatialPrefetcher:
                         continue
                     if chunk.permanent_failure:
                         continue
-                    
+
+                    total_submittable += 1
+
                     # Priority: mipmap 0 = most important, higher mipmaps = less important
                     # Lower priority number = more urgent
                     chunk.priority = self.PREFETCH_PRIORITY_OFFSET + mipmap
-                    
+
                     # Submit to chunk getter with shorter prefetch timeouts
                     # Prefetch chunks should fail fast to keep the pipeline flowing;
                     # the healing system handles any permanently failed chunks later
                     chunk_getter.submit(chunk, timeout=(5, 10), max_attempts=8)
                     submitted += 1
-                    
-                    # Limit chunks per tile to avoid flooding queue with one tile
-                    if submitted >= self.MAX_CHUNKS_PER_TILE:
-                        break
-                
-                if submitted >= self.MAX_CHUNKS_PER_TILE:
-                    break
-            
+
             # Register tile with completion tracker for predictive DDS generation
             # This must happen AFTER creating all chunks so the tracker can count them
             if tile_completion_tracker is not None and submitted > 0:
-                tile_completion_tracker.start_tracking(tile, zoom)
-            
-            return submitted
+                tile_completion_tracker.start_tracking(tile, zoom, submitted_count=submitted)
+
+            complete = (total_submittable == 0) or (submitted == total_submittable)
+            return submitted, complete
             
         except Exception as e:
             log.debug(f"Prefetch error for tile {row},{col}: {e}")
-            return 0
+            return 0, False
         finally:
             # Always close the tile to decrement refs - this balances _open_tile() above.
             # The tile stays in the cache (enable_cache=True) but with refs decremented,
@@ -2919,65 +2945,50 @@ class TileCompletionTracker:
         # build_from_jpegs handles None entries for missing chunks; healing fills gaps later.
         self._build_threshold = 1.0  # Always require all chunks for quality
     
-    def start_tracking(self, tile, zoom: int) -> None:
+    def start_tracking(self, tile, zoom: int, submitted_count: int = 0) -> None:
         """
         Begin tracking a tile's chunk completion for ALL mipmap levels.
-        
+
         Called by SpatialPrefetcher when it starts prefetching a tile.
         If tile is already being tracked, this is a no-op.
-        
-        Counts chunks across all mipmap levels (not just mipmap 0) to ensure
-        we wait for all native-resolution chunks before building the DDS.
-        
+
         Args:
             tile: Tile object to track
             zoom: Max zoom level for this tile (tile.max_zoom)
+            submitted_count: Actual number of chunks submitted by _prefetch_tile().
+                             When > 0, used as the expected count (guarantees match).
+                             When 0, falls back to counting non-ready chunks.
         """
         if tile is None:
             return
-        
+
         tile_id = tile.id
-        
+
         with self._lock:
             # Already tracking this tile
             if tile_id in self._tracked_tiles:
                 return
-            
-            # Calculate expected chunk count across ALL mipmap levels
-            # Each mipmap has chunks at its corresponding zoom level:
-            #   mipmap 0 → max_zoom (256 chunks typically)
-            #   mipmap 1 → max_zoom-1 (64 chunks)
-            #   mipmap 2 → max_zoom-2 (16 chunks)
-            #   mipmap 3 → max_zoom-3 (4 chunks)
-            #   mipmap 4 → max_zoom-4 (1 chunk)
-            total_expected = 0
-            
-            for mipmap in range(tile.max_mipmap + 1):
-                mipmap_zoom = tile.max_zoom - mipmap
-                
-                # Don't go below minimum zoom
-                if mipmap_zoom < tile.min_zoom:
-                    break
-                
-                chunks = tile.chunks.get(mipmap_zoom, [])
-                if chunks:
-                    total_expected += len(chunks)
-                else:
-                    # Chunks not created yet - estimate from tile dimensions
-                    # Chunk count follows 4^mipmap pattern relative to mipmap 0
-                    zoom_diff = tile.tilename_zoom - mipmap_zoom
-                    if zoom_diff >= 0:
-                        chunks_per_row = tile.width >> zoom_diff
-                        chunks_per_col = tile.height >> zoom_diff
-                    else:
-                        chunks_per_row = tile.width << (-zoom_diff)
-                        chunks_per_col = tile.height << (-zoom_diff)
-                    total_expected += max(1, chunks_per_row) * max(1, chunks_per_col)
-            
+
+            if submitted_count > 0:
+                total_expected = submitted_count
+            else:
+                # Fallback: count non-ready chunks in tile.chunks
+                total_expected = 0
+                for mipmap in range(tile.max_mipmap + 1):
+                    mipmap_zoom = tile.max_zoom - mipmap
+                    if mipmap_zoom < tile.min_zoom:
+                        break
+                    for chunk in tile.chunks.get(mipmap_zoom, []):
+                        if not chunk.ready.is_set():
+                            total_expected += 1
+
+            if total_expected == 0:
+                return  # Nothing to track
+
             # Enforce max tracked limit (evict oldest if needed)
             if len(self._tracked_tiles) >= self._max_tracked:
                 self._evict_oldest_unlocked()
-            
+
             self._tracked_tiles[tile_id] = _TrackedTile(tile, zoom, total_expected)
             log.debug(f"TileCompletionTracker: Started tracking {tile_id} "
                      f"(expecting {total_expected} chunks across all mipmaps)")
@@ -3231,6 +3242,10 @@ class BackgroundDDSBuilder:
 
             if self._stop_event.is_set():
                 break
+
+            # Yield all resources to live tile reads when X-Plane is active
+            if is_live_building():
+                continue
 
             # Fill all available worker slots
             with self._active_lock:
@@ -4317,12 +4332,12 @@ def start_predictive_dds(tile_cacher=None) -> None:
     disk_cache_mb = int(getattr(CFG.autoortho, 'ephemeral_dds_cache_mb', 4096))
     disk_cache_mb = max(1024, min(16384, disk_cache_mb))  # Min 1GB, max 16GB
     
-    build_interval_ms = int(getattr(CFG.autoortho, 'predictive_dds_build_interval_ms', 500))
-    build_interval_ms = max(100, min(2000, build_interval_ms))
+    build_interval_ms = int(getattr(CFG.autoortho, 'predictive_dds_build_interval_ms', 250))
+    build_interval_ms = max(50, min(2000, build_interval_ms))
     build_interval_sec = build_interval_ms / 1000.0
-    
-    background_builder_workers = int(getattr(CFG.autoortho, 'background_builder_workers', 4))
-    background_builder_workers = max(1, min(8, background_builder_workers))  # 1-8 workers
+
+    background_builder_workers = int(getattr(CFG.autoortho, 'background_builder_workers', 8))
+    background_builder_workers = max(1, min(16, background_builder_workers))  # 1-16 workers
     
     live_builder_concurrency = int(getattr(CFG.autoortho, 'live_builder_concurrency', 8))
     live_builder_concurrency = max(1, min(32, live_builder_concurrency))  # 1-32 workers
@@ -4348,43 +4363,41 @@ def start_predictive_dds(tile_cacher=None) -> None:
     # Initialize persistent Dynamic DDS Cache (cross-session)
     # Must be created before BackgroundDDSBuilder which depends on it.
     # ═══════════════════════════════════════════════════════════════════
-    persistent_dds_mb = int(getattr(CFG.autoortho, 'persistent_dds_cache_mb', 4096))
-    if persistent_dds_mb > 0:
+    persistent_dds_mb = int(getattr(CFG.autoortho, 'persistent_dds_cache_mb', 0))
+    try:
         try:
-            try:
-                from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
-            except ImportError:
-                from aopipeline.dynamic_dds_cache import DynamicDDSCache
-            
-            cache_dir = str(CFG.paths.cache_dir)
-            dynamic_dds_cache = DynamicDDSCache(
-                cache_dir=cache_dir,
-                max_size_mb=persistent_dds_mb,
-                enabled=True
-            )
-            
-            # Scan existing cache entries, then migrate uncompressed files
-            import threading as _threading
+            from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+        except ImportError:
+            from aopipeline.dynamic_dds_cache import DynamicDDSCache
 
-            def _scan_and_migrate():
-                dynamic_dds_cache.scan_existing()
-                dynamic_dds_cache.migrate_uncompressed()
+        cache_dir = str(CFG.paths.cache_dir)
+        dynamic_dds_cache = DynamicDDSCache(
+            cache_dir=cache_dir,
+            max_size_mb=persistent_dds_mb,
+            enabled=True
+        )
 
-            _scan_thread = _threading.Thread(
-                target=_scan_and_migrate,
-                daemon=True,
-                name="dds_cache_scan"
-            )
-            _scan_thread.start()
-            
-            # Wire network healing callback so cache can trigger downloads
-            dynamic_dds_cache._network_heal_callback = _dispatch_network_healing
+        # Scan existing cache entries, then migrate uncompressed files
+        import threading as _threading
 
-            log.info(f"Dynamic DDS cache initialized (max={persistent_dds_mb}MB)")
-        except Exception as e:
-            log.warning(f"Failed to initialize Dynamic DDS cache: {e}")
-    else:
-        log.info("Persistent DDS cache disabled (persistent_dds_cache_mb=0)")
+        def _scan_and_migrate():
+            dynamic_dds_cache.scan_existing()
+            dynamic_dds_cache.migrate_uncompressed()
+
+        _scan_thread = _threading.Thread(
+            target=_scan_and_migrate,
+            daemon=True,
+            name="dds_cache_scan"
+        )
+        _scan_thread.start()
+
+        # Wire network healing callback so cache can trigger downloads
+        dynamic_dds_cache._network_heal_callback = _dispatch_network_healing
+
+        size_desc = f"max={persistent_dds_mb}MB" if persistent_dds_mb > 0 else "unlimited"
+        log.info(f"Dynamic DDS cache initialized ({size_desc})")
+    except Exception as e:
+        log.warning(f"Failed to initialize Dynamic DDS cache: {e}")
     
     background_dds_builder = BackgroundDDSBuilder(
         dds_cache=dynamic_dds_cache,
@@ -6648,7 +6661,18 @@ class Tile(object):
 
     def read_dds_bytes(self, offset, length):
         log.debug(f"READ DDS BYTES: {offset} {length}")
-        
+
+        # Signal that a live tile read is in progress.
+        # While any live reads are active, prefetching and background DDS
+        # building pause so all chunk download and build resources serve
+        # X-Plane's requests.
+        _live_read_start()
+        try:
+            return self._read_dds_bytes_inner(offset, length)
+        finally:
+            _live_read_end()
+
+    def _read_dds_bytes_inner(self, offset, length):
         # ═══════════════════════════════════════════════════════════════════════
         # PER-REQUEST TIME BUDGET
         # ═══════════════════════════════════════════════════════════════════════
@@ -6661,7 +6685,7 @@ class Tile(object):
         # Default 30s is responsive for flight sims - config can override for quality
         budget_seconds = float(getattr(CFG.autoortho, 'tile_time_budget', 30.0))
         request_budget = TimeBudget(budget_seconds)
-        
+
         # Track when this tile was first requested (for stats only)
         if self.first_request_time is None:
             self.first_request_time = time.monotonic()
