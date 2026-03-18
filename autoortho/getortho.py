@@ -3,6 +3,7 @@ import logging
 import atexit
 import ctypes
 import gc
+import glob as glob_mod
 import os
 import re
 import sys
@@ -1795,8 +1796,16 @@ class TerrainTileLookup:
         self._lookups = 0
         self._cache_hits = 0
         self._files_found = 0
-        
+
+        # Sparse spatial index for high-zoom tiles (ZL18, ZL19)
+        # These are airport tiles — sparse but important for prefetching.
+        # Bucketed by 1° lat/lon cells for O(1) lookup.
+        # Built once at mount time via glob (typically <50ms for a few hundred files).
+        self._highzoom_index: Dict[Tuple[int, int], List[Tuple[int, int, str, int]]] = {}
+        self._highzoom_count = 0
+
         if self._folder_exists:
+            self._build_highzoom_index()
             log.info(f"TerrainTileLookup: Ready for {scenery_name} at {terrain_folder}")
         else:
             log.warning(f"TerrainTileLookup: Folder not found: {terrain_folder}")
@@ -1919,12 +1928,139 @@ class TerrainTileLookup:
         col = (raw_col // step) * step
         
         return (row, col)
-    
+
+    @staticmethod
+    def _tile_to_latlon(row: int, col: int, zoom: int) -> Tuple[float, float]:
+        """
+        Convert tile grid coordinates back to approximate center lat/lon.
+
+        Inverse of _latlon_to_tile. Used to bucket high-zoom tiles into
+        1° lat/lon cells for the sparse spatial index.
+
+        Returns:
+            (lat, lon) in degrees for the center of the 16×16 tile block.
+        """
+        n = 2 ** zoom
+        step = TerrainTileLookup.TILE_GRID_STEP
+        center_col = col + step / 2
+        center_row = row + step / 2
+        lon = center_col / n * 360 - 180
+        lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * center_row / n)))
+        lat = math.degrees(lat_rad)
+        return (lat, lon)
+
+    def _build_highzoom_index(self) -> None:
+        """
+        Build spatial index of ZL18/19 .ter files using glob (runs once at mount).
+
+        These are airport tiles — sparse but important for prefetching.
+        Parses filenames like "144224_260256_BI18.ter" and buckets them
+        by 1° lat/lon cells for fast radius queries.
+
+        Performance: typically <50ms for a few hundred airport tiles.
+        """
+        t0 = time.time()
+
+        for zoom in (18, 19):
+            # Match any .ter file ending with the zoom number
+            # Pattern: {row}_{col}_{maptype}{zoom}.ter
+            pattern = os.path.join(self._terrain_folder, f"*{zoom}.ter")
+            for path in glob_mod.iglob(pattern):
+                basename = os.path.basename(path)
+                # Parse: "144224_260256_BI18.ter" → row=144224, col=260256, maptype=BI, zoom=18
+                name = basename.rsplit('.', 1)[0]  # strip .ter
+                try:
+                    tokens = name.split('_', 2)  # ['144224', '260256', 'BI18']
+                    row_val = int(tokens[0])
+                    col_val = int(tokens[1])
+                    maptype_zoom = tokens[2]
+                    maptype = maptype_zoom[:-2]
+                    file_zoom = int(maptype_zoom[-2:])
+                except (ValueError, IndexError):
+                    continue
+
+                # Only index the target zoom levels (the glob may match
+                # files like *118.ter at ZL18 pattern, so verify)
+                if file_zoom != zoom:
+                    continue
+
+                # Verify grid alignment (defensive)
+                if row_val % self.TILE_GRID_STEP != 0 or col_val % self.TILE_GRID_STEP != 0:
+                    continue
+
+                # Convert tile coords to lat/lon for bucketing
+                lat, lon = self._tile_to_latlon(row_val, col_val, file_zoom)
+                bucket_key = (int(math.floor(lat)), int(math.floor(lon)))
+
+                if bucket_key not in self._highzoom_index:
+                    self._highzoom_index[bucket_key] = []
+                self._highzoom_index[bucket_key].append((row_val, col_val, maptype, file_zoom))
+                self._highzoom_count += 1
+
+        elapsed_ms = (time.time() - t0) * 1000
+        if self._highzoom_count > 0:
+            log.info(f"TerrainTileLookup: Indexed {self._highzoom_count} high-zoom tiles "
+                     f"in {len(self._highzoom_index)} cells for {self._scenery_name} "
+                     f"({elapsed_ms:.0f}ms)")
+
+    def get_highzoom_tiles_near(self, lat: float, lon: float,
+                                 radius_nm: float = 40.0,
+                                 maptype_filter: Optional[str] = None
+                                 ) -> List[Tuple[int, int, str, int]]:
+        """
+        Find all indexed high-zoom (ZL18/19) tiles within radius of a position.
+
+        Uses the bucketed spatial index for O(1) cell lookup, then filters
+        by approximate distance. No filesystem calls — purely in-memory.
+
+        Args:
+            lat, lon: Query position in degrees
+            radius_nm: Search radius in nautical miles
+            maptype_filter: Optional maptype to filter by (e.g., "BI")
+
+        Returns:
+            List of (row, col, maptype, zoom) tuples for matching tiles
+        """
+        if not self._highzoom_index:
+            return []
+
+        results = []
+        # 1° latitude ≈ 60nm
+        radius_deg = radius_nm / 60.0
+        lon_deg = radius_nm / (60.0 * max(0.1, math.cos(math.radians(lat))))
+
+        # Check all 1° cells that could contain tiles within radius
+        lat_min = int(math.floor(lat - radius_deg))
+        lat_max = int(math.floor(lat + radius_deg))
+        lon_min = int(math.floor(lon - lon_deg))
+        lon_max = int(math.floor(lon + lon_deg))
+
+        for blat in range(lat_min, lat_max + 1):
+            for blon in range(lon_min, lon_max + 1):
+                bucket = self._highzoom_index.get((blat, blon))
+                if not bucket:
+                    continue
+                for entry in bucket:
+                    row_val, col_val, maptype, zoom = entry
+                    if maptype_filter and maptype != maptype_filter:
+                        continue
+                    # Approximate distance check using tile center
+                    tile_lat, tile_lon = self._tile_to_latlon(row_val, col_val, zoom)
+                    dlat = (tile_lat - lat) * 60  # convert degrees to nm
+                    dlon = (tile_lon - lon) * 60 * math.cos(math.radians(lat))
+                    dist_sq = dlat * dlat + dlon * dlon
+                    if dist_sq <= radius_nm * radius_nm:
+                        results.append(entry)
+
+        return results
+
     def clear_cache(self) -> None:
-        """Clear the lookup cache."""
+        """Clear the lookup cache and spatial index."""
         with self._cache_lock:
             self._cache.clear()
-    
+        self._highzoom_index.clear()
+        self._highzoom_count = 0
+
     @property
     def is_ready(self) -> bool:
         """Always ready (no async indexing needed)."""
@@ -1942,6 +2078,8 @@ class TerrainTileLookup:
             'files_found': self._files_found,
             'cache_size': len(self._cache),
             'folder_exists': self._folder_exists,
+            'highzoom_tiles_indexed': self._highzoom_count,
+            'highzoom_cells': len(self._highzoom_index),
         }
 
 
@@ -1981,6 +2119,32 @@ def get_all_tiles_for_position(lat: float, lon: float,
     with _terrain_lookups_lock:
         for lookup in _terrain_lookups:
             results.extend(lookup.get_tiles_for_position(lat, lon, maptype_filter))
+    return results
+
+
+def get_highzoom_tiles_near(lat: float, lon: float,
+                            radius_nm: float = 40.0,
+                            maptype_filter: Optional[str] = None
+                            ) -> List[Tuple[int, int, str, int]]:
+    """
+    Query all terrain lookups for high-zoom (ZL18/19) tiles near a position.
+
+    This uses the pre-built sparse spatial index — no filesystem calls.
+
+    Args:
+        lat, lon: Position in degrees
+        radius_nm: Search radius in nautical miles
+        maptype_filter: Optional maptype to filter by
+
+    Returns:
+        List of (row, col, maptype, zoom) tuples from all sceneries
+    """
+    results = []
+    with _terrain_lookups_lock:
+        for lookup in _terrain_lookups:
+            results.extend(lookup.get_highzoom_tiles_near(
+                lat, lon, radius_nm, maptype_filter
+            ))
     return results
 
 
@@ -2303,7 +2467,25 @@ class SpatialPrefetcher:
                     tile_times[tile_key] = (point.time_to_reach_sec, point.altitude_agl_ft)
                 elif point.time_to_reach_sec < tile_times[tile_key][0]:
                     tile_times[tile_key] = (point.time_to_reach_sec, point.altitude_agl_ft)
-        
+
+        # ADDITIONAL: Query sparse index for high-zoom airport tiles (ZL18/19)
+        # along the flight path. Point-sampling misses these because ZL18 tiles
+        # are ~1.4nm wide but sample points are ~15-20nm apart.
+        for point in path_points:
+            highzoom_tiles = get_highzoom_tiles_near(
+                point.lat, point.lon,
+                radius_nm=prefetch_radius_nm,
+                maptype_filter=maptype_filter
+            )
+            for row, col, _maptype, hz_zoom in highzoom_tiles:
+                tile_key = (row, col, hz_zoom)
+                if tile_key in self._recently_prefetched:
+                    continue
+                if tile_key not in tile_times:
+                    tile_times[tile_key] = (point.time_to_reach_sec, point.altitude_agl_ft)
+                elif point.time_to_reach_sec < tile_times[tile_key][0]:
+                    tile_times[tile_key] = (point.time_to_reach_sec, point.altitude_agl_ft)
+
         # Sort tiles by time-to-encounter (earliest first = nearest in time)
         sorted_tiles = sorted(tile_times.items(), key=lambda x: x[1][0])
         
@@ -2458,81 +2640,47 @@ class SpatialPrefetcher:
         """
         Prefetch tiles within a radius around a waypoint.
         Skips tiles already opened by X-Plane.
-        
+
+        Uses _get_tiles_in_radius for correct 16-tile grid alignment.
+
         Returns number of chunks submitted.
         """
         chunks_submitted = 0
-        
+
         # Get maptype for checking if tiles are opened
         maptype_filter = self._get_maptype_filter()
         default_maptype = maptype_filter or "EOX"
-        
-        # Convert radius to degrees (approximate)
-        # 1 nm ≈ 1/60 degree latitude
-        radius_deg_lat = radius_nm / 60.0
-        radius_deg_lon = radius_nm / (60.0 * math.cos(math.radians(waypoint_lat)))
-        
-        # Calculate tile coordinates
-        n = 2 ** zoom
-        
-        def latlon_to_tile(lat, lon):
-            """Convert lat/lon to tile coordinates."""
-            x = int((lon + 180) / 360 * n)
-            lat_clamped = max(-85.0511, min(85.0511, lat))
-            lat_rad = math.radians(lat_clamped)
-            y = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
-            return (x, y)
-        
-        # Get tile range for the area
-        col_center, row_center = latlon_to_tile(waypoint_lat, waypoint_lon)
-        col_min, row_min = latlon_to_tile(
-            waypoint_lat + radius_deg_lat,
-            waypoint_lon - radius_deg_lon
-        )
-        col_max, row_max = latlon_to_tile(
-            waypoint_lat - radius_deg_lat,
-            waypoint_lon + radius_deg_lon
-        )
-        
-        # Limit the area to prevent too many tiles
-        max_tiles_per_dim = 3
-        if row_max - row_min > max_tiles_per_dim:
-            row_min = row_center - max_tiles_per_dim // 2
-            row_max = row_center + max_tiles_per_dim // 2
-        if col_max - col_min > max_tiles_per_dim:
-            col_min = col_center - max_tiles_per_dim // 2
-            col_max = col_center + max_tiles_per_dim // 2
-        
-        # Prefetch tiles in the area
-        for row in range(row_min, row_max + 1):
-            for col in range(col_min, col_max + 1):
-                if chunks_submitted >= self.max_chunks:
-                    return chunks_submitted
-                
-                # Create unique key for this tile
-                tile_key = (row, col, zoom)
-                
-                # Skip if recently prefetched
-                if tile_key in self._recently_prefetched:
-                    continue
-                
-                # Skip if tile is already opened by X-Plane
-                if self._tile_cacher and self._tile_cacher.is_tile_opened_by_xplane(row, col, default_maptype, zoom):
-                    log.debug(f"Skipping prefetch for {row},{col}@ZL{zoom} - already opened by X-Plane")
-                    continue
-                
-                # Prefetch this tile
-                submitted, complete = self._prefetch_tile(row, col, zoom)
-                chunks_submitted += submitted
 
-                # Only mark as recently prefetched if ALL chunks were submitted
-                if complete:
-                    self._recently_prefetched.add(tile_key)
-                    if len(self._recently_prefetched) > self._max_recent:
-                        try:
-                            self._recently_prefetched.pop()
-                        except KeyError:
-                            pass
+        # Get grid-aligned tiles within radius
+        tiles = self._get_tiles_in_radius(waypoint_lat, waypoint_lon, radius_nm, zoom)
+
+        for row, col in tiles:
+            if chunks_submitted >= self.max_chunks:
+                return chunks_submitted
+
+            tile_key = (row, col, zoom)
+
+            # Skip if recently prefetched
+            if tile_key in self._recently_prefetched:
+                continue
+
+            # Skip if tile is already opened by X-Plane
+            if self._tile_cacher and self._tile_cacher.is_tile_opened_by_xplane(row, col, default_maptype, zoom):
+                log.debug(f"Skipping prefetch for {row},{col}@ZL{zoom} - already opened by X-Plane")
+                continue
+
+            # Prefetch this tile
+            submitted, complete = self._prefetch_tile(row, col, zoom)
+            chunks_submitted += submitted
+
+            # Only mark as recently prefetched if ALL chunks were submitted
+            if complete:
+                self._recently_prefetched.add(tile_key)
+                if len(self._recently_prefetched) > self._max_recent:
+                    try:
+                        self._recently_prefetched.pop()
+                    except KeyError:
+                        pass
 
         return chunks_submitted
     
@@ -2697,7 +2845,27 @@ class SpatialPrefetcher:
                     tile_key = (row, col, fallback_maptype, zoom_level)
                     if tile_key not in tile_distances or distance_m < tile_distances[tile_key]:
                         tile_distances[tile_key] = distance_m
-        
+
+        # ADDITIONAL: Query sparse index for high-zoom airport tiles (ZL18/19)
+        # Point-sampling misses these because ZL18 tiles are ~1.4nm wide but
+        # sample points are ~15-20nm apart. The spatial index finds all ZL18/19
+        # tiles within the prefetch radius in O(1) — no filesystem calls.
+        highzoom_tiles = get_highzoom_tiles_near(
+            lat, lon,
+            radius_nm=self.prefetch_radius_nm,
+            maptype_filter=maptype_filter
+        )
+        for row, col, maptype, zoom in highzoom_tiles:
+            tile_key = (row, col, maptype, zoom)
+            if tile_key not in tile_distances:
+                # Estimate distance from aircraft to this tile's center
+                tile_lat, tile_lon = TerrainTileLookup._tile_to_latlon(row, col, zoom)
+                dlat = (tile_lat - lat) * 111320
+                cos_lat = math.cos(math.radians(lat))
+                dlon = (tile_lon - lon) * 111320 * cos_lat
+                dist_m = math.sqrt(dlat * dlat + dlon * dlon)
+                tile_distances[tile_key] = dist_m
+
         # Sort tiles by distance (nearest first - gradient from player outward)
         sorted_tiles = sorted(tile_distances.items(), key=lambda x: x[1])
         

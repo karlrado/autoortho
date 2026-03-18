@@ -1794,6 +1794,11 @@ class DynamicDDSCache:
             tile._dds_missing_indices = remaining_missing
             tile._dds_fallback_indices = remaining_fallback
             log.info(f"Healing complete: {tile_id} ({patched} chunks patched)")
+
+            # Clean up source JPEGs now that the DDS is fully healed
+            if remaining_total == 0:
+                self._cleanup_jpegs_async(tile)
+
             return True
 
         # Partial patch — update DDM with remaining indices
