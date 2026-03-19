@@ -88,6 +88,11 @@ except ImportError:
     from utils.simbrief_flight import simbrief_flight_manager, PathPoint
 
 try:
+    from autoortho.utils.custom_map import get_custom_map_config
+except ImportError:
+    from utils.custom_map import get_custom_map_config
+
+try:
     from autoortho.datareftrack import dt as datareftracker
 except ImportError:
     from datareftrack import dt as datareftracker
@@ -2911,14 +2916,15 @@ class SpatialPrefetcher:
     def _get_maptype_filter(self) -> Optional[str]:
         """
         Get the maptype to filter by when querying terrain index.
-        
+
         Returns:
             Maptype string (e.g., "BI", "EOX") if override is set, None otherwise.
             When None, all maptypes are accepted from the terrain index.
+            Returns None for "Custom Map" since different cells may use different providers.
         """
         if self._tile_cacher is not None:
             override = getattr(self._tile_cacher, 'maptype_override', None)
-            if override and override != "Use tile default":
+            if override and override != "Use tile default" and override != "Custom Map":
                 return override
         return None  # Accept any maptype from terrain index
     
@@ -9147,9 +9153,13 @@ class TileCacher(object):
         self.open_count = OrderedDict()  # Use OrderedDict for LRU-style eviction
 
         self.maptype_override = CFG.autoortho.maptype_override
+        self.custom_map = None
         if self.maptype_override:
             log.info(f"Maptype override set to {self.maptype_override}")
-            if self.maptype_override == "APPLE":
+            if self.maptype_override == "Custom Map":
+                self.custom_map = get_custom_map_config()
+                log.info(f"Custom map loaded with {len(self.custom_map.get_all_cells())} cells")
+            elif self.maptype_override == "APPLE":
                 apple_token_service.reset_apple_maps_token()
         else:
             log.info(f"Maptype override not set, will use default.")
@@ -9435,9 +9445,17 @@ class TileCacher(object):
             )
         return min(default_zoom + 1, uncapped_target_zoom)
 
+    def _resolve_maptype(self, row, col, map_type, zoom):
+        """Resolve the effective maptype, accounting for Custom Map per-cell overrides."""
+        if not self.maptype_override or self.maptype_override == "Use tile default":
+            return map_type
+        if self.maptype_override == "Custom Map" and self.custom_map:
+            lat, lon = _chunk_to_latlon(row, col, zoom)
+            return self.custom_map.get_maptype(lat, lon) or map_type
+        return self.maptype_override
+
     def _to_tile_id(self, row, col, map_type, zoom):
-        if self.maptype_override:
-            map_type = self.maptype_override
+        map_type = self._resolve_maptype(row, col, map_type, zoom)
         tile_id = f"{row}_{col}_{map_type}_{zoom}"
         return tile_id
 
@@ -9838,8 +9856,7 @@ class TileCacher(object):
         return tile
 
     def _open_tile(self, row, col, map_type, zoom):
-        if self.maptype_override and self.maptype_override != "Use tile default":
-            map_type = self.maptype_override
+        map_type = self._resolve_maptype(row, col, map_type, zoom)
         idx = self._to_tile_id(row, col, map_type, zoom)
 
         log.debug(f"Get_tile: {idx}")

@@ -46,6 +46,11 @@ try:
 except ImportError:
     from utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
 
+try:
+    from autoortho.utils.custom_map import get_custom_map_config, discover_dsf_tiles
+except ImportError:
+    from utils.custom_map import get_custom_map_config, discover_dsf_tiles
+
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QPushButton, QLabel, QLineEdit, QCheckBox, QComboBox,
@@ -1293,6 +1298,7 @@ class ConfigUI(QMainWindow):
         self.create_scenery_tab()
         self.create_settings_tab()
         self.create_logs_tab()
+        self.create_custom_map_tab()
 
         # Button layout
         button_layout = QHBoxLayout()
@@ -1993,6 +1999,213 @@ class ConfigUI(QMainWindow):
         
         # Set up the UI logging handler now that log_text exists
         self.setup_ui_logging()
+
+    def create_custom_map_tab(self):
+        """Create the Custom Map editor tab with a Leaflet map in QWebEngineView."""
+        custom_map_widget = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(5)
+        custom_map_widget.setLayout(layout)
+
+        try:
+            from PySide6.QtWebEngineWidgets import QWebEngineView
+            from PySide6.QtWebChannel import QWebChannel
+            from PySide6.QtCore import QUrl, Slot
+
+            class CustomMapBridge(QObject):
+                """Bridge between JavaScript and Python for custom map editing."""
+                def __init__(self, ao_scenery_path):
+                    super().__init__()
+                    self._config = get_custom_map_config()
+                    self._available_tiles = discover_dsf_tiles(ao_scenery_path)
+
+                @Slot(result=str)
+                def get_cells(self):
+                    import json
+                    return json.dumps(self._config.get_all_cells())
+
+                @Slot(str)
+                def set_cells(self, json_str):
+                    import json
+                    assignments = json.loads(json_str)
+                    self._config.set_cells(assignments)
+
+                @Slot(str)
+                def remove_cells(self, json_str):
+                    import json
+                    keys = json.loads(json_str)
+                    self._config.remove_cells(keys)
+
+
+            # WebEngine view
+            from PySide6.QtWebEngineCore import QWebEngineSettings
+
+            self.custom_map_view = QWebEngineView()
+            self.custom_map_bridge = CustomMapBridge(self.cfg.ao_scenery_path)
+
+            # Allow local page to load remote OSM tile images
+            settings = self.custom_map_view.settings()
+            settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+
+            channel = QWebChannel()
+            channel.registerObject("bridge", self.custom_map_bridge)
+            self.custom_map_view.page().setWebChannel(channel)
+
+            # Load the HTML template
+            html_path = os.path.join(CUR_PATH, "templates", "custommap_editor.html")
+            self.custom_map_view.setUrl(QUrl.fromLocalFile(html_path))
+
+            # Push available tiles to JS once the page finishes loading
+            def on_page_loaded(ok):
+                if ok:
+                    import json
+                    tiles_json = json.dumps(self.custom_map_bridge._available_tiles)
+                    self.custom_map_view.page().runJavaScript(
+                        f'loadAvailableTiles({tiles_json})'
+                    )
+            self.custom_map_view.loadFinished.connect(on_page_loaded)
+
+            layout.addWidget(self.custom_map_view, 1)
+
+            # Toolbar
+            toolbar = QHBoxLayout()
+
+            # Maptype selector
+            toolbar.addWidget(QLabel("Paint type:"))
+            maptype_paint_combo = QComboBox()
+            paint_maptypes = [m for m in MAPTYPES if m not in ('Use tile default', 'Custom Map')]
+            maptype_paint_combo.addItems(paint_maptypes)
+            maptype_paint_combo.currentTextChanged.connect(
+                lambda t: self.custom_map_view.page().runJavaScript(f'setCurrentMaptype("{t}")')
+            )
+            toolbar.addWidget(maptype_paint_combo)
+
+            toolbar.addSpacing(10)
+
+            # Undo / Redo
+            undo_btn = QPushButton("Undo")
+            undo_btn.setToolTip("Undo last action (Ctrl+Z)")
+            undo_btn.clicked.connect(
+                lambda: self.custom_map_view.page().runJavaScript('undo()')
+            )
+            toolbar.addWidget(undo_btn)
+
+            redo_btn = QPushButton("Redo")
+            redo_btn.setToolTip("Redo last undone action (Ctrl+Y)")
+            redo_btn.clicked.connect(
+                lambda: self.custom_map_view.page().runJavaScript('redo()')
+            )
+            toolbar.addWidget(redo_btn)
+
+            toolbar.addSpacing(10)
+
+            # Paint / Erase toggle buttons (mutually exclusive)
+            paint_btn = QPushButton("Paint")
+            paint_btn.setCheckable(True)
+            erase_btn = QPushButton("Erase")
+            erase_btn.setCheckable(True)
+
+            def on_paint_toggled(checked):
+                if checked:
+                    erase_btn.setChecked(False)
+                self.custom_map_view.page().runJavaScript(
+                    f'setPaintMode({"true" if checked else "false"})'
+                )
+
+            def on_erase_toggled(checked):
+                if checked:
+                    paint_btn.setChecked(False)
+                self.custom_map_view.page().runJavaScript(
+                    f'setEraseMode({"true" if checked else "false"})'
+                )
+
+            paint_btn.toggled.connect(on_paint_toggled)
+            erase_btn.toggled.connect(on_erase_toggled)
+            toolbar.addWidget(paint_btn)
+            toolbar.addWidget(erase_btn)
+
+            # Clear All
+            clear_btn = QPushButton("Clear All")
+            def on_clear():
+                reply = QMessageBox.question(
+                    self, "Clear Custom Map",
+                    "Remove all cell assignments?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.Yes:
+                    self.custom_map_bridge._config.clear()
+                    self.custom_map_view.page().runJavaScript('clearAllCells()')
+            clear_btn.clicked.connect(on_clear)
+            toolbar.addWidget(clear_btn)
+
+            # Override All (paint entire visible area)
+            override_all_btn = QPushButton("Override All Visible")
+            def on_override_all():
+                maptype = maptype_paint_combo.currentText()
+                reply = QMessageBox.question(
+                    self, "Override All Visible",
+                    f"Paint all visible cells with '{maptype}'?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.Yes:
+                    self.custom_map_view.page().runJavaScript(
+                        f'overrideAllVisible("{maptype}")'
+                    )
+            override_all_btn.clicked.connect(on_override_all)
+            toolbar.addWidget(override_all_btn)
+
+            toolbar.addSpacing(10)
+
+            # Import
+            import_btn = QPushButton("Import")
+            def on_import():
+                path, _ = QFileDialog.getOpenFileName(
+                    self, "Import Custom Map", "", "JSON Files (*.json)"
+                )
+                if path:
+                    with open(path, 'r') as f:
+                        json_str = f.read()
+                    reply = QMessageBox.question(
+                        self, "Import Mode",
+                        "Merge with existing cells?\n\nYes = merge, No = replace all",
+                        QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel
+                    )
+                    if reply == QMessageBox.Cancel:
+                        return
+                    merge = (reply == QMessageBox.Yes)
+                    self.custom_map_bridge._config.import_json(json_str, merge=merge)
+                    import json
+                    cells_json = json.dumps(self.custom_map_bridge._config.get_all_cells())
+                    self.custom_map_view.page().runJavaScript(f'refreshCells({cells_json})')
+            import_btn.clicked.connect(on_import)
+            toolbar.addWidget(import_btn)
+
+            # Export
+            export_btn = QPushButton("Export")
+            def on_export():
+                path, _ = QFileDialog.getSaveFileName(
+                    self, "Export Custom Map", "custom_map.json", "JSON Files (*.json)"
+                )
+                if path:
+                    with open(path, 'w') as f:
+                        f.write(self.custom_map_bridge._config.export_json())
+            export_btn.clicked.connect(on_export)
+            toolbar.addWidget(export_btn)
+
+            toolbar.addStretch()
+            layout.addLayout(toolbar)
+
+        except ImportError:
+            # QWebEngine not available - show fallback message
+            fallback = QLabel(
+                "Custom Map editor requires PySide6-Addons (QtWebEngine).\n"
+                "Install it with: pip install PySide6-Addons"
+            )
+            fallback.setAlignment(Qt.AlignCenter)
+            layout.addWidget(fallback)
+
+        self.tabs.addTab(custom_map_widget, "Custom Map")
 
     def setup_ui_logging(self):
         """Set up the UI logging handler with the configured log level"""
