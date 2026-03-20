@@ -2048,9 +2048,9 @@ class ConfigUI(QMainWindow):
             settings = self.custom_map_view.settings()
             settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
 
-            channel = QWebChannel()
-            channel.registerObject("bridge", self.custom_map_bridge)
-            self.custom_map_view.page().setWebChannel(channel)
+            self.custom_map_channel = QWebChannel()
+            self.custom_map_channel.registerObject("bridge", self.custom_map_bridge)
+            self.custom_map_view.page().setWebChannel(self.custom_map_channel)
 
             # Load the HTML template
             html_path = os.path.join(CUR_PATH, "templates", "custommap_editor.html")
