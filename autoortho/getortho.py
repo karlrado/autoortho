@@ -9449,9 +9449,11 @@ class TileCacher(object):
         """Resolve the effective maptype, accounting for Custom Map per-cell overrides."""
         if not self.maptype_override or self.maptype_override == "Use tile default":
             return map_type
-        if self.maptype_override == "Custom Map" and self.custom_map:
-            lat, lon = _chunk_to_latlon(row, col, zoom)
-            return self.custom_map.get_maptype(lat, lon) or map_type
+        if self.maptype_override == "Custom Map":
+            if self.custom_map:
+                lat, lon = _chunk_to_latlon(row, col, zoom)
+                return self.custom_map.get_maptype(lat, lon) or map_type
+            return map_type
         return self.maptype_override
 
     def _to_tile_id(self, row, col, map_type, zoom):
