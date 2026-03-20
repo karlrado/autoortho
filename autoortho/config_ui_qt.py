@@ -1504,6 +1504,17 @@ class ConfigUI(QMainWindow):
             "Select a specific map provider. Use Auto to use the source based on the tile default (base scenery uses BI)."
         )
         maptype_layout.addWidget(self.maptype_combo)
+
+        self.maptype_switch_btn = QPushButton("Switch")
+        self.maptype_switch_btn.setToolTip(
+            "Apply the new map type to all new tiles without restarting."
+        )
+        self.maptype_switch_btn.setVisible(False)
+        self.maptype_switch_btn.clicked.connect(self._on_maptype_switch)
+        maptype_layout.addWidget(self.maptype_switch_btn)
+
+        self.maptype_combo.currentTextChanged.connect(self._on_maptype_combo_changed)
+
         maptype_layout.addStretch()
         options_layout.addLayout(maptype_layout)
 
@@ -2015,10 +2026,28 @@ class ConfigUI(QMainWindow):
 
             class CustomMapBridge(QObject):
                 """Bridge between JavaScript and Python for custom map editing."""
-                def __init__(self, ao_scenery_path):
+                def __init__(self, ao_scenery_path, config_ui):
                     super().__init__()
                     self._config = get_custom_map_config()
                     self._available_tiles = discover_dsf_tiles(ao_scenery_path)
+                    self._config_ui = config_ui
+
+                def _notify_workers(self):
+                    """Signal macOS workers to reload custom map if running."""
+                    ui = self._config_ui
+                    if not ui.running:
+                        return
+                    if ui.cfg.autoortho.maptype_override != "Custom Map":
+                        return
+                    import platform
+                    if platform.system() == "Darwin" and hasattr(ui, 'mac_os_procs'):
+                        import signal
+                        for p in ui.mac_os_procs:
+                            try:
+                                if p.poll() is None:
+                                    p.send_signal(signal.SIGUSR1)
+                            except Exception:
+                                pass
 
                 @Slot(result=str)
                 def get_cells(self):
@@ -2030,19 +2059,21 @@ class ConfigUI(QMainWindow):
                     import json
                     assignments = json.loads(json_str)
                     self._config.set_cells(assignments)
+                    self._notify_workers()
 
                 @Slot(str)
                 def remove_cells(self, json_str):
                     import json
                     keys = json.loads(json_str)
                     self._config.remove_cells(keys)
+                    self._notify_workers()
 
 
             # WebEngine view
             from PySide6.QtWebEngineCore import QWebEngineSettings
 
             self.custom_map_view = QWebEngineView()
-            self.custom_map_bridge = CustomMapBridge(self.cfg.ao_scenery_path)
+            self.custom_map_bridge = CustomMapBridge(self.cfg.ao_scenery_path, self)
 
             # Allow local page to load remote OSM tile images
             settings = self.custom_map_view.settings()
@@ -2205,7 +2236,7 @@ class ConfigUI(QMainWindow):
             fallback.setAlignment(Qt.AlignCenter)
             layout.addWidget(fallback)
 
-        self.tabs.addTab(custom_map_widget, "Custom Map")
+        self.tabs.addTab(custom_map_widget, "Map")
 
     def setup_ui_logging(self):
         """Set up the UI logging handler with the configured log level"""
@@ -5188,6 +5219,55 @@ class ConfigUI(QMainWindow):
         # Minimize window if hide setting is enabled
         if self.cfg.general.hide:
             self.showMinimized()
+
+    def _on_maptype_combo_changed(self, text):
+        """Show the Switch button when maptype is changed while running."""
+        if self.running and text != self.cfg.autoortho.maptype_override:
+            self.maptype_switch_btn.setVisible(True)
+        else:
+            self.maptype_switch_btn.setVisible(False)
+
+    def _on_maptype_switch(self):
+        """Apply the new maptype to all live TileCacher instances."""
+        import platform
+
+        new_maptype = self.maptype_combo.currentText()
+        self.cfg.autoortho.maptype_override = new_maptype
+        self.cfg.save()
+
+        if platform.system() == "Darwin" and hasattr(self, 'mac_os_procs'):
+            # macOS: TileCachers live in separate worker processes.
+            # Send SIGUSR1 to tell them to reload maptype from config.
+            import signal
+            for p in self.mac_os_procs:
+                try:
+                    if p.poll() is None:
+                        p.send_signal(signal.SIGUSR1)
+                        log.info(f"Sent SIGUSR1 to worker pid {p.pid}")
+                except Exception as e:
+                    log.warning(f"Failed to signal worker pid {p.pid}: {e}")
+        else:
+            # Linux/Windows: TileCachers are in-process, update directly.
+            import gc
+            import getortho
+            for obj in gc.get_objects():
+                try:
+                    if isinstance(obj, getortho.TileCacher):
+                        obj.maptype_override = new_maptype
+                        if new_maptype == "Custom Map":
+                            from utils.custom_map import get_custom_map_config
+                            obj.custom_map = get_custom_map_config()
+                        elif new_maptype == "APPLE":
+                            from utils.apple_token_service import apple_token_service
+                            apple_token_service.reset_apple_maps_token()
+                        else:
+                            obj.custom_map = None
+                        log.info(f"Live-switched TileCacher maptype to {new_maptype}")
+                except Exception:
+                    pass
+
+        self.maptype_switch_btn.setVisible(False)
+        self.update_status_bar(f"Map type switched to {new_maptype}")
 
     def on_save(self):
         """Handle Save button click"""

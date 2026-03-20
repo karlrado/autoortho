@@ -132,3 +132,11 @@ def get_custom_map_config() -> CustomMapConfig:
             if _singleton is None:
                 _singleton = CustomMapConfig()
     return _singleton
+
+
+def reload_custom_map_config() -> CustomMapConfig:
+    """Force-reload the singleton from disk. Returns the refreshed instance."""
+    global _singleton
+    with _singleton_lock:
+        _singleton = CustomMapConfig()
+    return _singleton
