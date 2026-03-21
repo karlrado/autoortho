@@ -1297,8 +1297,8 @@ class ConfigUI(QMainWindow):
         self.create_setup_tab()
         self.create_scenery_tab()
         self.create_settings_tab()
-        self.create_logs_tab()
         self.create_custom_map_tab()
+        self.create_logs_tab()
 
         # Button layout
         button_layout = QHBoxLayout()
