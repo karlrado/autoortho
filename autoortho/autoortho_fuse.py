@@ -693,9 +693,12 @@ class AutoOrtho(Operations):
     def _getattr_real_file(self, path):
         """Get attributes for real filesystem files - never cached."""
         full_path = self._full_path(path)
-        exists = os.path.exists(full_path)
-        log.debug(f"GETATTR FULLPATH {full_path}  Exists? {exists}")
-        st = os.lstat(full_path)
+        log.debug(f"GETATTR FULLPATH {full_path}")
+        try:
+            st = os.lstat(full_path)
+        except OSError as e:
+            log.debug(f"GETATTR: lstat failed for {full_path}: {e}")
+            raise FuseOSError(errno.ENOENT)
         log.debug(f"GETATTR: Orig stat: {st}")
         attrs = {k: getattr(st, k) for k in (
             'st_atime',

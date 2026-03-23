@@ -1984,6 +1984,13 @@ class TerrainTileLookup:
                 except (ValueError, IndexError):
                     continue
 
+                # Skip entries where the extracted maptype is actually a
+                # zoom-level notation (e.g. "ZL18.ter") rather than a real
+                # map source.  These break the FUSE DDS regex which uses a
+                # negative lookahead to reject "ZL"-prefixed filenames.
+                if maptype.upper() in ("ZL", ""):
+                    continue
+
                 # Only index the target zoom levels (the glob may match
                 # files like *118.ter at ZL18 pattern, so verify)
                 if file_zoom != zoom:
