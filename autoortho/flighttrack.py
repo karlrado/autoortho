@@ -368,7 +368,7 @@ def run():
     #app.run(host='0.0.0.0', port=CFG.flightdata.webui_port, debug=CFG.general.debug, threaded=True, use_reloader=False)
     log.info("Start flighttracker...")
     try:
-        socketio.run(app, host='0.0.0.0', port=int(CFG.flightdata.webui_port))
+        socketio.run(app, host='0.0.0.0', port=int(CFG.flightdata.webui_port), allow_unsafe_werkzeug=True)
     except Exception as e:
         if not _server_shutdown_requested.is_set():
             log.error(f"FlightTracker server error: {e}")
