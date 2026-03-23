@@ -50,7 +50,7 @@
   <h4>Legend</h4>
   <div class="legend-body"></div>
 </div>
-<div id="status">Navigate (click Paint or Erase to start editing)</div>
+<div id="status">Paint mode — left-click & drag to paint, right-click & drag to pan</div>
 
 <script>
 // ============================================================================
@@ -69,7 +69,6 @@ const MAPTYPE_COLORS = {
 };
 
 let currentMaptype = 'BI';
-let paintMode = false;
 let eraseMode = false;
 let bridge = null;
 let debounceTimer = null;
@@ -273,9 +272,10 @@ function loadCells(cellsJson) {
 
 function updateStatus() {
   const count = Object.keys(cellRects).length;
-  let mode = 'Navigate (click Paint or Erase to start editing)';
-  if (eraseMode) mode = 'ERASE mode \u2014 click & drag to select area';
-  else if (paintMode) mode = 'Paint: ' + currentMaptype + ' \u2014 click & drag to select area';
+  let mode = eraseMode
+    ? 'Erase mode \u2014 left-click & drag to erase'
+    : 'Paint: ' + currentMaptype + ' \u2014 left-click & drag to paint';
+  mode += ' | right-click & drag to pan';
   let tileInfo = '';
   if (!availableTilesLoaded) tileInfo = ' | Loading tiles...';
   else if (availableTiles.size === 0) tileInfo = ' | No scenery tiles found';
@@ -435,31 +435,47 @@ function removeSelectionDiv() {
 }
 
 // ============================================================================
-// Mouse Interaction: drag-to-select in paint/erase mode
+// Mouse Interaction: left-click to paint/erase, right-click to pan
 // ============================================================================
+
+// Disable default left-click dragging; we handle pan via right-click
+map.dragging.disable();
+
+// Right-click drag panning state
+let rightDragStart = null;
+let rightDragCenter = null;
+
 map.on('mousedown', function(e) {
-  // Right-click erases a single cell (only if it's an available tile)
+  // Right-click: start panning
   if (e.originalEvent.button === 2) {
-    const key = cellKey(e.latlng.lat, e.latlng.lng);
-    if (!isTileAvailable(key)) return;
-    const before = snapshotKeys([key]);
-    removeCellRect(key);
-    const after = {};
-    after[key] = null;
-    if (bridge) bridge.remove_cells(JSON.stringify([key]));
-    pushUndo(before, after);
-    updateStatus();
+    rightDragStart = { x: e.originalEvent.clientX, y: e.originalEvent.clientY };
+    rightDragCenter = map.getCenter();
+    map.getContainer().style.cursor = 'grabbing';
     return;
   }
-  if (!paintMode && !eraseMode) return;
+
+  // Left-click: start paint/erase drag selection
+  if (e.originalEvent.button !== 0) return;
   if (!availableTilesLoaded || availableTiles.size === 0) return;
 
   dragStart = { x: e.originalEvent.clientX, y: e.originalEvent.clientY };
   dragStartLatLng = e.latlng;
-  map.dragging.disable();
 });
 
 map.on('mousemove', function(e) {
+  // Right-click panning
+  if (rightDragStart) {
+    const dx = e.originalEvent.clientX - rightDragStart.x;
+    const dy = e.originalEvent.clientY - rightDragStart.y;
+    const startPoint = map.latLngToContainerPoint(rightDragCenter);
+    const newCenter = map.containerPointToLatLng(
+      L.point(startPoint.x - dx, startPoint.y - dy)
+    );
+    map.setView(newCenter, map.getZoom(), { animate: false });
+    return;
+  }
+
+  // Left-click drag selection
   if (!dragStart) return;
   updateSelectionDiv(
     dragStart.x, dragStart.y,
@@ -468,10 +484,17 @@ map.on('mousemove', function(e) {
 });
 
 map.on('mouseup', function(e) {
-  if (!dragStart) return;
+  // End right-click pan
+  if (e.originalEvent.button === 2 && rightDragStart) {
+    rightDragStart = null;
+    rightDragCenter = null;
+    map.getContainer().style.cursor = 'crosshair';
+    return;
+  }
 
+  // End left-click drag selection
+  if (!dragStart) return;
   removeSelectionDiv();
-  map.dragging.enable();
 
   const endLatLng = e.latlng;
   applyCellsInBounds(
@@ -488,6 +511,9 @@ map.getContainer().addEventListener('contextmenu', function(e) {
   e.preventDefault();
 });
 
+// Set initial cursor to crosshair since we're always in paint/erase mode
+map.getContainer().style.cursor = 'crosshair';
+
 // ============================================================================
 // Bridge API (called from Python)
 // ============================================================================
@@ -496,17 +522,8 @@ function setCurrentMaptype(maptype) {
   updateStatus();
 }
 
-function setPaintMode(enabled) {
-  paintMode = enabled;
-  if (enabled) eraseMode = false;
-  map.getContainer().style.cursor = enabled ? 'crosshair' : '';
-  updateStatus();
-}
-
 function setEraseMode(enabled) {
   eraseMode = enabled;
-  if (enabled) paintMode = false;
-  map.getContainer().style.cursor = enabled ? 'crosshair' : '';
   updateStatus();
 }
 

@@ -2131,30 +2131,23 @@ class ConfigUI(QMainWindow):
 
             toolbar.addSpacing(10)
 
-            # Paint / Erase toggle buttons (mutually exclusive)
-            paint_btn = QPushButton("Paint")
-            paint_btn.setCheckable(True)
-            erase_btn = QPushButton("Erase")
-            erase_btn.setCheckable(True)
+            # Paint / Erase toggle button — label shows current mode
+            mode_toggle_btn = QPushButton("Mode: Paint")
+            mode_toggle_btn.setCheckable(True)
+            mode_toggle_btn.setToolTip("Click to switch between Paint and Erase")
+            mode_toggle_btn.setStyleSheet(
+                "QPushButton { font-weight: bold; padding: 4px 12px; }"
+                "QPushButton:checked { background-color: #d9534f; color: white; }"
+            )
 
-            def on_paint_toggled(checked):
-                if checked:
-                    erase_btn.setChecked(False)
-                self.custom_map_view.page().runJavaScript(
-                    f'setPaintMode({"true" if checked else "false"})'
-                )
-
-            def on_erase_toggled(checked):
-                if checked:
-                    paint_btn.setChecked(False)
+            def on_mode_toggled(checked):
+                mode_toggle_btn.setText("Mode: Erase" if checked else "Mode: Paint")
                 self.custom_map_view.page().runJavaScript(
                     f'setEraseMode({"true" if checked else "false"})'
                 )
 
-            paint_btn.toggled.connect(on_paint_toggled)
-            erase_btn.toggled.connect(on_erase_toggled)
-            toolbar.addWidget(paint_btn)
-            toolbar.addWidget(erase_btn)
+            mode_toggle_btn.toggled.connect(on_mode_toggled)
+            toolbar.addWidget(mode_toggle_btn)
 
             # Clear All
             clear_btn = QPushButton("Clear All")
