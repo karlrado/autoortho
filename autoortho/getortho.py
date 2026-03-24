@@ -2961,7 +2961,7 @@ class SpatialPrefetcher:
         # Get maptype from parameter or config
         if maptype is None:
             maptype = getattr(CFG.autoortho, 'maptype_override', None)
-            if not maptype or maptype == "Use tile default":
+            if not maptype or maptype in ("Use tile default", "Custom Map"):
                 maptype = "EOX"
         
         tile = None
@@ -9452,14 +9452,23 @@ class TileCacher(object):
         return min(default_zoom + 1, uncapped_target_zoom)
 
     def _resolve_maptype(self, row, col, map_type, zoom):
-        """Resolve the effective maptype, accounting for Custom Map per-cell overrides."""
+        """Resolve the effective maptype, accounting for Custom Map per-cell overrides.
+
+        Never returns the sentinel string ``"Custom Map"`` — if the custom map
+        has no entry for a position, the caller's ``map_type`` is returned
+        (but only when it is itself a real imagery source).
+        """
         if not self.maptype_override or self.maptype_override == "Use tile default":
             return map_type
         if self.maptype_override == "Custom Map":
             if self.custom_map:
                 lat, lon = _chunk_to_latlon(row, col, zoom)
-                return self.custom_map.get_maptype(lat, lon) or map_type
-            return map_type
+                resolved = self.custom_map.get_maptype(lat, lon)
+                if resolved:
+                    return resolved
+            # Fallback: use the caller's maptype only if it is a real source,
+            # otherwise default to "BI" to avoid passing "Custom Map" downstream.
+            return map_type if map_type != "Custom Map" else "BI"
         return self.maptype_override
 
     def _to_tile_id(self, row, col, map_type, zoom):
