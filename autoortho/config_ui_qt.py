@@ -2060,7 +2060,13 @@ class ConfigUI(QMainWindow):
 
     def _open_custom_map_in_browser(self):
         """Open the custom map editor in the default web browser."""
-        port = self.cfg.flightdata.webui_port
+        try:
+            import flighttrack
+            port = flighttrack.active_port
+        except (ImportError, AttributeError):
+            port = None
+        if not port:
+            port = self.cfg.flightdata.webui_port
         webbrowser.open(f"http://localhost:{port}/custommap")
 
     def setup_ui_logging(self):

@@ -364,14 +364,39 @@ def shutdown_server():
         log.debug(f"socketio.stop() error (may be expected): {e}")
 
 
+# The port the server is actually listening on (may differ from config if port was busy).
+active_port = None
+
+
 def run():
-    #app.run(host='0.0.0.0', port=CFG.flightdata.webui_port, debug=CFG.general.debug, threaded=True, use_reloader=False)
+    global active_port
     log.info("Start flighttracker...")
-    try:
-        socketio.run(app, host='0.0.0.0', port=int(CFG.flightdata.webui_port), allow_unsafe_werkzeug=True)
-    except Exception as e:
-        if not _server_shutdown_requested.is_set():
-            log.error(f"FlightTracker server error: {e}")
+    preferred_port = int(CFG.flightdata.webui_port)
+    # Try the configured port first, then a few fallbacks to avoid conflicts
+    # (e.g. macOS AirPlay Receiver occupies port 5000 by default).
+    ports_to_try = [preferred_port] + [p for p in (5847, 7847, 8847, 0) if p != preferred_port]
+    for port in ports_to_try:
+        try:
+            active_port = port
+            if port == 0:
+                log.warning("All preferred ports busy, binding to OS-assigned port.")
+            elif port != preferred_port:
+                log.warning(f"Port {preferred_port} unavailable, trying {port}.")
+            socketio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
+            break  # normal exit (server was stopped gracefully)
+        except OSError as e:
+            # Port already in use — try the next one
+            log.warning(f"Could not bind to port {port}: {e}")
+            active_port = None
+            continue
+        except Exception as e:
+            if not _server_shutdown_requested.is_set():
+                log.error(f"FlightTracker server error: {e}")
+            break
+    if active_port is not None:
+        log.info(f"FlightTracker was running on port {active_port}.")
+    else:
+        log.error("FlightTracker failed to start on any port.")
     log.info("Exiting flighttracker ...") 
 
 def main():
