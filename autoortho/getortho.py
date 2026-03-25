@@ -3553,18 +3553,21 @@ class BackgroundDDSBuilder:
             'missing_color': missing_color
         }
         
+        log.info(f"BackgroundDDSBuilder: DIAG acquiring builder for {tile_id} "
+                 f"chunks_per_row={tile.chunks_per_row} max_zoom={tile.max_zoom}")
         builder = builder_pool.acquire(config=config, timeout=30.0)
         if not builder:
             log.warning(f"BackgroundDDSBuilder: Failed to acquire streaming builder for {tile_id}")
             return False
-        
+        log.info(f"BackgroundDDSBuilder: DIAG builder acquired for {tile_id}")
+
         # Setup transition tracking
         tile._live_transition_event = threading.Event()
         tile._active_streaming_builder = builder
-        
+
         # Keep references alive for zero-copy mode (cleared after finalize)
         jpeg_refs_for_nocopy = []
-        
+
         try:
             # Get chunks for max zoom
             chunks = tile.chunks.get(tile.max_zoom, [])
@@ -3593,7 +3596,13 @@ class BackgroundDDSBuilder:
             # ZERO-COPY: Batch add chunks using nocopy mode
             # C stores pointers directly, we keep references in jpeg_refs_for_nocopy
             if ready_chunks:
+                log.info(f"BackgroundDDSBuilder: DIAG add_chunks_batch_nocopy {tile_id} "
+                         f"count={len(ready_chunks)} pending={len(pending_indices)}")
+                # Flush all log handlers before native call (crash won't flush)
+                for h in logging.getLogger().handlers:
+                    h.flush()
                 builder.add_chunks_batch_nocopy(ready_chunks, jpeg_refs_for_nocopy)
+                log.info(f"BackgroundDDSBuilder: DIAG add_chunks_batch_nocopy done for {tile_id}")
             
             # Phase 2: Process remaining chunks with transition handling
             # Key difference from live: NO initial time budget, but may get one on transition
@@ -3666,10 +3675,16 @@ class BackgroundDDSBuilder:
             # Finalize directly to disk via DynamicDDSCache staging path
             if self._dds_cache is not None:
                 staging_path = self._dds_cache.get_staging_path(tile_id, tile.max_zoom, tile)
+                log.info(f"BackgroundDDSBuilder: DIAG finalize_to_file {tile_id} "
+                         f"path={staging_path} threads={_compute_thread_budget()}")
+                for h in logging.getLogger().handlers:
+                    h.flush()
                 with _native_build_context():
                     success, bytes_written = builder.finalize_to_file(
                         staging_path, max_threads=_compute_thread_budget()
                     )
+                log.info(f"BackgroundDDSBuilder: DIAG finalize done {tile_id} "
+                         f"success={success} bytes={bytes_written}")
                 
                 if success and bytes_written >= 128:
                     self._dds_cache.store_from_file(
