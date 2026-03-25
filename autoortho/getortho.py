@@ -852,10 +852,19 @@ def _compute_thread_budget() -> int:
     return max(2, CURRENT_CPU_COUNT // active)
 
 
+_native_build_semaphore = threading.Semaphore(1)
+
 class _native_build_context:
-    """Track entry/exit of native DDS builds for thread budget coordination."""
+    """Serialize native DDS builds to prevent concurrent OpenMP crashes.
+
+    The ISPC/OpenMP runtime is not safe when multiple threads enter
+    ``omp_set_num_threads`` or parallel regions simultaneously.  Using a
+    semaphore (count=1) ensures only one ``finalize_to_file`` executes at
+    a time while still tracking active builds for thread budget math.
+    """
     def __enter__(self):
         global _active_native_builds
+        _native_build_semaphore.acquire()
         with _active_native_builds_lock:
             _active_native_builds += 1
         return self
@@ -864,6 +873,7 @@ class _native_build_context:
         global _active_native_builds
         with _active_native_builds_lock:
             _active_native_builds -= 1
+        _native_build_semaphore.release()
         return False
 
 
@@ -3557,14 +3567,14 @@ class BackgroundDDSBuilder:
         if not builder:
             log.warning(f"BackgroundDDSBuilder: Failed to acquire streaming builder for {tile_id}")
             return False
-        
+
         # Setup transition tracking
         tile._live_transition_event = threading.Event()
         tile._active_streaming_builder = builder
-        
+
         # Keep references alive for zero-copy mode (cleared after finalize)
         jpeg_refs_for_nocopy = []
-        
+
         try:
             # Get chunks for max zoom
             chunks = tile.chunks.get(tile.max_zoom, [])
