@@ -3374,10 +3374,13 @@ class BackgroundDDSBuilder:
                 pass
             self._coordinator_thread.join(timeout=2.0)
             self._coordinator_thread = None
-        
-        # Shutdown executor (wait for active builds)
+
+        # Shutdown executor — don't wait for in-flight builds since they are
+        # speculative background work.  cancel_futures=True prevents queued
+        # futures from starting; wait=False avoids blocking on builds that
+        # may be stuck on network I/O or holding the native build semaphore.
         if self._executor is not None:
-            self._executor.shutdown(wait=True, cancel_futures=False)
+            self._executor.shutdown(wait=False, cancel_futures=True)
             self._executor = None
         
         log.info(f"BackgroundDDSBuilder stopped "
